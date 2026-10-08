@@ -1,0 +1,6 @@
+path: /data/yolo/yolo/数据集/反光背心/image/fanguangbeixin
+train: images/train
+val: images/val
+
+names:
+  0: reflective_vest
