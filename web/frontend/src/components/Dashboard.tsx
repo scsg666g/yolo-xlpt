@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, MoreHorizontal, Plus, RefreshCw, Search, Square, Trash2, Zap } from 'lucide-react'
+import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompareArrows, MoreHorizontal, Plus, RefreshCw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import type { TrainingTask } from '../types'
@@ -74,6 +74,7 @@ export function Dashboard() {
             {['draft', 'stopped', 'failed', 'interrupted'].includes(task.status) && <button title="启动" onClick={(e) => taskAction(e, () => api.start(task.id))}><Zap size={15} /></button>}
             {['queued', 'starting', 'running'].includes(task.status) && <button title="停止" onClick={(e) => taskAction(e, () => api.stop(task.id))}><Square size={14} /></button>}
             <button title="克隆" onClick={(e) => taskAction(e, () => api.clone(task.id))}><Copy size={15} /></button>
+            <button title="加入实验对比" onClick={(e) => { e.stopPropagation(); navigate(`/compare?tasks=${task.id}`) }}><GitCompareArrows size={15} /></button>
             {!['queued', 'starting', 'running', 'stopping'].includes(task.status) && <button title="删除" onClick={(e) => taskAction(e, () => api.remove(task.id))}><Trash2 size={15} /></button>}
             <button title="打开画布"><ArrowUpRight size={15} /></button>
           </div></footer>
@@ -82,4 +83,3 @@ export function Dashboard() {
     <CreateTaskModal open={creating} onClose={() => setCreating(false)} onCreated={(task) => { setCreating(false); navigate(`/tasks/${task.id}/canvas`) }} />
   </div>
 }
-

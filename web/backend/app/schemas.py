@@ -41,6 +41,32 @@ class LayoutUpdate(BaseModel):
     layout: dict[str, Any]
 
 
+class TaskConfigUpdate(BaseModel):
+    epochs: int = Field(ge=1, le=10000)
+    batch: int = Field(ge=1, le=1024)
+    imgsz: int = Field(ge=32, le=4096)
+    device: str
+    workers: int = Field(ge=0, le=64)
+    optimizer: str = Field(min_length=1, max_length=40)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value in {"cpu", "mps"}:
+            return value
+        parts = value.split(",")
+        if not parts or any(not part.strip().isdigit() for part in parts):
+            raise ValueError("device 必须是 cpu、mps 或逗号分隔的 GPU 编号")
+        return ",".join(part.strip() for part in parts)
+
+
+class TaskResourceUpdate(BaseModel):
+    model_path: str | None = None
+    data_path: str | None = None
+
+
 class TaskRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -100,4 +126,3 @@ class EventRead(BaseModel):
     message: str
     payload: dict[str, Any]
     created_at: datetime
-

@@ -4,6 +4,7 @@ import { BrowserRouter } from 'react-router-dom'
 import App from './App'
 import '@xyflow/react/dist/style.css'
 import './styles.css'
+import './compare.css'
 
 const savedTheme = localStorage.getItem('yolo-forge-theme')
 document.documentElement.dataset.theme = savedTheme === 'dark' ? 'dark' : 'light'

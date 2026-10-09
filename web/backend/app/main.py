@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
 from .database import Base, SessionLocal, engine, get_db
 from .models import Artifact, MetricPoint, TaskEvent, TrainingTask, utcnow
-from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, TaskCreate, TaskRead
+from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, TaskConfigUpdate, TaskCreate, TaskRead, TaskResourceUpdate
 from .services import (
     add_event,
     discover_files,
@@ -29,6 +29,13 @@ from .services import (
     sync_metrics,
     validate_input_path,
 )
+
+EDITABLE_TRAINING_KEYS = {
+    "patience", "lr0", "pretrained", "cache", "amp", "close_mosaic", "cos_lr", "weight_decay",
+    "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed", "deterministic", "fraction",
+    "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "perspective",
+    "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl",
+}
 
 
 @asynccontextmanager
@@ -191,6 +198,62 @@ def save_layout(task_id: str, payload: LayoutUpdate, db: Session = Depends(get_d
     return task
 
 
+@app.patch("/api/tasks/{task_id}/config", response_model=TaskRead)
+def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.status in {"queued", "starting", "running", "stopping"}:
+        raise HTTPException(409, "任务正在运行或排队，不能修改训练参数")
+    if payload.epochs < task.completed_epochs:
+        raise HTTPException(422, f"训练轮数不能小于已有进度 {task.completed_epochs}")
+    unknown = set(payload.config) - EDITABLE_TRAINING_KEYS
+    if unknown:
+        raise HTTPException(422, f"包含不支持的参数：{', '.join(sorted(unknown))}")
+    task.epochs = payload.epochs
+    task.batch = payload.batch
+    task.imgsz = payload.imgsz
+    task.device = payload.device
+    task.workers = payload.workers
+    task.optimizer = payload.optimizer
+    preserved = {key: value for key, value in (task.config or {}).items() if key not in EDITABLE_TRAINING_KEYS}
+    task.config = {**preserved, **payload.config}
+    task.progress = min(100.0, round(task.completed_epochs / max(task.epochs, 1) * 100, 2))
+    add_event(db, task.id, "config_updated", "训练参数已更新", payload=payload.model_dump())
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.patch("/api/tasks/{task_id}/resources", response_model=TaskRead)
+def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.status in {"queued", "starting", "running", "stopping"}:
+        raise HTTPException(409, "任务正在运行或排队，不能更换模型或数据集")
+    if payload.model_path is None and payload.data_path is None:
+        raise HTTPException(422, "至少需要提供一个模型或数据集路径")
+    try:
+        if payload.model_path is not None:
+            task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+        if payload.data_path is not None:
+            task.data_path = str(validate_input_path(payload.data_path, DATASET_ROOTS, "数据集配置"))
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    current_config = dict(task.config or {})
+    issues = dict(current_config.get("path_issues") or {})
+    if payload.model_path is not None:
+        issues["model_missing"] = False
+        current_config["model"] = task.model_path
+    if payload.data_path is not None:
+        issues["data_missing"] = False
+        current_config["data"] = task.data_path
+    current_config["path_issues"] = issues
+    task.config = current_config
+    changed = "模型" if payload.model_path is not None else "数据集"
+    add_event(db, task.id, "resource_updated", f"{changed}路径已更新", payload=payload.model_dump(exclude_none=True))
+    db.commit()
+    db.refresh(task)
+    return task
+
+
 @app.get("/api/tasks/{task_id}/metrics", response_model=list[MetricRead])
 def task_metrics(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
@@ -269,4 +332,3 @@ def frontend_app(full_path: str):
     if path_is_within(candidate, [frontend_dist]) and candidate.is_file():
         return FileResponse(candidate)
     return FileResponse(frontend_dist / "index.html")
-

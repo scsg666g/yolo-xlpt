@@ -29,7 +29,7 @@ export function Layout() {
         </div>
         <nav>
           <NavLink to="/" end><LayoutDashboard size={18} />任务中心</NavLink>
-          <span className="nav-muted"><Activity size={18} />实验对比<em>即将推出</em></span>
+          <NavLink to="/compare"><Activity size={18} />实验对比</NavLink>
           <span className="nav-muted"><Cpu size={18} />算力资源</span>
         </nav>
         <div className="sidebar-footer">
