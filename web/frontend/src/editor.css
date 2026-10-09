@@ -10,6 +10,14 @@
 .custom-row { border-color: #3b3049; background: #12141d; }
 .custom-row > div span { color: #c69be0; }
 .custom-help { margin: 7px 2px 0; color: #596a77; font-size: 7px; line-height: 1.5; }
+.parameter-picker { min-width: 0; }
+.parameter-picker > button { width: 100%; height: 35px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 10px; text-align: left; border: 1px solid #283844; border-radius: 6px; color: #82919d; background: #101922; cursor: pointer; font-size: 9px; }
+.parameter-picker > button.open { border-color: #4a796c; }.parameter-picker > button > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }.parameter-picker > button strong { color: #c1cdd5; font-size: 9px; }.parameter-picker > button code { margin-left: 6px; color: #647682; font: 400 8px "DM Mono", monospace; }
+.parameter-picker-menu { margin-top: 5px; overflow: hidden; border: 1px solid #2d3e49; border-radius: 7px; background: #0c141b; box-shadow: 0 14px 38px rgba(0,0,0,.28); }
+.parameter-picker-menu > label { height: 38px; display: flex; align-items: center; gap: 7px; padding: 0 10px; color: #667986; border-bottom: 1px solid #24333e; background: #0a1117; }
+.parameter-picker-menu > label input { flex: 1; min-width: 0; border: 0; outline: none; color: #c8d4dc; background: transparent; font-size: 9px; }
+.parameter-picker-menu > div { max-height: 210px; overflow: auto; padding: 5px; }
+.parameter-picker-menu > div > button { width: 100%; min-height: 38px; display: flex; align-items: center; justify-content: space-between; padding: 5px 8px; text-align: left; border: 0; border-radius: 5px; color: #687a87; background: transparent; cursor: pointer; }.parameter-picker-menu > div > button:hover { color: #70f0bd; background: #13231f; }.parameter-picker-menu > div > button span, .parameter-picker-menu > div > button strong, .parameter-picker-menu > div > button code { display: block; }.parameter-picker-menu > div > button strong { color: #b5c1ca; font-size: 9px; }.parameter-picker-menu > div > button code { margin-top: 3px; color: #5d6f7b; font: 400 7px "DM Mono", monospace; }.parameter-picker-menu > div > p { margin: 0; padding: 24px 8px; text-align: center; color: #5c6d79; font-size: 8px; }
 :root[data-theme='light'] .custom-parameter-section { border-color: #dce5ea; }
 :root[data-theme='light'] .custom-title { color: #874ea6; }
 :root[data-theme='light'] .custom-title strong { color: #355263; }
@@ -18,3 +26,5 @@
 :root[data-theme='light'] .custom-add-row input, :root[data-theme='light'] .custom-add-row select { color: #294554; border-color: #cbd9e1; background: #fff; }
 :root[data-theme='light'] .custom-row { border-color: #dbc8e5; background: #fcf9fd; }
 :root[data-theme='light'] .custom-row > div span { color: #874ea6; }
+:root[data-theme='light'] .parameter-picker > button { color: #617987; border-color: #cbd9e1; background: #fff; }:root[data-theme='light'] .parameter-picker > button.open { border-color: #65a995; }:root[data-theme='light'] .parameter-picker > button strong { color: #294554; }:root[data-theme='light'] .parameter-picker > button code { color: #718793; }
+:root[data-theme='light'] .parameter-picker-menu { border-color: #cbd9e1; background: #fff; box-shadow: 0 14px 35px rgba(42,67,81,.14); }:root[data-theme='light'] .parameter-picker-menu > label { color: #6c8290; border-color: #dce6eb; background: #f5f8fa; }:root[data-theme='light'] .parameter-picker-menu > label input { color: #294554; }:root[data-theme='light'] .parameter-picker-menu > div > button:hover { color: #087e61; background: #eaf6f2; }:root[data-theme='light'] .parameter-picker-menu > div > button strong { color: #355263; }:root[data-theme='light'] .parameter-picker-menu > div > button code { color: #718793; }

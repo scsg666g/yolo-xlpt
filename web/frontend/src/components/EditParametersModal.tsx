@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { Braces, ChevronDown, LoaderCircle, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Braces, Check, ChevronDown, LoaderCircle, Plus, Search, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { api } from '../api'
 import type { TrainingTask } from '../types'
 
@@ -47,27 +47,38 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   const [extras, setExtras] = useState<Record<string, ExtraValue>>({})
   const [customArgs, setCustomArgs] = useState<Record<string, ExtraValue>>({})
   const [newKey, setNewKey] = useState('')
+  const [parameterSearch, setParameterSearch] = useState('')
+  const [parameterPickerOpen, setParameterPickerOpen] = useState(false)
   const [customKey, setCustomKey] = useState('')
   const [customType, setCustomType] = useState<'number' | 'boolean' | 'text'>('number')
   const [customValue, setCustomValue] = useState('')
   const [expanded, setExpanded] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const latestTask = useRef(task)
+  latestTask.current = task
 
   useEffect(() => {
-    if (!task || !open) return
+    const currentTask = latestTask.current
+    if (!currentTask || !open) return
     setForm({
-      epochs: task.epochs, batch: task.batch, imgsz: task.imgsz, device: task.device, workers: task.workers,
-      optimizer: task.optimizer, patience: Number(task.config.patience ?? 50),
-      lr0: task.config.lr0 == null ? '' : String(task.config.lr0), close_mosaic: Number(task.config.close_mosaic ?? 10),
-      pretrained: task.config.pretrained !== false, cache: Boolean(task.config.cache), amp: task.config.amp !== false,
+      epochs: currentTask.epochs, batch: currentTask.batch, imgsz: currentTask.imgsz, device: currentTask.device, workers: currentTask.workers,
+      optimizer: currentTask.optimizer, patience: Number(currentTask.config.patience ?? 50),
+      lr0: currentTask.config.lr0 == null ? '' : String(currentTask.config.lr0), close_mosaic: Number(currentTask.config.close_mosaic ?? 10),
+      pretrained: currentTask.config.pretrained !== false, cache: Boolean(currentTask.config.cache), amp: currentTask.config.amp !== false,
     })
-    setExtras(Object.fromEntries(Object.keys(extraDefinitions).filter((key) => task.config[key] != null).map((key) => [key, task.config[key] as ExtraValue])))
-    setCustomArgs((task.config.custom_args as Record<string, ExtraValue> | undefined) || {})
+    setExtras(Object.fromEntries(Object.keys(extraDefinitions).filter((key) => currentTask.config[key] != null).map((key) => [key, currentTask.config[key] as ExtraValue])))
+    setCustomArgs((currentTask.config.custom_args as Record<string, ExtraValue> | undefined) || {})
+    setNewKey(''); setParameterSearch(''); setParameterPickerOpen(false)
     setError('')
-  }, [task, open])
+  }, [task?.id, open])
 
   const availableKeys = useMemo(() => Object.keys(extraDefinitions).filter((key) => !(key in extras)), [extras])
+  const filteredAvailableKeys = useMemo(() => {
+    const keyword = parameterSearch.trim().toLowerCase()
+    if (!keyword) return availableKeys
+    return availableKeys.filter((key) => `${extraDefinitions[key].label} ${key}`.toLowerCase().includes(keyword))
+  }, [availableKeys, parameterSearch])
   if (!open || !task) return null
   const locked = ['queued', 'starting', 'running', 'stopping'].includes(task.status)
 
@@ -78,7 +89,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   function addExtra() {
     if (!newKey) return
     setExtras((current) => ({ ...current, [newKey]: extraDefinitions[newKey].default }))
-    setNewKey('')
+    setNewKey(''); setParameterSearch(''); setParameterPickerOpen(false)
   }
 
   function updateExtra(key: string, raw: string | boolean) {
@@ -143,7 +154,16 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
         <button type="button" className="advanced-toggle parameter-toggle" onClick={() => setExpanded((value) => !value)}><ChevronDown size={16} className={expanded ? 'rotated' : ''} />高级参数 <em>{Object.keys(extras).length} 项</em></button>
         {expanded && <div className="extra-parameters">
           {Object.entries(extras).map(([key, value]) => { const definition = extraDefinitions[key]; return <div className="extra-row" key={key}><div><span>{definition.label}</span><code>{key}</code></div>{definition.type === 'boolean' ? <select value={String(value)} onChange={(e) => updateExtra(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={definition.type} step={definition.step} value={String(value)} onChange={(e) => updateExtra(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setExtras((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div> })}
-          <div className="add-parameter"><select value={newKey} onChange={(e) => setNewKey(e.target.value)}><option value="">选择要添加的训练参数</option>{availableKeys.map((key) => <option key={key} value={key}>{extraDefinitions[key].label} · {key}</option>)}</select><button type="button" className="button ghost" disabled={!newKey} onClick={addExtra}><Plus size={15} />添加参数</button></div>
+          <div className="add-parameter">
+            <div className="parameter-picker">
+              <button type="button" className={parameterPickerOpen ? 'open' : ''} onClick={() => setParameterPickerOpen((value) => !value)}><span>{newKey ? <><strong>{extraDefinitions[newKey].label}</strong><code>{newKey}</code></> : '选择要添加的训练参数'}</span><ChevronDown size={15} /></button>
+              {parameterPickerOpen && <div className="parameter-picker-menu">
+                <label><Search size={14} /><input autoFocus value={parameterSearch} onChange={(event) => setParameterSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && filteredAvailableKeys[0]) { event.preventDefault(); setNewKey(filteredAvailableKeys[0]); setParameterPickerOpen(false); setParameterSearch('') } }} placeholder="搜索中文名称或参数名，例如 freeze" /></label>
+                <div>{filteredAvailableKeys.map((key) => <button type="button" key={key} onClick={() => { setNewKey(key); setParameterPickerOpen(false); setParameterSearch('') }}><span><strong>{extraDefinitions[key].label}</strong><code>{key}</code></span>{newKey === key && <Check size={14} />}</button>)}{!filteredAvailableKeys.length && <p>没有找到匹配的参数</p>}</div>
+              </div>}
+            </div>
+            <button type="button" className="button ghost" disabled={!newKey} onClick={addExtra}><Plus size={15} />添加参数</button>
+          </div>
           <div className="custom-parameter-section">
             <div className="custom-title"><Braces size={15} /><div><strong>自定义 YOLO 参数</strong><span>用于添加预设列表中没有的合法参数</span></div></div>
             {Object.entries(customArgs).map(([key, value]) => <div className="extra-row custom-row" key={key}><div><span>自定义参数</span><code>{key}</code></div>{typeof value === 'boolean' ? <select value={String(value)} onChange={(e) => updateCustom(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={typeof value === 'number' ? 'number' : 'text'} value={String(value)} onChange={(e) => updateCustom(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setCustomArgs((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div>)}
