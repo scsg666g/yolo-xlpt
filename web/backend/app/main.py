@@ -29,6 +29,7 @@ from .services import (
     scheduler,
     sync_artifacts,
     sync_metrics,
+    validate_dataset_config,
     validate_input_path,
 )
 
@@ -37,6 +38,10 @@ EDITABLE_TRAINING_KEYS = {
     "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed", "deterministic", "fraction",
     "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "perspective",
     "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl",
+    "save", "cls_remap", "verbose", "single_cls", "classes", "profile", "compile", "overlap_mask",
+    "mask_ratio", "dropout", "val", "split", "save_json", "conf", "iou", "max_det", "plots", "lrf",
+    "warmup_momentum", "warmup_bias_lr", "cls_pw", "pose", "kobj", "rle", "angle", "dlog", "dgrad",
+    "dlam", "nbs", "bgr", "cutmix", "copy_paste_mode", "auto_augment", "erasing",
 }
 RESERVED_CUSTOM_KEYS = {
     "model", "data", "project", "name", "device", "epochs", "batch", "imgsz", "workers", "optimizer",
@@ -106,7 +111,7 @@ def list_tasks(status: str | None = Query(default=None), db: Session = Depends(g
 def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
     try:
         model_path = validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件")
-        data_path = validate_input_path(payload.data_path, DATASET_ROOTS, "数据集配置")
+        data_path = validate_dataset_config(payload.data_path)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     task_id = uuid.uuid4().hex[:16]
@@ -154,6 +159,10 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
     if not Path(task.model_path).exists() or not Path(task.data_path).exists():
         raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
+    try:
+        validate_dataset_config(task.data_path)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     task.status = "queued"
     task.queued_at = utcnow()
     task.finished_at = None
@@ -254,7 +263,7 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
         if payload.model_path is not None:
             task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
         if payload.data_path is not None:
-            task.data_path = str(validate_input_path(payload.data_path, DATASET_ROOTS, "数据集配置"))
+            task.data_path = str(validate_dataset_config(payload.data_path))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     current_config = dict(task.config or {})

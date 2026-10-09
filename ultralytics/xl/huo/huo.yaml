@@ -1,0 +1,6 @@
+path: /data/yolo-模型训练平台开发/yolo/数据集/huo
+train: images/train
+val: images/val
+
+names:
+  0: fire

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -17,7 +18,16 @@ from typing import Any
 import yaml
 from sqlalchemy import select
 
-from .config import DATASET_ROOTS, MODEL_ROOTS, NVIDIA_SMI_BIN, RUNS_ROOT, ULTRALYTICS_ROOT, YOLO_BIN
+from .config import (
+    DATASET_ROOTS,
+    MODEL_ROOTS,
+    NVIDIA_SMI_BIN,
+    RUNTIME_ROOT,
+    RUNS_ROOT,
+    TRAINING_MKL_THREADING_LAYER,
+    ULTRALYTICS_ROOT,
+    YOLO_BIN,
+)
 from .database import SessionLocal
 from .models import Artifact, MetricPoint, TaskEvent, TrainingTask, utcnow
 
@@ -27,7 +37,33 @@ TRAINING_KEYS = {
     "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed", "deterministic", "fraction",
     "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "perspective",
     "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl",
+    "save", "cls_remap", "verbose", "single_cls", "classes", "profile", "compile", "overlap_mask",
+    "mask_ratio", "dropout", "val", "split", "save_json", "conf", "iou", "max_det", "plots", "lrf",
+    "warmup_momentum", "warmup_bias_lr", "cls_pw", "pose", "kobj", "rle", "angle", "dlog", "dgrad",
+    "dlam", "nbs", "bgr", "cutmix", "copy_paste_mode", "auto_augment", "erasing",
 }
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def training_environment() -> dict[str, str]:
+    """Build a stable environment for PyTorch and its DDP worker processes."""
+    environment = os.environ.copy()
+    environment["MKL_THREADING_LAYER"] = TRAINING_MKL_THREADING_LAYER
+    return environment
+
+
+def failure_detail(log_path: str | None) -> str:
+    if not log_path or not Path(log_path).exists():
+        return ""
+    lines = [
+        ANSI_ESCAPE.sub("", line).strip()
+        for line in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        if line.strip()
+    ]
+    root_markers = ("Error:", "RuntimeError:", "ValueError:", "FileNotFoundError:", "OutOfMemoryError:")
+    detail = next((line for line in reversed(lines) if line.startswith(root_markers)), "")
+    return detail or (lines[-1] if lines else "")
 
 
 def add_event(db, task_id: str, event_type: str, message: str, level: str = "info", payload: dict | None = None):
@@ -46,6 +82,51 @@ def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
     if not path_is_within(path, roots):
         raise ValueError(f"{label}必须位于允许的目录中")
     return path
+
+
+def validate_dataset_config(raw: str) -> Path:
+    """Validate the dataset YAML and resolve train/val entries before queuing a run."""
+    path = validate_input_path(raw, DATASET_ROOTS, "数据集配置")
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"数据集配置无法读取：{path}（{exc}）") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"数据集配置格式错误：{path}")
+    root_value = config.get("path")
+    root = Path(str(root_value)).expanduser() if root_value else path.parent
+    if not root.is_absolute():
+        root = (path.parent / root).resolve()
+    entries: list[tuple[str, Any]] = [("train", config.get("train")), ("val", config.get("val"))]
+    missing: list[str] = []
+    for name, value in entries:
+        if value is None:
+            if name == "train": missing.append("缺少 train 配置")
+            continue
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            candidate = Path(str(item)).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if not candidate.exists():
+                missing.append(f"{name}: {candidate}")
+    if missing:
+        raise ValueError(f"数据集图片路径不存在（{path}）：" + "; ".join(missing))
+    return path
+
+
+def prepare_dataset_config(raw: str, destination: Path) -> Path:
+    """Write a run-local dataset YAML with an absolute root for Ultralytics."""
+    source = validate_dataset_config(raw)
+    config = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    root_value = config.get("path")
+    root = Path(str(root_value)).expanduser() if root_value else source.parent
+    if not root.is_absolute():
+        root = (source.parent / root).resolve()
+    config["path"] = str(root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return destination
 
 
 def discover_files(roots: list[Path], suffixes: set[str]) -> list[dict[str, Any]]:
@@ -346,11 +427,12 @@ class TrainingScheduler:
                 used |= self.requested_gpus(other.device)
         return not wanted.intersection(used)
 
-    def _command(self, task: TrainingTask) -> list[str]:
+    def _command(self, task: TrainingTask, data_path: Path | None = None) -> list[str]:
         config = task.config or {}
+        resolved_data_path = data_path or Path(task.data_path)
         command = [
             str(YOLO_BIN), task.task_type, "train",
-            f"model={task.model_path}", f"data={task.data_path}", f"epochs={task.epochs}",
+            f"model={task.model_path}", f"data={resolved_data_path}", f"epochs={task.epochs}",
             f"batch={task.batch}", f"imgsz={task.imgsz}", f"device={task.device}",
             f"workers={task.workers}", f"optimizer={task.optimizer}",
             f"project={RUNS_ROOT / task.task_type}", f"name={task.id}", "exist_ok=True",
@@ -364,15 +446,26 @@ class TrainingScheduler:
 
     def _launch(self, db, task: TrainingTask) -> None:
         run_dir = RUNS_ROOT / task.task_type / task.id
-        run_dir.mkdir(parents=True, exist_ok=True)
-        log_path = run_dir / "platform.log"
-        command = self._command(task)
+        runtime_dir = RUNTIME_ROOT / task.id
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        log_path = runtime_dir / "platform.log"
+        try:
+            dataset_path = prepare_dataset_config(task.data_path, runtime_dir / "dataset.yaml")
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            task.status = "failed"
+            task.error_message = str(exc)
+            task.finished_at = utcnow()
+            add_event(db, task.id, "failed", f"数据集配置校验失败：{exc}", "error")
+            return
+        command = self._command(task, dataset_path)
         log_handle = log_path.open("a", encoding="utf-8", buffering=1)
         log_handle.write(f"\n[{utcnow().isoformat()}] COMMAND {json.dumps(command, ensure_ascii=False)}\n")
+        log_handle.write(f"[{utcnow().isoformat()}] ENV MKL_THREADING_LAYER={TRAINING_MKL_THREADING_LAYER}\n")
         try:
             process = subprocess.Popen(
                 command,
                 cwd=ULTRALYTICS_ROOT,
+                env=training_environment(),
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -385,6 +478,7 @@ class TrainingScheduler:
             task.finished_at = utcnow()
             add_event(db, task.id, "failed", f"训练进程启动失败：{exc}", "error")
             return
+        log_handle.close()
         task.status = "running"
         task.pid = process.pid
         task.started_at = utcnow()
@@ -438,7 +532,10 @@ class TrainingScheduler:
                 message, level = "训练已完成", "info"
             else:
                 task.status = "failed"
+                detail = failure_detail(task.log_path)
                 task.error_message = f"训练进程异常退出，退出码 {code}"
+                if detail:
+                    task.error_message += f"：{detail[-500:]}"
                 message, level = task.error_message, "error"
             sync_artifacts(db, task)
             add_event(db, task.id, task.status, message, level)
