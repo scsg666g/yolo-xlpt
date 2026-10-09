@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { ChevronDown, LoaderCircle, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { Braces, ChevronDown, LoaderCircle, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { api } from '../api'
 import type { TrainingTask } from '../types'
 
@@ -45,7 +45,11 @@ const extraDefinitions: Record<string, { label: string; type: 'number' | 'boolea
 export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   const [form, setForm] = useState({ epochs: 100, batch: 16, imgsz: 640, device: '0', workers: 8, optimizer: 'auto', patience: 50, lr0: '', close_mosaic: 10, pretrained: true, cache: false, amp: true })
   const [extras, setExtras] = useState<Record<string, ExtraValue>>({})
+  const [customArgs, setCustomArgs] = useState<Record<string, ExtraValue>>({})
   const [newKey, setNewKey] = useState('')
+  const [customKey, setCustomKey] = useState('')
+  const [customType, setCustomType] = useState<'number' | 'boolean' | 'text'>('number')
+  const [customValue, setCustomValue] = useState('')
   const [expanded, setExpanded] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -59,6 +63,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
       pretrained: task.config.pretrained !== false, cache: Boolean(task.config.cache), amp: task.config.amp !== false,
     })
     setExtras(Object.fromEntries(Object.keys(extraDefinitions).filter((key) => task.config[key] != null).map((key) => [key, task.config[key] as ExtraValue])))
+    setCustomArgs((task.config.custom_args as Record<string, ExtraValue> | undefined) || {})
     setError('')
   }, [task, open])
 
@@ -82,6 +87,20 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
     setExtras((current) => ({ ...current, [key]: value }))
   }
 
+  function addCustom() {
+    const key = customKey.trim()
+    if (!key) return
+    const value: ExtraValue = customType === 'boolean' ? customValue !== 'false' : customType === 'number' ? Number(customValue || 0) : customValue
+    setCustomArgs((current) => ({ ...current, [key]: value }))
+    setCustomKey(''); setCustomValue(''); setCustomType('number')
+  }
+
+  function updateCustom(key: string, raw: string | boolean) {
+    const current = customArgs[key]
+    const value = typeof current === 'number' ? Number(raw) : raw
+    setCustomArgs((items) => ({ ...items, [key]: value }))
+  }
+
   async function save(event: React.FormEvent) {
     event.preventDefault()
     if (!task) return
@@ -94,7 +113,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
       if (form.lr0 !== '') config.lr0 = Number(form.lr0)
       const updated = await api.updateConfig(task.id, {
         epochs: form.epochs, batch: form.batch, imgsz: form.imgsz, device: form.device,
-        workers: form.workers, optimizer: form.optimizer, config,
+        workers: form.workers, optimizer: form.optimizer, config, custom_config: customArgs,
       })
       onSaved(updated)
     } catch (reason) {
@@ -125,6 +144,12 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
         {expanded && <div className="extra-parameters">
           {Object.entries(extras).map(([key, value]) => { const definition = extraDefinitions[key]; return <div className="extra-row" key={key}><div><span>{definition.label}</span><code>{key}</code></div>{definition.type === 'boolean' ? <select value={String(value)} onChange={(e) => updateExtra(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={definition.type} step={definition.step} value={String(value)} onChange={(e) => updateExtra(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setExtras((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div> })}
           <div className="add-parameter"><select value={newKey} onChange={(e) => setNewKey(e.target.value)}><option value="">选择要添加的训练参数</option>{availableKeys.map((key) => <option key={key} value={key}>{extraDefinitions[key].label} · {key}</option>)}</select><button type="button" className="button ghost" disabled={!newKey} onClick={addExtra}><Plus size={15} />添加参数</button></div>
+          <div className="custom-parameter-section">
+            <div className="custom-title"><Braces size={15} /><div><strong>自定义 YOLO 参数</strong><span>用于添加预设列表中没有的合法参数</span></div></div>
+            {Object.entries(customArgs).map(([key, value]) => <div className="extra-row custom-row" key={key}><div><span>自定义参数</span><code>{key}</code></div>{typeof value === 'boolean' ? <select value={String(value)} onChange={(e) => updateCustom(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={typeof value === 'number' ? 'number' : 'text'} value={String(value)} onChange={(e) => updateCustom(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setCustomArgs((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div>)}
+            <div className="custom-add-row"><input value={customKey} onChange={(e) => setCustomKey(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))} placeholder="参数名，例如 save_json" /><select value={customType} onChange={(e) => { const type = e.target.value as typeof customType; setCustomType(type); setCustomValue(type === 'boolean' ? 'true' : '') }}><option value="number">数字</option><option value="boolean">布尔</option><option value="text">文本</option></select>{customType === 'boolean' ? <select value={customValue || 'true'} onChange={(e) => setCustomValue(e.target.value)}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={customType === 'number' ? 'number' : 'text'} value={customValue} onChange={(e) => setCustomValue(e.target.value)} placeholder="参数值" />}<button type="button" className="button ghost" disabled={!customKey || customKey in customArgs} onClick={addCustom}><Plus size={15} />自定义添加</button></div>
+            <p className="custom-help">参数名只能包含小写字母、数字和下划线；模型、数据集、设备等平台关键参数不能覆盖。</p>
+          </div>
         </div>}
       </div>
       <footer><span className="parameter-note">双击配置节点可随时重新打开</span><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked}>{saving && <LoaderCircle size={16} className="spin" />}保存参数</button></footer>

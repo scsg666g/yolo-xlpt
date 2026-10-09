@@ -49,6 +49,7 @@ class TaskConfigUpdate(BaseModel):
     workers: int = Field(ge=0, le=64)
     optimizer: str = Field(min_length=1, max_length=40)
     config: dict[str, Any] = Field(default_factory=dict)
+    custom_config: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("device")
     @classmethod

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import mimetypes
+import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -35,6 +36,10 @@ EDITABLE_TRAINING_KEYS = {
     "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed", "deterministic", "fraction",
     "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "perspective",
     "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl",
+}
+RESERVED_CUSTOM_KEYS = {
+    "model", "data", "project", "name", "device", "epochs", "batch", "imgsz", "workers", "optimizer",
+    "task", "mode", "exist_ok", "save_dir", "resume", "source",
 }
 
 
@@ -208,14 +213,23 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     unknown = set(payload.config) - EDITABLE_TRAINING_KEYS
     if unknown:
         raise HTTPException(422, f"包含不支持的参数：{', '.join(sorted(unknown))}")
+    if len(payload.custom_config) > 30:
+        raise HTTPException(422, "自定义参数最多添加 30 项")
+    for key, value in payload.custom_config.items():
+        if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key):
+            raise HTTPException(422, f"自定义参数名不合法：{key}")
+        if key in RESERVED_CUSTOM_KEYS or key in EDITABLE_TRAINING_KEYS:
+            raise HTTPException(422, f"参数 {key} 由平台或预设参数管理，不能自定义覆盖")
+        if not isinstance(value, (str, int, float, bool)) or isinstance(value, str) and len(value) > 500:
+            raise HTTPException(422, f"自定义参数 {key} 的值必须是布尔、数字或短文本")
     task.epochs = payload.epochs
     task.batch = payload.batch
     task.imgsz = payload.imgsz
     task.device = payload.device
     task.workers = payload.workers
     task.optimizer = payload.optimizer
-    preserved = {key: value for key, value in (task.config or {}).items() if key not in EDITABLE_TRAINING_KEYS}
-    task.config = {**preserved, **payload.config}
+    preserved = {key: value for key, value in (task.config or {}).items() if key not in EDITABLE_TRAINING_KEYS and key != "custom_args"}
+    task.config = {**preserved, **payload.config, "custom_args": payload.custom_config}
     task.progress = min(100.0, round(task.completed_epochs / max(task.epochs, 1) * 100, 2))
     add_event(db, task.id, "config_updated", "训练参数已更新", payload=payload.model_dump())
     db.commit()

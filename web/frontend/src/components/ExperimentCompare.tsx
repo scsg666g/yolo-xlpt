@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { Activity, AlertCircle, BarChart3, Check, ChevronDown, Cpu, Gauge, Layers3, Search, Trophy, X } from 'lucide-react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import type { MetricPoint, TrainingTask } from '../types'
 
@@ -57,26 +57,34 @@ export function ExperimentCompare() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [params, setParams] = useSearchParams()
-  const navigate = useNavigate()
-  const selectedIds = useMemo(() => (params.get('tasks') || '').split(',').filter(Boolean).slice(0, 4), [params])
+  const [selectedIds, setSelectedIds] = useState<string[]>(() => {
+    const incoming = (params.get('tasks') || '').split(',').filter(Boolean)
+    let persisted: string[] = []
+    try { persisted = JSON.parse(localStorage.getItem('yolo-forge-compare-tasks') || '[]') } catch { persisted = [] }
+    return [...new Set([...persisted, ...incoming])].slice(0, 4)
+  })
   const selected = useMemo(() => selectedIds.map((id) => tasks.find((task) => task.id === id)).filter(Boolean) as TrainingTask[], [tasks, selectedIds])
+
+  useEffect(() => {
+    localStorage.setItem('yolo-forge-compare-tasks', JSON.stringify(selectedIds))
+    const next = new URLSearchParams(window.location.search)
+    if (selectedIds.length) next.set('tasks', selectedIds.join(',')); else next.delete('tasks')
+    if (next.toString() !== params.toString()) setParams(next, { replace: true })
+  }, [selectedIds, params, setParams])
 
   const load = useCallback(async () => {
     try {
       const taskList = await api.tasks()
       setTasks(taskList)
-      const ids = (params.get('tasks') || '').split(',').filter(Boolean).slice(0, 4)
-      const points = await Promise.all(ids.map(async (id) => [id, await api.metrics(id)] as const))
+      const points = await Promise.all(selectedIds.map(async (id) => [id, await api.metrics(id)] as const))
       setMetrics(Object.fromEntries(points)); setError('')
     } catch (reason) { setError(reason instanceof Error ? reason.message : '加载对比数据失败') } finally { setLoading(false) }
-  }, [params])
+  }, [selectedIds])
 
   useEffect(() => { load(); const timer = window.setInterval(load, 5000); return () => window.clearInterval(timer) }, [load])
 
   function setSelection(ids: string[]) {
-    const next = new URLSearchParams(params)
-    if (ids.length) next.set('tasks', ids.join(',')); else next.delete('tasks')
-    setParams(next); setPickerOpen(false)
+    setSelectedIds([...new Set(ids)].slice(0, 4))
   }
 
   function toggleTask(id: string) {
@@ -119,7 +127,7 @@ export function ExperimentCompare() {
   return <div className="page compare-page">
     <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较训练配置、收敛趋势和最终效果。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择实验 <span className="selection-count">{selected.length}/4</span><ChevronDown size={15} /></button></header>
     {pickerOpen && <div className="compare-picker">
-      <header><div><strong>选择参与对比的训练任务</strong><span>最多同时选择 4 条</span></div><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></header>
+      <header><div><strong>选择参与对比的训练任务</strong><span>已选择 {selectedIds.length} 条，最多同时选择 4 条</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
       <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务或模型" /></div>
       <div className="compare-picker-list">{filteredTasks.map((task) => { const checked = selectedIds.includes(task.id); return <button key={task.id} onClick={() => toggleTask(task.id)} disabled={!checked && selectedIds.length >= 4}><i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i><span><strong>{task.name}</strong><small>{task.model_path.split('/').pop()} · Epoch {task.completed_epochs}/{task.epochs}</small></span><em className={`status ${task.status}`}>{statusLabel(task.status)}</em></button> })}</div>
     </div>}
@@ -138,4 +146,3 @@ export function ExperimentCompare() {
     </>}
   </div>
 }
-

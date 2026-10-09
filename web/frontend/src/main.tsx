@@ -5,6 +5,7 @@ import App from './App'
 import '@xyflow/react/dist/style.css'
 import './styles.css'
 import './compare.css'
+import './editor.css'
 
 const savedTheme = localStorage.getItem('yolo-forge-theme')
 document.documentElement.dataset.theme = savedTheme === 'dark' ? 'dark' : 'light'

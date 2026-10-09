@@ -256,6 +256,8 @@ class TrainingScheduler:
         for key, value in config.items():
             if key in TRAINING_KEYS and value is not None:
                 command.append(f"{key}={value}")
+        for key, value in (config.get("custom_args") or {}).items():
+            command.append(f"{key}={value}")
         return command
 
     def _launch(self, db, task: TrainingTask) -> None:
@@ -359,4 +361,3 @@ class TrainingScheduler:
 
 
 scheduler = TrainingScheduler()
-
