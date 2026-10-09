@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class TaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    task_type: Literal["detect", "segment", "classify", "pose", "obb"] = "detect"
+    model_path: str
+    data_path: str
+    epochs: int = Field(default=100, ge=1, le=10000)
+    batch: int = Field(default=16, ge=1, le=1024)
+    imgsz: int = Field(default=640, ge=32, le=4096)
+    device: str = "0"
+    workers: int = Field(default=8, ge=0, le=64)
+    optimizer: str = Field(default="auto", max_length=40)
+    patience: int = Field(default=50, ge=0, le=10000)
+    lr0: float | None = Field(default=None, gt=0, le=1)
+    pretrained: bool = True
+    cache: bool | str = False
+    amp: bool = True
+    close_mosaic: int = Field(default=10, ge=0, le=1000)
+    advanced: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("device")
+    @classmethod
+    def validate_device(cls, value: str) -> str:
+        value = value.strip().lower()
+        if value in {"cpu", "mps"}:
+            return value
+        parts = value.split(",")
+        if not parts or any(not part.strip().isdigit() for part in parts):
+            raise ValueError("device 必须是 cpu、mps 或逗号分隔的 GPU 编号")
+        return ",".join(part.strip() for part in parts)
+
+
+class LayoutUpdate(BaseModel):
+    layout: dict[str, Any]
+
+
+class TaskRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    task_type: str
+    status: str
+    source: str
+    model_path: str
+    data_path: str
+    run_dir: str | None
+    log_path: str | None
+    epochs: int
+    completed_epochs: int
+    batch: int
+    imgsz: int
+    device: str
+    workers: int
+    optimizer: str
+    progress: float
+    pid: int | None
+    exit_code: int | None
+    error_message: str | None
+    config: dict[str, Any]
+    latest_metrics: dict[str, Any]
+    canvas_layout: dict[str, Any]
+    created_at: datetime
+    queued_at: datetime | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    updated_at: datetime
+
+
+class MetricRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    epoch: int
+    elapsed: float
+    values: dict[str, Any]
+    created_at: datetime
+
+
+class ArtifactRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    kind: str
+    name: str
+    path: str
+    size: int
+    modified_at: datetime | None
+
+
+class EventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    level: str
+    event_type: str
+    message: str
+    payload: dict[str, Any]
+    created_at: datetime
+

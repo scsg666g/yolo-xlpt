@@ -1,0 +1,15 @@
+[Unit]
+Description=YOLO Training Platform
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/data/yolo-模型训练平台开发/yolo/web/backend
+EnvironmentFile=-/data/yolo-模型训练平台开发/yolo/web/.env
+ExecStart=/data/conda/envs/yolo/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 18088 --workers 1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+
