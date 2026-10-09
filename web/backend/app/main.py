@@ -27,7 +27,6 @@ from .services import (
     import_existing_runs,
     path_is_within,
     scheduler,
-    sync_artifacts,
     sync_metrics,
     validate_dataset_config,
     validate_input_path,
@@ -147,7 +146,6 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
 def get_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     sync_metrics(db, task)
-    sync_artifacts(db, task)
     db.commit()
     return task
 
@@ -293,9 +291,7 @@ def task_metrics(task_id: str, db: Session = Depends(get_db)):
 
 @app.get("/api/tasks/{task_id}/artifacts", response_model=list[ArtifactRead])
 def task_artifacts(task_id: str, db: Session = Depends(get_db)):
-    task = get_task_or_404(db, task_id)
-    sync_artifacts(db, task)
-    db.commit()
+    get_task_or_404(db, task_id)
     return db.scalars(select(Artifact).where(Artifact.task_id == task_id).order_by(Artifact.kind, Artifact.name)).all()
 
 

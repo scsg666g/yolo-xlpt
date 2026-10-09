@@ -1,8 +1,12 @@
 from pathlib import Path
 
 import yaml
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
-from app.services import failure_detail, path_is_within, prepare_dataset_config, training_environment
+from app.database import Base
+from app.models import Artifact, TrainingTask
+from app.services import failure_detail, path_is_within, prepare_dataset_config, sync_artifacts, training_environment
 
 
 def test_path_is_within(tmp_path: Path):
@@ -41,3 +45,30 @@ def test_failure_detail_prefers_root_error(tmp_path: Path):
     )
     assert failure_detail(str(log)) == "Error: mkl-service is incompatible with libgomp.so.1"
 
+
+def test_sync_artifacts_is_idempotent(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "results.csv").write_text("epoch,metrics\n", encoding="utf-8")
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    Base.metadata.create_all(engine)
+    session = sessionmaker(bind=engine, expire_on_commit=False)()
+    task = TrainingTask(
+        id="task-idempotent",
+        name="test",
+        task_type="detect",
+        model_path="model.pt",
+        data_path="data.yaml",
+        run_dir=str(run_dir),
+    )
+    session.add(task)
+    session.commit()
+
+    sync_artifacts(session, task)
+    session.commit()
+    sync_artifacts(session, task)
+    session.commit()
+
+    paths = session.scalars(select(Artifact.path).where(Artifact.task_id == task.id)).all()
+    assert paths == [str((run_dir / "results.csv").resolve())]
+    session.close()

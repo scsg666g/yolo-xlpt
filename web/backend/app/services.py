@@ -17,6 +17,7 @@ from typing import Any
 
 import yaml
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from .config import (
     DATASET_ROOTS,
@@ -326,14 +327,30 @@ def sync_artifacts(db, task: TrainingTask) -> None:
         if raw in known:
             continue
         stat = path.stat()
-        db.add(Artifact(
-            task_id=task.id,
-            kind=artifact_kind(path),
-            name=str(path.relative_to(task.run_dir)),
-            path=raw,
-            size=stat.st_size,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, timezone.utc),
-        ))
+        values = {
+            "task_id": task.id,
+            "kind": artifact_kind(path),
+            "name": str(path.relative_to(task.run_dir)),
+            "path": raw,
+            "size": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc),
+        }
+        # The scheduler and API can discover the same file concurrently. A savepoint
+        # makes a uniqueness race harmless on SQLite and other supported databases.
+        try:
+            with db.begin_nested():
+                db.add(Artifact(**values))
+                db.flush()
+        except IntegrityError:
+            existing = db.scalar(
+                select(Artifact).where(Artifact.task_id == task.id, Artifact.path == raw)
+            )
+            if existing:
+                existing.kind = values["kind"]
+                existing.name = values["name"]
+                existing.size = values["size"]
+                existing.modified_at = values["modified_at"]
+        known.add(raw)
 
 
 def import_existing_runs() -> int:
