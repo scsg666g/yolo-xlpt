@@ -21,6 +21,7 @@ from .models import Artifact, MetricPoint, TaskEvent, TrainingTask, utcnow
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, TaskConfigUpdate, TaskCreate, TaskRead, TaskResourceUpdate
 from .services import (
     add_event,
+    compute_inventory,
     discover_files,
     gpu_inventory,
     import_existing_runs,
@@ -81,6 +82,11 @@ def resources():
         "models": discover_files(MODEL_ROOTS, {".pt", ".pth", ".onnx", ".yaml", ".yml"}),
         "datasets": discover_files(DATASET_ROOTS, {".yaml", ".yml"}),
     }
+
+
+@app.get("/api/compute")
+def compute_resources():
+    return compute_inventory()
 
 
 @app.get("/api/tasks", response_model=list[TaskRead])

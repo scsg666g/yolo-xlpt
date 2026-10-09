@@ -30,7 +30,7 @@ export function Layout() {
         <nav>
           <NavLink to="/" end><LayoutDashboard size={18} />任务中心</NavLink>
           <NavLink to="/compare"><Activity size={18} />实验对比</NavLink>
-          <span className="nav-muted"><Cpu size={18} />算力资源</span>
+          <NavLink to="/compute"><Cpu size={18} />算力资源</NavLink>
         </nav>
         <div className="sidebar-footer">
           <div className="service-state"><i />训练服务在线</div>

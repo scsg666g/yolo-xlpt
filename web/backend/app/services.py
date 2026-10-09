@@ -4,7 +4,9 @@ import csv
 import hashlib
 import json
 import os
+import platform
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -15,7 +17,7 @@ from typing import Any
 import yaml
 from sqlalchemy import select
 
-from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, ULTRALYTICS_ROOT, YOLO_BIN
+from .config import DATASET_ROOTS, MODEL_ROOTS, NVIDIA_SMI_BIN, RUNS_ROOT, ULTRALYTICS_ROOT, YOLO_BIN
 from .database import SessionLocal
 from .models import Artifact, MetricPoint, TaskEvent, TrainingTask, utcnow
 
@@ -58,25 +60,125 @@ def discover_files(roots: list[Path], suffixes: set[str]) -> list[dict[str, Any]
     return sorted(files, key=lambda item: item["name"].lower())
 
 
-def gpu_inventory() -> list[dict[str, Any]]:
+def _nullable_number(value: str, integer: bool = False) -> int | float | None:
+    value = value.strip()
+    if not value or value.lower() in {"n/a", "[n/a]", "not supported"}:
+        return None
+    try:
+        number = float(value)
+        return int(number) if integer else number
+    except ValueError:
+        return None
+
+
+def _run_nvidia_smi(arguments: list[str]) -> str:
+    return subprocess.check_output(
+        [NVIDIA_SMI_BIN, *arguments], text=True, timeout=5, stderr=subprocess.STDOUT,
+    )
+
+
+def _gpu_processes() -> dict[str, list[dict[str, Any]]]:
     command = [
-        "nvidia-smi",
-        "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+        "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
         "--format=csv,noheader,nounits",
     ]
     try:
-        output = subprocess.check_output(command, text=True, timeout=5)
+        output = _run_nvidia_smi(command)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    result: dict[str, list[dict[str, Any]]] = {}
+    for row in csv.reader(output.splitlines()):
+        if len(row) != 4:
+            continue
+        uuid, pid, name, memory = (value.strip() for value in row)
+        parsed_pid = _nullable_number(pid, integer=True)
+        if parsed_pid is None:
+            continue
+        result.setdefault(uuid, []).append({
+            "pid": parsed_pid,
+            "name": Path(name).name or name,
+            "memory_used": _nullable_number(memory, integer=True),
+        })
+    return result
+
+
+def gpu_inventory() -> list[dict[str, Any]]:
+    fields = [
+        "index", "uuid", "name", "driver_version", "memory.total", "memory.used", "memory.free",
+        "utilization.gpu", "utilization.memory", "temperature.gpu", "power.draw", "power.limit",
+        "clocks.current.graphics", "clocks.current.memory",
+    ]
+    command = [f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"]
+    try:
+        output = _run_nvidia_smi(command)
     except (OSError, subprocess.SubprocessError):
         return []
-    result = []
-    for line in output.splitlines():
-        parts = [part.strip() for part in line.split(",")]
-        if len(parts) == 6:
-            result.append({
-                "index": int(parts[0]), "name": parts[1], "memory_total": int(parts[2]),
-                "memory_used": int(parts[3]), "utilization": int(parts[4]), "temperature": int(parts[5]),
-            })
+    processes = _gpu_processes()
+    result: list[dict[str, Any]] = []
+    for row in csv.reader(output.splitlines()):
+        if len(row) != len(fields):
+            continue
+        values = [value.strip() for value in row]
+        index = _nullable_number(values[0], integer=True)
+        if index is None:
+            continue
+        uuid = values[1]
+        result.append({
+            "index": index,
+            "uuid": uuid,
+            "name": values[2],
+            "driver_version": values[3],
+            "memory_total": _nullable_number(values[4], integer=True),
+            "memory_used": _nullable_number(values[5], integer=True),
+            "memory_free": _nullable_number(values[6], integer=True),
+            "utilization": _nullable_number(values[7], integer=True),
+            "memory_utilization": _nullable_number(values[8], integer=True),
+            "temperature": _nullable_number(values[9], integer=True),
+            "power_draw": _nullable_number(values[10]),
+            "power_limit": _nullable_number(values[11]),
+            "graphics_clock": _nullable_number(values[12], integer=True),
+            "memory_clock": _nullable_number(values[13], integer=True),
+            "processes": processes.get(uuid, []),
+        })
     return result
+
+
+def _host_memory() -> tuple[int | None, int | None]:
+    try:
+        values: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, raw = line.split(":", 1)
+            values[key] = int(raw.strip().split()[0]) * 1024
+        total = values.get("MemTotal")
+        available = values.get("MemAvailable")
+        return total, total - available if total is not None and available is not None else None
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def compute_inventory() -> dict[str, Any]:
+    """Return live host/GPU data without assuming a specific server or GPU model."""
+    total_memory, used_memory = _host_memory()
+    try:
+        load_average = [round(value, 2) for value in os.getloadavg()]
+    except OSError:
+        load_average = []
+    gpus = gpu_inventory()
+    return {
+        "available": bool(gpus),
+        "provider": "NVIDIA" if gpus else None,
+        "message": None if gpus else "未检测到 NVIDIA GPU，或 nvidia-smi 当前不可用",
+        "sampled_at": datetime.now(timezone.utc).isoformat(),
+        "host": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+            "cpu_count": os.cpu_count(),
+            "load_average": load_average,
+            "memory_total": total_memory,
+            "memory_used": used_memory,
+        },
+        "gpus": gpus,
+    }
 
 
 def parse_number(value: Any) -> float | str | None:
