@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, type Connection, type Edge, type Node } from '@xyflow/react'
-import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, FileArchive, FileText, Gauge, LoaderCircle, Maximize, Play, RefreshCw, Save, SlidersHorizontal, Square, Terminal, Zap } from 'lucide-react'
+import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, RefreshCw, RotateCcw, Save, SlidersHorizontal, Square, Terminal, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue, statusLabel } from '../api'
-import type { Artifact, MetricPoint, TaskEvent, TrainingTask } from '../types'
+import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { CanvasNode, type PanelNodeData } from './CanvasNode'
 import { EditParametersModal } from './EditParametersModal'
 import { EditResourceModal } from './EditResourceModal'
@@ -38,6 +38,8 @@ function TaskCanvasInner() {
   const { taskId = '' } = useParams()
   const navigate = useNavigate()
   const [task, setTask] = useState<TrainingTask | null>(null)
+  const [runs, setRuns] = useState<TrainingRun[]>([])
+  const [selectedRunId, setSelectedRunId] = useState('')
   const [metrics, setMetrics] = useState<MetricPoint[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [events, setEvents] = useState<TaskEvent[]>([])
@@ -56,11 +58,22 @@ function TaskCanvasInner() {
     try {
       // Validate the task first so a stale canvas URL does not fire several
       // dependent 404 requests on every polling cycle.
-      const taskData = await api.task(taskId)
+      const [taskData, runData] = await Promise.all([api.task(taskId), api.runs(taskId)])
+      const selectedId = runData.some((run) => run.id === selectedRunId)
+        ? selectedRunId
+        : (taskData.current_run_id || runData[0]?.id || '')
+      const selectedRun = runData.find((run) => run.id === selectedId)
+      setTask(taskData); setRuns(runData)
+      if (selectedId !== selectedRunId) setSelectedRunId(selectedId)
+      if (!selectedRun) {
+        setMetrics([]); setArtifacts([]); setEvents([]); setLogs([])
+        return
+      }
       const [metricData, artifactData, eventData, logData] = await Promise.all([
-        api.metrics(taskId), api.artifacts(taskId), api.events(taskId), api.logs(taskId),
+        api.runMetrics(taskId, selectedRun.id), api.runArtifacts(taskId, selectedRun.id),
+        api.runEvents(taskId, selectedRun.id), api.runLogs(taskId, selectedRun.id),
       ])
-      setTask(taskData); setMetrics(metricData); setArtifacts(artifactData); setEvents(eventData); setLogs(logData.lines)
+      setMetrics(metricData); setArtifacts(artifactData); setEvents(eventData); setLogs(logData.lines)
     } catch (reason) {
       const status = reason instanceof Error ? (reason as Error & { status?: number }).status : undefined
       if (status === 404) {
@@ -69,21 +82,52 @@ function TaskCanvasInner() {
       }
       setNotice(reason instanceof Error ? reason.message : '加载失败')
     } finally { setLoading(false) }
-  }, [navigate, taskId])
+  }, [navigate, selectedRunId, taskId])
 
   useEffect(() => { refresh(); const timer = window.setInterval(refresh, 3000); return () => window.clearInterval(timer) }, [refresh])
 
-  const latest = task?.latest_metrics || {}
-  const nodeData = useMemo<Record<string, PanelNodeData> | null>(() => task ? {
-    dataset: { title: task.data_path.split('/').pop() || '数据集', kicker: 'DATASET · 双击编辑', icon: <Database size={17} />, content: <><p className="mono path-value">{task.data_path}</p>{row('配置状态', task.config.path_issues && (task.config.path_issues as { data_missing?: boolean }).data_missing ? <span className="bad">路径失效</span> : <span className="good">可用</span>)}<div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换训练数据集</div></> },
-    model: { title: task.model_path.split('/').pop() || '基础模型', kicker: 'MODEL · 双击编辑', icon: <Box size={17} />, accent: '#6da8ff', content: <><p className="mono path-value">{task.model_path}</p>{row('任务类型', task.task_type)}{row('预训练', task.config.pretrained === false ? '关闭' : '启用')}<div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换基础模型</div></> },
-    config: { title: '超参数配置', kicker: 'CONFIGURATION · 双击编辑', icon: <Braces size={17} />, accent: '#d99cff', content: <><div className="node-grid">{row('Epochs', task.epochs)}{row('Batch', task.batch)}{row('Image', task.imgsz)}{row('Optimizer', task.optimizer)}{row('Workers', task.workers)}{row('Patience', String(task.config.patience ?? '—'))}</div><div className="node-edit-hint"><SlidersHorizontal size={12} />双击添加或修改训练参数</div></> },
-    runtime: { title: `GPU ${task.device}`, kicker: 'RUNTIME', icon: <Cpu size={17} />, accent: '#ffba6b', content: <>{row('进程 PID', task.pid || '—')}{row('输出目录', task.run_dir ? task.run_dir.split('/').slice(-3).join('/') : '等待创建')}{row('训练环境', 'PyTorch · CUDA')}</> },
-    status: { title: statusLabel(task.status), kicker: 'TRAINING STATUS', icon: task.status === 'running' ? <Zap size={17} /> : <Gauge size={17} />, content: <><div className="big-progress"><strong>{Math.round(task.progress)}%</strong><span>Epoch {task.completed_epochs} / {task.epochs}</span></div><div className="progress"><i style={{ width: `${task.progress}%` }} /></div><div className="node-grid metrics-mini">{row('mAP50', metricValue(task, ['metrics/mAP50(B)']))}{row('Precision', metricValue(task, ['metrics/precision(B)']))}{row('Recall', metricValue(task, ['metrics/recall(B)']))}{row('Box loss', typeof latest['train/box_loss'] === 'number' ? latest['train/box_loss'].toFixed(4) : '—')}</div>{task.error_message && <p className="node-error">{task.error_message}</p>}</> },
+  const selectedRun = useMemo(() => runs.find((run) => run.id === selectedRunId) || null, [runs, selectedRunId])
+  const isCurrentRun = !selectedRun || selectedRun.id === task?.current_run_id
+  const viewTask = useMemo(() => {
+    if (!task || !selectedRun) return task
+    const snapshot = selectedRun.parameter_snapshot || {}
+    const snapshotConfig = (snapshot.config as Record<string, unknown> | undefined) || task.config || {}
+    return {
+      ...task,
+      status: selectedRun.status,
+      model_path: selectedRun.model_path,
+      data_path: selectedRun.data_path,
+      run_dir: selectedRun.run_dir,
+      log_path: selectedRun.log_path,
+      epochs: Number(snapshot.epochs ?? task.epochs),
+      batch: Number(snapshot.batch ?? task.batch),
+      imgsz: Number(snapshot.imgsz ?? task.imgsz),
+      device: String(snapshot.device ?? task.device),
+      workers: Number(snapshot.workers ?? task.workers),
+      optimizer: String(snapshot.optimizer ?? task.optimizer),
+      config: snapshotConfig,
+      completed_epochs: selectedRun.completed_epochs,
+      progress: selectedRun.progress,
+      pid: selectedRun.pid,
+      exit_code: selectedRun.exit_code,
+      error_message: selectedRun.error_message,
+      latest_metrics: selectedRun.latest_metrics,
+      queued_at: selectedRun.queued_at,
+      started_at: selectedRun.started_at,
+      finished_at: selectedRun.finished_at,
+    } satisfies TrainingTask
+  }, [selectedRun, task])
+  const latest = viewTask?.latest_metrics || {}
+  const nodeData = useMemo<Record<string, PanelNodeData> | null>(() => viewTask ? {
+    dataset: { title: viewTask.data_path.split('/').pop() || '数据集', kicker: `DATASET${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Database size={17} />, content: <><p className="mono path-value">{viewTask.data_path}</p>{row('配置状态', viewTask.config.path_issues && (viewTask.config.path_issues as { data_missing?: boolean }).data_missing ? <span className="bad">路径失效</span> : <span className="good">可用</span>)}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换训练数据集</div>}</> },
+    model: { title: viewTask.model_path.split('/').pop() || '基础模型', kicker: `MODEL${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Box size={17} />, accent: '#6da8ff', content: <><p className="mono path-value">{viewTask.model_path}</p>{row('任务类型', viewTask.task_type)}{row('预训练', viewTask.config.pretrained === false ? '关闭' : '启用')}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换基础模型</div>}</> },
+    config: { title: '超参数配置', kicker: `CONFIGURATION${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Braces size={17} />, accent: '#d99cff', content: <><div className="node-grid">{row('Epochs', viewTask.epochs)}{row('Batch', viewTask.batch)}{row('Image', viewTask.imgsz)}{row('Optimizer', viewTask.optimizer)}{row('Workers', viewTask.workers)}{row('Patience', String(viewTask.config.patience ?? '—'))}</div>{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击添加或修改训练参数</div>}</> },
+    runtime: { title: `GPU ${viewTask.device}`, kicker: 'RUNTIME', icon: <Cpu size={17} />, accent: '#ffba6b', content: <>{row('进程 PID', viewTask.pid || '—')}{row('输出目录', viewTask.run_dir ? viewTask.run_dir.split('/').slice(-4).join('/') : '等待创建')}{row('训练环境', 'PyTorch · CUDA')}</> },
+    status: { title: statusLabel(viewTask.status), kicker: selectedRun ? `ATTEMPT ${String(selectedRun.attempt_number).padStart(3, '0')}` : 'TRAINING STATUS', icon: viewTask.status === 'running' ? <Zap size={17} /> : <Gauge size={17} />, content: <><div className="big-progress"><strong>{Math.round(viewTask.progress)}%</strong><span>Epoch {viewTask.completed_epochs} / {viewTask.epochs}</span></div><div className="progress"><i style={{ width: `${viewTask.progress}%` }} /></div><div className="node-grid metrics-mini">{row('mAP50', metricValue(viewTask, ['metrics/mAP50(B)']))}{row('Precision', metricValue(viewTask, ['metrics/precision(B)']))}{row('Recall', metricValue(viewTask, ['metrics/recall(B)']))}{row('Box loss', typeof latest['train/box_loss'] === 'number' ? latest['train/box_loss'].toFixed(4) : '—')}</div>{viewTask.error_message && <p className="node-error">{viewTask.error_message}</p>}</> },
     metrics: { title: '验证指标趋势', kicker: 'METRICS', icon: <Activity size={17} />, accent: '#53d6e8', content: metrics.length ? <ReactECharts option={chartOption(metrics)} style={{ height: 220, width: 380 }} /> : <div className="node-empty">训练产生首个 Epoch 后显示曲线</div> },
     logs: { title: '实时训练日志', kicker: 'LIVE OUTPUT · 双击放大', icon: <Terminal size={17} />, accent: '#95a3b3', content: <><pre className="log-view">{logs.slice(-18).join('\n') || '等待训练日志…'}</pre><div className="node-edit-hint"><Maximize size={12} />双击打开大屏日志</div></> },
     artifacts: { title: '训练产物', kicker: 'ARTIFACTS', icon: <FileArchive size={17} />, accent: '#ffd56d', content: artifacts.length ? <div className="artifact-list">{artifacts.slice(0, 12).map((item) => <a key={item.id} href={`/api/artifacts/${item.id}/download`}><FileText size={14} /><span>{item.name}</span><small>{formatBytes(item.size)}</small></a>)}</div> : <div className="node-empty">暂无训练产物</div> },
-  } : null, [task, metrics, artifacts, logs, latest])
+  } : null, [viewTask, isCurrentRun, selectedRun, metrics, artifacts, logs, latest])
 
   useEffect(() => {
     if (!task || !nodeData) return
@@ -99,9 +143,14 @@ function TaskCanvasInner() {
 
   const onConnect = useCallback((connection: Connection) => setEdges((items) => addEdge(connection, items)), [setEdges])
 
-  async function action(kind: 'start' | 'stop' | 'resume') {
+  async function action(kind: 'start' | 'stop' | 'resume' | 'retry') {
     setWorking(true); setNotice('')
-    try { await api[kind](taskId); await refresh() } catch (reason) { setNotice(reason instanceof Error ? reason.message : '操作失败') } finally { setWorking(false) }
+    try {
+      const updated = await api[kind](taskId)
+      setTask(updated)
+      if (updated.current_run_id && updated.current_run_id !== selectedRunId) setSelectedRunId(updated.current_run_id)
+      else await refresh()
+    } catch (reason) { setNotice(reason instanceof Error ? reason.message : '操作失败') } finally { setWorking(false) }
   }
 
   async function saveLayout() {
@@ -110,27 +159,31 @@ function TaskCanvasInner() {
     setNotice('画布布局已保存'); window.setTimeout(() => setNotice(''), 1800)
   }
 
-  if (loading || !task) return <div className="canvas-loading"><LoaderCircle className="spin" />正在装载训练画布…</div>
-  const canStart = ['draft', 'failed'].includes(task.status)
+  if (loading || !task || !viewTask) return <div className="canvas-loading"><LoaderCircle className="spin" />正在装载训练画布…</div>
+  const canStart = task.status === 'draft'
   const canResume = ['stopped', 'interrupted'].includes(task.status)
   const canStop = ['queued', 'starting', 'running'].includes(task.status)
+  const canRetry = ['failed', 'stopped', 'interrupted', 'completed'].includes(task.status)
+  const launchModeLabel = { fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[selectedRun?.launch_mode || 'fresh']
 
   return <div className="canvas-page">
     <header className="canvas-toolbar">
       <button className="icon-button" onClick={() => navigate('/')}><ArrowLeft size={19} /></button>
-      <div className="canvas-title"><span className={`status-dot ${task.status}`} /><div><strong>{task.name}</strong><span>{task.task_type} · {task.model_path.split('/').pop()}</span></div></div>
-      <div className="canvas-state"><Clock3 size={14} />{statusLabel(task.status)} · Epoch {task.completed_epochs}/{task.epochs}</div>
+      <div className="canvas-title"><span className={`status-dot ${viewTask.status}`} /><div><strong>{task.name}</strong><span>{task.task_type} · {viewTask.model_path.split('/').pop()}</span></div></div>
+      {runs.length > 0 && <label className="attempt-picker"><History size={15} /><select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {{ fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[run.launch_mode]} · {statusLabel(run.status)}</option>)}</select></label>}
+      <div className="canvas-state"><Clock3 size={14} />{selectedRun ? `Attempt ${String(selectedRun.attempt_number).padStart(3, '0')} · ${launchModeLabel} · ` : ''}{statusLabel(viewTask.status)} · Epoch {viewTask.completed_epochs}/{viewTask.epochs}</div>
       <div className="canvas-actions">
         {notice && <span className="toast"><Check size={14} />{notice}</span>}
         <button className="button ghost compact" onClick={() => fitView({ padding: 0.16, duration: 500 })}><Maximize size={15} />适应画布</button>
         <button className="button ghost compact" onClick={saveLayout}><Save size={15} />保存布局</button>
-        {canStart && <button className="button primary compact" disabled={working} onClick={() => action('start')}><Play size={15} />启动训练</button>}
-        {canResume && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
-        {canStop && <button className="button danger compact" disabled={working} onClick={() => action('stop')}><Square size={14} />停止</button>}
+        {isCurrentRun && canStart && <button className="button primary compact" disabled={working} onClick={() => action('start')}><Play size={15} />启动训练</button>}
+        {isCurrentRun && canResume && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
+        {isCurrentRun && canRetry && <button className="button ghost compact" disabled={working} onClick={() => action('retry')}><RotateCcw size={15} />重新训练</button>}
+        {isCurrentRun && canStop && <button className="button danger compact" disabled={working} onClick={() => action('stop')}><Square size={14} />停止</button>}
       </div>
     </header>
     <div className="canvas-wrap">
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeDoubleClick={(_, node) => { if (node.id === 'config') setEditingParameters(true); if (node.id === 'dataset' || node.id === 'model') setEditingResource(node.id); if (node.id === 'logs') setViewingLogs(true) }} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeDoubleClick={(_, node) => { if (isCurrentRun && node.id === 'config') setEditingParameters(true); if (isCurrentRun && (node.id === 'dataset' || node.id === 'model')) setEditingResource(node.id); if (node.id === 'logs') setViewingLogs(true) }} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
         <Background color="#24313d" gap={24} size={1} />
         <MiniMap pannable zoomable nodeColor={(node) => node.id === 'status' ? '#70f0bd' : '#344657'} maskColor="rgba(5,9,13,.72)" />
         <Controls showInteractive={false} />
@@ -139,7 +192,7 @@ function TaskCanvasInner() {
     </div>
     <EditParametersModal task={task} open={editingParameters} onClose={() => setEditingParameters(false)} onSaved={(updated) => { setTask(updated); setEditingParameters(false); setNotice('训练参数已保存'); window.setTimeout(() => setNotice(''), 1800) }} />
     <EditResourceModal task={task} mode={editingResource} onClose={() => setEditingResource(null)} onSaved={(updated) => { setTask(updated); setEditingResource(null); setNotice('训练资源已更新'); window.setTimeout(() => setNotice(''), 1800) }} />
-    <LogViewerModal task={task} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
+    <LogViewerModal task={viewTask} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
   </div>
 }
 

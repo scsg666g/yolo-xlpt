@@ -99,6 +99,36 @@ class TaskRead(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     updated_at: datetime
+    current_run_id: str | None
+
+
+class RunRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    task_id: str
+    attempt_number: int
+    launch_mode: str
+    status: str
+    pid: int | None
+    process_started_at: datetime | None
+    command: list[Any]
+    parameter_snapshot: dict[str, Any]
+    model_path: str
+    data_path: str
+    checkpoint_path: str | None
+    run_dir: str | None
+    log_path: str | None
+    completed_epochs: int
+    progress: float
+    latest_metrics: dict[str, Any]
+    exit_code: int | None
+    error_message: str | None
+    queued_at: datetime | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class MetricRead(BaseModel):

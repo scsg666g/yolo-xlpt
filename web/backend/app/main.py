@@ -16,18 +16,22 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
-from .database import Base, SessionLocal, engine, get_db
-from .models import Artifact, MetricPoint, TaskEvent, TrainingTask, utcnow
-from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, TaskConfigUpdate, TaskCreate, TaskRead, TaskResourceUpdate
+from .database import Base, SessionLocal, engine, get_db, migrate_database
+from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask
+from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskRead, TaskResourceUpdate
 from .services import (
     add_event,
+    backfill_training_runs,
     compute_inventory,
+    create_training_run,
+    current_run,
     discover_files,
     gpu_inventory,
     import_existing_runs,
     path_is_within,
     resume_checkpoint,
     scheduler,
+    sync_artifacts,
     sync_metrics,
     validate_dataset_config,
     validate_input_path,
@@ -51,8 +55,10 @@ RESERVED_CUSTOM_KEYS = {
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    migrate_database()
     Base.metadata.create_all(engine)
     import_existing_runs()
+    backfill_training_runs()
     scheduler.start()
     yield
     scheduler.stop()
@@ -73,6 +79,13 @@ def get_task_or_404(db: Session, task_id: str) -> TrainingTask:
     if not task:
         raise HTTPException(404, "训练任务不存在")
     return task
+
+
+def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
+    run = db.scalar(select(TrainingRun).where(TrainingRun.id == run_id, TrainingRun.task_id == task_id))
+    if not run:
+        raise HTTPException(404, "训练运行不存在")
+    return run
 
 
 @app.get("/api/health")
@@ -154,7 +167,7 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/start", response_model=TaskRead)
 def start_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    if task.status not in {"draft", "failed"}:
+    if task.status != "draft":
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
     if not Path(task.model_path).exists() or not Path(task.data_path).exists():
         raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
@@ -162,13 +175,8 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
         validate_dataset_config(task.data_path)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    task.status = "queued"
-    task.config = {key: value for key, value in (task.config or {}).items() if key != "_resume_checkpoint"}
-    task.queued_at = utcnow()
-    task.finished_at = None
-    task.exit_code = None
-    task.error_message = None
-    add_event(db, task.id, "queued", "任务已加入训练队列")
+    run = create_training_run(db, task, "fresh")
+    add_event(db, task.id, "queued", f"Attempt {run.attempt_number:03d} 已加入训练队列", run_id=run.id)
     db.commit()
     db.refresh(task)
     return task
@@ -188,19 +196,34 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
         validate_dataset_config(task.data_path)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    task.config = {**(task.config or {}), "_resume_checkpoint": str(checkpoint)}
-    task.status = "queued"
-    task.queued_at = utcnow()
-    task.finished_at = None
-    task.exit_code = None
-    task.error_message = None
+    if task.epochs <= task.completed_epochs:
+        raise HTTPException(409, f"断点已经完成 {task.completed_epochs} 个 Epoch，请增加训练轮数或选择重新训练")
+    run = create_training_run(db, task, "resume", checkpoint)
     add_event(
         db,
         task.id,
         "resume_queued",
-        "任务已加入断点续训队列",
+        f"Attempt {run.attempt_number:03d} 已加入断点续训队列",
         payload={"checkpoint": str(checkpoint), "completed_epochs": task.completed_epochs},
+        run_id=run.id,
     )
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/api/tasks/{task_id}/retry", response_model=TaskRead)
+def retry_task(task_id: str, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.status not in {"failed", "stopped", "interrupted", "completed"}:
+        raise HTTPException(409, f"当前状态 {task.status} 不能重新训练")
+    try:
+        validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
+        validate_dataset_config(task.data_path)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    run = create_training_run(db, task, "retry")
+    add_event(db, task.id, "retry_queued", f"Attempt {run.attempt_number:03d} 已加入重新训练队列", run_id=run.id)
     db.commit()
     db.refresh(task)
     return task
@@ -255,8 +278,6 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     task = get_task_or_404(db, task_id)
     if task.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "任务正在运行或排队，不能修改训练参数")
-    if payload.epochs < task.completed_epochs:
-        raise HTTPException(422, f"训练轮数不能小于已有进度 {task.completed_epochs}")
     unknown = set(payload.config) - EDITABLE_TRAINING_KEYS
     if unknown:
         raise HTTPException(422, f"包含不支持的参数：{', '.join(sorted(unknown))}")
@@ -277,7 +298,6 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     task.optimizer = payload.optimizer
     preserved = {key: value for key, value in (task.config or {}).items() if key not in EDITABLE_TRAINING_KEYS and key != "custom_args"}
     task.config = {**preserved, **payload.config, "custom_args": payload.custom_config}
-    task.progress = min(100.0, round(task.completed_epochs / max(task.epochs, 1) * 100, 2))
     add_event(db, task.id, "config_updated", "训练参数已更新", payload=payload.model_dump())
     db.commit()
     db.refresh(task)
@@ -318,30 +338,88 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
 @app.get("/api/tasks/{task_id}/metrics", response_model=list[MetricRead])
 def task_metrics(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    sync_metrics(db, task)
+    run = current_run(db, task)
+    sync_metrics(db, task, run)
     db.commit()
-    return db.scalars(select(MetricPoint).where(MetricPoint.task_id == task_id).order_by(MetricPoint.epoch)).all()
+    if not run:
+        return []
+    return db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id).order_by(MetricPoint.epoch)).all()
 
 
 @app.get("/api/tasks/{task_id}/artifacts", response_model=list[ArtifactRead])
 def task_artifacts(task_id: str, db: Session = Depends(get_db)):
-    get_task_or_404(db, task_id)
-    return db.scalars(select(Artifact).where(Artifact.task_id == task_id).order_by(Artifact.kind, Artifact.name)).all()
+    task = get_task_or_404(db, task_id)
+    run = current_run(db, task)
+    if not run:
+        return []
+    sync_artifacts(db, task, run)
+    db.commit()
+    return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
 
 
 @app.get("/api/tasks/{task_id}/events", response_model=list[EventRead])
 def task_events(task_id: str, db: Session = Depends(get_db)):
-    get_task_or_404(db, task_id)
-    return db.scalars(select(TaskEvent).where(TaskEvent.task_id == task_id).order_by(TaskEvent.id.desc()).limit(100)).all()
+    task = get_task_or_404(db, task_id)
+    run = current_run(db, task)
+    if not run:
+        return []
+    return db.scalars(select(TaskEvent).where(TaskEvent.run_id == run.id).order_by(TaskEvent.id.desc()).limit(100)).all()
 
 
 @app.get("/api/tasks/{task_id}/logs")
 def task_logs(task_id: str, tail: int = Query(default=400, ge=20, le=5000), db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    if not task.log_path or not Path(task.log_path).exists():
-        return {"lines": [], "path": task.log_path}
-    lines = Path(task.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
-    return {"lines": lines[-tail:], "path": task.log_path}
+    run = current_run(db, task)
+    if not run or not run.log_path or not Path(run.log_path).exists():
+        return {"lines": [], "path": run.log_path if run else None}
+    lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    return {"lines": lines[-tail:], "path": run.log_path}
+
+
+@app.get("/api/tasks/{task_id}/runs", response_model=list[RunRead])
+def task_runs(task_id: str, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    return db.scalars(select(TrainingRun).where(TrainingRun.task_id == task_id).order_by(TrainingRun.attempt_number.desc())).all()
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}", response_model=RunRead)
+def task_run(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    return get_run_or_404(db, task_id, run_id)
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/metrics", response_model=list[MetricRead])
+def run_metrics(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    sync_metrics(db, task, run)
+    db.commit()
+    return db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id).order_by(MetricPoint.epoch)).all()
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/artifacts", response_model=list[ArtifactRead])
+def run_artifacts(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    sync_artifacts(db, task, run)
+    db.commit()
+    return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/events", response_model=list[EventRead])
+def run_events(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    return db.scalars(select(TaskEvent).where(TaskEvent.run_id == run.id).order_by(TaskEvent.id.desc()).limit(100)).all()
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/logs")
+def run_logs(task_id: str, run_id: str, tail: int = Query(default=400, ge=20, le=5000), db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    if not run.log_path or not Path(run.log_path).exists():
+        return {"lines": [], "path": run.log_path}
+    lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    return {"lines": lines[-tail:], "path": run.log_path}
 
 
 @app.get("/api/artifacts/{artifact_id}/download")
@@ -351,7 +429,8 @@ def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "产物不存在")
     path = Path(artifact.path).resolve()
     task = get_task_or_404(db, artifact.task_id)
-    if not task.run_dir or not path_is_within(path, [Path(task.run_dir)]):
+    run = db.get(TrainingRun, artifact.run_id) if artifact.run_id else current_run(db, task)
+    if not run or not run.run_dir or not path_is_within(path, [Path(run.run_dir)]):
         raise HTTPException(403, "产物路径不受信任")
     if not path.exists():
         raise HTTPException(404, "产物文件已经不存在")

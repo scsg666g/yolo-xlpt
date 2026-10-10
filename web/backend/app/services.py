@@ -11,12 +11,13 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import (
@@ -30,7 +31,7 @@ from .config import (
     YOLO_BIN,
 )
 from .database import SessionLocal
-from .models import Artifact, MetricPoint, TaskEvent, TrainingTask, utcnow
+from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 
 
 TRAINING_KEYS = {
@@ -67,8 +68,129 @@ def failure_detail(log_path: str | None) -> str:
     return detail or (lines[-1] if lines else "")
 
 
-def add_event(db, task_id: str, event_type: str, message: str, level: str = "info", payload: dict | None = None):
-    db.add(TaskEvent(task_id=task_id, event_type=event_type, message=message, level=level, payload=payload or {}))
+def add_event(
+    db, task_id: str, event_type: str, message: str, level: str = "info",
+    payload: dict | None = None, run_id: str | None = None,
+):
+    db.add(TaskEvent(task_id=task_id, run_id=run_id, event_type=event_type, message=message, level=level, payload=payload or {}))
+
+
+def parameter_snapshot(task: TrainingTask) -> dict[str, Any]:
+    return {
+        "epochs": task.epochs,
+        "batch": task.batch,
+        "imgsz": task.imgsz,
+        "device": task.device,
+        "workers": task.workers,
+        "optimizer": task.optimizer,
+        "config": dict(task.config or {}),
+    }
+
+
+def mirror_run_to_task(task: TrainingTask, run: TrainingRun) -> None:
+    """Keep the old task response useful while run-aware clients migrate."""
+    task.current_run_id = run.id
+    task.status = run.status
+    task.run_dir = run.run_dir
+    task.log_path = run.log_path
+    task.completed_epochs = run.completed_epochs
+    task.progress = run.progress
+    task.pid = run.pid
+    task.exit_code = run.exit_code
+    task.error_message = run.error_message
+    task.latest_metrics = dict(run.latest_metrics or {})
+    task.queued_at = run.queued_at
+    task.started_at = run.started_at
+    task.finished_at = run.finished_at
+
+
+def current_run(db, task: TrainingTask) -> TrainingRun | None:
+    if task.current_run_id:
+        run = db.get(TrainingRun, task.current_run_id)
+        if run:
+            return run
+    return db.scalar(
+        select(TrainingRun).where(TrainingRun.task_id == task.id).order_by(TrainingRun.attempt_number.desc()).limit(1)
+    )
+
+
+def create_training_run(
+    db, task: TrainingTask, launch_mode: str, checkpoint_path: Path | None = None,
+) -> TrainingRun:
+    attempt = (db.scalar(select(func.max(TrainingRun.attempt_number)).where(TrainingRun.task_id == task.id)) or 0) + 1
+    attempt_name = f"attempt-{attempt:03d}"
+    run = TrainingRun(
+        id=uuid.uuid4().hex,
+        task_id=task.id,
+        attempt_number=attempt,
+        launch_mode=launch_mode,
+        status="queued",
+        parameter_snapshot=parameter_snapshot(task),
+        model_path=task.model_path,
+        data_path=task.data_path,
+        checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
+        run_dir=str(RUNS_ROOT / task.task_type / task.id / attempt_name),
+        log_path=str(RUNTIME_ROOT / task.id / attempt_name / "platform.log"),
+        completed_epochs=task.completed_epochs if launch_mode == "resume" else 0,
+        progress=task.progress if launch_mode == "resume" else 0.0,
+        latest_metrics=dict(task.latest_metrics or {}) if launch_mode == "resume" else {},
+        queued_at=utcnow(),
+    )
+    db.add(run)
+    db.flush()
+    mirror_run_to_task(task, run)
+    return run
+
+
+def backfill_training_runs() -> int:
+    """Register pre-migration task outputs as Attempt 001 in place."""
+    created = 0
+    with SessionLocal() as db:
+        tasks = db.scalars(select(TrainingTask).order_by(TrainingTask.created_at)).all()
+        for task in tasks:
+            run = current_run(db, task)
+            if not run and task.status == "draft" and not task.run_dir and not task.log_path:
+                continue
+            if not run:
+                run = TrainingRun(
+                    id=uuid.uuid4().hex,
+                    task_id=task.id,
+                    attempt_number=1,
+                    launch_mode="fresh",
+                    status=task.status,
+                    pid=task.pid,
+                    process_started_at=task.started_at,
+                    parameter_snapshot=parameter_snapshot(task),
+                    model_path=task.model_path,
+                    data_path=task.data_path,
+                    run_dir=task.run_dir,
+                    log_path=task.log_path,
+                    completed_epochs=task.completed_epochs,
+                    progress=task.progress,
+                    latest_metrics=dict(task.latest_metrics or {}),
+                    exit_code=task.exit_code,
+                    error_message=task.error_message,
+                    queued_at=task.queued_at,
+                    started_at=task.started_at,
+                    finished_at=task.finished_at,
+                    created_at=task.created_at,
+                    updated_at=task.updated_at,
+                )
+                db.add(run)
+                db.flush()
+                created += 1
+            task.current_run_id = run.id
+            db.execute(update(MetricPoint).where(MetricPoint.task_id == task.id, MetricPoint.run_id.is_(None)).values(run_id=run.id))
+            db.execute(update(Artifact).where(Artifact.task_id == task.id, Artifact.run_id.is_(None)).values(run_id=run.id))
+            db.execute(update(TaskEvent).where(TaskEvent.task_id == task.id, TaskEvent.run_id.is_(None)).values(run_id=run.id))
+            sync_metrics(db, task, run)
+            sync_artifacts(db, task, run)
+            if task.source == "imported" and run.completed_epochs >= task.epochs:
+                run.status = "completed"
+                run.progress = 100.0
+                mirror_run_to_task(task, run)
+        db.commit()
+    return created
 
 
 def path_is_within(path: Path, roots: list[Path]) -> bool:
@@ -272,20 +394,21 @@ def parse_number(value: Any) -> float | str | None:
         return str(value)
 
 
-def sync_metrics(db, task: TrainingTask) -> None:
-    if not task.run_dir:
+def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None:
+    run = run or current_run(db, task)
+    if not run or not run.run_dir:
         return
-    csv_path = Path(task.run_dir) / "results.csv"
+    csv_path = Path(run.run_dir) / "results.csv"
     if not csv_path.exists():
         return
-    existing = set(db.scalars(select(MetricPoint.epoch).where(MetricPoint.task_id == task.id)).all())
+    existing = set(db.scalars(select(MetricPoint.epoch).where(MetricPoint.run_id == run.id)).all())
     try:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
     except (OSError, csv.Error):
         return
     latest: dict[str, Any] = {}
-    latest_epoch = task.completed_epochs
+    latest_epoch = run.completed_epochs
     for row in rows:
         try:
             epoch = int(float(row.get("epoch", "0")))
@@ -294,12 +417,20 @@ def sync_metrics(db, task: TrainingTask) -> None:
         values = {key.strip(): parse_number(value) for key, value in row.items() if key and key.strip() not in {"epoch", "time"}}
         elapsed = float(row.get("time") or 0)
         if epoch not in existing:
-            db.add(MetricPoint(task_id=task.id, epoch=epoch, elapsed=elapsed, values=values))
+            try:
+                with db.begin_nested():
+                    db.add(MetricPoint(task_id=task.id, run_id=run.id, epoch=epoch, elapsed=elapsed, values=values))
+                    db.flush()
+            except IntegrityError:
+                pass
         latest, latest_epoch = values, max(latest_epoch, epoch)
     if rows:
-        task.completed_epochs = latest_epoch
-        task.progress = min(100.0, round(latest_epoch / max(task.epochs, 1) * 100, 2))
-        task.latest_metrics = latest
+        epochs = int((run.parameter_snapshot or {}).get("epochs") or task.epochs)
+        run.completed_epochs = latest_epoch
+        run.progress = min(100.0, round(latest_epoch / max(epochs, 1) * 100, 2))
+        run.latest_metrics = latest
+        if task.current_run_id == run.id:
+            mirror_run_to_task(task, run)
 
 
 def artifact_kind(path: Path) -> str:
@@ -324,11 +455,12 @@ def resume_checkpoint(task: TrainingTask) -> Path | None:
     return checkpoint if checkpoint.is_file() else None
 
 
-def sync_artifacts(db, task: TrainingTask) -> None:
-    if not task.run_dir or not Path(task.run_dir).exists():
+def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> None:
+    run = run or current_run(db, task)
+    if not run or not run.run_dir or not Path(run.run_dir).exists():
         return
-    known = set(db.scalars(select(Artifact.path).where(Artifact.task_id == task.id)).all())
-    for path in Path(task.run_dir).rglob("*"):
+    known = set(db.scalars(select(Artifact.path).where(Artifact.run_id == run.id)).all())
+    for path in Path(run.run_dir).rglob("*"):
         if not path.is_file() or path.name.startswith("."):
             continue
         raw = str(path.resolve())
@@ -337,8 +469,9 @@ def sync_artifacts(db, task: TrainingTask) -> None:
         stat = path.stat()
         values = {
             "task_id": task.id,
+            "run_id": run.id,
             "kind": artifact_kind(path),
-            "name": str(path.relative_to(task.run_dir)),
+            "name": str(path.relative_to(run.run_dir)),
             "path": raw,
             "size": stat.st_size,
             "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc),
@@ -418,18 +551,21 @@ def import_existing_runs() -> int:
 
 class TrainingScheduler:
     def __init__(self) -> None:
-        self.processes: dict[str, subprocess.Popen] = {}
+        self.processes: dict[str, tuple[str, subprocess.Popen]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
         with SessionLocal() as db:
-            running = db.scalars(select(TrainingTask).where(TrainingTask.status.in_(["starting", "running", "stopping"]))).all()
-            for task in running:
-                task.status = "interrupted"
-                task.pid = None
-                task.error_message = "平台服务重启后未发现受管训练进程"
-                add_event(db, task.id, "interrupted", task.error_message, "warning")
+            running = db.scalars(select(TrainingRun).where(TrainingRun.status.in_(["starting", "running", "stopping"]))).all()
+            for run in running:
+                task = db.get(TrainingTask, run.task_id)
+                run.status = "interrupted"
+                run.pid = None
+                run.error_message = "平台服务重启后未发现受管训练进程"
+                if task:
+                    mirror_run_to_task(task, run)
+                    add_event(db, task.id, "interrupted", run.error_message, "warning", run_id=run.id)
             db.commit()
         self._thread = threading.Thread(target=self._loop, name="training-scheduler", daemon=True)
         self._thread.start()
@@ -455,20 +591,23 @@ class TrainingScheduler:
     def _command(
         self,
         task: TrainingTask,
+        run: TrainingRun,
         data_path: Path | None = None,
-        resume_path: Path | None = None,
     ) -> list[str]:
-        config = task.config or {}
-        resolved_data_path = data_path or Path(task.data_path)
+        snapshot = run.parameter_snapshot or {}
+        config = snapshot.get("config") or {}
+        resolved_data_path = data_path or Path(run.data_path)
+        attempt_name = f"attempt-{run.attempt_number:03d}"
         command = [
             str(YOLO_BIN), task.task_type, "train",
-            f"model={task.model_path}", f"data={resolved_data_path}", f"epochs={task.epochs}",
-            f"batch={task.batch}", f"imgsz={task.imgsz}", f"device={task.device}",
-            f"workers={task.workers}", f"optimizer={task.optimizer}",
-            f"project={RUNS_ROOT / task.task_type}", f"name={task.id}", "exist_ok=True",
+            f"model={run.model_path}", f"data={resolved_data_path}", f"epochs={snapshot.get('epochs', task.epochs)}",
+            f"batch={snapshot.get('batch', task.batch)}", f"imgsz={snapshot.get('imgsz', task.imgsz)}",
+            f"device={snapshot.get('device', task.device)}", f"workers={snapshot.get('workers', task.workers)}",
+            f"optimizer={snapshot.get('optimizer', task.optimizer)}",
+            f"project={RUNS_ROOT / task.task_type / task.id}", f"name={attempt_name}", "exist_ok=True",
         ]
-        if resume_path:
-            command.append(f"resume={resume_path}")
+        if run.checkpoint_path:
+            command.extend([f"resume={run.checkpoint_path}", f"save_dir={run.run_dir}"])
         for key, value in config.items():
             if key in TRAINING_KEYS and value is not None:
                 command.append(f"{key}={value}")
@@ -476,28 +615,30 @@ class TrainingScheduler:
             command.append(f"{key}={value}")
         return command
 
-    def _launch(self, db, task: TrainingTask) -> None:
-        run_dir = RUNS_ROOT / task.task_type / task.id
-        runtime_dir = RUNTIME_ROOT / task.id
+    def _launch(self, db, task: TrainingTask, run: TrainingRun) -> None:
+        run_dir = Path(run.run_dir or RUNS_ROOT / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
+        runtime_dir = Path(run.log_path).parent if run.log_path else RUNTIME_ROOT / task.id / f"attempt-{run.attempt_number:03d}"
         runtime_dir.mkdir(parents=True, exist_ok=True)
         log_path = runtime_dir / "platform.log"
         try:
-            dataset_path = prepare_dataset_config(task.data_path, runtime_dir / "dataset.yaml")
+            dataset_path = prepare_dataset_config(run.data_path, runtime_dir / "dataset.yaml")
         except (OSError, ValueError, yaml.YAMLError) as exc:
-            task.status = "failed"
-            task.error_message = str(exc)
-            task.finished_at = utcnow()
-            add_event(db, task.id, "failed", f"数据集配置校验失败：{exc}", "error")
+            run.status = "failed"
+            run.error_message = str(exc)
+            run.finished_at = utcnow()
+            mirror_run_to_task(task, run)
+            add_event(db, task.id, "failed", f"数据集配置校验失败：{exc}", "error", run_id=run.id)
             return
-        requested_resume = (task.config or {}).get("_resume_checkpoint")
-        resume_path = Path(requested_resume).resolve() if requested_resume else None
+        resume_path = Path(run.checkpoint_path).resolve() if run.checkpoint_path else None
         if resume_path and not resume_path.is_file():
-            task.status = "failed"
-            task.error_message = f"断点检查点不存在：{resume_path}"
-            task.finished_at = utcnow()
-            add_event(db, task.id, "failed", task.error_message, "error")
+            run.status = "failed"
+            run.error_message = f"断点检查点不存在：{resume_path}"
+            run.finished_at = utcnow()
+            mirror_run_to_task(task, run)
+            add_event(db, task.id, "failed", run.error_message, "error", run_id=run.id)
             return
-        command = self._command(task, dataset_path, resume_path)
+        command = self._command(task, run, dataset_path)
+        run.command = command
         log_handle = log_path.open("a", encoding="utf-8", buffering=1)
         log_handle.write(f"\n[{utcnow().isoformat()}] COMMAND {json.dumps(command, ensure_ascii=False)}\n")
         log_handle.write(f"[{utcnow().isoformat()}] ENV MKL_THREADING_LAYER={TRAINING_MKL_THREADING_LAYER}\n")
@@ -513,20 +654,23 @@ class TrainingScheduler:
             )
         except OSError as exc:
             log_handle.close()
-            task.status = "failed"
-            task.error_message = str(exc)
-            task.finished_at = utcnow()
-            add_event(db, task.id, "failed", f"训练进程启动失败：{exc}", "error")
+            run.status = "failed"
+            run.error_message = str(exc)
+            run.finished_at = utcnow()
+            mirror_run_to_task(task, run)
+            add_event(db, task.id, "failed", f"训练进程启动失败：{exc}", "error", run_id=run.id)
             return
         log_handle.close()
-        task.status = "running"
-        task.pid = process.pid
-        task.started_at = utcnow()
-        task.run_dir = str(run_dir)
-        task.log_path = str(log_path)
-        task.error_message = None
-        self.processes[task.id] = process
-        add_event(db, task.id, "started", f"训练已启动，PID {process.pid}", payload={"command": command})
+        run.status = "running"
+        run.pid = process.pid
+        run.started_at = utcnow()
+        run.process_started_at = run.started_at
+        run.run_dir = str(run_dir)
+        run.log_path = str(log_path)
+        run.error_message = None
+        mirror_run_to_task(task, run)
+        self.processes[task.id] = (run.id, process)
+        add_event(db, task.id, "started", f"Attempt {run.attempt_number:03d} 已启动，PID {process.pid}", payload={"command": command}, run_id=run.id)
 
     def stop_task(self, task_id: str) -> bool:
         with SessionLocal() as db:
@@ -534,16 +678,25 @@ class TrainingScheduler:
             if not task:
                 return False
             if task.status == "queued":
-                task.status = "stopped"
-                task.finished_at = utcnow()
-                add_event(db, task.id, "stopped", "已从等待队列移除")
+                run = current_run(db, task)
+                if not run:
+                    return False
+                run.status = "stopped"
+                run.finished_at = utcnow()
+                mirror_run_to_task(task, run)
+                add_event(db, task.id, "stopped", "已从等待队列移除", run_id=run.id)
                 db.commit()
                 return True
-            process = self.processes.get(task_id)
-            if task.status not in {"starting", "running"} or not process:
+            managed = self.processes.get(task_id)
+            if task.status not in {"starting", "running"} or not managed:
                 return False
-            task.status = "stopping"
-            add_event(db, task.id, "stopping", "正在停止训练进程")
+            run_id, process = managed
+            run = db.get(TrainingRun, run_id)
+            if not run:
+                return False
+            run.status = "stopping"
+            mirror_run_to_task(task, run)
+            add_event(db, task.id, "stopping", "正在停止训练进程", run_id=run.id)
             db.commit()
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -552,33 +705,35 @@ class TrainingScheduler:
             return True
 
     def _poll_processes(self, db) -> None:
-        for task_id, process in list(self.processes.items()):
+        for task_id, (run_id, process) in list(self.processes.items()):
             task = db.get(TrainingTask, task_id)
-            if not task:
+            run = db.get(TrainingRun, run_id)
+            if not task or not run:
                 continue
-            sync_metrics(db, task)
+            sync_metrics(db, task, run)
             code = process.poll()
             if code is None:
                 continue
-            task.exit_code = code
-            task.pid = None
-            task.finished_at = utcnow()
-            if task.status == "stopping":
-                task.status = "stopped"
+            run.exit_code = code
+            run.pid = None
+            run.finished_at = utcnow()
+            if run.status == "stopping":
+                run.status = "stopped"
                 message, level = "训练已停止", "info"
             elif code == 0:
-                task.status = "completed"
-                task.progress = 100.0
+                run.status = "completed"
+                run.progress = 100.0
                 message, level = "训练已完成", "info"
             else:
-                task.status = "failed"
-                detail = failure_detail(task.log_path)
-                task.error_message = f"训练进程异常退出，退出码 {code}"
+                run.status = "failed"
+                detail = failure_detail(run.log_path)
+                run.error_message = f"训练进程异常退出，退出码 {code}"
                 if detail:
-                    task.error_message += f"：{detail[-500:]}"
-                message, level = task.error_message, "error"
-            sync_artifacts(db, task)
-            add_event(db, task.id, task.status, message, level)
+                    run.error_message += f"：{detail[-500:]}"
+                message, level = run.error_message, "error"
+            mirror_run_to_task(task, run)
+            sync_artifacts(db, task, run)
+            add_event(db, task.id, run.status, message, level, run_id=run.id)
             self.processes.pop(task_id, None)
 
     def _loop(self) -> None:
@@ -586,13 +741,13 @@ class TrainingScheduler:
             try:
                 with SessionLocal() as db:
                     self._poll_processes(db)
-                    queued = db.scalars(
-                        select(TrainingTask).where(TrainingTask.status == "queued").order_by(TrainingTask.queued_at)
-                    ).all()
-                    for task in queued:
-                        if self._available(db, task):
-                            task.status = "starting"
-                            self._launch(db, task)
+                    queued = db.scalars(select(TrainingRun).where(TrainingRun.status == "queued").order_by(TrainingRun.queued_at)).all()
+                    for run in queued:
+                        task = db.get(TrainingTask, run.task_id)
+                        if task and task.current_run_id == run.id and self._available(db, task):
+                            run.status = "starting"
+                            mirror_run_to_task(task, run)
+                            self._launch(db, task, run)
                     db.commit()
             except Exception:
                 # Keep the scheduler alive; errors are surfaced by the next API health check/log inspection.
