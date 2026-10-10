@@ -54,8 +54,8 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
       <div className="log-tool-row">
         <div className="log-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索日志内容" />{search && <span>{visibleLines.length} 条匹配</span>}</div>
         <label className="auto-scroll"><input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />自动滚动</label>
-        <button onClick={copyLogs}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? '已复制' : '复制全部'}</button>
-        <button onClick={downloadLogs}><Download size={15} />下载日志</button>
+        <button className="log-action-button" title="复制当前日志内容" aria-label="复制当前日志内容" onClick={copyLogs}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? '已复制' : '复制全部'}</button>
+        <button className="log-action-button" title="下载当前日志文件" aria-label="下载当前日志文件" onClick={downloadLogs}><Download size={15} />下载日志</button>
       </div>
       <div className="terminal-window">
         <div className="terminal-chrome"><span className="red" /><span className="yellow" /><span className="green" /><code>yolo://training/{task.id}</code><em>{visibleLines.length} lines</em></div>
