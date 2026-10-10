@@ -316,6 +316,14 @@ def artifact_kind(path: Path) -> str:
     return "file"
 
 
+def resume_checkpoint(task: TrainingTask) -> Path | None:
+    """Return the checkpoint written by the latest incomplete run, if available."""
+    if not task.run_dir:
+        return None
+    checkpoint = Path(task.run_dir) / "weights" / "last.pt"
+    return checkpoint if checkpoint.is_file() else None
+
+
 def sync_artifacts(db, task: TrainingTask) -> None:
     if not task.run_dir or not Path(task.run_dir).exists():
         return
@@ -444,7 +452,12 @@ class TrainingScheduler:
                 used |= self.requested_gpus(other.device)
         return not wanted.intersection(used)
 
-    def _command(self, task: TrainingTask, data_path: Path | None = None) -> list[str]:
+    def _command(
+        self,
+        task: TrainingTask,
+        data_path: Path | None = None,
+        resume_path: Path | None = None,
+    ) -> list[str]:
         config = task.config or {}
         resolved_data_path = data_path or Path(task.data_path)
         command = [
@@ -454,6 +467,8 @@ class TrainingScheduler:
             f"workers={task.workers}", f"optimizer={task.optimizer}",
             f"project={RUNS_ROOT / task.task_type}", f"name={task.id}", "exist_ok=True",
         ]
+        if resume_path:
+            command.append(f"resume={resume_path}")
         for key, value in config.items():
             if key in TRAINING_KEYS and value is not None:
                 command.append(f"{key}={value}")
@@ -474,7 +489,15 @@ class TrainingScheduler:
             task.finished_at = utcnow()
             add_event(db, task.id, "failed", f"数据集配置校验失败：{exc}", "error")
             return
-        command = self._command(task, dataset_path)
+        requested_resume = (task.config or {}).get("_resume_checkpoint")
+        resume_path = Path(requested_resume).resolve() if requested_resume else None
+        if resume_path and not resume_path.is_file():
+            task.status = "failed"
+            task.error_message = f"断点检查点不存在：{resume_path}"
+            task.finished_at = utcnow()
+            add_event(db, task.id, "failed", task.error_message, "error")
+            return
+        command = self._command(task, dataset_path, resume_path)
         log_handle = log_path.open("a", encoding="utf-8", buffering=1)
         log_handle.write(f"\n[{utcnow().isoformat()}] COMMAND {json.dumps(command, ensure_ascii=False)}\n")
         log_handle.write(f"[{utcnow().isoformat()}] ENV MKL_THREADING_LAYER={TRAINING_MKL_THREADING_LAYER}\n")

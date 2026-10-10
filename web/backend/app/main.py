@@ -26,6 +26,7 @@ from .services import (
     gpu_inventory,
     import_existing_runs,
     path_is_within,
+    resume_checkpoint,
     scheduler,
     sync_metrics,
     validate_dataset_config,
@@ -153,7 +154,7 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/start", response_model=TaskRead)
 def start_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    if task.status not in {"draft", "stopped", "failed", "interrupted"}:
+    if task.status not in {"draft", "failed"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
     if not Path(task.model_path).exists() or not Path(task.data_path).exists():
         raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
@@ -162,11 +163,44 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     task.status = "queued"
+    task.config = {key: value for key, value in (task.config or {}).items() if key != "_resume_checkpoint"}
     task.queued_at = utcnow()
     task.finished_at = None
     task.exit_code = None
     task.error_message = None
     add_event(db, task.id, "queued", "任务已加入训练队列")
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.post("/api/tasks/{task_id}/resume", response_model=TaskRead)
+def resume_task(task_id: str, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.status not in {"stopped", "interrupted"}:
+        raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
+    checkpoint = resume_checkpoint(task)
+    if not checkpoint:
+        raise HTTPException(409, "该任务没有可用的断点检查点 last.pt，无法继续训练")
+    if not Path(task.data_path).exists():
+        raise HTTPException(409, "数据集路径已经失效，无法继续训练")
+    try:
+        validate_dataset_config(task.data_path)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    task.config = {**(task.config or {}), "_resume_checkpoint": str(checkpoint)}
+    task.status = "queued"
+    task.queued_at = utcnow()
+    task.finished_at = None
+    task.exit_code = None
+    task.error_message = None
+    add_event(
+        db,
+        task.id,
+        "resume_queued",
+        "任务已加入断点续训队列",
+        payload={"checkpoint": str(checkpoint), "completed_epochs": task.completed_epochs},
+    )
     db.commit()
     db.refresh(task)
     return task
@@ -188,7 +222,7 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
         id=uuid.uuid4().hex[:16], name=f"{source.name} - 副本", task_type=source.task_type,
         model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
         imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
-        config=source.config.copy(), canvas_layout=source.canvas_layout.copy(),
+        config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
     )
     db.add(clone)
     db.flush()

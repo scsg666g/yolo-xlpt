@@ -71,7 +71,8 @@ export function Dashboard() {
           <div className="metric-strip"><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>GPU {task.device}</strong></div></div>
           {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
           <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
-            {['draft', 'stopped', 'failed', 'interrupted'].includes(task.status) && <button title="启动" onClick={(e) => taskAction(e, () => api.start(task.id))}><Zap size={15} /></button>}
+            {['draft', 'failed'].includes(task.status) && <button title="启动" onClick={(e) => taskAction(e, () => api.start(task.id))}><Zap size={15} /></button>}
+            {['stopped', 'interrupted'].includes(task.status) && <button title="继续训练" onClick={(e) => taskAction(e, () => api.resume(task.id))}><RefreshCw size={15} /></button>}
             {['queued', 'starting', 'running'].includes(task.status) && <button title="停止" onClick={(e) => taskAction(e, () => api.stop(task.id))}><Square size={14} /></button>}
             <button title="克隆" onClick={(e) => taskAction(e, () => api.clone(task.id))}><Copy size={15} /></button>
             <button title="加入实验对比" onClick={(e) => { e.stopPropagation(); navigate(`/compare?tasks=${task.id}`) }}><GitCompareArrows size={15} /></button>

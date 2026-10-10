@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import ReactECharts from 'echarts-for-react'
 import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, type Connection, type Edge, type Node } from '@xyflow/react'
-import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, FileArchive, FileText, Gauge, LoaderCircle, Maximize, Play, Save, SlidersHorizontal, Square, Terminal, Zap } from 'lucide-react'
+import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, FileArchive, FileText, Gauge, LoaderCircle, Maximize, Play, RefreshCw, Save, SlidersHorizontal, Square, Terminal, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingTask } from '../types'
@@ -54,12 +54,22 @@ function TaskCanvasInner() {
 
   const refresh = useCallback(async () => {
     try {
-      const [taskData, metricData, artifactData, eventData, logData] = await Promise.all([
-        api.task(taskId), api.metrics(taskId), api.artifacts(taskId), api.events(taskId), api.logs(taskId),
+      // Validate the task first so a stale canvas URL does not fire several
+      // dependent 404 requests on every polling cycle.
+      const taskData = await api.task(taskId)
+      const [metricData, artifactData, eventData, logData] = await Promise.all([
+        api.metrics(taskId), api.artifacts(taskId), api.events(taskId), api.logs(taskId),
       ])
       setTask(taskData); setMetrics(metricData); setArtifacts(artifactData); setEvents(eventData); setLogs(logData.lines)
-    } catch (reason) { setNotice(reason instanceof Error ? reason.message : '加载失败') } finally { setLoading(false) }
-  }, [taskId])
+    } catch (reason) {
+      const status = reason instanceof Error ? (reason as Error & { status?: number }).status : undefined
+      if (status === 404) {
+        navigate('/', { replace: true })
+        return
+      }
+      setNotice(reason instanceof Error ? reason.message : '加载失败')
+    } finally { setLoading(false) }
+  }, [navigate, taskId])
 
   useEffect(() => { refresh(); const timer = window.setInterval(refresh, 3000); return () => window.clearInterval(timer) }, [refresh])
 
@@ -89,7 +99,7 @@ function TaskCanvasInner() {
 
   const onConnect = useCallback((connection: Connection) => setEdges((items) => addEdge(connection, items)), [setEdges])
 
-  async function action(kind: 'start' | 'stop') {
+  async function action(kind: 'start' | 'stop' | 'resume') {
     setWorking(true); setNotice('')
     try { await api[kind](taskId); await refresh() } catch (reason) { setNotice(reason instanceof Error ? reason.message : '操作失败') } finally { setWorking(false) }
   }
@@ -101,7 +111,8 @@ function TaskCanvasInner() {
   }
 
   if (loading || !task) return <div className="canvas-loading"><LoaderCircle className="spin" />正在装载训练画布…</div>
-  const canStart = ['draft', 'stopped', 'failed', 'interrupted'].includes(task.status)
+  const canStart = ['draft', 'failed'].includes(task.status)
+  const canResume = ['stopped', 'interrupted'].includes(task.status)
   const canStop = ['queued', 'starting', 'running'].includes(task.status)
 
   return <div className="canvas-page">
@@ -114,6 +125,7 @@ function TaskCanvasInner() {
         <button className="button ghost compact" onClick={() => fitView({ padding: 0.16, duration: 500 })}><Maximize size={15} />适应画布</button>
         <button className="button ghost compact" onClick={saveLayout}><Save size={15} />保存布局</button>
         {canStart && <button className="button primary compact" disabled={working} onClick={() => action('start')}><Play size={15} />启动训练</button>}
+        {canResume && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
         {canStop && <button className="button danger compact" disabled={working} onClick={() => action('stop')}><Square size={14} />停止</button>}
       </div>
     </header>

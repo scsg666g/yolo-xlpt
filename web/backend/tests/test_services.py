@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app.models import Artifact, TrainingTask
-from app.services import failure_detail, path_is_within, prepare_dataset_config, sync_artifacts, training_environment
+from app.services import TrainingScheduler, failure_detail, path_is_within, prepare_dataset_config, resume_checkpoint, sync_artifacts, training_environment
 
 
 def test_path_is_within(tmp_path: Path):
@@ -72,3 +72,22 @@ def test_sync_artifacts_is_idempotent(tmp_path: Path):
     paths = session.scalars(select(Artifact.path).where(Artifact.task_id == task.id)).all()
     assert paths == [str((run_dir / "results.csv").resolve())]
     session.close()
+
+
+def test_resume_checkpoint_and_command(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    checkpoint = run_dir / "weights" / "last.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    task = TrainingTask(
+        id="task-resume",
+        name="test",
+        task_type="detect",
+        model_path="model.pt",
+        data_path="data.yaml",
+        run_dir=str(run_dir),
+        config={},
+    )
+    assert resume_checkpoint(task) == checkpoint
+    command = TrainingScheduler()._command(task, Path("generated.yaml"), checkpoint)
+    assert f"resume={checkpoint}" in command
