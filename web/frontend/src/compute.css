@@ -28,3 +28,16 @@
 :root[data-theme='light'] .gpu-card > header, :root[data-theme='light'] .gpu-details, :root[data-theme='light'] .gpu-details > div, :root[data-theme='light'] .compute-panel > header { border-color: #dce6eb; }:root[data-theme='light'] .gpu-index { color: #087e61; background: #e1f4ee; }:root[data-theme='light'] .gpu-card header h2, :root[data-theme='light'] .compute-panel header span strong { color: #294758; }:root[data-theme='light'] .usage-gauge { background: conic-gradient(#159a78 var(--gauge-value), #dce8ec 0); }:root[data-theme='light'] .usage-gauge::before { background: #fff; }:root[data-theme='light'] .usage-gauge strong, :root[data-theme='light'] .gpu-bars label strong, :root[data-theme='light'] .gpu-details strong { color: #355363; }:root[data-theme='light'] .gpu-bars > div > div { background: #dce8ec; }
 :root[data-theme='light'] .process-table th, :root[data-theme='light'] .process-table td, :root[data-theme='light'] .host-panel dl > div { border-color: #e1e9ed; }:root[data-theme='light'] .process-table th { color: #657c89; background: #f3f7f9; }:root[data-theme='light'] .process-table td { color: #3d5969; }:root[data-theme='light'] .linked-task { color: #087e61; background: #e3f4ef; }:root[data-theme='light'] .host-name { color: #159a78; border-color: #d6e2e8; background: #f5f8fa; }:root[data-theme='light'] .host-name strong, :root[data-theme='light'] .host-panel dd { color: #355363; }
 @media (max-width: 1300px) { .compute-overview { grid-template-columns: repeat(2, 1fr); }.gpu-grid { grid-template-columns: 1fr; }.compute-lower-grid { grid-template-columns: 1fr; } }
+:root[data-theme='dark'] .auto-refresh { color: #a5b4be; border-color: #40535f; background: #18242f; }
+:root[data-theme='dark'] .auto-refresh.active { color: #8cebc5; border-color: #4e786d; background: #1c3932; }
+:root[data-theme='dark'] .compute-overview article, :root[data-theme='dark'] .gpu-card, :root[data-theme='dark'] .compute-panel { border-color: #3a4d59; background: #18242f; box-shadow: 0 8px 22px rgba(0,0,0,.12); }
+:root[data-theme='dark'] .compute-overview strong, :root[data-theme='dark'] .gpu-card header h2, :root[data-theme='dark'] .compute-panel header span strong { color: #dce6ed; }
+:root[data-theme='dark'] .gpu-card > header, :root[data-theme='dark'] .gpu-details, :root[data-theme='dark'] .gpu-details > div, :root[data-theme='dark'] .compute-panel > header { border-color: #344652; }
+:root[data-theme='dark'] .usage-gauge { background: conic-gradient(#76e9ba var(--gauge-value), #344651 0); }
+:root[data-theme='dark'] .usage-gauge::before { background: #18242f; }
+:root[data-theme='dark'] .gpu-bars > div > div { background: #344651; }
+:root[data-theme='dark'] .gpu-details strong, :root[data-theme='dark'] .gpu-bars label strong { color: #cdd8df; }
+:root[data-theme='dark'] .process-table th, :root[data-theme='dark'] .process-table td, :root[data-theme='dark'] .host-panel dl > div { border-color: #344652; }
+:root[data-theme='dark'] .process-table th { color: #9dacb7; background: #1c2a36; }
+:root[data-theme='dark'] .process-table td, :root[data-theme='dark'] .host-panel dd { color: #c2ced6; }
+:root[data-theme='dark'] .host-name { color: #8cebc5; border-color: #3b4e5a; background: #16212b; }
