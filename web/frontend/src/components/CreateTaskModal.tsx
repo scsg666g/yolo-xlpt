@@ -3,7 +3,7 @@ import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Upload, X }
 import { api } from '../api'
 import type { DatasetUploadResult, Resources, TaskCreatePayload, TrainingTask } from '../types'
 import { UploadDatasetModal } from './UploadDatasetModal'
-import { parseImportedParameters, type DetectedParameter } from './EditParametersModal'
+import { analyzeImportedParameters, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
 
 interface Props {
   open: boolean
@@ -30,6 +30,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
   const [jsonCopied, setJsonCopied] = useState(false)
   const [importText, setImportText] = useState('')
   const [detectedParameters, setDetectedParameters] = useState<DetectedParameter[]>([])
+  const [importDiagnostics, setImportDiagnostics] = useState<ImportDiagnostic[]>([])
   const [selectedImportKeys, setSelectedImportKeys] = useState<string[]>([])
 
   useEffect(() => {
@@ -56,8 +57,11 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
   const update = <K extends keyof TaskCreatePayload>(key: K, value: TaskCreatePayload[K]) =>
     setForm((current) => ({ ...current, [key]: value }))
 
-  function openImport() { setImportText(''); setDetectedParameters([]); setSelectedImportKeys([]); setImportOpen(true) }
-  function changeImportText(value: string) { setImportText(value); setDetectedParameters(parseImportedParameters(value)); setSelectedImportKeys([]) }
+  function openImport() { setImportText(''); setDetectedParameters([]); setImportDiagnostics([]); setSelectedImportKeys([]); setImportOpen(true) }
+  function changeImportText(value: string) {
+    const analysis = analyzeImportedParameters(value)
+    setImportText(value); setDetectedParameters(analysis.parameters); setImportDiagnostics(analysis.diagnostics); setSelectedImportKeys(analysis.parameters.map((item) => item.key))
+  }
   function applyImportedParameters() {
     const selected = detectedParameters.filter((item) => selectedImportKeys.includes(item.key))
     setForm((current) => {
@@ -122,7 +126,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
             {Object.entries(form.advanced).map(([key, value]) => <label key={key} className="imported-advanced-field"><span>{key}</span>{typeof value === 'boolean' ? <select value={String(value)} onChange={(e) => setForm((current) => ({ ...current, advanced: { ...current.advanced, [key]: e.target.value === 'true' } }))}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={typeof value === 'number' ? 'number' : 'text'} value={String(value)} onChange={(e) => setForm((current) => ({ ...current, advanced: { ...current.advanced, [key]: typeof value === 'number' ? Number(e.target.value) : e.target.value } }))} />}</label>)}
           </div>}
         </div>
-        {importOpen && <div className="parameter-import-backdrop" onMouseDown={() => setImportOpen(false)}><div className="parameter-import-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3>批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。只会识别平台支持的参数。</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)}><X size={18} /></button></header><div className="parameter-import-body"><textarea value={importText} onChange={(event) => changeImportText(event.target.value)} placeholder={'例如：\nmodel.train(epochs=100, batch=16, imgsz=640, lr0=0.01, freeze=10)\n\n或：\nepochs: 100\namp: true\nmosaic: 0.8'} /><div className="detected-toolbar"><strong>已识别 {detectedParameters.length} 个参数</strong><button type="button" onClick={() => setSelectedImportKeys(selectedImportKeys.length === detectedParameters.length ? [] : detectedParameters.map((item) => item.key))}>{selectedImportKeys.length === detectedParameters.length && detectedParameters.length ? '取消全选' : '全选'}</button></div><div className="detected-list">{detectedParameters.map((item) => { const checked = selectedImportKeys.includes(item.key); return <label key={item.key} className={checked ? 'selected' : ''}><input type="checkbox" checked={checked} onChange={() => setSelectedImportKeys((current) => checked ? current.filter((key) => key !== item.key) : [...current, item.key])} /><span><strong>{item.label}</strong><code>{item.key}</code></span><em>{String(item.value)}</em></label> })}{!detectedParameters.length && <div className="detected-empty">粘贴参数后会在这里显示识别结果</div>}</div></div><footer><span>已选 {selectedImportKeys.length} 个，确认后会填充到任务参数</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>填充已选参数</button></footer></div></div>}
+        {importOpen && <div className="parameter-import-backdrop" onMouseDown={() => setImportOpen(false)}><div className="parameter-import-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3>批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。全部字段都会列出诊断结果，不会执行粘贴的代码。</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)}><X size={18} /></button></header><div className="parameter-import-body"><textarea value={importText} onChange={(event) => changeImportText(event.target.value)} placeholder={'例如：\nmodel.train(epochs=100, batch=16, imgsz=640, lr0=0.01, freeze=10)\n\n或：\nepochs: 100\namp: true\nmosaic: 0.8'} /><ParameterImportResults diagnostics={importDiagnostics} parameters={detectedParameters} selectedKeys={selectedImportKeys} onSelectionChange={setSelectedImportKeys} /></div><footer><span>将导入 {selectedImportKeys.length} 项{importDiagnostics.length > detectedParameters.length ? `，${importDiagnostics.length - detectedParameters.length} 项不会导入` : ''}</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>导入 {selectedImportKeys.length} 个参数</button></footer></div></div>}
         {jsonOpen && <div className="parameter-import-backdrop" onMouseDown={() => setJsonOpen(false)}><div className="parameter-json-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">EFFECTIVE CONFIGURATION</span><h3>完整 JSON 参数</h3><p>{Object.keys(jsonParameters).length} 个当前参数</p></div><button type="button" className="icon-button" onClick={() => setJsonOpen(false)}><X size={18} /></button></header><div className="parameter-json-body"><pre>{jsonText}</pre></div><footer><span>当前新建任务配置</span><button type="button" className="button primary" onClick={copyJson}>{jsonCopied ? <Check size={15} /> : <Clipboard size={15} />}{jsonCopied ? '已复制' : '复制 JSON'}</button></footer></div></div>}
         <footer><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={submitting}>{submitting && <LoaderCircle size={16} className="spin" />}创建任务</button></footer>
       </form>

@@ -1,10 +1,10 @@
 import { useEffect, useMemo } from 'react'
 import ReactECharts from 'echarts-for-react'
-import { Activity, Cpu, Download, FileArchive, FileText, Gauge, Image, Terminal, X } from 'lucide-react'
+import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Image, Save, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 
-export type CanvasDetailKind = 'runtime' | 'status' | 'metrics' | 'artifacts'
+export type CanvasDetailKind = 'runtime' | 'status' | 'metrics' | 'artifacts' | 'weights'
 
 type Props = {
   kind: CanvasDetailKind | null
@@ -21,6 +21,7 @@ const detailMeta = {
   status: { eyebrow: 'TRAINING RUN', title: '训练状态详情', icon: Gauge, accent: '#70f0bd' },
   metrics: { eyebrow: 'METRICS EXPLORER', title: '完整训练指标', icon: Activity, accent: '#53d6e8' },
   artifacts: { eyebrow: 'RUN ARTIFACTS', title: '训练产物浏览', icon: FileArchive, accent: '#ffd56d' },
+  weights: { eyebrow: 'MODEL CHECKPOINTS', title: '模型权重详情', icon: Save, accent: '#7da8ff' },
 } satisfies Record<CanvasDetailKind, { eyebrow: string; title: string; icon: typeof Cpu; accent: string }>
 
 const launchModeLabel = { fresh: '首次训练', resume: '继续训练', retry: '重新训练' }
@@ -170,14 +171,37 @@ function MetricsDetails({ metrics, task }: Pick<Props, 'metrics' | 'task'>) {
 }
 
 function ArtifactsDetails({ artifacts }: Pick<Props, 'artifacts'>) {
-  const images = artifacts.filter((item) => item.kind === 'image')
-  if (!artifacts.length) return <div className="canvas-detail-empty large">当前运行暂未生成训练产物。</div>
+  const files = artifacts.filter((item) => item.kind !== 'weight')
+  const images = files.filter((item) => item.kind === 'image')
+  if (!files.length) return <div className="canvas-detail-empty large">当前运行暂未生成训练产物。</div>
   return <div className="canvas-detail-sections">
     {images.length > 0 && <section className="canvas-detail-section"><h3>图片预览 <span>{images.length}</span></h3><div className="artifact-gallery">{images.map((item) => <a key={item.id} href={`/api/artifacts/${item.id}/download`} target="_blank" rel="noreferrer" title={`打开 ${item.name}`}><img src={`/api/artifacts/${item.id}/download`} alt={item.name} loading="lazy" /><span><Image size={13} />{item.name}</span></a>)}</div></section>}
     <section className="canvas-detail-section">
-      <h3>全部文件 <span>{artifacts.length}</span></h3>
-      <div className="artifact-detail-list">{artifacts.map((item) => <article key={item.id}><div className={`artifact-kind kind-${item.kind}`}><FileText size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{item.kind.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified_at)}</small><a href={`/api/artifacts/${item.id}/download`} title={`下载 ${item.name}`} aria-label={`下载 ${item.name}`}><Download size={16} /></a></article>)}</div>
+      <h3>全部文件 <span>{files.length}</span></h3>
+      <div className="artifact-detail-list">{files.map((item) => <article key={item.id}><div className={`artifact-kind kind-${item.kind}`}><FileText size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{item.kind.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified_at)}</small><a href={`/api/artifacts/${item.id}/download`} title={`下载 ${item.name}`} aria-label={`下载 ${item.name}`}><Download size={16} /></a></article>)}</div>
     </section>
+  </div>
+}
+
+function WeightsDetails({ artifacts, task, run }: Pick<Props, 'artifacts' | 'task' | 'run'>) {
+  const weights = artifacts.filter((item) => item.kind === 'weight')
+  const knownWeights = [
+    { name: 'best.pt', label: '最佳模型', description: '训练过程中验证指标表现最好的检查点，通常用于部署、推理和导出。', icon: Trophy },
+    { name: 'last.pt', label: '最新模型', description: '最后一个 Epoch 保存的检查点，保留训练状态，通常用于中断后继续训练。', icon: History },
+  ]
+  return <div className="canvas-detail-sections">
+    <div className="weight-detail-summary"><div><span>运行批次</span><strong>{run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '—'}</strong></div><div><span>训练状态</span><strong>{statusLabel(task.status)}</strong></div><div><span>权重数量</span><strong>{weights.length}</strong></div><div><span>输出目录</span><strong title={task.run_dir || ''}>{task.run_dir?.split('/').slice(-3).join('/') || '等待创建'}</strong></div></div>
+    <div className="weight-card-grid">{knownWeights.map(({ name, label, description, icon: Icon }) => {
+      const artifact = weights.find((item) => item.name.split('/').pop() === name)
+      return <article className={`weight-detail-card ${artifact ? '' : 'pending'}`} key={name}>
+        <div className="weight-card-top"><div className="weight-card-icon"><Icon size={24} /></div><div><span>{label}</span><h3>{name}</h3></div><em>{artifact ? '已生成' : '等待生成'}</em></div>
+        <p>{description}</p>
+        <div className="weight-card-meta"><div><HardDrive size={14} /><span>文件大小</span><strong>{artifact ? formatBytes(artifact.size) : '—'}</strong></div><div><History size={14} /><span>更新时间</span><strong>{artifact ? formatDate(artifact.modified_at) : '—'}</strong></div></div>
+        <div className="weight-card-path" title={artifact?.path}>{artifact?.path || `${task.run_dir || '训练输出目录'}/weights/${name}`}</div>
+        {artifact ? <a className="button primary weight-download" href={`/api/artifacts/${artifact.id}/download`}><Download size={16} />下载 {name}</a> : <button className="button ghost weight-download" disabled><Download size={16} />暂不可下载</button>}
+      </article>
+    })}</div>
+    {weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).length > 0 && <section className="canvas-detail-section"><h3>其他模型权重</h3><div className="artifact-detail-list">{weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).map((item) => <article key={item.id}><div className="artifact-kind kind-weight"><Save size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{formatBytes(item.size)} · {formatDate(item.modified_at)}</small><a href={`/api/artifacts/${item.id}/download`} title={`下载 ${item.name}`}><Download size={16} /></a></article>)}</div></section>}
   </div>
 }
 
@@ -200,6 +224,7 @@ export function CanvasDetailModal({ kind, task, run, metrics, artifacts, events,
         {kind === 'status' && <StatusDetails task={task} run={run} events={events} />}
         {kind === 'metrics' && <MetricsDetails task={task} metrics={metrics} />}
         {kind === 'artifacts' && <ArtifactsDetails artifacts={artifacts} />}
+        {kind === 'weights' && <WeightsDetails task={task} run={run} artifacts={artifacts} />}
       </div>
       <footer><span>双击画布中的其他节点可切换查看对应内容</span><button className="button ghost" onClick={onClose}>关闭</button></footer>
     </div>

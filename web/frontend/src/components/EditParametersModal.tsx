@@ -20,6 +20,23 @@ export interface DetectedParameter {
   type: 'number' | 'boolean' | 'text'
 }
 
+export type ImportDiagnosticStatus = 'supported' | 'context' | 'deprecated' | 'unknown' | 'invalid'
+
+export interface ImportDiagnostic {
+  key: string
+  label: string
+  rawValue: string
+  line: number
+  occurrences: number
+  status: ImportDiagnosticStatus
+  message: string
+}
+
+export interface ImportAnalysis {
+  parameters: DetectedParameter[]
+  diagnostics: ImportDiagnostic[]
+}
+
 const extraDefinitions: Record<string, { label: string; type: 'number' | 'boolean' | 'text'; default: ExtraValue; step?: number }> = {
   weight_decay: { label: '权重衰减', type: 'number', default: 0.0005, step: 0.0001 },
   momentum: { label: '动量', type: 'number', default: 0.937, step: 0.001 },
@@ -92,6 +109,24 @@ export const importDefinitions: Record<string, { label: string; type: DetectedPa
   ...Object.fromEntries(Object.entries(extraDefinitions).map(([key, definition]) => [key, { label: definition.label, type: definition.type }])),
 }
 
+const contextDefinitions: Record<string, { label: string; message: string }> = {
+  task: { label: '任务类型', message: '任务上下文参数，请在任务类型中设置' },
+  mode: { label: '运行模式', message: '平台训练任务固定使用 train，无需导入' },
+  model: { label: '基础模型', message: '模型资源不会在参数导入中覆盖，请在模型节点设置' },
+  data: { label: '数据集', message: '数据集资源不会在参数导入中覆盖，请在数据集节点设置' },
+  name: { label: '运行名称', message: '运行名称由平台管理，不会作为训练参数导入' },
+  project: { label: '输出目录', message: '训练输出目录由平台管理，不会作为训练参数导入' },
+  resume: { label: '断点恢复', message: '断点恢复由平台操作管理，不会作为训练参数导入' },
+  save_dir: { label: '保存目录', message: '保存目录由平台管理，不会作为训练参数导入' },
+  source: { label: '输入源', message: '输入源不是训练参数，不会导入' },
+}
+
+const deprecatedDefinitions: Record<string, string> = {
+  label_smoothing: '当前 Ultralytics 版本已移除此参数，没有直接替代项',
+  save_hybrid: '当前 Ultralytics 版本已移除此参数',
+  crop_fraction: '当前 Ultralytics 版本已移除此参数',
+}
+
 function parseImportValue(raw: string, type: DetectedParameter['type']): ImportValue | null {
   let value = raw.trim().replace(/[;,]+$/, '').trim()
   if (!value) return null
@@ -109,18 +144,128 @@ function parseImportValue(raw: string, type: DetectedParameter['type']): ImportV
   return value
 }
 
-export function parseImportedParameters(text: string): DetectedParameter[] {
-  const found = new Map<string, DetectedParameter>()
-  for (const [key, definition] of Object.entries(importDefinitions)) {
-    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const pattern = new RegExp(`(?:^|[\\s,{(])['\\\"]?${escapedKey}['\\\"]?\\s*(?:=|:)\\s*(\"[^\"]*\"|'[^']*'|\\[[^\\]]*\\]|[^,\\s}\\)]+)`, 'gim')
-    const match = pattern.exec(text)
-    if (!match) continue
-    const value = parseImportValue(match[1], definition.type)
-    if (value == null) continue
-    found.set(key, { key, label: definition.label, value, type: definition.type })
+function stripImportComments(text: string): string {
+  let result = ''
+  let quote = ''
+  let escaped = false
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index]
+    if (quote) {
+      result += character
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'") { quote = character; result += character; continue }
+    if (character === '#' || character === '/' && text[index + 1] === '/') {
+      while (index < text.length && text[index] !== '\n') index++
+      if (index < text.length) result += '\n'
+      continue
+    }
+    result += character
   }
-  return [...found.values()]
+  return result
+}
+
+function editDistance(left: string, right: string): number {
+  const row = Array.from({ length: right.length + 1 }, (_, index) => index)
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex++) {
+    let previous = row[0]
+    row[0] = leftIndex
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex++) {
+      const current = row[rightIndex]
+      row[rightIndex] = Math.min(row[rightIndex] + 1, row[rightIndex - 1] + 1, previous + (left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1))
+      previous = current
+    }
+  }
+  return row[right.length]
+}
+
+function closestSupportedKey(key: string): string | undefined {
+  const matches = Object.keys(importDefinitions).map((candidate) => ({ candidate, distance: editDistance(key, candidate) })).sort((left, right) => left.distance - right.distance)
+  const closest = matches[0]
+  return closest && closest.distance <= Math.max(2, Math.floor(key.length * .25)) ? closest.candidate : undefined
+}
+
+export function analyzeImportedParameters(text: string): ImportAnalysis {
+  const cleaned = stripImportComments(text)
+  const pattern = /(?:^|[\s,{(])['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*(?:=|:)\s*("[^"]*"|'[^']*'|\[[^\]]*\]|[^,\s})]+)/gim
+  const candidates = new Map<string, Array<{ rawValue: string; line: number }>>()
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(cleaned))) {
+    const key = match[1].toLowerCase()
+    const keyOffset = match[0].lastIndexOf(match[1])
+    const line = cleaned.slice(0, match.index + Math.max(0, keyOffset)).split('\n').length
+    const entries = candidates.get(key) || []
+    entries.push({ rawValue: match[2], line })
+    candidates.set(key, entries)
+  }
+
+  const parameters: DetectedParameter[] = []
+  const diagnostics: ImportDiagnostic[] = []
+  for (const [key, entries] of candidates) {
+    const effective = entries.at(-1)!
+    const duplicateMessage = entries.length > 1 ? `；出现 ${entries.length} 次，采用最后一次（第 ${effective.line} 行）` : ''
+    const definition = importDefinitions[key]
+    if (definition) {
+      const value = parseImportValue(effective.rawValue, definition.type)
+      if (value == null) {
+        diagnostics.push({ key, label: definition.label, rawValue: effective.rawValue, line: effective.line, occurrences: entries.length, status: 'invalid', message: `值格式无效，需要${definition.type === 'number' ? '数字' : definition.type === 'boolean' ? 'true 或 false' : '文本'}${duplicateMessage}` })
+      } else {
+        parameters.push({ key, label: definition.label, value, type: definition.type })
+        diagnostics.push({ key, label: definition.label, rawValue: String(value), line: effective.line, occurrences: entries.length, status: 'supported', message: `可以导入${duplicateMessage}` })
+      }
+      continue
+    }
+    if (contextDefinitions[key]) {
+      const context = contextDefinitions[key]
+      diagnostics.push({ key, label: context.label, rawValue: effective.rawValue, line: effective.line, occurrences: entries.length, status: 'context', message: `${context.message}${duplicateMessage}` })
+      continue
+    }
+    if (deprecatedDefinitions[key]) {
+      diagnostics.push({ key, label: '已废弃参数', rawValue: effective.rawValue, line: effective.line, occurrences: entries.length, status: 'deprecated', message: `${deprecatedDefinitions[key]}${duplicateMessage}` })
+      continue
+    }
+    const suggestion = closestSupportedKey(key)
+    diagnostics.push({ key, label: '未知参数', rawValue: effective.rawValue, line: effective.line, occurrences: entries.length, status: 'unknown', message: `${suggestion ? `平台不支持该参数，是否想输入 ${suggestion}？` : '平台当前不支持该参数，请确认名称和当前 YOLO 版本'}${duplicateMessage}` })
+  }
+  return { parameters, diagnostics }
+}
+
+export function parseImportedParameters(text: string): DetectedParameter[] {
+  return analyzeImportedParameters(text).parameters
+}
+
+export function ParameterImportResults({ diagnostics, parameters, selectedKeys, onSelectionChange }: {
+  diagnostics: ImportDiagnostic[]
+  parameters: DetectedParameter[]
+  selectedKeys: string[]
+  onSelectionChange: (keys: string[]) => void
+}) {
+  const supportedKeys = parameters.map((item) => item.key)
+  const excludedCount = diagnostics.length - parameters.length
+  const allSelected = supportedKeys.length > 0 && supportedKeys.every((key) => selectedKeys.includes(key))
+  const parameterValues = new Map(parameters.map((item) => [item.key, item.value]))
+  const labels: Record<ImportDiagnosticStatus, string> = { supported: '可导入', context: '单独设置', deprecated: '已废弃', unknown: '未识别', invalid: '值无效' }
+  return <>
+    <div className="import-summary" role="status">
+      <span><strong>{diagnostics.length}</strong>检测字段</span><span className="supported"><strong>{parameters.length}</strong>可导入</span><span className={excludedCount ? 'excluded' : ''}><strong>{excludedCount}</strong>不导入</span>
+    </div>
+    <div className="detected-toolbar"><strong>{diagnostics.length ? '逐项检查结果' : '等待粘贴参数'}</strong>{!!supportedKeys.length && <button type="button" onClick={() => onSelectionChange(allSelected ? [] : supportedKeys)}>{allSelected ? '取消全选' : '选择全部可用项'}</button>}</div>
+    <div className="detected-list import-diagnostic-list">
+      {diagnostics.map((item) => {
+        const supported = item.status === 'supported'
+        const checked = supported && selectedKeys.includes(item.key)
+        return <div key={item.key} className={`import-diagnostic ${item.status} ${checked ? 'selected' : ''}`}>
+          {supported ? <input aria-label={`选择 ${item.key}`} type="checkbox" checked={checked} onChange={() => onSelectionChange(checked ? selectedKeys.filter((key) => key !== item.key) : [...selectedKeys, item.key])} /> : <i aria-hidden="true">!</i>}
+          <span><strong>{item.label}</strong><code>{item.key} · 第 {item.line} 行</code><small>{item.message}</small></span>
+          <div><em>{String(parameterValues.get(item.key) ?? item.rawValue)}</em><b>{labels[item.status]}</b></div>
+        </div>
+      })}
+      {!diagnostics.length && <div className="detected-empty">粘贴参数后会列出全部检测结果，未识别项也不会被隐藏</div>}
+    </div>
+  </>
 }
 
 export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
@@ -135,6 +280,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   const [jsonCopied, setJsonCopied] = useState(false)
   const [importText, setImportText] = useState('')
   const [detectedParameters, setDetectedParameters] = useState<DetectedParameter[]>([])
+  const [importDiagnostics, setImportDiagnostics] = useState<ImportDiagnostic[]>([])
   const [selectedImportKeys, setSelectedImportKeys] = useState<string[]>([])
   const [customKey, setCustomKey] = useState('')
   const [customType, setCustomType] = useState<'number' | 'boolean' | 'text'>('number')
@@ -157,7 +303,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
     setExtras(Object.fromEntries(Object.keys(extraDefinitions).filter((key) => currentTask.config[key] != null).map((key) => [key, currentTask.config[key] as ExtraValue])))
     setCustomArgs((currentTask.config.custom_args as Record<string, ExtraValue> | undefined) || {})
     setNewKey(''); setParameterSearch(''); setParameterPickerOpen(false)
-    setImportOpen(false); setJsonOpen(false); setJsonCopied(false); setImportText(''); setDetectedParameters([]); setSelectedImportKeys([])
+    setImportOpen(false); setJsonOpen(false); setJsonCopied(false); setImportText(''); setDetectedParameters([]); setImportDiagnostics([]); setSelectedImportKeys([])
     setError('')
   }, [task?.id, open])
 
@@ -212,7 +358,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   }
 
   function openImport() {
-    setImportText(''); setDetectedParameters([]); setSelectedImportKeys([]); setImportOpen(true)
+    setImportText(''); setDetectedParameters([]); setImportDiagnostics([]); setSelectedImportKeys([]); setImportOpen(true)
   }
 
   async function copyJson() {
@@ -236,8 +382,8 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   }
 
   function changeImportText(text: string) {
-    const detected = parseImportedParameters(text)
-    setImportText(text); setDetectedParameters(detected); setSelectedImportKeys(detected.map((item) => item.key))
+    const analysis = analyzeImportedParameters(text)
+    setImportText(text); setDetectedParameters(analysis.parameters); setImportDiagnostics(analysis.diagnostics); setSelectedImportKeys(analysis.parameters.map((item) => item.key))
   }
 
   function applyImportedParameters() {
@@ -310,12 +456,11 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
         </div>}
       </div>
       {importOpen && <div className="parameter-import-backdrop" onMouseDown={() => setImportOpen(false)}><div className="parameter-import-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3>批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。只会识别平台支持的参数，不会执行粘贴的代码。</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)}><X size={18} /></button></header>
+        <header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3>批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。全部字段都会列出诊断结果，不会执行粘贴的代码。</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)}><X size={18} /></button></header>
         <div className="parameter-import-body"><textarea value={importText} onChange={(event) => changeImportText(event.target.value)} placeholder={'例如：\nmodel.train(epochs=100, batch=16, imgsz=640, lr0=0.01, freeze=10)\n\n或：\nepochs: 100\namp: true\nmosaic: 0.8'} />
-          <div className="detected-toolbar"><strong>已识别 {detectedParameters.length} 个参数</strong><button type="button" onClick={() => setSelectedImportKeys(selectedImportKeys.length === detectedParameters.length ? [] : detectedParameters.map((item) => item.key))}>{selectedImportKeys.length === detectedParameters.length && detectedParameters.length ? '取消全选' : '全选'}</button></div>
-          <div className="detected-list">{detectedParameters.map((item) => { const checked = selectedImportKeys.includes(item.key); return <label key={item.key} className={checked ? 'selected' : ''}><input type="checkbox" checked={checked} onChange={() => setSelectedImportKeys((current) => checked ? current.filter((key) => key !== item.key) : [...current, item.key])} /><span><strong>{item.label}</strong><code>{item.key}</code></span><em>{String(item.value)}</em></label> })}{!detectedParameters.length && <div className="detected-empty">粘贴参数后会在这里显示识别结果</div>}</div>
+          <ParameterImportResults diagnostics={importDiagnostics} parameters={detectedParameters} selectedKeys={selectedImportKeys} onSelectionChange={setSelectedImportKeys} />
         </div>
-        <footer><span>已选 {selectedImportKeys.length} 个，确认后会填充到参数编辑器</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>填充已选参数</button></footer>
+        <footer><span>将导入 {selectedImportKeys.length} 项{importDiagnostics.length > detectedParameters.length ? `，${importDiagnostics.length - detectedParameters.length} 项不会导入` : ''}</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>导入 {selectedImportKeys.length} 个参数</button></footer>
       </div></div>}
       {jsonOpen && <div className="parameter-import-backdrop" onMouseDown={() => setJsonOpen(false)}><div className="parameter-json-modal" onMouseDown={(event) => event.stopPropagation()}>
         <header><div><span className="eyebrow">EFFECTIVE CONFIGURATION</span><h3>完整 JSON 参数</h3><p>{Object.keys(jsonParameters).length} 个当前参数</p></div><button type="button" className="icon-button" onClick={() => setJsonOpen(false)}><X size={18} /></button></header>

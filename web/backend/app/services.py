@@ -496,14 +496,23 @@ def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> No
     run = run or current_run(db, task)
     if not run or not run.run_dir or not Path(run.run_dir).exists():
         return
-    known = set(db.scalars(select(Artifact.path).where(Artifact.run_id == run.id)).all())
+    known = {
+        artifact.path: artifact
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id)).all()
+    }
     for path in Path(run.run_dir).rglob("*"):
         if not path.is_file() or path.name.startswith("."):
             continue
         raw = str(path.resolve())
-        if raw in known:
-            continue
         stat = path.stat()
+        modified_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+        existing = known.get(raw)
+        if existing:
+            existing.kind = artifact_kind(path)
+            existing.name = str(path.relative_to(run.run_dir))
+            existing.size = stat.st_size
+            existing.modified_at = modified_at
+            continue
         values = {
             "task_id": task.id,
             "run_id": run.id,
@@ -511,13 +520,14 @@ def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> No
             "name": str(path.relative_to(run.run_dir)),
             "path": raw,
             "size": stat.st_size,
-            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc),
+            "modified_at": modified_at,
         }
         # The scheduler and API can discover the same file concurrently. A savepoint
         # makes a uniqueness race harmless on SQLite and other supported databases.
+        artifact = Artifact(**values)
         try:
             with db.begin_nested():
-                db.add(Artifact(**values))
+                db.add(artifact)
                 db.flush()
         except IntegrityError:
             existing = db.scalar(
@@ -528,7 +538,9 @@ def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> No
                 existing.name = values["name"]
                 existing.size = values["size"]
                 existing.modified_at = values["modified_at"]
-        known.add(raw)
+            artifact = existing
+        if artifact:
+            known[raw] = artifact
 
 
 def import_existing_runs() -> int:

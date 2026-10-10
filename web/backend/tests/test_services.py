@@ -86,7 +86,8 @@ def test_failure_detail_prefers_root_error(tmp_path: Path):
 def test_sync_artifacts_is_idempotent(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
-    (run_dir / "results.csv").write_text("epoch,metrics\n", encoding="utf-8")
+    results_file = run_dir / "results.csv"
+    results_file.write_text("epoch,metrics\n", encoding="utf-8")
     session = make_session(tmp_path)
     task = make_task("task-idempotent", run_dir=str(run_dir))
     run = TrainingRun(
@@ -101,9 +102,13 @@ def test_sync_artifacts_is_idempotent(tmp_path: Path):
     session.commit()
     sync_artifacts(session, task, run)
     session.commit()
+    results_file.write_text("epoch,metrics\n1,0.5\n", encoding="utf-8")
+    sync_artifacts(session, task, run)
+    session.commit()
 
-    paths = session.scalars(select(Artifact.path).where(Artifact.task_id == task.id)).all()
-    assert paths == [str((run_dir / "results.csv").resolve())]
+    artifact = session.scalar(select(Artifact).where(Artifact.task_id == task.id))
+    assert artifact.path == str(results_file.resolve())
+    assert artifact.size == results_file.stat().st_size
     session.close()
 
 
