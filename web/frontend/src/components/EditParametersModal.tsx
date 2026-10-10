@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Braces, Check, ChevronDown, LoaderCircle, Plus, Search, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Plus, Search, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { api } from '../api'
 import type { TrainingTask } from '../types'
 
@@ -131,6 +131,8 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   const [parameterSearch, setParameterSearch] = useState('')
   const [parameterPickerOpen, setParameterPickerOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [jsonOpen, setJsonOpen] = useState(false)
+  const [jsonCopied, setJsonCopied] = useState(false)
   const [importText, setImportText] = useState('')
   const [detectedParameters, setDetectedParameters] = useState<DetectedParameter[]>([])
   const [selectedImportKeys, setSelectedImportKeys] = useState<string[]>([])
@@ -155,7 +157,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
     setExtras(Object.fromEntries(Object.keys(extraDefinitions).filter((key) => currentTask.config[key] != null).map((key) => [key, currentTask.config[key] as ExtraValue])))
     setCustomArgs((currentTask.config.custom_args as Record<string, ExtraValue> | undefined) || {})
     setNewKey(''); setParameterSearch(''); setParameterPickerOpen(false)
-    setImportOpen(false); setImportText(''); setDetectedParameters([]); setSelectedImportKeys([])
+    setImportOpen(false); setJsonOpen(false); setJsonCopied(false); setImportText(''); setDetectedParameters([]); setSelectedImportKeys([])
     setError('')
   }, [task?.id, open])
 
@@ -165,6 +167,17 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
     if (!keyword) return availableKeys
     return availableKeys.filter((key) => `${extraDefinitions[key].label} ${key}`.toLowerCase().includes(keyword))
   }, [availableKeys, parameterSearch])
+  const jsonParameters = useMemo(() => {
+    const parameters: Record<string, ExtraValue> = {
+      task: task?.task_type || 'detect', mode: 'train', model: task?.model_path || '', data: task?.data_path || '',
+      epochs: form.epochs, batch: form.batch, imgsz: form.imgsz, device: form.device, workers: form.workers,
+      optimizer: form.optimizer, patience: form.patience, pretrained: form.pretrained, cache: form.cache,
+      amp: form.amp, close_mosaic: form.close_mosaic, ...extras, ...customArgs,
+    }
+    if (form.lr0 !== '') parameters.lr0 = Number(form.lr0)
+    return parameters
+  }, [customArgs, extras, form, task?.data_path, task?.model_path, task?.task_type])
+  const jsonText = useMemo(() => JSON.stringify(jsonParameters, null, 2), [jsonParameters])
   if (!open || !task) return null
   const locked = ['queued', 'starting', 'running', 'stopping'].includes(task.status)
 
@@ -200,6 +213,26 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
 
   function openImport() {
     setImportText(''); setDetectedParameters([]); setSelectedImportKeys([]); setImportOpen(true)
+  }
+
+  async function copyJson() {
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(jsonText)
+      else {
+        const textarea = document.createElement('textarea')
+        textarea.value = jsonText
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        textarea.remove()
+      }
+      setJsonCopied(true)
+      window.setTimeout(() => setJsonCopied(false), 1800)
+    } catch {
+      setError('复制失败，请在 JSON 窗口中手动选择文本')
+    }
   }
 
   function changeImportText(text: string) {
@@ -255,7 +288,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
           <label>关闭 Mosaic 轮数<input type="number" min="0" value={form.close_mosaic} onChange={(e) => update('close_mosaic', Number(e.target.value))} /></label>
           <div className="toggle-cluster"><label><input type="checkbox" checked={form.pretrained} onChange={(e) => update('pretrained', e.target.checked)} /><span>预训练权重</span></label><label><input type="checkbox" checked={form.amp} onChange={(e) => update('amp', e.target.checked)} /><span>AMP</span></label><label><input type="checkbox" checked={form.cache} onChange={(e) => update('cache', e.target.checked)} /><span>缓存数据</span></label></div>
         </div>
-        <div className="parameter-toolbar"><button type="button" className="advanced-toggle parameter-toggle" onClick={() => setExpanded((value) => !value)}><ChevronDown size={16} className={expanded ? 'rotated' : ''} />高级参数 <em>{Object.keys(extras).length} 项</em></button><button type="button" className="batch-import-button" onClick={openImport}><Braces size={14} />批量导入参数</button></div>
+        <div className="parameter-toolbar"><button type="button" className="advanced-toggle parameter-toggle" onClick={() => setExpanded((value) => !value)}><ChevronDown size={16} className={expanded ? 'rotated' : ''} />高级参数 <em>{Object.keys(extras).length} 项</em></button><button type="button" className="json-preview-button" onClick={() => { setJsonCopied(false); setJsonOpen(true) }}><Code2 size={14} />查看 JSON</button><button type="button" className="batch-import-button" onClick={openImport}><Braces size={14} />批量导入参数</button></div>
         {expanded && <div className="extra-parameters">
           {Object.entries(extras).map(([key, value]) => { const definition = extraDefinitions[key]; return <div className="extra-row" key={key}><div><span>{definition.label}</span><code>{key}</code></div>{definition.type === 'boolean' ? <select value={String(value)} onChange={(e) => updateExtra(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={definition.type} step={definition.step} value={String(value)} onChange={(e) => updateExtra(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setExtras((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div> })}
           <div className="add-parameter">
@@ -283,6 +316,11 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
           <div className="detected-list">{detectedParameters.map((item) => { const checked = selectedImportKeys.includes(item.key); return <label key={item.key} className={checked ? 'selected' : ''}><input type="checkbox" checked={checked} onChange={() => setSelectedImportKeys((current) => checked ? current.filter((key) => key !== item.key) : [...current, item.key])} /><span><strong>{item.label}</strong><code>{item.key}</code></span><em>{String(item.value)}</em></label> })}{!detectedParameters.length && <div className="detected-empty">粘贴参数后会在这里显示识别结果</div>}</div>
         </div>
         <footer><span>已选 {selectedImportKeys.length} 个，确认后会填充到参数编辑器</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>填充已选参数</button></footer>
+      </div></div>}
+      {jsonOpen && <div className="parameter-import-backdrop" onMouseDown={() => setJsonOpen(false)}><div className="parameter-json-modal" onMouseDown={(event) => event.stopPropagation()}>
+        <header><div><span className="eyebrow">EFFECTIVE CONFIGURATION</span><h3>完整 JSON 参数</h3><p>{Object.keys(jsonParameters).length} 个当前参数</p></div><button type="button" className="icon-button" onClick={() => setJsonOpen(false)}><X size={18} /></button></header>
+        <div className="parameter-json-body"><pre>{jsonText}</pre></div>
+        <footer><span>当前表单配置</span><button type="button" className="button primary" onClick={copyJson}>{jsonCopied ? <Check size={15} /> : <Clipboard size={15} />}{jsonCopied ? '已复制' : '复制 JSON'}</button></footer>
       </div></div>}
       <footer><span className="parameter-note">双击配置节点可随时重新打开</span><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked}>{saving && <LoaderCircle size={16} className="spin" />}保存参数</button></footer>
     </form>
