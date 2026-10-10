@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import signal
+import shutil
 import socket
 import subprocess
 import threading
@@ -196,6 +197,41 @@ def backfill_training_runs() -> int:
 def path_is_within(path: Path, roots: list[Path]) -> bool:
     resolved = path.expanduser().resolve()
     return any(resolved == root.resolve() or root.resolve() in resolved.parents for root in roots)
+
+
+def _safe_delete_directory(path: Path, roots: list[Path]) -> None:
+    """Delete a run directory only when it is below an explicitly allowed root."""
+    candidate = path.expanduser().resolve()
+    allowed = [root.expanduser().resolve() for root in roots]
+    if not path_is_within(candidate, allowed) or candidate in allowed:
+        raise ValueError(f"训练目录不在允许的删除范围内：{candidate}")
+    if not candidate.exists():
+        return
+    if candidate.is_symlink() or not candidate.is_dir():
+        candidate.unlink()
+    else:
+        shutil.rmtree(candidate)
+
+
+def permanently_delete_task_files(task: TrainingTask) -> list[str]:
+    """Remove only task-owned run/runtime directories; model and dataset paths are never targets."""
+    run_dirs = {Path(run.run_dir) for run in task.runs if run.run_dir}
+    if task.run_dir:
+        run_dirs.add(Path(task.run_dir))
+    runtime_dir = RUNTIME_ROOT / task.id
+    deletion_roots = [RUNS_ROOT, ULTRALYTICS_ROOT / "runs", RUNTIME_ROOT]
+    targets = sorted(run_dirs | {runtime_dir}, key=lambda path: len(str(path)), reverse=True)
+    for target in targets:
+        candidate = target.expanduser().resolve()
+        allowed = [root.expanduser().resolve() for root in deletion_roots]
+        if not path_is_within(candidate, allowed) or candidate in allowed:
+            raise ValueError(f"训练目录不在允许的删除范围内：{candidate}")
+    deleted: list[str] = []
+    for target in targets:
+        if target.exists():
+            _safe_delete_directory(target, deletion_roots)
+            deleted.append(str(target.resolve()))
+    return deleted
 
 
 def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
@@ -505,6 +541,8 @@ def import_existing_runs() -> int:
             task_id = "legacy-" + hashlib.sha1(str(run_dir).encode()).hexdigest()[:12]
             if db.get(TrainingTask, task_id):
                 task = db.get(TrainingTask, task_id)
+                if task.deleted_at:
+                    continue
                 sync_metrics(db, task)
                 sync_artifacts(db, task)
                 continue

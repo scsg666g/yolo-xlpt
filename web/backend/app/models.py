@@ -44,6 +44,8 @@ class TrainingTask(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     current_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    deleted_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     runs: Mapped[list["TrainingRun"]] = relationship(back_populates="task", cascade="all, delete-orphan", foreign_keys="TrainingRun.task_id")
     metrics: Mapped[list["MetricPoint"]] = relationship(back_populates="task", cascade="all, delete-orphan")
@@ -130,4 +132,3 @@ class TaskEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     task: Mapped[TrainingTask] = relationship(back_populates="events")
     run: Mapped[TrainingRun | None] = relationship(back_populates="events")
-

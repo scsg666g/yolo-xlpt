@@ -32,6 +32,8 @@ def migrate_database() -> Path | None:
     event_columns = {column["name"] for column in inspector.get_columns("task_events")}
     needs_migration = (
         "current_run_id" not in task_columns
+        or "deleted_at" not in task_columns
+        or "deleted_reason" not in task_columns
         or "run_id" not in metric_columns
         or "run_id" not in artifact_columns
         or "run_id" not in event_columns
@@ -47,6 +49,11 @@ def migrate_database() -> Path | None:
         if "current_run_id" not in task_columns:
             connection.execute(text("ALTER TABLE training_tasks ADD COLUMN current_run_id VARCHAR(64)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_current_run_id ON training_tasks (current_run_id)"))
+        if "deleted_at" not in task_columns:
+            connection.execute(text("ALTER TABLE training_tasks ADD COLUMN deleted_at DATETIME"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_deleted_at ON training_tasks (deleted_at)"))
+        if "deleted_reason" not in task_columns:
+            connection.execute(text("ALTER TABLE training_tasks ADD COLUMN deleted_reason VARCHAR(40)"))
         if "run_id" not in artifact_columns:
             connection.execute(text("ALTER TABLE artifacts ADD COLUMN run_id VARCHAR(64)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_artifacts_run_id ON artifacts (run_id)"))
@@ -84,4 +91,3 @@ def get_db():
         yield db
     finally:
         db.close()
-

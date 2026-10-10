@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
 from .database import Base, SessionLocal, engine, get_db, migrate_database
-from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask
+from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskRead, TaskResourceUpdate
 from .services import (
     add_event,
@@ -29,6 +29,7 @@ from .services import (
     gpu_inventory,
     import_existing_runs,
     path_is_within,
+    permanently_delete_task_files,
     resume_checkpoint,
     scheduler,
     sync_artifacts,
@@ -74,9 +75,9 @@ app.add_middleware(
 )
 
 
-def get_task_or_404(db: Session, task_id: str) -> TrainingTask:
+def get_task_or_404(db: Session, task_id: str, *, include_deleted: bool = False) -> TrainingTask:
     task = db.get(TrainingTask, task_id)
-    if not task:
+    if not task or (task.deleted_at and not include_deleted):
         raise HTTPException(404, "训练任务不存在")
     return task
 
@@ -108,8 +109,10 @@ def compute_resources():
 
 
 @app.get("/api/tasks", response_model=list[TaskRead])
-def list_tasks(status: str | None = Query(default=None), db: Session = Depends(get_db)):
+def list_tasks(status: str | None = Query(default=None), include_deleted: bool = Query(default=False), db: Session = Depends(get_db)):
     query = select(TrainingTask).order_by(TrainingTask.created_at.desc())
+    if not include_deleted:
+        query = query.where(TrainingTask.deleted_at.is_(None))
     if status:
         query = query.where(TrainingTask.status == status)
     tasks = db.scalars(query).all()
@@ -255,11 +258,40 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     return clone
 
 
-@app.delete("/api/tasks/{task_id}", status_code=204)
+@app.post("/api/tasks/{task_id}/trash", status_code=204)
+@app.delete("/api/tasks/{task_id}", status_code=204, deprecated=True)
 def delete_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "运行中或排队中的任务不能删除")
+    task.deleted_at = utcnow()
+    task.deleted_reason = "soft_delete"
+    add_event(db, task.id, "soft_deleted", "任务已移入回收站")
+    db.commit()
+
+
+@app.post("/api/tasks/{task_id}/restore", response_model=TaskRead)
+def restore_task(task_id: str, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id, include_deleted=True)
+    if not task.deleted_at:
+        raise HTTPException(409, "任务当前不在回收站")
+    task.deleted_at = None
+    task.deleted_reason = None
+    add_event(db, task.id, "restored", "任务已从回收站恢复")
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@app.delete("/api/tasks/{task_id}/permanent", status_code=204)
+def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id, include_deleted=True)
+    if task.status in {"queued", "starting", "running", "stopping"}:
+        raise HTTPException(409, "运行中或排队中的任务不能永久删除")
+    try:
+        permanently_delete_task_files(task)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, f"训练文件未删除，已保留数据库记录：{exc}") from exc
     db.delete(task)
     db.commit()
 
@@ -447,7 +479,7 @@ async def stream():
     async def events():
         while True:
             with SessionLocal() as db:
-                tasks = db.scalars(select(TrainingTask).order_by(TrainingTask.updated_at.desc())).all()
+                tasks = db.scalars(select(TrainingTask).where(TrainingTask.deleted_at.is_(None)).order_by(TrainingTask.updated_at.desc())).all()
                 payload = [TaskRead.model_validate(task).model_dump(mode="json") for task in tasks]
             yield f"event: tasks\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             await asyncio.sleep(2)

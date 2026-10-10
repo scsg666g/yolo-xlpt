@@ -100,6 +100,8 @@ class TaskRead(BaseModel):
     finished_at: datetime | None
     updated_at: datetime
     current_run_id: str | None
+    deleted_at: datetime | None
+    deleted_reason: str | None
 
 
 class RunRead(BaseModel):

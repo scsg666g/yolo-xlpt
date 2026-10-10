@@ -10,7 +10,7 @@ import app.services as services_module
 from app.database import Base
 from app.database import get_db
 from app.main import app
-from app.models import Artifact, MetricPoint, TrainingRun, TrainingTask
+from app.models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask
 from app.services import (
     TrainingScheduler,
     backfill_training_runs,
@@ -18,6 +18,7 @@ from app.services import (
     failure_detail,
     mirror_run_to_task,
     path_is_within,
+    permanently_delete_task_files,
     prepare_dataset_config,
     resume_checkpoint,
     sync_artifacts,
@@ -256,6 +257,128 @@ def test_historical_run_api_returns_selected_attempt(tmp_path: Path):
         assert [item["attempt_number"] for item in runs.json()] == [2, 1]
         assert metrics.status_code == 200
         assert metrics.json()[0]["values"] == {"score": 0.1}
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
+def test_permanent_delete_removes_only_run_and_runtime_directories(tmp_path: Path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    runtime_root = tmp_path / "runtime"
+    run_dir = runs_root / "detect" / "task-files" / "attempt-001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "weights").mkdir()
+    (run_dir / "weights" / "best.pt").write_bytes(b"weights")
+    (runtime_root / "task-files" / "attempt-001").mkdir(parents=True)
+    (runtime_root / "task-files" / "attempt-001" / "platform.log").write_text("log", encoding="utf-8")
+    monkeypatch.setattr(services_module, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", runtime_root)
+    task = make_task("task-files", run_dir=str(run_dir))
+    task.runs = [TrainingRun(
+        id="run-files", task_id=task.id, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path="/models/base.pt", data_path="/datasets/data.yaml", run_dir=str(run_dir),
+        parameter_snapshot={},
+    )]
+
+    deleted = permanently_delete_task_files(task)
+
+    assert str(run_dir.resolve()) in deleted
+    assert not run_dir.exists()
+    assert not (runtime_root / "task-files").exists()
+
+
+def test_permanent_delete_rejects_outside_run_directory(tmp_path: Path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    runtime_root = tmp_path / "runtime"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(services_module, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", runtime_root)
+    task = make_task("task-outside", run_dir=str(outside))
+
+    try:
+        permanently_delete_task_files(task)
+    except ValueError as error:
+        assert "允许的删除范围" in str(error)
+    else:
+        raise AssertionError("outside run directory should be rejected")
+
+
+def test_soft_delete_filters_task_list_and_restore(tmp_path: Path):
+    session = make_session(tmp_path)
+    task = make_task("task-delete", status="completed")
+    session.add(task)
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        assert client.post(f"/api/tasks/{task.id}/trash").status_code == 204
+        assert client.get("/api/tasks").json() == []
+        deleted = client.get("/api/tasks?include_deleted=true").json()
+        assert deleted[0]["deleted_at"] is not None
+        assert client.post(f"/api/tasks/{task.id}/restore").status_code == 200
+        assert client.get("/api/tasks").json()[0]["id"] == task.id
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
+def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_path: Path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    runtime_root = tmp_path / "runtime"
+    run_dir = runs_root / "detect" / "task-permanent" / "attempt-001"
+    runtime_dir = runtime_root / "task-permanent"
+    run_dir.mkdir(parents=True)
+    runtime_dir.mkdir(parents=True)
+    artifact_path = run_dir / "best.pt"
+    artifact_path.write_bytes(b"trained weights")
+    (runtime_dir / "platform.log").write_text("training log", encoding="utf-8")
+    model_path = tmp_path / "base.pt"
+    data_path = tmp_path / "data.yaml"
+    model_path.write_bytes(b"base model")
+    data_path.write_text("names: [object]\n", encoding="utf-8")
+
+    monkeypatch.setattr(services_module, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", runtime_root)
+    session = make_session(tmp_path)
+    task = make_task(
+        "task-permanent", status="completed", model_path=str(model_path),
+        data_path=str(data_path), run_dir=str(run_dir),
+    )
+    run = TrainingRun(
+        id="run-permanent", task=task, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path=str(model_path), data_path=str(data_path), run_dir=str(run_dir), parameter_snapshot={},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.flush()
+    session.add_all([
+        MetricPoint(task_id=task.id, run_id=run.id, epoch=1, elapsed=1, values={"score": 0.5}),
+        Artifact(task_id=task.id, run_id=run.id, kind="weight", name="best.pt", path=str(artifact_path), size=15),
+        TaskEvent(task_id=task.id, run_id=run.id, event_type="completed", message="done", payload={}),
+    ])
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        response = TestClient(app).delete(f"/api/tasks/{task.id}/permanent")
+        assert response.status_code == 204
+        assert session.get(TrainingTask, task.id) is None
+        assert session.get(TrainingRun, run.id) is None
+        assert session.scalar(select(MetricPoint).where(MetricPoint.task_id == task.id)) is None
+        assert session.scalar(select(Artifact).where(Artifact.task_id == task.id)) is None
+        assert session.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id)) is None
+        assert not run_dir.exists()
+        assert not runtime_dir.exists()
+        assert model_path.exists()
+        assert data_path.exists()
     finally:
         app.dependency_overrides.clear()
         session.close()
