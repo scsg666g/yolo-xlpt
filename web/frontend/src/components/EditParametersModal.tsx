@@ -13,7 +13,7 @@ interface Props {
 type ExtraValue = string | number | boolean
 type ImportValue = ExtraValue
 
-interface DetectedParameter {
+export interface DetectedParameter {
   key: string
   label: string
   value: ImportValue
@@ -84,7 +84,7 @@ const extraDefinitions: Record<string, { label: string; type: 'number' | 'boolea
   erasing: { label: '随机擦除概率（分类）', type: 'number', default: 0.4, step: 0.05 },
 }
 
-const importDefinitions: Record<string, { label: string; type: DetectedParameter['type'] }> = {
+export const importDefinitions: Record<string, { label: string; type: DetectedParameter['type'] }> = {
   epochs: { label: '训练轮数', type: 'number' }, batch: { label: 'Batch 大小', type: 'number' }, imgsz: { label: '输入尺寸', type: 'number' },
   device: { label: 'GPU 设备', type: 'text' }, workers: { label: '数据线程', type: 'number' }, optimizer: { label: '优化器', type: 'text' },
   patience: { label: '早停耐心值', type: 'number' }, lr0: { label: '初始学习率', type: 'number' }, close_mosaic: { label: '关闭 Mosaic 轮数', type: 'number' },
@@ -109,7 +109,7 @@ function parseImportValue(raw: string, type: DetectedParameter['type']): ImportV
   return value
 }
 
-function parseImportedParameters(text: string): DetectedParameter[] {
+export function parseImportedParameters(text: string): DetectedParameter[] {
   const found = new Map<string, DetectedParameter>()
   for (const [key, definition] of Object.entries(importDefinitions)) {
     const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')

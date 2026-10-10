@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
-import { ChevronDown, LoaderCircle, X } from 'lucide-react'
+import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Upload, X } from 'lucide-react'
 import { api } from '../api'
-import type { Resources, TaskCreatePayload, TrainingTask } from '../types'
+import type { DatasetUploadResult, Resources, TaskCreatePayload, TrainingTask } from '../types'
+import { UploadDatasetModal } from './UploadDatasetModal'
+import { parseImportedParameters, type DetectedParameter } from './EditParametersModal'
 
 interface Props {
   open: boolean
@@ -21,6 +23,14 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
   const [advanced, setAdvanced] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [uploading, setUploading] = useState(false)
+  const [uploaded, setUploaded] = useState<DatasetUploadResult | null>(null)
+  const [importOpen, setImportOpen] = useState(false)
+  const [jsonOpen, setJsonOpen] = useState(false)
+  const [jsonCopied, setJsonCopied] = useState(false)
+  const [importText, setImportText] = useState('')
+  const [detectedParameters, setDetectedParameters] = useState<DetectedParameter[]>([])
+  const [selectedImportKeys, setSelectedImportKeys] = useState<string[]>([])
 
   useEffect(() => {
     if (!open) return
@@ -37,8 +47,34 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
 
   if (!open) return null
 
+  if (uploading) return <UploadDatasetModal onClose={() => setUploading(false)} onUploaded={(result) => {
+    setResources((current) => current ? { ...current, datasets: [...current.datasets.filter((file) => file.path !== result.resource.path), result.resource] } : { gpus: [], models: [], datasets: [result.resource] })
+    setForm((current) => ({ ...current, data_path: result.resource.path }))
+    setUploaded(result); setError(''); setUploading(false)
+  }} />
+
   const update = <K extends keyof TaskCreatePayload>(key: K, value: TaskCreatePayload[K]) =>
     setForm((current) => ({ ...current, [key]: value }))
+
+  function openImport() { setImportText(''); setDetectedParameters([]); setSelectedImportKeys([]); setImportOpen(true) }
+  function changeImportText(value: string) { setImportText(value); setDetectedParameters(parseImportedParameters(value)); setSelectedImportKeys([]) }
+  function applyImportedParameters() {
+    const selected = detectedParameters.filter((item) => selectedImportKeys.includes(item.key))
+    setForm((current) => {
+      const next = { ...current, advanced: { ...current.advanced } }
+      for (const item of selected) {
+        if (item.key === 'epochs' || item.key === 'batch' || item.key === 'imgsz' || item.key === 'workers' || item.key === 'patience' || item.key === 'close_mosaic') (next as Record<string, unknown>)[item.key] = Number(item.value)
+        else if (item.key === 'lr0') next.lr0 = Number(item.value)
+        else if (item.key === 'optimizer' || item.key === 'device' || item.key === 'pretrained' || item.key === 'cache' || item.key === 'amp') (next as Record<string, unknown>)[item.key] = item.value
+        else next.advanced[item.key] = item.value
+      }
+      return next
+    })
+    setAdvanced(true); setImportOpen(false)
+  }
+  const jsonParameters = { task: form.task_type, mode: 'train', name: form.name, model: form.model_path, data: form.data_path, epochs: form.epochs, batch: form.batch, imgsz: form.imgsz, device: form.device, workers: form.workers, optimizer: form.optimizer, patience: form.patience, lr0: form.lr0, pretrained: form.pretrained, cache: form.cache, amp: form.amp, close_mosaic: form.close_mosaic, ...form.advanced }
+  const jsonText = JSON.stringify(jsonParameters, null, 2)
+  async function copyJson() { try { await navigator.clipboard.writeText(jsonText); setJsonCopied(true); window.setTimeout(() => setJsonCopied(false), 1600) } catch { setError('复制失败，请手动复制 JSON') } }
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
@@ -47,6 +83,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
     try {
       const task = await api.create(form)
       setForm(initial)
+      setUploaded(null); setImportOpen(false); setJsonOpen(false)
       onCreated(task)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '创建失败')
@@ -66,13 +103,14 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
             <label>任务类型<select value={form.task_type} onChange={(e) => update('task_type', e.target.value)}><option value="detect">目标检测</option><option value="segment">实例分割</option><option value="classify">图像分类</option><option value="pose">姿态估计</option><option value="obb">旋转框</option></select></label>
             <label>GPU 设备<select value={form.device} onChange={(e) => update('device', e.target.value)}>{resources?.gpus.map((gpu) => <option key={gpu.index} value={gpu.index}>{gpu.index} · {gpu.name}</option>)}{(resources?.gpus.length || 0) > 1 && <option value={resources!.gpus.map((gpu) => gpu.index).join(',')}>全部 GPU（DDP）</option>}<option value="cpu">CPU</option></select></label>
             <label className="span-2">基础模型<select required value={form.model_path} onChange={(e) => update('model_path', e.target.value)}><option value="">请选择模型</option>{resources?.models.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>
-            <label className="span-2">数据集配置<select required value={form.data_path} onChange={(e) => update('data_path', e.target.value)}><option value="">请选择数据集 YAML</option>{resources?.datasets.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>
+            <div className="dataset-field"><div className="dataset-field-heading"><label htmlFor="task-dataset">数据集配置</label><button type="button" className="button ghost compact" disabled={form.task_type !== 'detect'} onClick={() => setUploading(true)} title={form.task_type === 'detect' ? '上传本地数据集文件夹' : '文件夹上传目前支持目标检测，请选择已有数据集配置'}><Upload size={14} />上传数据集</button></div><label><select id="task-dataset" required value={form.data_path} onChange={(e) => { update('data_path', e.target.value); setUploaded(null) }}><option value="">请选择数据集 YAML</option>{resources?.datasets.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>{form.task_type !== 'detect' && <small className="upload-help">文件夹上传目前支持目标检测，其他任务请使用已有数据集配置。</small>}</div>
+            {uploaded && <div className="alert dataset-upload-success span-2" role="status" style={{ gridColumn: 'span 2', marginBottom: 0 }}><strong>已上传并选中：{uploaded.name}</strong><p>训练 {uploaded.stats.train_images} 张 · 验证 {uploaded.stats.val_images} 张 · {uploaded.stats.classes} 个类别</p><p>path: {uploaded.directory}</p>{uploaded.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
             <label>训练轮数<input type="number" min="1" value={form.epochs} onChange={(e) => update('epochs', Number(e.target.value))} /></label>
             <label>批大小<input type="number" min="1" value={form.batch} onChange={(e) => update('batch', Number(e.target.value))} /></label>
             <label>输入尺寸<input type="number" min="32" step="32" value={form.imgsz} onChange={(e) => update('imgsz', Number(e.target.value))} /></label>
             <label>数据线程<input type="number" min="0" value={form.workers} onChange={(e) => update('workers', Number(e.target.value))} /></label>
           </div>
-          <button type="button" className="advanced-toggle" onClick={() => setAdvanced((value) => !value)}><ChevronDown size={16} className={advanced ? 'rotated' : ''} />高级训练参数</button>
+          <div className="parameter-toolbar create-parameter-toolbar"><button type="button" className="advanced-toggle parameter-toggle" onClick={() => setAdvanced((value) => !value)}><ChevronDown size={16} className={advanced ? 'rotated' : ''} />高级训练参数</button><button type="button" className="json-preview-button" onClick={() => { setJsonCopied(false); setJsonOpen(true) }}><Code2 size={14} />查看 JSON</button><button type="button" className="batch-import-button" onClick={openImport}><Braces size={14} />批量导入参数</button></div>
           {advanced && <div className="form-grid advanced-fields">
             <label>优化器<select value={form.optimizer} onChange={(e) => update('optimizer', e.target.value)}><option>auto</option><option>SGD</option><option>Adam</option><option>AdamW</option><option>MuSGD</option></select></label>
             <label>初始学习率<input type="number" step="0.00001" placeholder="自动" value={form.lr0 ?? ''} onChange={(e) => update('lr0', e.target.value ? Number(e.target.value) : null)} /></label>
@@ -80,11 +118,14 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
             <label>关闭 Mosaic 轮数<input type="number" min="0" value={form.close_mosaic} onChange={(e) => update('close_mosaic', Number(e.target.value))} /></label>
             <label className="check"><input type="checkbox" checked={form.amp} onChange={(e) => update('amp', e.target.checked)} />自动混合精度 AMP</label>
             <label className="check"><input type="checkbox" checked={form.pretrained} onChange={(e) => update('pretrained', e.target.checked)} />使用预训练权重</label>
+            <label className="check"><input type="checkbox" checked={Boolean(form.cache)} onChange={(e) => update('cache', e.target.checked)} />缓存数据</label>
+            {Object.entries(form.advanced).map(([key, value]) => <label key={key} className="imported-advanced-field"><span>{key}</span>{typeof value === 'boolean' ? <select value={String(value)} onChange={(e) => setForm((current) => ({ ...current, advanced: { ...current.advanced, [key]: e.target.value === 'true' } }))}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={typeof value === 'number' ? 'number' : 'text'} value={String(value)} onChange={(e) => setForm((current) => ({ ...current, advanced: { ...current.advanced, [key]: typeof value === 'number' ? Number(e.target.value) : e.target.value } }))} />}</label>)}
           </div>}
         </div>
+        {importOpen && <div className="parameter-import-backdrop" onMouseDown={() => setImportOpen(false)}><div className="parameter-import-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3>批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。只会识别平台支持的参数。</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)}><X size={18} /></button></header><div className="parameter-import-body"><textarea value={importText} onChange={(event) => changeImportText(event.target.value)} placeholder={'例如：\nmodel.train(epochs=100, batch=16, imgsz=640, lr0=0.01, freeze=10)\n\n或：\nepochs: 100\namp: true\nmosaic: 0.8'} /><div className="detected-toolbar"><strong>已识别 {detectedParameters.length} 个参数</strong><button type="button" onClick={() => setSelectedImportKeys(selectedImportKeys.length === detectedParameters.length ? [] : detectedParameters.map((item) => item.key))}>{selectedImportKeys.length === detectedParameters.length && detectedParameters.length ? '取消全选' : '全选'}</button></div><div className="detected-list">{detectedParameters.map((item) => { const checked = selectedImportKeys.includes(item.key); return <label key={item.key} className={checked ? 'selected' : ''}><input type="checkbox" checked={checked} onChange={() => setSelectedImportKeys((current) => checked ? current.filter((key) => key !== item.key) : [...current, item.key])} /><span><strong>{item.label}</strong><code>{item.key}</code></span><em>{String(item.value)}</em></label> })}{!detectedParameters.length && <div className="detected-empty">粘贴参数后会在这里显示识别结果</div>}</div></div><footer><span>已选 {selectedImportKeys.length} 个，确认后会填充到任务参数</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>填充已选参数</button></footer></div></div>}
+        {jsonOpen && <div className="parameter-import-backdrop" onMouseDown={() => setJsonOpen(false)}><div className="parameter-json-modal" onMouseDown={(event) => event.stopPropagation()}><header><div><span className="eyebrow">EFFECTIVE CONFIGURATION</span><h3>完整 JSON 参数</h3><p>{Object.keys(jsonParameters).length} 个当前参数</p></div><button type="button" className="icon-button" onClick={() => setJsonOpen(false)}><X size={18} /></button></header><div className="parameter-json-body"><pre>{jsonText}</pre></div><footer><span>当前新建任务配置</span><button type="button" className="button primary" onClick={copyJson}>{jsonCopied ? <Check size={15} /> : <Clipboard size={15} />}{jsonCopied ? '已复制' : '复制 JSON'}</button></footer></div></div>}
         <footer><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={submitting}>{submitting && <LoaderCircle size={16} className="spin" />}创建任务</button></footer>
       </form>
     </div>
   )
 }
-

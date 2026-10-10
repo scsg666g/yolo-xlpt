@@ -9,6 +9,7 @@ dependencies = [
   "sqlalchemy>=2.0,<3",
   "pydantic>=2.10,<3",
   "pyyaml>=6.0,<7",
+  "pillow>=10,<13",
 ]
 
 [project.optional-dependencies]
@@ -16,4 +17,3 @@ dev = ["pytest>=8,<9", "httpx>=0.28,<1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

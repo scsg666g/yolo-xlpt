@@ -296,7 +296,8 @@ def discover_files(roots: list[Path], suffixes: set[str]) -> list[dict[str, Any]
         for path in root.rglob("*"):
             if path.is_file() and path.suffix.lower() in suffixes:
                 stat = path.stat()
-                files.append({"name": path.name, "path": str(path), "size": stat.st_size, "root": str(root)})
+                name = path.parent.name if path.name in {"data.yaml", "data.yml"} and root in DATASET_ROOTS else path.name
+                files.append({"name": name, "path": str(path), "size": stat.st_size, "root": str(root)})
     return sorted(files, key=lambda item: item["name"].lower())
 
 

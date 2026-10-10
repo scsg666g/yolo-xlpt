@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
 from .database import Base, SessionLocal, engine, get_db, migrate_database
+from .dataset_uploads import router as dataset_upload_router
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskResourceUpdate
 from .services import (
@@ -66,6 +67,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="YOLO 模型训练平台", version="0.1.0", lifespan=lifespan)
+app.include_router(dataset_upload_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -146,11 +148,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
         raise HTTPException(422, str(exc)) from exc
     task_id = uuid.uuid4().hex[:16]
     config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
-    config.update({key: value for key, value in payload.advanced.items() if key in {
-        "cos_lr", "weight_decay", "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed",
-        "deterministic", "fraction", "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate",
-        "scale", "shear", "perspective", "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl",
-    }})
+    config.update({key: value for key, value in payload.advanced.items() if key in EDITABLE_TRAINING_KEYS})
     task = TrainingTask(
         id=task_id,
         name=payload.name.strip(),
