@@ -43,6 +43,8 @@ class TrainingTask(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    # Stable presentation order shared by every browser and client.
+    display_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
     current_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     deleted_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)

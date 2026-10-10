@@ -573,6 +573,7 @@ def import_existing_runs() -> int:
                     "model_missing": bool(args.get("model")) and not Path(str(args["model"])).exists(),
                     "data_missing": bool(args.get("data")) and not Path(str(args["data"])).exists(),
                 }},
+                display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
             )
             db.add(task)
             db.flush()

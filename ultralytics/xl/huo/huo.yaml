@@ -1,4 +1,4 @@
-path: /data/yolo-模型训练平台开发/yolo/数据集/huo
+path: /data/yolo-模型训练平台开发/yolo/数据集/huo/image/huo
 train: images/train
 val: images/val
 

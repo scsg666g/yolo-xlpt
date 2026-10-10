@@ -30,8 +30,16 @@ def migrate_database() -> Path | None:
     metric_columns = {column["name"] for column in inspector.get_columns("metric_points")}
     artifact_columns = {column["name"] for column in inspector.get_columns("artifacts")}
     event_columns = {column["name"] for column in inspector.get_columns("task_events")}
+    display_order_needs_repair = False
+    if "display_order" in task_columns:
+        with engine.connect() as connection:
+            display_order_needs_repair = bool(connection.scalar(text(
+                "SELECT 1 FROM training_tasks WHERE display_order IS NULL OR display_order = 0 LIMIT 1"
+            )))
     needs_migration = (
-        "current_run_id" not in task_columns
+        "display_order" not in task_columns
+        or display_order_needs_repair
+        or "current_run_id" not in task_columns
         or "deleted_at" not in task_columns
         or "deleted_reason" not in task_columns
         or "run_id" not in metric_columns
@@ -46,6 +54,26 @@ def migrate_database() -> Path | None:
         shutil.copy2(database, backup)
 
     with engine.begin() as connection:
+        if "display_order" not in task_columns:
+            connection.execute(text("ALTER TABLE training_tasks ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_display_order ON training_tasks (display_order)"))
+        # Existing cards keep their current newest-first order. Repair rows left at
+        # the SQL default as well, which covers databases migrated by an older build.
+        connection.execute(text("""
+            WITH ranked AS (
+                SELECT id, (ROW_NUMBER() OVER (
+                    ORDER BY
+                        CASE WHEN display_order IS NULL OR display_order = 0 THEN 1 ELSE 0 END,
+                        display_order,
+                        created_at DESC,
+                        id DESC
+                ) * 1000) AS position
+                FROM training_tasks
+            )
+            UPDATE training_tasks
+            SET display_order = (SELECT position FROM ranked WHERE ranked.id = training_tasks.id)
+            WHERE display_order IS NULL OR display_order = 0
+        """))
         if "current_run_id" not in task_columns:
             connection.execute(text("ALTER TABLE training_tasks ADD COLUMN current_run_id VARCHAR(64)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_current_run_id ON training_tasks (current_run_id)"))

@@ -12,13 +12,13 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
-from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskRead, TaskResourceUpdate
+from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskResourceUpdate
 from .services import (
     add_event,
     backfill_training_runs,
@@ -110,7 +110,7 @@ def compute_resources():
 
 @app.get("/api/tasks", response_model=list[TaskRead])
 def list_tasks(status: str | None = Query(default=None), include_deleted: bool = Query(default=False), db: Session = Depends(get_db)):
-    query = select(TrainingTask).order_by(TrainingTask.created_at.desc())
+    query = select(TrainingTask).order_by(TrainingTask.display_order, TrainingTask.created_at.desc(), TrainingTask.id)
     if not include_deleted:
         query = query.where(TrainingTask.deleted_at.is_(None))
     if status:
@@ -121,6 +121,20 @@ def list_tasks(status: str | None = Query(default=None), include_deleted: bool =
             sync_metrics(db, task)
     db.commit()
     return tasks
+
+
+@app.patch("/api/tasks/order", status_code=204)
+def update_task_order(payload: TaskOrderUpdate, db: Session = Depends(get_db)):
+    requested = list(dict.fromkeys(payload.task_ids))
+    if len(requested) != len(payload.task_ids):
+        raise HTTPException(422, "任务排序列表不能包含重复任务")
+    tasks = db.scalars(select(TrainingTask).where(TrainingTask.deleted_at.is_(None))).all()
+    by_id = {task.id: task for task in tasks}
+    if set(requested) != set(by_id):
+        raise HTTPException(409, "任务列表已更新，请刷新页面后重新排序")
+    for index, task_id in enumerate(requested, start=1):
+        by_id[task_id].display_order = index * 1000
+    db.commit()
 
 
 @app.post("/api/tasks", response_model=TaskRead, status_code=201)
@@ -150,6 +164,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
         workers=payload.workers,
         optimizer=payload.optimizer,
         config=config,
+        display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
     )
     db.add(task)
     db.flush()
@@ -249,6 +264,7 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
         model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
         imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
         config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
+        display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
     )
     db.add(clone)
     db.flush()
@@ -479,7 +495,7 @@ async def stream():
     async def events():
         while True:
             with SessionLocal() as db:
-                tasks = db.scalars(select(TrainingTask).where(TrainingTask.deleted_at.is_(None)).order_by(TrainingTask.updated_at.desc())).all()
+                tasks = db.scalars(select(TrainingTask).where(TrainingTask.deleted_at.is_(None)).order_by(TrainingTask.display_order, TrainingTask.created_at.desc(), TrainingTask.id)).all()
                 payload = [TaskRead.model_validate(task).model_dump(mode="json") for task in tasks]
             yield f"event: tasks\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
             await asyncio.sleep(2)

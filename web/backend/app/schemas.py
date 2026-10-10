@@ -41,6 +41,10 @@ class LayoutUpdate(BaseModel):
     layout: dict[str, Any]
 
 
+class TaskOrderUpdate(BaseModel):
+    task_ids: list[str] = Field(min_length=1)
+
+
 class TaskConfigUpdate(BaseModel):
     epochs: int = Field(ge=1, le=10000)
     batch: int = Field(ge=1, le=1024)
@@ -99,6 +103,7 @@ class TaskRead(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     updated_at: datetime
+    display_order: int
     current_run_id: str | None
     deleted_at: datetime | None
     deleted_reason: str | None

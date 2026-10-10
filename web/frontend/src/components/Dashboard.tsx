@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompareArrows, MoreHorizontal, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompareArrows, GripVertical, MoreHorizontal, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import type { TrainingTask } from '../types'
@@ -18,6 +18,11 @@ export function Dashboard() {
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
+  const [draggingId, setDraggingId] = useState<string | null>(null)
+  const [dragOverId, setDragOverId] = useState<string | null>(null)
+  const [ordering, setOrdering] = useState(false)
+  const dragMoved = useRef(false)
+  const orderRequest = useRef(false)
   const navigate = useNavigate()
 
   const refresh = useCallback(async () => {
@@ -27,7 +32,20 @@ export function Dashboard() {
   useEffect(() => {
     refresh()
     const source = new EventSource('/api/stream')
-    source.addEventListener('tasks', (event) => setTasks(JSON.parse((event as MessageEvent).data)))
+    source.addEventListener('tasks', (event) => {
+      const incoming = JSON.parse((event as MessageEvent).data) as TrainingTask[]
+      setTasks((current) => {
+        if (!current.length) return incoming
+        if (orderRequest.current) return current
+        const incomingById = new Map(incoming.map((task) => [task.id, task]))
+        const currentIds = current.map((task) => task.id)
+        const orderedIds = [
+          ...currentIds.filter((id) => incomingById.has(id)),
+          ...incoming.map((task) => task.id).filter((id) => !currentIds.includes(id)),
+        ]
+        return orderedIds.map((id) => incomingById.get(id)!).filter(Boolean)
+      })
+    })
     source.onerror = () => undefined
     return () => source.close()
   }, [refresh])
@@ -41,6 +59,57 @@ export function Dashboard() {
   const active = tasks.filter((task) => ['queued', 'starting', 'running', 'stopping'].includes(task.status)).length
   const completed = tasks.filter((task) => task.status === 'completed').length
   const attention = tasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
+
+  function reorderedTasks(draggedId: string, targetId: string, after = false): TrainingTask[] {
+    if (draggedId === targetId) return tasks
+    const taskById = new Map(tasks.map((task) => [task.id, task]))
+    // A task can disappear while the pointer is held because SSE updates the list.
+    // Keep the current order intact instead of creating an undefined card.
+    if (!taskById.has(draggedId) || !taskById.has(targetId)) return tasks
+    const visibleIds = new Set(filtered.map((task) => task.id))
+    const visibleOrder = filtered.map((task) => task.id).filter((id) => id !== draggedId)
+    const targetIndex = visibleOrder.indexOf(targetId)
+    if (targetIndex < 0) return tasks
+    visibleOrder.splice(targetIndex + (after ? 1 : 0), 0, draggedId)
+    const replacement = visibleOrder
+      .map((id) => taskById.get(id))
+      .filter((task): task is TrainingTask => Boolean(task))
+    if (replacement.length !== visibleIds.size) return tasks
+    let cursor = 0
+    return tasks.map((task) => visibleIds.has(task.id) ? replacement[cursor++] : task)
+  }
+
+  async function dropTask(targetId: string) {
+    if (!draggingId || draggingId === targetId || ordering) return
+    const previous = tasks
+    const sourceIndex = filtered.findIndex((task) => task.id === draggingId)
+    const targetIndex = filtered.findIndex((task) => task.id === targetId)
+    if (sourceIndex < 0 || targetIndex < 0) {
+      setDraggingId(null); setDragOverId(null)
+      setError('任务列表刚刚发生变化，请重新拖动')
+      return
+    }
+    // A card dragged toward a later position is placed after the target; a card
+    // dragged toward an earlier position is placed before it.
+    const next = reorderedTasks(draggingId, targetId, sourceIndex < targetIndex)
+    if (next === previous) {
+      setDraggingId(null); setDragOverId(null)
+      setError('任务列表刚刚发生变化，请重新拖动')
+      return
+    }
+    setTasks(next)
+    setDraggingId(null); setDragOverId(null); dragMoved.current = true
+    setOrdering(true); orderRequest.current = true; setError('')
+    try {
+      await api.reorderTasks(next.map((task) => task.id))
+    } catch (reason) {
+      setTasks(previous)
+      setError(reason instanceof Error ? reason.message : '排序保存失败，请重试')
+    } finally {
+      orderRequest.current = false
+      setOrdering(false)
+    }
+  }
 
   async function taskAction(event: React.MouseEvent, action: () => Promise<unknown>) {
     event.stopPropagation()
@@ -97,8 +166,8 @@ export function Dashboard() {
       </div>
       {error && <div className="alert error">{error}</div>}
       {loading ? <div className="empty">正在加载任务…</div> : filtered.length === 0 ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>创建任务后，每一次训练都会拥有独立画布。</span></div> :
-        <div className="task-grid">{filtered.map((task) => <article key={task.id} className="task-card" onClick={() => navigate(`/tasks/${task.id}/canvas`)}>
-          <div className="task-card-top"><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span><button className="icon-button"><MoreHorizontal size={18} /></button></div>
+        <div className="task-grid">{filtered.map((task) => <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
+          <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整顺序" aria-label="按住拖动调整顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span><button className="icon-button" onClick={(event) => event.stopPropagation()}><MoreHorizontal size={18} /></button></div>
           <h3>{task.name}</h3><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
           <div className="progress-heading"><span>Epoch {task.completed_epochs} / {task.epochs}</span><strong>{Math.round(task.progress)}%</strong></div>
           <div className="progress"><i style={{ width: `${task.progress}%` }} /></div>
@@ -115,6 +184,7 @@ export function Dashboard() {
           </div></footer>
         </article>)}</div>}
     </section>
+    {ordering && <div className="order-saving" role="status"><RefreshCw size={13} className="spin" />正在保存任务顺序…</div>}
     {deleteTarget && <div className="modal-backdrop delete-choice-backdrop" onMouseDown={() => !deleting && setDeleteTarget(null)}>
       <div className="modal delete-choice-modal" onMouseDown={(event) => event.stopPropagation()}>
         <header><div><span className="eyebrow">DELETE TRAINING TASK</span><h2>删除训练任务</h2><p>{deleteTarget.name}</p></div><button type="button" className="icon-button" disabled={deleting} onClick={() => setDeleteTarget(null)}>×</button></header>
