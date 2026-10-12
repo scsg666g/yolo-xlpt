@@ -273,11 +273,39 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
         return get_task_or_404(refreshed_db, task_id)
 
 
+def clone_name_parts(name: str) -> tuple[str, int]:
+    """Strip generated clone suffixes, including names from older versions."""
+    number = 0
+    while match := re.search(r" - 副本(?: ([1-9][0-9]*))?$", name):
+        number = max(number, int(match.group(1) or 1))
+        name = name[:match.start()]
+    return name or "未命名任务", number
+
+
+def next_clone_name(db: Session, source_name: str) -> str:
+    base, number = clone_name_parts(source_name)
+    existing_names = set(db.scalars(select(TrainingTask.name)))
+    for name in existing_names:
+        existing_base, existing_number = clone_name_parts(name)
+        suffix = re.search(r" - 副本(?: ([1-9][0-9]*))?$", name)
+        if existing_base == base or (
+            suffix and existing_base == base[:160 - len(suffix.group())]
+        ):
+            number = max(number, existing_number)
+
+    while True:
+        number += 1
+        suffix = f" - 副本 {number}"
+        candidate = f"{base[:160 - len(suffix)]}{suffix}"
+        if candidate not in existing_names:
+            return candidate
+
+
 @app.post("/api/tasks/{task_id}/clone", response_model=TaskRead, status_code=201)
 def clone_task(task_id: str, db: Session = Depends(get_db)):
     source = get_task_or_404(db, task_id)
     clone = TrainingTask(
-        id=uuid.uuid4().hex[:16], name=f"{source.name} - 副本", task_type=source.task_type,
+        id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
         model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
         imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
         config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
