@@ -210,7 +210,7 @@ export function ComputeResources() {
     </header>
     <div className="node-toolbar">
       <label className="node-search"><Search size={16} /><input aria-label="搜索服务器" placeholder="搜索名称、地址或主机名" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-      <select aria-label="服务器状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option>{Object.entries(statusNames).map(([key, value]) => <option key={key} value={key}>{value}</option>)}</select>
+      <select className="node-status-filter" aria-label="服务器状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option>{Object.entries(statusNames).map(([key, value]) => <option key={key} value={key}>{value}</option>)}</select>
       <span>{nodes.length} 台服务器 · {nodes.filter((node) => node.status === 'online').length} 台在线</span>
       <button className="button compact" onClick={() => { const next = [...new Set([...expanded, ...visible.map((node) => node.id)])]; expandedRef.current = next; setExpanded(next); void load(false, true) }}>展开全部</button>
       <button className="button compact" onClick={() => { expandedRef.current = []; setExpanded([]) }}>折叠全部</button>
