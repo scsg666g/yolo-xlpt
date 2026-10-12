@@ -330,7 +330,7 @@ function TaskCanvasInner() {
         <button className="button ghost compact" onClick={() => fitView({ padding: 0.16, duration: reduceMotion ? 0 : 500 })}><Maximize size={15} />适应画布</button>
         <button className="button ghost compact" onClick={saveLayout}><Save size={15} />保存布局</button>
         {isCurrentRun && canStart && <button className="button primary compact" disabled={working} onClick={() => action('start')}><Play size={15} />启动训练</button>}
-        {isCurrentRun && canResume && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
+        {isCurrentRun && canResume && !task.execution_node_id && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
         {isCurrentRun && canRetry && <button className="button ghost compact" disabled={working} onClick={() => action('retry')}><RotateCcw size={15} />重新训练</button>}
         {isCurrentRun && canStop && <button className="button danger compact" disabled={working} onClick={() => action('stop')}><Square size={14} />停止</button>}
       </div>

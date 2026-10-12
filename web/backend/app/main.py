@@ -19,7 +19,7 @@ from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
 from .compute_nodes import ensure_local_node, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
-from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .parameter_catalog import load_parameter_catalog
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
@@ -32,6 +32,7 @@ from .services import (
     gpu_inventory,
     import_existing_runs,
     migrate_training_logs,
+    mirror_run_to_task,
     path_is_within,
     permanently_delete_task_files,
     resume_checkpoint,
@@ -163,21 +164,35 @@ def update_task_order(payload: TaskOrderUpdate, db: Session = Depends(get_db)):
 
 @app.post("/api/tasks", response_model=TaskRead, status_code=201)
 def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
-    try:
-        model_path = validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件")
-        data_path = validate_dataset_config(payload.data_path)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
+    node = db.get(ComputeNode, payload.execution_node_id) if payload.execution_node_id else None
+    if payload.execution_node_id:
+        if not node or node.kind != "agent" or not node.enabled:
+            raise HTTPException(422, "请选择已启用的远程 Agent 服务器")
+        model_path, data_path = payload.model_path.strip(), payload.data_path.strip()
+        output_root = (payload.remote_output_root or "").strip()
+        if not Path(model_path).is_absolute() or not Path(data_path).is_absolute() or not Path(output_root).is_absolute():
+            raise HTTPException(422, "远程模型、数据 YAML 和输出目录都必须是远程服务器上的绝对路径")
+        if any("\x00" in value for value in (model_path, data_path, output_root)):
+            raise HTTPException(422, "路径不能包含空字符")
+    else:
+        try:
+            model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+            data_path = str(validate_dataset_config(payload.data_path))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     task_id = uuid.uuid4().hex[:16]
-    config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
+    config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "execution_node_id", "remote_output_root", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
+    if node:
+        config["remote_output_root"] = payload.remote_output_root.strip()
     supported_keys = editable_training_keys()
     config.update({key: value for key, value in payload.advanced.items() if key in supported_keys})
     task = TrainingTask(
         id=task_id,
         name=payload.name.strip(),
         task_type=payload.task_type,
-        model_path=str(model_path),
-        data_path=str(data_path),
+        execution_node_id=node.id if node else None,
+        model_path=model_path,
+        data_path=data_path,
         epochs=payload.epochs,
         batch=payload.batch,
         imgsz=payload.imgsz,
@@ -208,12 +223,13 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.status != "draft":
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
-    if not Path(task.model_path).exists() or not Path(task.data_path).exists():
-        raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
-    try:
-        validate_dataset_config(task.data_path)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
+    if not task.execution_node_id:
+        if not Path(task.model_path).exists() or not Path(task.data_path).exists():
+            raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
+        try:
+            validate_dataset_config(task.data_path)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     run = create_training_run(db, task, "fresh")
     add_event(db, task.id, "queued", f"Attempt {run.attempt_number:03d} 已加入训练队列", run_id=run.id)
     db.commit()
@@ -224,17 +240,20 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/resume", response_model=TaskRead)
 def resume_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
+    if task.execution_node_id:
+        raise HTTPException(409, "远程断点续训尚未支持；可使用重新训练创建独立 Attempt")
     if task.status not in {"stopped", "interrupted"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
     checkpoint = resume_checkpoint(task)
     if not checkpoint:
         raise HTTPException(409, "该任务没有可用的断点检查点 last.pt，无法继续训练")
-    if not Path(task.data_path).exists():
+    if not task.execution_node_id and not Path(task.data_path).exists():
         raise HTTPException(409, "数据集路径已经失效，无法继续训练")
-    try:
-        validate_dataset_config(task.data_path)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
+    if not task.execution_node_id:
+        try:
+            validate_dataset_config(task.data_path)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     if task.epochs <= task.completed_epochs:
         raise HTTPException(409, f"断点已经完成 {task.completed_epochs} 个 Epoch，请增加训练轮数或选择重新训练")
     run = create_training_run(db, task, "resume", checkpoint)
@@ -256,11 +275,12 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.status not in {"failed", "stopped", "interrupted", "completed"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能重新训练")
-    try:
-        validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
-        validate_dataset_config(task.data_path)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
+    if not task.execution_node_id:
+        try:
+            validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
+            validate_dataset_config(task.data_path)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     run = create_training_run(db, task, "retry")
     add_event(db, task.id, "retry_queued", f"Attempt {run.attempt_number:03d} 已加入重新训练队列", run_id=run.id)
     db.commit()
@@ -270,7 +290,22 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
 
 @app.post("/api/tasks/{task_id}/stop", response_model=TaskRead)
 def stop_task(task_id: str, db: Session = Depends(get_db)):
-    get_task_or_404(db, task_id)
+    task = get_task_or_404(db, task_id)
+    if task.execution_node_id:
+        run = current_run(db, task)
+        if not run or run.status not in {"queued", "starting", "running", "stopping"}:
+            raise HTTPException(409, "该远程任务当前无法停止")
+        if run.status == "queued":
+            run.status = "stopped"
+            run.finished_at = utcnow()
+        else:
+            run.stop_requested = True
+            run.status = "stopping"
+        mirror_run_to_task(task, run)
+        add_event(db, task.id, "stop_requested", "已向远程 Agent 请求停止", run_id=run.id)
+        db.commit()
+        db.refresh(task)
+        return task
     if not scheduler.stop_task(task_id):
         raise HTTPException(409, "该任务当前无法停止")
     with SessionLocal() as refreshed_db:
@@ -310,6 +345,7 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     source = get_task_or_404(db, task_id)
     clone = TrainingTask(
         id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
+        execution_node_id=source.execution_node_id,
         model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
         imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
         config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
@@ -426,9 +462,19 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
         raise HTTPException(422, "至少需要提供一个模型或数据集路径")
     try:
         if payload.model_path is not None:
-            task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+            if task.execution_node_id:
+                if not Path(payload.model_path).is_absolute() or "\x00" in payload.model_path:
+                    raise ValueError("远程模型必须是绝对路径")
+                task.model_path = payload.model_path.strip()
+            else:
+                task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
         if payload.data_path is not None:
-            task.data_path = str(validate_dataset_config(payload.data_path))
+            if task.execution_node_id:
+                if not Path(payload.data_path).is_absolute() or "\x00" in payload.data_path:
+                    raise ValueError("远程数据集 YAML 必须是绝对路径")
+                task.data_path = payload.data_path.strip()
+            else:
+                task.data_path = str(validate_dataset_config(payload.data_path))
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     current_config = dict(task.config or {})
@@ -483,6 +529,8 @@ def task_events(task_id: str, db: Session = Depends(get_db)):
 def task_logs(task_id: str, tail: int = Query(default=400, ge=20, le=5000), db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     run = current_run(db, task)
+    if run and run.execution_node_id:
+        return {"lines": (run.remote_log_tail or [])[-tail:], "path": run.log_path}
     if not run or not run.log_path or not Path(run.log_path).exists():
         return {"lines": [], "path": run.log_path if run else None}
     lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -529,6 +577,8 @@ def run_events(task_id: str, run_id: str, db: Session = Depends(get_db)):
 def run_logs(task_id: str, run_id: str, tail: int = Query(default=400, ge=20, le=5000), db: Session = Depends(get_db)):
     get_task_or_404(db, task_id)
     run = get_run_or_404(db, task_id, run_id)
+    if run.execution_node_id:
+        return {"lines": (run.remote_log_tail or [])[-tail:], "path": run.log_path}
     if not run.log_path or not Path(run.log_path).exists():
         return {"lines": [], "path": run.log_path}
     lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -543,6 +593,8 @@ def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
     path = Path(artifact.path).resolve()
     task = get_task_or_404(db, artifact.task_id)
     run = db.get(TrainingRun, artifact.run_id) if artifact.run_id else current_run(db, task)
+    if run and run.execution_node_id:
+        raise HTTPException(409, "远程产物保存在执行服务器，当前不支持通过中台下载")
     if not run or not run.run_dir or not path_is_within(path, [Path(run.run_dir)]):
         raise HTTPException(403, "产物路径不受信任")
     if not path.exists():

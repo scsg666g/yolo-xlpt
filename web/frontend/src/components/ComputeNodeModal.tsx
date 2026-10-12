@@ -81,7 +81,9 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('请输入有效的中心平台 HTTP(S) 地址')
     if (!token || !savedNode) throw new Error('请先生成该服务器的 Agent Token')
     return JSON.stringify({ center_url: center.trim().replace(/\/+$/, ''), node_id: savedNode.id, token,
-      report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi' }, null, 2)
+      report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi',
+      enable_training: false, allowed_training_roots: [], yolo_bin: '/data/conda/envs/yolo/bin/yolo',
+      training_cwd: '/data/yolo/yolo' }, null, 2)
   }
 
   function downloadConfig() {
@@ -105,7 +107,7 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
       <header><h2 id="compute-node-title">{setup ? `接入服务器 · ${savedNode?.name || ''}` : node ? '编辑服务器' : '添加服务器'}</h2><button className="icon-button" disabled={busy} aria-label="关闭服务器窗口" onClick={close}><X size={18} /></button></header>
       {setup ? <>
         <div className="modal-body">
-          <p className="node-help">在对应服务器运行只读 Agent，即可显示算力数据。无需填写 SSH 用户或密码。</p>
+          <p className="node-help">在对应服务器运行 Agent，即可显示算力数据；训练执行默认关闭，启用前需配置该机的环境路径和允许访问的目录。无需提供 SSH 密码。</p>
           <div className="form-grid"><label className="span-2">中心平台地址<input value={center} onChange={(event) => setCenter(event.target.value)} placeholder="http://中心服务器:18088" /></label></div>
           <p className="node-help">请填写远程服务器能访问的地址。当前浏览器地址仅作为初始值。</p>
           {token ? <div className="node-info">专属 Token 已生成，仅在本窗口提供。配置中包含 Token，请勿提交到 Git 或分享给他人。</div>
@@ -115,8 +117,9 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
             <li>把 <code>monitor_agent.py</code> 和 <code>agent-config.json</code> 放到远程服务器的同一目录。</li>
             <li>验证权限和连通性，然后上报一次：<pre>chmod 600 agent-config.json{'\n'}python3 monitor_agent.py --config agent-config.json --once</pre></li>
             <li>看到“采样上报成功”后，持续运行：<pre>python3 monitor_agent.py --config agent-config.json</pre></li>
+            <li>如需执行训练，先在 JSON 中设置 <code>enable_training</code> 为 <code>true</code>，并填写 <code>allowed_training_roots</code>（仅允许 Agent 访问这些绝对路径）；确认 <code>yolo_bin</code> 与 <code>training_cwd</code> 后重启 Agent。</li>
           </ol>
-          <p className="node-help">Agent 使用 Python 3.9+ 标准库，无需安装第三方依赖；GPU 指标由本机 nvidia-smi 提供。长期运行可按 Agent 文档配置 systemd 服务。</p>
+          <p className="node-help">Agent 使用 Python 标准库；GPU 指标由本机 nvidia-smi 提供。训练会调用配置的 YOLO CLI，不执行任意 Shell。日志与产物留在远程服务器；当前平台接收进度、指标和最近日志，不会自动复制模型文件。</p>
           <button className="button compact" disabled={busy} onClick={() => void rotate()}><RefreshCw size={14} />重新生成 Token</button>
           {notice && <div className="node-info" role="status">{notice}</div>}
           {error && <div className="alert error" role="alert">{error}</div>}

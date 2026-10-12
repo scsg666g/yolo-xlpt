@@ -11,6 +11,8 @@ class TaskCreate(BaseModel):
     task_type: Literal["detect", "segment", "classify", "pose", "obb"] = "detect"
     model_path: str
     data_path: str
+    execution_node_id: str | None = None
+    remote_output_root: str | None = None
     epochs: int = Field(default=100, ge=1, le=10000)
     batch: int = Field(default=16, ge=1, le=1024)
     imgsz: int = Field(default=640, ge=32, le=4096)
@@ -91,6 +93,7 @@ class TaskRead(BaseModel):
     task_type: str
     status: str
     source: str
+    execution_node_id: str | None = None
     model_path: str
     data_path: str
     run_dir: str | None
@@ -128,6 +131,7 @@ class RunRead(BaseModel):
     attempt_number: int
     launch_mode: str
     status: str
+    execution_node_id: str | None = None
     pid: int | None
     process_started_at: datetime | None
     command: list[Any]

@@ -93,6 +93,7 @@ def parameter_snapshot(task: TrainingTask) -> dict[str, Any]:
         "workers": task.workers,
         "optimizer": task.optimizer,
         "config": dict(task.config or {}),
+        "remote_output_root": (task.config or {}).get("remote_output_root"),
     }
 
 
@@ -140,12 +141,15 @@ def create_training_run(
         attempt_number=attempt,
         launch_mode=launch_mode,
         status="queued",
+        execution_node_id=task.execution_node_id,
         parameter_snapshot=parameter_snapshot(task),
         model_path=task.model_path,
         data_path=task.data_path,
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
-        run_dir=str(RUNS_ROOT / task.task_type / task.id / attempt_name),
-        log_path=str(log_path_for_run(task.id, attempt)),
+        run_dir=(str(Path((task.config or {}).get("remote_output_root")) / task.task_type / task.id / attempt_name)
+                 if task.execution_node_id and (task.config or {}).get("remote_output_root") else str(RUNS_ROOT / task.task_type / task.id / attempt_name)),
+        log_path=(str(Path((task.config or {}).get("remote_output_root")) / task.task_type / task.id / attempt_name / "platform.log")
+                  if task.execution_node_id and (task.config or {}).get("remote_output_root") else str(log_path_for_run(task.id, attempt))),
         completed_epochs=task.completed_epochs if launch_mode == "resume" else 0,
         progress=task.progress if launch_mode == "resume" else 0.0,
         latest_metrics=dict(task.latest_metrics or {}) if launch_mode == "resume" else {},
@@ -215,7 +219,7 @@ def migrate_training_logs() -> int:
     with SessionLocal() as db:
         runs = db.scalars(select(TrainingRun).order_by(TrainingRun.task_id, TrainingRun.attempt_number)).all()
         for run in runs:
-            if not run.log_path or run.status in active_statuses:
+            if not run.log_path or run.execution_node_id or run.status in active_statuses:
                 continue
             source = Path(run.log_path).expanduser().resolve()
             if path_is_within(source, [LOG_ROOT]) or not source.is_file():
@@ -254,6 +258,8 @@ def _safe_delete_directory(path: Path, roots: list[Path]) -> None:
 
 def permanently_delete_task_files(task: TrainingTask) -> list[str]:
     """Remove only task-owned run/runtime directories; model and dataset paths are never targets."""
+    if task.execution_node_id:
+        raise ValueError("远程训练目录不在本机，当前不支持永久删除远程任务的文件")
     run_dirs = {Path(run.run_dir) for run in task.runs if run.run_dir}
     log_files = {Path(run.log_path) for run in task.runs if run.log_path}
     if task.run_dir:
@@ -475,7 +481,7 @@ def parse_number(value: Any) -> float | str | None:
 
 def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None:
     run = run or current_run(db, task)
-    if not run or not run.run_dir:
+    if not run or run.execution_node_id or not run.run_dir:
         return
     csv_path = Path(run.run_dir) / "results.csv"
     if not csv_path.exists():
@@ -536,7 +542,7 @@ def resume_checkpoint(task: TrainingTask) -> Path | None:
 
 def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> None:
     run = run or current_run(db, task)
-    if not run or not run.run_dir or not Path(run.run_dir).exists():
+    if not run or run.execution_node_id or not run.run_dir or not Path(run.run_dir).exists():
         return
     known = {
         artifact.path: artifact
@@ -651,7 +657,10 @@ class TrainingScheduler:
 
     def start(self) -> None:
         with SessionLocal() as db:
-            running = db.scalars(select(TrainingRun).where(TrainingRun.status.in_(["starting", "running", "stopping"]))).all()
+            running = db.scalars(select(TrainingRun).where(
+                TrainingRun.status.in_(["starting", "running", "stopping"]),
+                TrainingRun.execution_node_id.is_(None),
+            )).all()
             for run in running:
                 task = db.get(TrainingTask, run.task_id)
                 run.status = "interrupted"
@@ -837,7 +846,7 @@ class TrainingScheduler:
             try:
                 with SessionLocal() as db:
                     self._poll_processes(db)
-                    queued = db.scalars(select(TrainingRun).where(TrainingRun.status == "queued").order_by(TrainingRun.queued_at)).all()
+                    queued = db.scalars(select(TrainingRun).where(TrainingRun.status == "queued", TrainingRun.execution_node_id.is_(None)).order_by(TrainingRun.queued_at)).all()
                     for run in queued:
                         task = db.get(TrainingTask, run.task_id)
                         if task and task.current_run_id == run.id and self._available(db, task):

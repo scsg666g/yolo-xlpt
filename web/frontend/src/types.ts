@@ -15,6 +15,7 @@ export interface TrainingTask {
   task_type: string
   status: TaskStatus
   source: string
+  execution_node_id: string | null
   model_path: string
   data_path: string
   run_dir: string | null
@@ -195,6 +196,8 @@ export interface TaskCreatePayload {
   task_type: string
   model_path: string
   data_path: string
+  execution_node_id?: string | null
+  remote_output_root?: string
   epochs: number
   batch: number
   imgsz: number

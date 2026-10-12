@@ -12,7 +12,8 @@ from sqlalchemy.orm import sessionmaker
 import app.compute_nodes as monitoring
 from app.database import Base, get_db
 from app.main import app
-from app.models import ComputeNode, utcnow
+from app.models import ComputeNode, TrainingRun, TrainingTask, utcnow
+from app.services import create_training_run
 
 
 def sample(gpus=None):
@@ -162,3 +163,115 @@ def test_agent_gpu_collection_with_unavailable_fields(monitoring_client, monkeyp
     gpu = payload.compute.gpus[0]
     assert gpu.power_draw is None and gpu.utilization == 75
     assert gpu.processes[0].name == "python" and gpu.processes[1].memory_used is None
+
+
+def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
+    client, factory = monitoring_client
+    first, second = create(client), create(client, "Other")
+    node_id = first["node"]["id"]
+    task = TrainingTask(id="remote-test", name="remote", task_type="detect", execution_node_id=node_id,
+                        model_path="/remote/model.pt", data_path="/remote/data.yaml",
+                        config={"remote_output_root": "/remote/runs"})
+    with factory() as db:
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run_id = run.id
+        db.commit()
+    poll_url = f"/api/compute/nodes/{node_id}/agent/poll"
+    assert client.post(poll_url).status_code == 401
+    assert client.post(poll_url, headers=headers(second)).status_code == 401
+    assert client.post(f"/api/compute/nodes/{second['node']['id']}/agent/poll", headers=headers(second)).json()["task"] is None
+    claimed = client.post(poll_url, headers=headers(first)).json()["task"]
+    assert claimed["run_id"] == run_id
+    assert claimed["run_dir"] == "/remote/runs/detect/remote-test/attempt-001"
+    assert client.post(poll_url, headers=headers(first)).json()["task"] is None
+    update_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update"
+    assert client.post(update_url, headers=headers(second), json={"status": "running"}).status_code == 401
+    update = client.post(update_url, headers=headers(first), json={"status": "running", "pid": 1234,
+        "completed_epochs": 1, "progress": 10, "latest_metrics": {"score": 0.5},
+        "metrics": [{"epoch": 1, "values": {"score": 0.5}}], "log_tail": ["epoch 1"]})
+    assert update.status_code == 200, update.text
+    assert client.get("/api/tasks/remote-test/logs", params={"tail": 20}).json()["lines"] == ["epoch 1"]
+    assert len(client.get("/api/tasks/remote-test/metrics").json()) == 1
+    assert client.post("/api/tasks/remote-test/stop").status_code == 200
+    control = client.get(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/control", headers=headers(first))
+    assert control.json()["stop"] is True
+    reply = client.post(update_url, headers=headers(first), json={"status": "running", "pid": 1234})
+    assert reply.json()["status"] == "stopping" and reply.json()["stop_requested"] is True
+    assert client.post(update_url, headers=headers(first), json={"status": "stopped", "exit_code": -15}).status_code == 200
+    with factory() as db:
+        assert db.get(TrainingRun, run_id).status == "stopped"
+
+
+def test_agent_rejects_outside_paths_and_keeps_training_disabled_by_default(monitoring_client, tmp_path):
+    client, _ = monitoring_client
+    credential = create(client)
+    script = Path(__file__).resolve().parents[2] / "agent" / "monitor_agent.py"
+    spec = importlib.util.spec_from_file_location("remote_agent_test", script)
+    agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent)
+    path = tmp_path / "agent-config.json"
+    path.write_text(json.dumps({"center_url": "https://example.com", "node_id": credential["node"]["id"],
+                                "token": credential["token"]}))
+    path.chmod(0o600)
+    assert agent.load_config(path)["enable_training"] is False
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"x")
+    with pytest.raises(ValueError, match="允许目录"):
+        agent.within_allowed(str(outside), [str(allowed)])
+
+
+def test_remote_command_uses_allowed_files_and_separate_attempt_directory(tmp_path):
+    script = Path(__file__).resolve().parents[2] / "agent" / "monitor_agent.py"
+    spec = importlib.util.spec_from_file_location("remote_command_test", script)
+    agent = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent)
+    root = tmp_path / "training"
+    root.mkdir()
+    model = root / "model.pt"
+    dataset = root / "data.yaml"
+    model.write_bytes(b"model")
+    dataset.write_text("train: images/train\nval: images/val\n")
+    yolo = root / "yolo"
+    yolo.write_text("#!/bin/sh\n")
+    yolo.chmod(0o700)
+    run_dir = root / "runs" / "detect" / "task-id" / "attempt-001"
+    run_dir.parent.mkdir(parents=True)
+    payload = {"model_path": str(model), "data_path": str(dataset), "run_dir": str(run_dir),
+               "log_path": str(run_dir / "platform.log"), "task_type": "detect", "checkpoint_path": None,
+               "parameters": {"epochs": 2, "batch": 1, "imgsz": 640, "device": "0", "workers": 2,
+                              "optimizer": "auto", "remote_output_root": str(root / "runs"),
+                              "config": {"custom_args": {"label_smoothing": 0.1}}}}
+    config = {"allowed_training_roots": [str(root)], "yolo_bin": str(yolo)}
+    command = agent.build_training_command(config, payload)
+    assert command[0] == str(yolo)
+    assert "label_smoothing=0.1" in command
+    assert f"name={run_dir.name}" in command
+    with pytest.raises(ValueError, match="已存在"):
+        agent.build_training_command(config, payload)
+    payload["run_dir"] = str(root / "runs" / "detect" / "task-id" / "attempt-002")
+    payload["log_path"] = str(Path(payload["run_dir"]) / "platform.log")
+    payload["parameters"]["config"]["custom_args"] = {"project": "/tmp/elsewhere"}
+    with pytest.raises(ValueError, match="不允许"):
+        agent.build_training_command(config, payload)
+
+
+def test_active_remote_run_blocks_node_disabling_and_token_rotation(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        task = TrainingTask(id="active-remote", name="remote", task_type="detect", execution_node_id=node_id,
+                            model_path="/remote/model.pt", data_path="/remote/data.yaml",
+                            config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run.status = "running"
+        db.commit()
+    assert client.post(f"/api/compute/nodes/{node_id}/token").status_code == 409
+    assert client.patch(f"/api/compute/nodes/{node_id}", json={"name": "remote", "enabled": False}).status_code == 409
+    assert client.delete(f"/api/compute/nodes/{node_id}").status_code == 409

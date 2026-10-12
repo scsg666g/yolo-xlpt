@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Upload, X } from 'lucide-react'
 import { api } from '../api'
-import type { DatasetUploadResult, Resources, TaskCreatePayload, TrainingTask } from '../types'
+import type { ComputeNode, DatasetUploadResult, Resources, TaskCreatePayload, TrainingTask } from '../types'
 import { UploadDatasetModal } from './UploadDatasetModal'
 import { analyzeImportedParameters, definitionsFromCatalog, importDefinitions, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
 
@@ -13,12 +13,14 @@ interface Props {
 
 const initial: TaskCreatePayload = {
   name: '', task_type: 'detect', model_path: '', data_path: '', epochs: 100, batch: 16,
+  execution_node_id: null, remote_output_root: '',
   imgsz: 640, device: '0', workers: 8, optimizer: 'auto', patience: 50, lr0: null,
   pretrained: true, cache: false, amp: true, close_mosaic: 10, advanced: {},
 }
 
 export function CreateTaskModal({ open, onClose, onCreated }: Props) {
   const [resources, setResources] = useState<Resources | null>(null)
+  const [nodes, setNodes] = useState<ComputeNode[]>([])
   const [form, setForm] = useState<TaskCreatePayload>(initial)
   const [advanced, setAdvanced] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -45,6 +47,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
         device: data.gpus.length > 1 ? data.gpus.map((gpu) => gpu.index).join(',') : String(data.gpus[0]?.index ?? 'cpu'),
       }))
     }).catch((reason) => setError(reason.message))
+    api.computeNodes().then(setNodes).catch(() => setNodes([]))
   }, [open])
 
   useEffect(() => {
@@ -89,6 +92,8 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
     setAdvanced(true); setImportOpen(false)
   }
   const jsonParameters = { task: form.task_type, mode: 'train', name: form.name, model: form.model_path, data: form.data_path, epochs: form.epochs, batch: form.batch, imgsz: form.imgsz, device: form.device, workers: form.workers, optimizer: form.optimizer, patience: form.patience, lr0: form.lr0, pretrained: form.pretrained, cache: form.cache, amp: form.amp, close_mosaic: form.close_mosaic, ...form.advanced }
+  const isRemote = Boolean(form.execution_node_id)
+  const executionNode = nodes.find((node) => node.id === form.execution_node_id)
   const jsonText = JSON.stringify(jsonParameters, null, 2)
   async function copyJson() { try { await navigator.clipboard.writeText(jsonText); setJsonCopied(true); window.setTimeout(() => setJsonCopied(false), 1600) } catch { setError('复制失败，请手动复制 JSON') } }
 
@@ -116,10 +121,10 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
           {error && <div className="alert error">{error}</div>}
           <div className="form-grid">
             <label className="span-2">任务名称<input required value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：反光背心 YOLO26x 试验 02" /></label>
+            <label className="span-2">执行服务器<select value={form.execution_node_id || ''} onChange={(e) => { const id = e.target.value || null; setForm((current) => ({ ...current, execution_node_id: id, model_path: id ? '' : (resources?.models[0]?.path || ''), data_path: id ? '' : (resources?.datasets[0]?.path || ''), device: id ? '0' : String(resources?.gpus[0]?.index ?? 'cpu'), remote_output_root: '' })) }}><option value="">本机（中台服务器）</option>{nodes.filter((node) => node.kind === 'agent' && node.enabled).map((node) => <option key={node.id} value={node.id}>{node.name} · {node.address || node.hostname || node.status}</option>)}</select><small>{isRemote ? `远程 Agent：${executionNode?.status === 'online' ? '在线' : `当前${executionNode?.status || '未知'}，任务会等待 Agent 拉取`}` : '使用中台服务器本机资源与路径'}</small></label>
             <label>任务类型<select value={form.task_type} onChange={(e) => update('task_type', e.target.value)}><option value="detect">目标检测</option><option value="segment">实例分割</option><option value="classify">图像分类</option><option value="pose">姿态估计</option><option value="obb">旋转框</option></select></label>
-            <label>GPU 设备<select value={form.device} onChange={(e) => update('device', e.target.value)}>{resources?.gpus.map((gpu) => <option key={gpu.index} value={gpu.index}>{gpu.index} · {gpu.name}</option>)}{(resources?.gpus.length || 0) > 1 && <option value={resources!.gpus.map((gpu) => gpu.index).join(',')}>全部 GPU（DDP）</option>}<option value="cpu">CPU</option></select></label>
-            <label className="span-2">基础模型<select required value={form.model_path} onChange={(e) => update('model_path', e.target.value)}><option value="">请选择模型</option>{resources?.models.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>
-            <div className="dataset-field"><div className="dataset-field-heading"><label htmlFor="task-dataset">数据集配置</label><button type="button" className="button ghost compact" disabled={form.task_type !== 'detect'} onClick={() => setUploading(true)} title={form.task_type === 'detect' ? '上传本地数据集文件夹' : '文件夹上传目前支持目标检测，请选择已有数据集配置'}><Upload size={14} />上传数据集</button></div><label><select id="task-dataset" required value={form.data_path} onChange={(e) => { update('data_path', e.target.value); setUploaded(null) }}><option value="">请选择数据集 YAML</option>{resources?.datasets.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>{form.task_type !== 'detect' && <small className="upload-help">文件夹上传目前支持目标检测，其他任务请使用已有数据集配置。</small>}</div>
+            <label>GPU 设备{isRemote ? <input value={form.device} onChange={(e) => update('device', e.target.value)} placeholder="例如 0 或 0,1；也可填 cpu" /> : <select value={form.device} onChange={(e) => update('device', e.target.value)}>{resources?.gpus.map((gpu) => <option key={gpu.index} value={gpu.index}>{gpu.index} · {gpu.name}</option>)}{(resources?.gpus.length || 0) > 1 && <option value={resources!.gpus.map((gpu) => gpu.index).join(',')}>全部 GPU（DDP）</option>}<option value="cpu">CPU</option></select>}</label>
+            {isRemote ? <><label className="span-2">远程基础模型绝对路径<input required value={form.model_path} onChange={(e) => update('model_path', e.target.value)} placeholder="例如 /data/yolo/models/yolo26x.pt" /></label><label className="span-2">远程数据集 YAML 绝对路径<input required value={form.data_path} onChange={(e) => update('data_path', e.target.value)} placeholder="例如 /data/yolo/datasets/mydata/data.yaml" /></label><label className="span-2">远程训练输出根目录<input required value={form.remote_output_root} onChange={(e) => update('remote_output_root', e.target.value)} placeholder="例如 /data/yolo/runs" /></label><div className="alert span-2" style={{ gridColumn: 'span 2', marginBottom: 0 }}>远程 Agent 会检查模型、YAML 文件和输出目录；YAML 内引用的图像路径由 YOLO 在训练时检查。数据不会自动从中台复制。</div></> : <><label className="span-2">基础模型<select required value={form.model_path} onChange={(e) => update('model_path', e.target.value)}><option value="">请选择模型</option>{resources?.models.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label><div className="dataset-field"><div className="dataset-field-heading"><label htmlFor="task-dataset">数据集配置</label><button type="button" className="button ghost compact" disabled={form.task_type !== 'detect'} onClick={() => setUploading(true)} title={form.task_type === 'detect' ? '上传本地数据集文件夹' : '文件夹上传目前支持目标检测，请选择已有数据集配置'}><Upload size={14} />上传数据集</button></div><label><select id="task-dataset" required value={form.data_path} onChange={(e) => { update('data_path', e.target.value); setUploaded(null) }}><option value="">请选择数据集 YAML</option>{resources?.datasets.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>{form.task_type !== 'detect' && <small className="upload-help">文件夹上传目前支持目标检测，其他任务请使用已有数据集配置。</small>}</div></>}
             {uploaded && <div className="alert dataset-upload-success span-2" role="status" style={{ gridColumn: 'span 2', marginBottom: 0 }}><strong>已上传并选中：{uploaded.name}</strong><p>训练 {uploaded.stats.train_images} 张 · 验证 {uploaded.stats.val_images} 张 · {uploaded.stats.classes} 个类别</p><p>path: {uploaded.directory}</p>{uploaded.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
             <label>训练轮数<input type="number" min="1" value={form.epochs} onChange={(e) => update('epochs', Number(e.target.value))} /></label>
             <label>批大小<input type="number" min="1" value={form.batch} onChange={(e) => update('batch', Number(e.target.value))} /></label>

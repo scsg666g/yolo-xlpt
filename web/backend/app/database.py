@@ -30,6 +30,7 @@ def migrate_database() -> Path | None:
     metric_columns = {column["name"] for column in inspector.get_columns("metric_points")}
     artifact_columns = {column["name"] for column in inspector.get_columns("artifacts")}
     event_columns = {column["name"] for column in inspector.get_columns("task_events")}
+    run_columns = {column["name"] for column in inspector.get_columns("training_runs")} if inspector.has_table("training_runs") else set()
     display_order_needs_repair = False
     if "display_order" in task_columns:
         with engine.connect() as connection:
@@ -45,6 +46,10 @@ def migrate_database() -> Path | None:
         or "run_id" not in metric_columns
         or "run_id" not in artifact_columns
         or "run_id" not in event_columns
+        or "execution_node_id" not in task_columns
+        or (bool(run_columns) and "execution_node_id" not in run_columns)
+        or (bool(run_columns) and "stop_requested" not in run_columns)
+        or (bool(run_columns) and "remote_log_tail" not in run_columns)
     )
     if not needs_migration:
         return None
@@ -57,15 +62,26 @@ def migrate_database() -> Path | None:
         if "display_order" not in task_columns:
             connection.execute(text("ALTER TABLE training_tasks ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_display_order ON training_tasks (display_order)"))
+        if "execution_node_id" not in task_columns:
+            connection.execute(text("ALTER TABLE training_tasks ADD COLUMN execution_node_id VARCHAR(64)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_execution_node_id ON training_tasks (execution_node_id)"))
+        if run_columns and "execution_node_id" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN execution_node_id VARCHAR(64)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_runs_execution_node_id ON training_runs (execution_node_id)"))
+        if run_columns and "stop_requested" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN stop_requested BOOLEAN NOT NULL DEFAULT 0"))
+        if run_columns and "remote_log_tail" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN remote_log_tail JSON NOT NULL DEFAULT '[]'"))
         # Existing cards keep their current newest-first order. Repair rows left at
         # the SQL default as well, which covers databases migrated by an older build.
-        connection.execute(text("""
+        order_timestamp = "created_at DESC," if "created_at" in task_columns else ""
+        connection.execute(text(f"""
             WITH ranked AS (
                 SELECT id, (ROW_NUMBER() OVER (
                     ORDER BY
                         CASE WHEN display_order IS NULL OR display_order = 0 THEN 1 ELSE 0 END,
                         display_order,
-                        created_at DESC,
+                        {order_timestamp}
                         id DESC
                 ) * 1000) AS position
                 FROM training_tasks

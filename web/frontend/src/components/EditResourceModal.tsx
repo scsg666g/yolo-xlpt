@@ -21,7 +21,7 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
     if (!task || !mode) return
     setPath(mode === 'dataset' ? task.data_path : task.model_path)
     setSearch(''); setError('')
-    api.resources().then(setResources).catch((reason) => setError(reason.message))
+    if (!task.execution_node_id) api.resources().then(setResources).catch((reason) => setError(reason.message))
   }, [task, mode])
 
   const files = useMemo(() => {
@@ -32,7 +32,7 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
   if (!task || !mode) return null
   const isDataset = mode === 'dataset'
   const locked = ['queued', 'starting', 'running', 'stopping'].includes(task.status)
-  const currentMissing = !files.some((file) => file.path === path) && path === (isDataset ? task.data_path : task.model_path)
+  const currentMissing = !task.execution_node_id && !files.some((file) => file.path === path) && path === (isDataset ? task.data_path : task.model_path)
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
@@ -56,14 +56,14 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
         {currentMissing && <div className="alert error">当前路径已经失效，请从下方选择服务器中存在的文件。</div>}
         {error && <div className="alert error">{error}</div>}
         <label className="resource-path-label">当前选择<input value={path} onChange={(event) => setPath(event.target.value)} placeholder={isDataset ? '数据集 YAML 的绝对路径' : '模型权重的绝对路径'} /></label>
-        <div className="resource-toolbar"><div><FolderSearch size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索名称或路径" /></div><span>发现 {files.length} 个可用文件</span></div>
+        {task.execution_node_id && <div className="node-info">填写执行服务器上的绝对路径；Agent 将在启动训练前检查文件和允许目录。</div>}
+        {!task.execution_node_id && <><div className="resource-toolbar"><div><FolderSearch size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索名称或路径" /></div><span>发现 {files.length} 个可用文件</span></div>
         <div className="resource-list">
           {files.map((file) => <button type="button" key={file.path} className={path === file.path ? 'selected' : ''} onClick={() => selectFile(file)}><span className="resource-file-icon">{isDataset ? <Database size={16} /> : <Box size={16} />}</span><span><strong>{file.name}</strong><small>{file.path}</small></span><em>{formatBytes(file.size)}</em>{path === file.path && <FileCheck2 className="selected-check" size={16} />}</button>)}
           {!files.length && <div className="resource-empty">没有找到匹配的文件</div>}
-        </div>
+        </div></>}
       </div>
-      <footer><span className="parameter-note">仅允许选择平台批准目录中的文件</span><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked || !path}>{saving && <LoaderCircle size={16} className="spin" />}保存{isDataset ? '数据集' : '模型'}</button></footer>
+      <footer><span className="parameter-note">{task.execution_node_id ? '远程 Agent 将验证路径及权限' : '仅允许选择平台批准目录中的文件'}</span><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked || !path}>{saving && <LoaderCircle size={16} className="spin" />}保存{isDataset ? '数据集' : '模型'}</button></footer>
     </form>
   </div>
 }
-

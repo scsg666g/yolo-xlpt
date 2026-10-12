@@ -7,19 +7,21 @@ import secrets
 import threading
 import time
 import uuid
+import math
+from pathlib import Path
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .config import WEB_ROOT
 from .database import get_db
-from .models import ComputeNode, utcnow
-from .services import compute_inventory
+from .models import ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .services import add_event, compute_inventory, mirror_run_to_task
 
 router = APIRouter(prefix="/api/compute", tags=["compute nodes"])
 MAX_REPORT_BYTES = 1024 * 1024
@@ -115,6 +117,33 @@ class AgentReport(BaseModel):
     compute: ComputeReport
 
 
+class RemoteRunUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: str
+    pid: int | None = Field(default=None, ge=1)
+    completed_epochs: int = Field(default=0, ge=0)
+    progress: float = Field(default=0, ge=0, le=100, allow_inf_nan=False)
+    latest_metrics: dict[str, Any] = Field(default_factory=dict)
+    metrics: list[dict[str, Any]] = Field(default_factory=list, max_length=256)
+    log_tail: list[str] = Field(default_factory=list, max_length=200)
+    exit_code: int | None = None
+    error_message: str | None = Field(default=None, max_length=4000)
+    run_dir: str | None = Field(default=None, max_length=2000)
+    command: list[str] = Field(default_factory=list, max_length=256)
+
+    @field_validator("status")
+    @classmethod
+    def allowed_status(cls, value: str) -> str:
+        if value not in {"starting", "running", "stopping", "stopped", "completed", "failed"}:
+            raise ValueError("不支持的远程运行状态")
+        return value
+
+    @field_validator("log_tail")
+    @classmethod
+    def clean_logs(cls, value: list[str]) -> list[str]:
+        return [line[:4000] for line in value]
+
+
 _local_lock = threading.Lock()
 _local_cache: dict = {}
 _local_sampled = 0.0
@@ -191,6 +220,18 @@ def issue_token(node: ComputeNode) -> str:
     return token
 
 
+def authenticated_agent(node_id: str, request: Request, db: Session) -> ComputeNode:
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    node = db.get(ComputeNode, node_id)
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    if scheme.lower() != "bearer" or not token or not node or node.kind != "agent" or not node.token_hash or not hmac.compare_digest(digest, node.token_hash):
+        raise HTTPException(401, "Agent 身份验证失败", headers={"WWW-Authenticate": "Bearer"})
+    if not node.enabled:
+        raise HTTPException(403, "服务器监控已禁用")
+    return node
+
+
 @router.get("/nodes")
 def list_nodes(db: Session = Depends(get_db)):
     nodes = db.scalars(select(ComputeNode).order_by(ComputeNode.kind.desc(), ComputeNode.created_at, ComputeNode.id)).all()
@@ -222,6 +263,11 @@ def update_node(node_id: str, payload: NodeSettings, db: Session = Depends(get_d
     node = node_or_404(db, node_id)
     if node.kind == "local" and not payload.enabled:
         raise HTTPException(422, "本机监控不能禁用")
+    if not payload.enabled and db.scalar(select(TrainingRun.id).where(
+        TrainingRun.execution_node_id == node_id,
+        TrainingRun.status.in_(["starting", "running", "stopping"]),
+    ).limit(1)):
+        raise HTTPException(409, "该服务器正在执行训练，请先停止并等待状态上报后再禁用")
     for key, value in payload.model_dump().items():
         setattr(node, key, value)
     db.commit()
@@ -234,6 +280,11 @@ def rotate_token(node_id: str, db: Session = Depends(get_db)):
     node = node_or_404(db, node_id)
     if node.kind != "agent":
         raise HTTPException(409, "本机无需 Agent Token")
+    if db.scalar(select(TrainingRun.id).where(
+        TrainingRun.execution_node_id == node_id,
+        TrainingRun.status.in_(["starting", "running", "stopping"]),
+    ).limit(1)):
+        raise HTTPException(409, "该服务器正在执行训练，请等待完成后再更换 Token")
     token = issue_token(node)
     # Old observations do not establish the connection of the replacement Agent.
     node.last_seen_at = None
@@ -247,20 +298,15 @@ def delete_node(node_id: str, db: Session = Depends(get_db)):
     node = node_or_404(db, node_id)
     if node.kind == "local":
         raise HTTPException(409, "不能移除本机服务器")
+    if db.scalar(select(TrainingTask.id).where(TrainingTask.execution_node_id == node_id).limit(1)):
+        raise HTTPException(409, "该服务器仍有关联任务，请先处理任务后再移除服务器")
     db.delete(node)
     db.commit()
 
 
 @router.post("/nodes/{node_id}/report")
 async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
-    authorization = request.headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    node = db.get(ComputeNode, node_id)
-    digest = hashlib.sha256(token.encode()).hexdigest()
-    if scheme.lower() != "bearer" or not token or not node or node.kind != "agent" or not node.token_hash or not hmac.compare_digest(digest, node.token_hash):
-        raise HTTPException(401, "Agent 身份验证失败", headers={"WWW-Authenticate": "Bearer"})
-    if not node.enabled:
-        raise HTTPException(403, "服务器监控已禁用")
+    node = authenticated_agent(node_id, request, db)
     body = bytearray()
     async for chunk in request.stream():
         body.extend(chunk)
@@ -278,3 +324,108 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
     node.last_seen_at = utcnow()
     db.commit()
     return {"status": "ok", "report_interval_seconds": node.report_interval_seconds}
+
+
+@router.post("/nodes/{node_id}/agent/poll")
+def poll_training(node_id: str, request: Request, db: Session = Depends(get_db)):
+    authenticated_agent(node_id, request, db)
+    # A task is delivered once, by atomically switching queued -> starting.
+    run = db.scalar(select(TrainingRun).where(
+        TrainingRun.execution_node_id == node_id, TrainingRun.status == "queued"
+    ).order_by(TrainingRun.queued_at, TrainingRun.id).limit(1))
+    if not run:
+        return {"task": None, "poll_interval_seconds": 5}
+    task = db.get(TrainingTask, run.task_id)
+    if not task or task.deleted_at or task.current_run_id != run.id:
+        run.status = "failed"
+        run.error_message = "任务已删除或不再是当前运行，未执行"
+        run.finished_at = utcnow()
+        db.commit()
+        return {"task": None, "poll_interval_seconds": 5}
+    snapshot = run.parameter_snapshot or {}
+    run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
+    claimed_at = utcnow()
+    claimed = db.execute(update(TrainingRun).where(
+        TrainingRun.id == run.id, TrainingRun.status == "queued",
+    ).values(status="starting", started_at=claimed_at, process_started_at=claimed_at,
+             run_dir=run_dir, log_path=str(Path(run_dir) / "platform.log")))
+    if claimed.rowcount != 1:
+        db.rollback()
+        return {"task": None, "poll_interval_seconds": 5}
+    db.refresh(run)
+    mirror_run_to_task(task, run)
+    add_event(db, task.id, "remote_claimed", f"远程服务器已领取 Attempt {run.attempt_number:03d}", run_id=run.id)
+    db.commit()
+    return {"poll_interval_seconds": 5, "task": {
+        "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
+        "task_type": task.task_type, "launch_mode": run.launch_mode,
+        "model_path": run.model_path, "data_path": run.data_path,
+        "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir,
+        "log_path": run.log_path, "parameters": snapshot,
+    }}
+
+
+@router.post("/nodes/{node_id}/agent/runs/{run_id}/update")
+def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, request: Request, db: Session = Depends(get_db)):
+    authenticated_agent(node_id, request, db)
+    run = db.get(TrainingRun, run_id)
+    if not run or run.execution_node_id != node_id:
+        raise HTTPException(404, "远程训练运行不存在")
+    task = db.get(TrainingTask, run.task_id)
+    if not task:
+        raise HTTPException(404, "训练任务不存在")
+    prior_status = run.status
+    terminal = {"stopped", "completed", "failed"}
+    if prior_status in terminal:
+        return {"status": prior_status, "stop_requested": False}
+    if payload.status not in {"starting", "running", "stopping", *terminal}:
+        raise HTTPException(422, "非法状态")
+    effective_status = "stopping" if run.stop_requested and payload.status in {"starting", "running"} else payload.status
+    run.status = effective_status
+    run.pid = payload.pid if payload.status in {"starting", "running", "stopping"} else None
+    run.completed_epochs = payload.completed_epochs
+    run.progress = payload.progress
+    run.latest_metrics = payload.latest_metrics
+    run.remote_log_tail = payload.log_tail[-200:]
+    if payload.run_dir and payload.run_dir != run.run_dir:
+        raise HTTPException(422, "远程运行目录不得更改")
+    if payload.command:
+        run.command = payload.command
+    if payload.error_message:
+        run.error_message = payload.error_message
+    if payload.exit_code is not None:
+        run.exit_code = payload.exit_code
+    for point in payload.metrics:
+        try:
+            epoch = int(point["epoch"])
+            values = point["values"]
+            elapsed = float(point.get("elapsed", 0))
+            if epoch < 0 or epoch > payload.completed_epochs or not isinstance(values, dict) or not math.isfinite(elapsed) or elapsed < 0:
+                continue
+            exists = db.scalar(select(MetricPoint.id).where(MetricPoint.run_id == run.id, MetricPoint.epoch == epoch))
+            if not exists:
+                db.add(MetricPoint(task_id=task.id, run_id=run.id, epoch=epoch, elapsed=elapsed, values=values))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    if effective_status in terminal:
+        run.finished_at = utcnow()
+        if effective_status == "completed":
+            run.progress = 100
+            run.exit_code = payload.exit_code if payload.exit_code is not None else 0
+        if effective_status == "stopped" and not run.error_message:
+            run.error_message = "由用户请求停止"
+        add_event(db, task.id, effective_status, run.error_message or f"远程训练{effective_status}", "error" if effective_status == "failed" else "info", run_id=run.id)
+    elif effective_status != prior_status:
+        add_event(db, task.id, effective_status, f"远程训练状态：{effective_status}", run_id=run.id)
+    mirror_run_to_task(task, run)
+    db.commit()
+    return {"status": run.status, "stop_requested": bool(run.stop_requested)}
+
+
+@router.get("/nodes/{node_id}/agent/runs/{run_id}/control")
+def remote_run_control(node_id: str, run_id: str, request: Request, db: Session = Depends(get_db)):
+    authenticated_agent(node_id, request, db)
+    run = db.get(TrainingRun, run_id)
+    if not run or run.execution_node_id != node_id:
+        raise HTTPException(404, "远程训练运行不存在")
+    return {"stop": bool(run.stop_requested), "status": run.status}
