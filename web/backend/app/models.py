@@ -12,6 +12,23 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class ComputeNode(Base):
+    __tablename__ = "compute_nodes"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160))
+    address: Mapped[str] = mapped_column(String(255), default="")
+    notes: Mapped[str] = mapped_column(String(1000), default="")
+    kind: Mapped[str] = mapped_column(String(16), default="agent")
+    enabled: Mapped[bool] = mapped_column(default=True)
+    token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    report_interval_seconds: Mapped[int] = mapped_column(Integer, default=5)
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    agent_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TrainingTask(Base):
     __tablename__ = "training_tasks"
 

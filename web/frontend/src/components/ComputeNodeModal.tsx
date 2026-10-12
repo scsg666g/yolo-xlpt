@@ -1,0 +1,140 @@
+import { useEffect, useRef, useState } from 'react'
+import { Copy, Download, LoaderCircle, RefreshCw, X } from 'lucide-react'
+import { api } from '../api'
+import type { ComputeNode, ComputeNodeSettings } from '../types'
+
+interface Props {
+  node?: ComputeNode
+  connect?: boolean
+  onClose: () => void
+  onSaved: () => void
+}
+
+export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Props) {
+  const [settings, setSettings] = useState<ComputeNodeSettings>({
+    name: node?.name || '', address: node?.address || '', notes: node?.notes || '',
+    enabled: node?.enabled ?? true, report_interval_seconds: node?.report_interval_seconds || 5,
+  })
+  const [savedNode, setSavedNode] = useState(node)
+  const [setup, setSetup] = useState(connect)
+  const [token, setToken] = useState('')
+  const [downloaded, setDownloaded] = useState(false)
+  const [center, setCenter] = useState(window.location.origin)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const dialog = useRef<HTMLDivElement>(null)
+  const submitting = useRef(false)
+
+  useEffect(() => {
+    const previous = document.activeElement
+    dialog.current?.querySelector<HTMLElement>('input, button')?.focus()
+    return () => { if (previous instanceof HTMLElement && previous.isConnected) previous.focus() }
+  }, [])
+
+  function close() {
+    if (submitting.current) return
+    if (token && !downloaded && !window.confirm('Agent Token 只在本窗口显示。还没有下载配置，确认关闭吗？关闭后需要重新生成 Token。')) return
+    onClose()
+  }
+
+  function handleKeys(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (event.nativeEvent.isComposing) return
+    if (event.key === 'Escape') { event.preventDefault(); close() }
+    if (event.key === 'Tab') {
+      const controls = event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href]')
+      const first = controls[0], last = controls[controls.length - 1]
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+    }
+  }
+
+  async function save(event: React.FormEvent) {
+    event.preventDefault()
+    if (submitting.current) return
+    submitting.current = true; setBusy(true); setError('')
+    try {
+      if (node) {
+        await api.updateComputeNode(node.id, settings)
+        onSaved(); onClose()
+      } else {
+        const result = await api.createComputeNode(settings)
+        setSavedNode(result.node); setToken(result.token); setSetup(true); onSaved()
+      }
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '服务器保存失败') }
+    finally { submitting.current = false; setBusy(false) }
+  }
+
+  async function rotate() {
+    if (!savedNode || submitting.current) return
+    if (!window.confirm('重新生成后旧 Token 会立即失效，需要替换远程 Agent 配置并重启 Agent。是否继续？')) return
+    submitting.current = true; setBusy(true); setError('')
+    try {
+      const result = await api.rotateComputeToken(savedNode.id)
+      setSavedNode(result.node); setToken(result.token); setDownloaded(false); setNotice('新 Token 已生成，请下载配置。'); onSaved()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Token 生成失败') }
+    finally { submitting.current = false; setBusy(false) }
+  }
+
+  function configText() {
+    const url = new URL(center)
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('请输入有效的中心平台 HTTP(S) 地址')
+    if (!token || !savedNode) throw new Error('请先生成该服务器的 Agent Token')
+    return JSON.stringify({ center_url: center.trim().replace(/\/+$/, ''), node_id: savedNode.id, token,
+      report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi' }, null, 2)
+  }
+
+  function downloadConfig() {
+    try {
+      const url = URL.createObjectURL(new Blob([configText()], { type: 'application/json' }))
+      const link = document.createElement('a'); link.href = url; link.download = 'agent-config.json'; link.click()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+      setDownloaded(true); setError(''); setNotice('配置已下载，请妥善保存。')
+    } catch (reason) { setError(reason instanceof Error ? reason.message : '配置下载失败') }
+  }
+
+  async function copyConfig() {
+    try { await navigator.clipboard.writeText(configText()); setDownloaded(true); setError(''); setNotice('配置已复制。') }
+    catch (reason) { setError(reason instanceof Error ? reason.message : '复制失败，请使用下载配置') }
+  }
+
+  const update = <K extends keyof ComputeNodeSettings>(key: K, value: ComputeNodeSettings[K]) => setSettings((previous) => ({ ...previous, [key]: value }))
+
+  return <div className="modal-backdrop" onMouseDown={close}>
+    <div ref={dialog} className="modal compute-node-modal" role="dialog" aria-modal="true" aria-labelledby="compute-node-title" onKeyDown={handleKeys} onMouseDown={(event) => event.stopPropagation()}>
+      <header><h2 id="compute-node-title">{setup ? `接入服务器 · ${savedNode?.name || ''}` : node ? '编辑服务器' : '添加服务器'}</h2><button className="icon-button" disabled={busy} aria-label="关闭服务器窗口" onClick={close}><X size={18} /></button></header>
+      {setup ? <>
+        <div className="modal-body">
+          <p className="node-help">在对应服务器运行只读 Agent，即可显示算力数据。无需填写 SSH 用户或密码。</p>
+          <div className="form-grid"><label className="span-2">中心平台地址<input value={center} onChange={(event) => setCenter(event.target.value)} placeholder="http://中心服务器:18088" /></label></div>
+          <p className="node-help">请填写远程服务器能访问的地址。当前浏览器地址仅作为初始值。</p>
+          {token ? <div className="node-info">专属 Token 已生成，仅在本窗口提供。配置中包含 Token，请勿提交到 Git 或分享给他人。</div>
+            : <div className="node-info">已有 Token 不会再次显示。保留原 Agent 配置即可继续使用；丢失配置时，可重新生成。</div>}
+          <div className="agent-downloads"><a className="button" href="/api/compute/agent/download" download><Download size={15} />下载 Agent</a><button className="button primary" disabled={!token} onClick={downloadConfig}><Download size={15} />下载专属配置</button><button className="button" disabled={!token} onClick={() => void copyConfig()}><Copy size={15} />复制配置 JSON</button></div>
+          <ol className="agent-steps">
+            <li>把 <code>monitor_agent.py</code> 和 <code>agent-config.json</code> 放到远程服务器的同一目录。</li>
+            <li>验证权限和连通性，然后上报一次：<pre>chmod 600 agent-config.json{'\n'}python3 monitor_agent.py --config agent-config.json --once</pre></li>
+            <li>看到“采样上报成功”后，持续运行：<pre>python3 monitor_agent.py --config agent-config.json</pre></li>
+          </ol>
+          <p className="node-help">Agent 使用 Python 3.9+ 标准库，无需安装第三方依赖；GPU 指标由本机 nvidia-smi 提供。长期运行可按 Agent 文档配置 systemd 服务。</p>
+          <button className="button compact" disabled={busy} onClick={() => void rotate()}><RefreshCw size={14} />重新生成 Token</button>
+          {notice && <div className="node-info" role="status">{notice}</div>}
+          {error && <div className="alert error" role="alert">{error}</div>}
+        </div>
+        <footer><button className="button primary" disabled={busy} onClick={close}>完成</button></footer>
+      </> : <form onSubmit={save}>
+        <div className="modal-body">
+          <div className="form-grid">
+            <label className="span-2">服务器名称<input autoFocus required maxLength={160} value={settings.name} disabled={busy} onChange={(event) => update('name', event.target.value)} placeholder="例如：训练服务器-02" /></label>
+            <label className="span-2">地址 / IP（可选）<input maxLength={255} value={settings.address} disabled={busy} onChange={(event) => update('address', event.target.value)} placeholder="例如：10.180.0.123，仅用于识别服务器" /></label>
+            <label className="span-2">备注（可选）<input maxLength={1000} value={settings.notes} disabled={busy} onChange={(event) => update('notes', event.target.value)} placeholder="位置、用途或负责人" /></label>
+            {node?.kind !== 'local' && <><label>Agent 上报间隔<select value={settings.report_interval_seconds} disabled={busy} onChange={(event) => update('report_interval_seconds', Number(event.target.value))}>{[5, 10, 15, 30, 60, 120, 300].map((value) => <option key={value} value={value}>{value} 秒</option>)}</select></label><label className="check"><input type="checkbox" checked={settings.enabled} disabled={busy} onChange={(event) => update('enabled', event.target.checked)} />启用监控</label></>}
+          </div>
+          <p className="node-help">{node?.kind === 'local' ? '本机算力自动采集，可以修改显示名称、地址和备注。' : '保存后提供专属 Agent 和配置下载。服务器资料保存在中心数据库，刷新或换浏览器仍会保留。'}</p>
+          {error && <div className="alert error" role="alert">{error}</div>}
+        </div>
+        <footer><button type="button" className="button" disabled={busy} onClick={close}>取消</button><button type="submit" className="button primary" disabled={busy || !settings.name.trim()}>{busy && <LoaderCircle size={15} className="spin" />}{node ? '保存' : '保存并获取 Agent'}</button></footer>
+      </form>}
+    </div>
+  </div>
+}

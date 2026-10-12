@@ -143,6 +143,38 @@ export interface ComputeResources {
   gpus: GpuInfo[]
 }
 
+export interface ComputeNodeSettings {
+  name: string
+  address: string
+  notes: string
+  enabled: boolean
+  report_interval_seconds: number
+}
+
+export interface ComputeNode extends ComputeNodeSettings {
+  id: string
+  kind: 'local' | 'agent'
+  status: 'online' | 'offline' | 'pending' | 'disabled'
+  offline_after_seconds: number
+  last_seen_at: string | null
+  sampled_at: string | null
+  agent_version: string | null
+  hostname: string | null
+  summary: {
+    gpu_count: number
+    utilization: number | null
+    memory_used: number
+    memory_total: number
+    process_count: number
+  } | null
+  compute?: ComputeResources | null
+}
+
+export interface ComputeNodeCredential {
+  node: ComputeNode
+  token: string
+}
+
 export interface Resources {
   gpus: GpuInfo[]
   models: ResourceFile[]

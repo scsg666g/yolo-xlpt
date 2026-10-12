@@ -1,4 +1,4 @@
-import type { Artifact, ComputeResources, DatasetUploadResult, MetricPoint, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, MetricPoint, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -58,6 +58,12 @@ export const api = {
   runLogs: (id: string, runId: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`),
   resources: () => request<Resources>('/api/resources'),
   compute: () => request<ComputeResources>('/api/compute'),
+  computeNodes: (signal?: AbortSignal) => request<ComputeNode[]>('/api/compute/nodes', { signal }),
+  computeNode: (id: string, signal?: AbortSignal) => request<ComputeNode>(`/api/compute/nodes/${id}`, { signal }),
+  createComputeNode: (payload: ComputeNodeSettings) => request<ComputeNodeCredential>('/api/compute/nodes', { method: 'POST', body: JSON.stringify(payload) }),
+  updateComputeNode: (id: string, payload: ComputeNodeSettings) => request<ComputeNode>(`/api/compute/nodes/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  rotateComputeToken: (id: string) => request<ComputeNodeCredential>(`/api/compute/nodes/${id}/token`, { method: 'POST' }),
+  deleteComputeNode: (id: string) => request<void>(`/api/compute/nodes/${id}`, { method: 'DELETE' }),
   trainingParameters: () => request<{ source: string; parameters: TrainingParameterDefinition[] }>('/api/training-parameters'),
   importRuns: () => request<{ imported: number }>('/api/import', { method: 'POST' }),
 }

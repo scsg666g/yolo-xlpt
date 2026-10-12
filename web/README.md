@@ -4,13 +4,15 @@
 
 ## 功能
 
-- 训练任务创建、排队、启动、停止、克隆和历史任务导入
+- 训练任务创建、排队、启动、停止、断点续训、重新训练、克隆和历史任务导入
+- 一条任务保留多次独立训练运行，各自保存参数快照、指标、日志和权重
 - 每条训练任务对应一张 React Flow 无限画布
 - 实时训练进度、指标曲线、日志、GPU 设备和训练产物
 - GPU 独占调度，防止多个任务占用同一设备
 - 训练参数白名单和模型/数据集目录边界检查
 - 本地数据集文件夹上传、格式检查、自动生成配置和选中数据集
 - 服务重启后的任务中断识别
+- 按服务器折叠的算力监控，服务器搜索、编辑、独立 Token 与只读 Agent 接入
 
 ## 目录
 
@@ -18,24 +20,65 @@
 - `backend/`：FastAPI、SQLAlchemy 和训练调度器
 - `data/`：SQLite 数据库、日志和平台训练产物，不提交 Git
 - `deploy/`：systemd 服务模板
+- `agent/`：无第三方依赖的远程只读算力 Agent 和部署说明
+
+## 多服务器算力监控
+
+「算力资源」默认注册并展示本机。每台服务器是一组可折叠的资源面板：收起时显示名称、地址、状态和 GPU 摘要，展开后保留原有 GPU、显存、功耗、温度、时钟、进程及主机详情。
+
+### 添加与接入
+
+1. 点击“添加服务器”，填写名称、地址 / IP（可选）、备注（可选），选择上报间隔及是否启用监控。地址仅用于显示，不是 SSH 连接目标。
+2. 保存后确认“中心平台地址”可从远程服务器访问，下载 Agent 与专属配置。当前浏览器地址只是初始值，可按网络情况修改。
+3. 将两个下载文件放到远程服务器，执行 `chmod 600 agent-config.json`，再执行 `python3 monitor_agent.py --config agent-config.json --once` 验证。
+4. 验证成功后执行 `python3 monitor_agent.py --config agent-config.json` 持续上报，回到页面刷新并展开对应服务器。
+
+Agent 使用 Python 3.9+ 标准库，NVIDIA GPU 需要驱动和 `nvidia-smi`；不需要安装完整平台或提供 SSH 用户、密码。终端关闭后前台 Agent 会退出，长期运行可配置 systemd，详见 [Agent 部署说明](agent/README.md)。
+
+### 页面操作与状态
+
+搜索支持名称、地址、主机名和备注；支持按状态筛选、全部展开或折叠。页面默认每 5 秒刷新，可暂停自动刷新或立即刷新；远程指标的实际更新频率取决于 Agent 上报间隔。收起的远程服务器只读取摘要，详情在展开时加载。
+
+| 状态 | 含义 |
+| --- | --- |
+| 等待接入 | 尚未收到有效上报，或重新生成 Token 后等待新的 Agent 上报 |
+| 在线 | 已收到有效上报，采样未过期；没有 GPU 也可以在线 |
+| 离线 | 最近接收或采样时间超过 `max(30, 上报间隔 × 3)` 秒，下方显示最后一次数据并标记过期 |
+| 已禁用 | 中心拒绝该节点的上报，页面保留此前数据 |
+
+名称、地址、备注、启用状态、上报间隔和最近采样保存在中心数据库，刷新页面或换浏览器仍然保留。展开状态保存在当前浏览器，不跨浏览器同步。离线状态也会受远程服务器时钟偏差影响，建议保持系统时间同步。
+
+### 编辑、Token 与移除
+
+本机支持修改显示名称、地址和备注，不能禁用或移除。远程服务器还可以调整上报间隔、禁用监控、查看接入步骤、重新生成 Token 或移除。
+
+每个节点使用独立 Token，中心数据库只保存哈希，创建或重置后仅在当前接入窗口提供配置下载。配置丢失时需要重新生成 Token；旧 Token 立即失效，必须替换远程配置并重启 Agent。调整上报间隔后，Agent 在后续成功上报的响应中接收新间隔，通常无需重启。
+
+移除服务器会删除中心端该节点的资料和最近采样，并使 Token 失效；远程文件和训练进程不受影响。重新添加会生成新的节点和 Token。
+
+此功能仅监控算力，不控制远程训练，也未同步远程训练记录、日志或模型文件。远程 PID 不会根据同号 PID 匹配本机训练任务。后端重启时会自动创建独立的 `compute_nodes` 表，不改动原有训练表。
 
 ## 安装与运行
 
 ```bash
 cd /data/yolo-模型训练平台开发/yolo/web
-cp .env.example .env
+conda activate yolo
 
-/data/conda/envs/yolo/bin/python -m pip install -e './backend[dev]'
+python -m pip install -e './backend[dev]'
 
 cd frontend
-npm install
+npm ci
 npm run build
 
 cd ../backend
-/data/conda/envs/yolo/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 18088 --workers 1
+python -m uvicorn app.main:app --host 0.0.0.0 --port 18088 --workers 1
 ```
 
 打开 `http://服务器地址:18088`。API 文档位于 `/docs`。
+
+以上是当前开发服务器的路径，部署到其他服务器时应替换项目目录和 Python 环境。默认路径从源码目录推导，需要覆盖时参考 [环境变量示例](.env.example)。直接启动 Uvicorn 不会自动读取 `.env`；应显式导入环境变量，或使用 [systemd 模板](deploy/yolo-platform.service) 中的 `EnvironmentFile`。不要覆盖已有配置文件。
+
+已安装依赖、构建过前端时，只需进入 `web/backend/` 启动后端。前端修改后重新构建，后端修改后重启服务；出现端口占用时先确认原进程或 systemd 服务，避免重复启动。
 
 > 当前调度器运行在 API 进程内，因此 Uvicorn 必须保持 `--workers 1`。若以后部署多个 API 实例，应将调度器拆分为独立 Worker，并使用 PostgreSQL/Redis 做协调。
 
@@ -63,13 +106,39 @@ cd ../backend
 
 ## 训练目录
 
-新任务默认写入：
+一条训练任务对应多次运行，每次启动、续训或重新训练生成新的 `Attempt`。新运行默认写入：
 
 ```text
-web/data/runs/<task-type>/<task-id>/
+web/data/runs/<task-type>/<task-id>/attempt-001/
+web/data/runs/<task-type>/<task-id>/attempt-002/
 ```
 
-已有的 `ultralytics/runs/**/args.yaml` 会自动以只读方式导入。导入不会移动、删除或改写历史训练文件。
+各次运行的参数快照、`results.csv` 和权重分别保存；`weights/best.pt` 与 `weights/last.pt` 可从对应运行的训练产物中查看和下载。实际生成哪些产物由训练框架和保存参数决定。
+
+断点续训使用上一次运行的 `weights/last.pt`，需要任务处于已停止或已中断状态、检查点存在且目标轮数大于已完成轮数；从检查点保存的训练状态继续。重新训练则使用当前任务配置从头启动。
+
+已有的 `ultralytics/runs/**/args.yaml` 会自动导入。扫描导入本身不会移动、删除或改写原训练文件。移入回收站会保留记录和文件，刷新或重启后仍隐藏；恢复后重新显示。永久删除会清理数据库记录及允许目录内的对应训练结果、运行时配置和日志，包括该任务关联的历史训练产物，但不会删除作为训练输入的模型或数据集。
+
+### 日志和运行数据
+
+训练日志默认保存到 `web/data/log/`，当前开发服务器对应 `/data/yolo-模型训练平台开发/yolo/web/data/log/`。文件名格式为：
+
+```text
+YYYYMMDD_<task-id>_attempt-001.log
+YYYYMMDD_<task-id>_attempt-002.log
+```
+
+例如 `20261012_<task-id>_attempt-001.log`。日期前缀配合任务 ID 和运行编号，避免同一天多个任务覆盖日志。日志保存训练命令和训练进程输出；Uvicorn 访问日志仍由启动终端或 systemd journal 收集，不自动写入此目录。
+
+| 内容 | 默认位置 |
+| --- | --- |
+| 数据库、服务器资料及最近算力采样 | `web/data/platform.db` |
+| 每次训练产物 | `web/data/runs/<task-type>/<task-id>/attempt-NNN/` |
+| 每次训练的运行时配置 | `web/data/task_runtime/<task-id>/attempt-NNN/` |
+| 训练日志 | `web/data/log/YYYYMMDD_<task-id>_attempt-NNN.log` |
+| 上传数据集及生成的 YAML | `数据集/<原文件夹名>/data.yaml` |
+
+运行数据根目录可通过 `PLATFORM_DATA_ROOT` 调整，也可以单独设置 `PLATFORM_RUNS_ROOT`、`PLATFORM_RUNTIME_ROOT` 和 `PLATFORM_LOG_ROOT`；数据库可通过 `DATABASE_URL` 指定。迁移时需一起保留数据库和相关文件，并核对绝对路径。服务器列表和采样会随数据库迁移，远程 Agent 的中心地址需另行更新。
 
 ## 安全边界
 
@@ -78,3 +147,5 @@ web/data/runs/<task-type>/<task-id>/
 - 训练命令使用参数数组执行，不调用 Shell。
 - 产物下载必须位于对应任务的训练目录内。
 - 面向非受信网络部署前，应在 Nginx 或统一网关增加身份认证和 HTTPS。
+- 当前管理页面和 API 没有内置登录认证；Agent Token 只验证对应节点的上报，不能替代管理入口的访问认证。
+- Agent 配置包含专属 Token，应设置权限为 `600`，不提交到 Git；Agent 不跟随 HTTP 重定向，HTTPS 默认验证证书。

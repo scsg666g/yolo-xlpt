@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
+from .compute_nodes import ensure_local_node, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
@@ -67,6 +68,8 @@ RESERVED_CUSTOM_KEYS = {
 async def lifespan(_: FastAPI):
     migrate_database()
     Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        ensure_local_node(db)
     import_existing_runs()
     backfill_training_runs()
     migrate_training_logs()
@@ -77,6 +80,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="YOLO 模型训练平台", version="0.1.0", lifespan=lifespan)
 app.include_router(dataset_upload_router)
+app.include_router(compute_nodes_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
