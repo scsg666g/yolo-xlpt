@@ -10,7 +10,8 @@ import app.services as services_module
 from app.database import Base
 from app.database import get_db
 from app.main import app
-from app.models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask
+from app.models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from app.schemas import TaskRead
 from app.services import (
     TrainingScheduler,
     backfill_training_runs,
@@ -45,6 +46,80 @@ def make_task(task_id: str = "task-test", **values):
     )
     defaults.update(values)
     return TrainingTask(**defaults)
+
+
+def test_rename_task_preserves_training_state(tmp_path: Path):
+    session = make_session(tmp_path)
+    task = make_task(
+        "task-rename", name="火", config={"lr0": 0.001, "_resume_checkpoint": "last.pt"},
+        run_dir="existing-run", log_path="existing.log", completed_epochs=20,
+        latest_metrics={"metrics/mAP50(B)": 0.6508},
+    )
+    run = TrainingRun(
+        id="rename-run", task=task, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path=task.model_path, data_path=task.data_path,
+        parameter_snapshot={"epochs": 100, "name": "火"},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        for status in ("draft", "running", "completed"):
+            task.status = status
+            session.commit()
+            session.refresh(task)
+            before = TaskRead.model_validate(task).model_dump(mode="json")
+            response = client.patch(f"/api/tasks/{task.id}/name", json={"name": f"  火焰训练 {status}  "})
+            assert response.status_code == 200, response.text
+            after = response.json()
+            assert after["name"] == f"火焰训练 {status}"
+            assert {k: v for k, v in after.items() if k not in {"name", "updated_at"}} == {
+                k: v for k, v in before.items() if k not in {"name", "updated_at"}
+            }
+            session.expire_all()
+            assert session.get(TrainingTask, task.id).name == after["name"]
+            assert run.parameter_snapshot == {"epochs": 100, "name": "火"}
+        events = session.scalars(select(TaskEvent).where(TaskEvent.task_id == task.id)).all()
+        assert len(events) == 3
+        assert events[0].payload == {"old_name": "火", "new_name": "火焰训练 draft"}
+        # Saving the current name does not add another rename event.
+        assert client.patch(f"/api/tasks/{task.id}/name", json={"name": task.name}).status_code == 200
+        assert len(session.scalars(select(TaskEvent).where(TaskEvent.task_id == task.id)).all()) == 3
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
+
+
+def test_rename_rejects_invalid_names_and_missing_tasks(tmp_path: Path):
+    session = make_session(tmp_path)
+    task = make_task("task-invalid-rename", name="火")
+    session.add(task)
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        for payload in ({"name": ""}, {"name": " \t\n "}, {"name": "火" * 161},
+                        {"name": None}, {"name": 123}, {"name": "新名称", "epochs": 1}):
+            assert client.patch(f"/api/tasks/{task.id}/name", json=payload).status_code == 422
+        assert task.name == "火"
+        assert client.patch("/api/tasks/missing/name", json={"name": "新名称"}).status_code == 404
+        task.deleted_at = utcnow()
+        session.commit()
+        assert client.patch(f"/api/tasks/{task.id}/name", json={"name": "新名称"}).status_code == 404
+        assert session.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id)) is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
 
 
 def test_path_is_within(tmp_path: Path):

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompareArrows, GripVertical, MoreHorizontal, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
+import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompareArrows, GripVertical, MoreHorizontal, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import type { TrainingTask } from '../types'
 import { CreateTaskModal } from './CreateTaskModal'
+import { RenameTaskModal } from './RenameTaskModal'
 
 const statusIcon = (status: string) => status === 'completed' ? <CheckCircle2 size={15} /> : status === 'failed' || status === 'interrupted' ? <AlertTriangle size={15} /> : status === 'running' ? <Zap size={15} /> : <Clock3 size={15} />
 
@@ -15,6 +16,7 @@ export function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<TrainingTask | null>(null)
+  const [renameTarget, setRenameTarget] = useState<TrainingTask | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
@@ -168,7 +170,7 @@ export function Dashboard() {
       {loading ? <div className="empty">正在加载任务…</div> : filtered.length === 0 ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>创建任务后，每一次训练都会拥有独立画布。</span></div> :
         <div className="task-grid">{filtered.map((task) => <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
           <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整顺序" aria-label="按住拖动调整顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span><button className="icon-button" onClick={(event) => event.stopPropagation()}><MoreHorizontal size={18} /></button></div>
-          <h3>{task.name}</h3><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
+          <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
           <div className="progress-heading"><span>Epoch {task.completed_epochs} / {task.epochs}</span><strong>{Math.round(task.progress)}%</strong></div>
           <div className="progress"><i style={{ width: `${task.progress}%` }} /></div>
           <div className="metric-strip"><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>GPU {task.device}</strong></div></div>
@@ -185,6 +187,7 @@ export function Dashboard() {
         </article>)}</div>}
     </section>
     {ordering && <div className="order-saving" role="status"><RefreshCw size={13} className="spin" />正在保存任务顺序…</div>}
+    {renameTarget && <RenameTaskModal task={renameTarget} onClose={() => setRenameTarget(null)} onSaved={(updated) => { setTasks((current) => current.map((task) => task.id === updated.id ? { ...task, name: updated.name } : task)); setRenameTarget(null) }} />}
     {deleteTarget && <div className="modal-backdrop delete-choice-backdrop" onMouseDown={() => !deleting && setDeleteTarget(null)}>
       <div className="modal delete-choice-modal" onMouseDown={(event) => event.stopPropagation()}>
         <header><div><span className="eyebrow">DELETE TRAINING TASK</span><h2>删除训练任务</h2><p>{deleteTarget.name}</p></div><button type="button" className="icon-button" disabled={deleting} onClick={() => setDeleteTarget(null)}>×</button></header>

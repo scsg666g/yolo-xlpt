@@ -45,6 +45,17 @@ class TaskOrderUpdate(BaseModel):
     task_ids: list[str] = Field(min_length=1)
 
 
+class TaskRename(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=160, strict=True)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
 class TaskConfigUpdate(BaseModel):
     epochs: int = Field(ge=1, le=10000)
     batch: int = Field(ge=1, le=1024)

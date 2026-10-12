@@ -20,7 +20,7 @@ from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .parameter_catalog import load_parameter_catalog
-from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskResourceUpdate
+from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
     add_event,
     backfill_training_runs,
@@ -317,6 +317,21 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(clone)
     return clone
+
+
+@app.patch("/api/tasks/{task_id}/name", response_model=TaskRead)
+def rename_task(task_id: str, payload: TaskRename, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    if task.name != payload.name:
+        old_name = task.name
+        task.name = payload.name
+        add_event(
+            db, task.id, "renamed", f"任务已重命名：{old_name} → {task.name}",
+            payload={"old_name": old_name, "new_name": task.name},
+        )
+        db.commit()
+        db.refresh(task)
+    return task
 
 
 @app.post("/api/tasks/{task_id}/trash", status_code=204)

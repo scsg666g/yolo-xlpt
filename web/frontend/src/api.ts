@@ -36,6 +36,7 @@ export const api = {
   retry: (id: string) => request<TrainingTask>(`/api/tasks/${id}/retry`, { method: 'POST' }),
   stop: (id: string) => request<TrainingTask>(`/api/tasks/${id}/stop`, { method: 'POST' }),
   clone: (id: string) => request<TrainingTask>(`/api/tasks/${id}/clone`, { method: 'POST' }),
+  rename: (id: string, name: string) => request<TrainingTask>(`/api/tasks/${id}/name`, { method: 'PATCH', body: JSON.stringify({ name }) }),
   remove: (id: string) => request<void>(`/api/tasks/${id}/trash`, { method: 'POST' }),
   restore: (id: string) => request<TrainingTask>(`/api/tasks/${id}/restore`, { method: 'POST' }),
   permanentRemove: (id: string) => request<void>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }),
