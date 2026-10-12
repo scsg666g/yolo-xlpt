@@ -177,3 +177,11 @@ export interface TaskCreatePayload {
   close_mosaic: number
   advanced: Record<string, unknown>
 }
+
+export interface TrainingParameterDefinition {
+  key: string
+  label: string
+  type: 'number' | 'boolean' | 'text'
+  default: string | number | boolean | null
+  section: string
+}

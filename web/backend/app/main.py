@@ -19,6 +19,7 @@ from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .parameter_catalog import load_parameter_catalog
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskResourceUpdate
 from .services import (
     add_event,
@@ -29,6 +30,7 @@ from .services import (
     discover_files,
     gpu_inventory,
     import_existing_runs,
+    migrate_training_logs,
     path_is_within,
     permanently_delete_task_files,
     resume_checkpoint,
@@ -49,6 +51,12 @@ EDITABLE_TRAINING_KEYS = {
     "warmup_momentum", "warmup_bias_lr", "cls_pw", "pose", "kobj", "rle", "angle", "dlog", "dgrad",
     "dlam", "nbs", "bgr", "cutmix", "copy_paste_mode", "auto_augment", "erasing",
 }
+
+
+def editable_training_keys() -> set[str]:
+    return set(load_parameter_catalog()) or EDITABLE_TRAINING_KEYS
+
+
 RESERVED_CUSTOM_KEYS = {
     "model", "data", "project", "name", "device", "epochs", "batch", "imgsz", "workers", "optimizer",
     "task", "mode", "exist_ok", "save_dir", "resume", "source",
@@ -61,6 +69,7 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
     import_existing_runs()
     backfill_training_runs()
+    migrate_training_logs()
     scheduler.start()
     yield
     scheduler.stop()
@@ -110,6 +119,15 @@ def compute_resources():
     return compute_inventory()
 
 
+@app.get("/api/training-parameters")
+def training_parameters():
+    catalog = load_parameter_catalog()
+    return {
+        "source": "default.yaml" if catalog else "fallback",
+        "parameters": list(catalog.values()),
+    }
+
+
 @app.get("/api/tasks", response_model=list[TaskRead])
 def list_tasks(status: str | None = Query(default=None), include_deleted: bool = Query(default=False), db: Session = Depends(get_db)):
     query = select(TrainingTask).order_by(TrainingTask.display_order, TrainingTask.created_at.desc(), TrainingTask.id)
@@ -148,7 +166,8 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
         raise HTTPException(422, str(exc)) from exc
     task_id = uuid.uuid4().hex[:16]
     config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
-    config.update({key: value for key, value in payload.advanced.items() if key in EDITABLE_TRAINING_KEYS})
+    supported_keys = editable_training_keys()
+    config.update({key: value for key, value in payload.advanced.items() if key in supported_keys})
     task = TrainingTask(
         id=task_id,
         name=payload.name.strip(),
@@ -324,7 +343,8 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     task = get_task_or_404(db, task_id)
     if task.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "任务正在运行或排队，不能修改训练参数")
-    unknown = set(payload.config) - EDITABLE_TRAINING_KEYS
+    supported_keys = editable_training_keys()
+    unknown = set(payload.config) - supported_keys
     if unknown:
         raise HTTPException(422, f"包含不支持的参数：{', '.join(sorted(unknown))}")
     if len(payload.custom_config) > 30:
@@ -332,7 +352,7 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     for key, value in payload.custom_config.items():
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key):
             raise HTTPException(422, f"自定义参数名不合法：{key}")
-        if key in RESERVED_CUSTOM_KEYS or key in EDITABLE_TRAINING_KEYS:
+        if key in RESERVED_CUSTOM_KEYS or key in supported_keys:
             raise HTTPException(422, f"参数 {key} 由平台或预设参数管理，不能自定义覆盖")
         if not isinstance(value, (str, int, float, bool)) or isinstance(value, str) and len(value) > 500:
             raise HTTPException(422, f"自定义参数 {key} 的值必须是布尔、数字或短文本")
@@ -342,7 +362,7 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     task.device = payload.device
     task.workers = payload.workers
     task.optimizer = payload.optimizer
-    preserved = {key: value for key, value in (task.config or {}).items() if key not in EDITABLE_TRAINING_KEYS and key != "custom_args"}
+    preserved = {key: value for key, value in (task.config or {}).items() if key not in supported_keys and key != "custom_args"}
     task.config = {**preserved, **payload.config, "custom_args": payload.custom_config}
     add_event(db, task.id, "config_updated", "训练参数已更新", payload=payload.model_dump())
     db.commit()

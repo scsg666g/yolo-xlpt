@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Plus, Search, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { api } from '../api'
-import type { TrainingTask } from '../types'
+import type { TrainingParameterDefinition, TrainingTask } from '../types'
 
 interface Props {
   task: TrainingTask | null
@@ -12,6 +12,7 @@ interface Props {
 
 type ExtraValue = string | number | boolean
 type ImportValue = ExtraValue
+type ParameterDefinition = { label: string; type: 'number' | 'boolean' | 'text'; default?: ExtraValue; step?: number }
 
 export interface DetectedParameter {
   key: string
@@ -37,7 +38,7 @@ export interface ImportAnalysis {
   diagnostics: ImportDiagnostic[]
 }
 
-const extraDefinitions: Record<string, { label: string; type: 'number' | 'boolean' | 'text'; default: ExtraValue; step?: number }> = {
+const extraDefinitions: Record<string, ParameterDefinition & { default: ExtraValue }> = {
   weight_decay: { label: '权重衰减', type: 'number', default: 0.0005, step: 0.0001 },
   momentum: { label: '动量', type: 'number', default: 0.937, step: 0.001 },
   warmup_epochs: { label: '预热轮数', type: 'number', default: 3, step: 0.1 },
@@ -101,12 +102,26 @@ const extraDefinitions: Record<string, { label: string; type: 'number' | 'boolea
   erasing: { label: '随机擦除概率（分类）', type: 'number', default: 0.4, step: 0.05 },
 }
 
-export const importDefinitions: Record<string, { label: string; type: DetectedParameter['type'] }> = {
+const baseDefinitions: Record<string, ParameterDefinition> = {
   epochs: { label: '训练轮数', type: 'number' }, batch: { label: 'Batch 大小', type: 'number' }, imgsz: { label: '输入尺寸', type: 'number' },
   device: { label: 'GPU 设备', type: 'text' }, workers: { label: '数据线程', type: 'number' }, optimizer: { label: '优化器', type: 'text' },
   patience: { label: '早停耐心值', type: 'number' }, lr0: { label: '初始学习率', type: 'number' }, close_mosaic: { label: '关闭 Mosaic 轮数', type: 'number' },
   pretrained: { label: '预训练权重', type: 'boolean' }, cache: { label: '缓存数据', type: 'boolean' }, amp: { label: 'AMP', type: 'boolean' },
-  ...Object.fromEntries(Object.entries(extraDefinitions).map(([key, definition]) => [key, { label: definition.label, type: definition.type }])),
+}
+
+const baseParameterKeys = new Set(Object.keys(baseDefinitions))
+
+export const importDefinitions: Record<string, ParameterDefinition> = { ...baseDefinitions, ...extraDefinitions }
+
+export function definitionsFromCatalog(parameters: TrainingParameterDefinition[]): Record<string, ParameterDefinition> {
+  return {
+    ...baseDefinitions,
+    ...Object.fromEntries(parameters.map((item) => [item.key, {
+      label: item.label,
+      type: item.type,
+      default: item.default == null ? item.type === 'boolean' ? false : item.type === 'number' ? 0 : '' : item.default,
+    }])),
+  }
 }
 
 const contextDefinitions: Record<string, { label: string; message: string }> = {
@@ -182,13 +197,13 @@ function editDistance(left: string, right: string): number {
   return row[right.length]
 }
 
-function closestSupportedKey(key: string): string | undefined {
-  const matches = Object.keys(importDefinitions).map((candidate) => ({ candidate, distance: editDistance(key, candidate) })).sort((left, right) => left.distance - right.distance)
+function closestSupportedKey(key: string, definitions: Record<string, ParameterDefinition>): string | undefined {
+  const matches = Object.keys(definitions).map((candidate) => ({ candidate, distance: editDistance(key, candidate) })).sort((left, right) => left.distance - right.distance)
   const closest = matches[0]
   return closest && closest.distance <= Math.max(2, Math.floor(key.length * .25)) ? closest.candidate : undefined
 }
 
-export function analyzeImportedParameters(text: string): ImportAnalysis {
+export function analyzeImportedParameters(text: string, definitions: Record<string, ParameterDefinition> = importDefinitions): ImportAnalysis {
   const cleaned = stripImportComments(text)
   const pattern = /(?:^|[\s,{(])['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?\s*(?:=|:)\s*("[^"]*"|'[^']*'|\[[^\]]*\]|[^,\s})]+)/gim
   const candidates = new Map<string, Array<{ rawValue: string; line: number }>>()
@@ -207,7 +222,7 @@ export function analyzeImportedParameters(text: string): ImportAnalysis {
   for (const [key, entries] of candidates) {
     const effective = entries.at(-1)!
     const duplicateMessage = entries.length > 1 ? `；出现 ${entries.length} 次，采用最后一次（第 ${effective.line} 行）` : ''
-    const definition = importDefinitions[key]
+    const definition = definitions[key]
     if (definition) {
       const value = parseImportValue(effective.rawValue, definition.type)
       if (value == null) {
@@ -227,7 +242,7 @@ export function analyzeImportedParameters(text: string): ImportAnalysis {
       diagnostics.push({ key, label: '已废弃参数', rawValue: effective.rawValue, line: effective.line, occurrences: entries.length, status: 'deprecated', message: `${deprecatedDefinitions[key]}${duplicateMessage}` })
       continue
     }
-    const suggestion = closestSupportedKey(key)
+    const suggestion = closestSupportedKey(key, definitions)
     diagnostics.push({ key, label: '未知参数', rawValue: effective.rawValue, line: effective.line, occurrences: entries.length, status: 'unknown', message: `${suggestion ? `平台不支持该参数，是否想输入 ${suggestion}？` : '平台当前不支持该参数，请确认名称和当前 YOLO 版本'}${duplicateMessage}` })
   }
   return { parameters, diagnostics }
@@ -288,6 +303,7 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   const [expanded, setExpanded] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [catalogDefinitions, setCatalogDefinitions] = useState<Record<string, ParameterDefinition> | null>(null)
   const latestTask = useRef(task)
   latestTask.current = task
 
@@ -307,12 +323,36 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
     setError('')
   }, [task?.id, open])
 
-  const availableKeys = useMemo(() => Object.keys(extraDefinitions).filter((key) => !(key in extras)), [extras])
+  useEffect(() => {
+    if (!open) return
+    let active = true
+    api.trainingParameters().then((result) => {
+      if (!active) return
+      if (!result.parameters.length) { setCatalogDefinitions(null); return }
+      const definitions = definitionsFromCatalog(result.parameters)
+      setCatalogDefinitions(definitions)
+      const currentTask = latestTask.current
+      if (currentTask) {
+        setExtras((current) => ({
+          ...Object.fromEntries(Object.keys(definitions).filter((key) => !baseParameterKeys.has(key) && currentTask.config[key] != null).map((key) => [key, currentTask.config[key] as ExtraValue])),
+          ...current,
+        }))
+      }
+    }).catch(() => {
+      if (active) setCatalogDefinitions(null)
+    })
+    return () => { active = false }
+  }, [open])
+
+  const activeDefinitions = catalogDefinitions || importDefinitions
+  const activeExtraDefinitions = useMemo(() => Object.fromEntries(Object.entries(activeDefinitions).filter(([key]) => !baseParameterKeys.has(key))), [activeDefinitions])
+
+  const availableKeys = useMemo(() => Object.keys(activeExtraDefinitions).filter((key) => !(key in extras)), [activeExtraDefinitions, extras])
   const filteredAvailableKeys = useMemo(() => {
     const keyword = parameterSearch.trim().toLowerCase()
     if (!keyword) return availableKeys
-    return availableKeys.filter((key) => `${extraDefinitions[key].label} ${key}`.toLowerCase().includes(keyword))
-  }, [availableKeys, parameterSearch])
+    return availableKeys.filter((key) => `${activeExtraDefinitions[key].label} ${key}`.toLowerCase().includes(keyword))
+  }, [activeExtraDefinitions, availableKeys, parameterSearch])
   const jsonParameters = useMemo(() => {
     const parameters: Record<string, ExtraValue> = {
       task: task?.task_type || 'detect', mode: 'train', model: task?.model_path || '', data: task?.data_path || '',
@@ -333,12 +373,15 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
 
   function addExtra() {
     if (!newKey) return
-    setExtras((current) => ({ ...current, [newKey]: extraDefinitions[newKey].default }))
+    const definition = activeExtraDefinitions[newKey]
+    if (!definition) return
+    setExtras((current) => ({ ...current, [newKey]: definition.default ?? (definition.type === 'boolean' ? false : definition.type === 'number' ? 0 : '') }))
     setNewKey(''); setParameterSearch(''); setParameterPickerOpen(false)
   }
 
   function updateExtra(key: string, raw: string | boolean) {
-    const definition = extraDefinitions[key]
+    const definition = activeExtraDefinitions[key]
+    if (!definition) return
     const value = definition.type === 'number' ? Number(raw) : raw
     setExtras((current) => ({ ...current, [key]: value }))
   }
@@ -382,14 +425,14 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   }
 
   function changeImportText(text: string) {
-    const analysis = analyzeImportedParameters(text)
+    const analysis = analyzeImportedParameters(text, activeDefinitions)
     setImportText(text); setDetectedParameters(analysis.parameters); setImportDiagnostics(analysis.diagnostics); setSelectedImportKeys(analysis.parameters.map((item) => item.key))
   }
 
   function applyImportedParameters() {
     const selected = detectedParameters.filter((item) => selectedImportKeys.includes(item.key))
-    const importedExtras = selected.filter((item) => item.key in extraDefinitions)
-    const importedBase = selected.filter((item) => !(item.key in extraDefinitions))
+    const importedBase = selected.filter((item) => baseParameterKeys.has(item.key))
+    const importedExtras = selected.filter((item) => !baseParameterKeys.has(item.key))
     if (importedBase.length) setForm((current) => ({ ...current, ...Object.fromEntries(importedBase.map((item) => [item.key, item.value])) }))
     if (importedExtras.length) setExtras((current) => ({ ...current, ...Object.fromEntries(importedExtras.map((item) => [item.key, item.value])) }))
     setImportOpen(false)
@@ -436,13 +479,13 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
         </div>
         <div className="parameter-toolbar"><button type="button" className="advanced-toggle parameter-toggle" onClick={() => setExpanded((value) => !value)}><ChevronDown size={16} className={expanded ? 'rotated' : ''} />高级参数 <em>{Object.keys(extras).length} 项</em></button><button type="button" className="json-preview-button" onClick={() => { setJsonCopied(false); setJsonOpen(true) }}><Code2 size={14} />查看 JSON</button><button type="button" className="batch-import-button" onClick={openImport}><Braces size={14} />批量导入参数</button></div>
         {expanded && <div className="extra-parameters">
-          {Object.entries(extras).map(([key, value]) => { const definition = extraDefinitions[key]; return <div className="extra-row" key={key}><div><span>{definition.label}</span><code>{key}</code></div>{definition.type === 'boolean' ? <select value={String(value)} onChange={(e) => updateExtra(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={definition.type} step={definition.step} value={String(value)} onChange={(e) => updateExtra(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setExtras((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div> })}
+          {Object.entries(extras).map(([key, value]) => { const definition = activeExtraDefinitions[key] || { label: key, type: typeof value === 'boolean' ? 'boolean' as const : typeof value === 'number' ? 'number' as const : 'text' as const }; return <div className="extra-row" key={key}><div><span>{definition.label}</span><code>{key}</code></div>{definition.type === 'boolean' ? <select value={String(value)} onChange={(e) => updateExtra(key, e.target.value === 'true')}><option value="true">开启</option><option value="false">关闭</option></select> : <input type={definition.type} step={definition.step} value={String(value)} onChange={(e) => updateExtra(key, e.target.value)} />}<button type="button" title="删除参数" onClick={() => setExtras((current) => { const next = { ...current }; delete next[key]; return next })}><Trash2 size={15} /></button></div> })}
           <div className="add-parameter">
             <div className="parameter-picker">
-              <button type="button" className={parameterPickerOpen ? 'open' : ''} onClick={() => setParameterPickerOpen((value) => !value)}><span>{newKey ? <><strong>{extraDefinitions[newKey].label}</strong><code>{newKey}</code></> : '选择要添加的训练参数'}</span><ChevronDown size={15} /></button>
+              <button type="button" className={parameterPickerOpen ? 'open' : ''} onClick={() => setParameterPickerOpen((value) => !value)}><span>{newKey && activeExtraDefinitions[newKey] ? <><strong>{activeExtraDefinitions[newKey].label}</strong><code>{newKey}</code></> : '选择要添加的训练参数'}</span><ChevronDown size={15} /></button>
               {parameterPickerOpen && <div className="parameter-picker-menu">
                 <label><Search size={14} /><input autoFocus value={parameterSearch} onChange={(event) => setParameterSearch(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && filteredAvailableKeys[0]) { event.preventDefault(); setNewKey(filteredAvailableKeys[0]); setParameterPickerOpen(false); setParameterSearch('') } }} placeholder="搜索中文名称或参数名，例如 freeze" /></label>
-                <div>{filteredAvailableKeys.map((key) => <button type="button" key={key} onClick={() => { setNewKey(key); setParameterPickerOpen(false); setParameterSearch('') }}><span><strong>{extraDefinitions[key].label}</strong><code>{key}</code></span>{newKey === key && <Check size={14} />}</button>)}{!filteredAvailableKeys.length && <p>没有找到匹配的参数</p>}</div>
+                <div>{filteredAvailableKeys.map((key) => <button type="button" key={key} onClick={() => { setNewKey(key); setParameterPickerOpen(false); setParameterSearch('') }}><span><strong>{activeExtraDefinitions[key].label}</strong><code>{key}</code></span>{newKey === key && <Check size={14} />}</button>)}{!filteredAvailableKeys.length && <p>没有找到匹配的参数</p>}</div>
               </div>}
             </div>
             <button type="button" className="button ghost" disabled={!newKey} onClick={addExtra}><Plus size={15} />添加参数</button>

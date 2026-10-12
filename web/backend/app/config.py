@@ -13,10 +13,11 @@ TRAINING_MKL_THREADING_LAYER = os.getenv("PLATFORM_MKL_THREADING_LAYER", "GNU")
 DATA_ROOT = Path(os.getenv("PLATFORM_DATA_ROOT", str(WEB_ROOT / "data"))).resolve()
 RUNS_ROOT = Path(os.getenv("PLATFORM_RUNS_ROOT", str(DATA_ROOT / "runs"))).resolve()
 RUNTIME_ROOT = Path(os.getenv("PLATFORM_RUNTIME_ROOT", str(DATA_ROOT / "task_runtime"))).resolve()
+LOG_ROOT = Path(os.getenv("PLATFORM_LOG_ROOT", str(DATA_ROOT / "log"))).resolve()
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_ROOT / 'platform.db'}")
 
 MODEL_ROOTS = [PROJECT_ROOT / "models", PROJECT_ROOT / "pt", ULTRALYTICS_ROOT / "weights"]
 DATASET_ROOTS = [PROJECT_ROOT / "数据集", ULTRALYTICS_ROOT / "xl"]
 
-for directory in (DATA_ROOT, RUNS_ROOT, RUNTIME_ROOT):
+for directory in (DATA_ROOT, RUNS_ROOT, RUNTIME_ROOT, LOG_ROOT):
     directory.mkdir(parents=True, exist_ok=True)

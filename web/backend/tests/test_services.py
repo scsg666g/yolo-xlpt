@@ -16,6 +16,7 @@ from app.services import (
     backfill_training_runs,
     create_training_run,
     failure_detail,
+    migrate_training_logs,
     mirror_run_to_task,
     path_is_within,
     permanently_delete_task_files,
@@ -134,6 +135,8 @@ def test_attempt_numbering_and_task_mirror(tmp_path: Path, monkeypatch):
     session = make_session(tmp_path)
     monkeypatch.setattr("app.services.RUNS_ROOT", tmp_path / "runs")
     monkeypatch.setattr("app.services.RUNTIME_ROOT", tmp_path / "runtime")
+    log_root = tmp_path / "log"
+    monkeypatch.setattr("app.services.LOG_ROOT", log_root)
     task = make_task("task-numbering", epochs=20, batch=4)
     session.add(task)
     session.commit()
@@ -144,11 +147,59 @@ def test_attempt_numbering_and_task_mirror(tmp_path: Path, monkeypatch):
 
     assert (first.attempt_number, second.attempt_number) == (1, 2)
     assert second.run_dir.endswith("detect/task-numbering/attempt-002")
-    assert second.log_path.endswith("task-numbering/attempt-002/platform.log")
+    assert Path(first.log_path).parent == log_root
+    assert Path(second.log_path).parent == log_root
+    assert Path(first.log_path).name.endswith("_task-numbering_attempt-001.log")
+    assert Path(second.log_path).name.endswith("_task-numbering_attempt-002.log")
+    assert len(Path(second.log_path).name.split("_", 1)[0]) == 8
+    assert Path(second.log_path).name.split("_", 1)[0].isdigit()
     assert task.current_run_id == second.id
     assert task.status == "queued"
     assert second.parameter_snapshot["batch"] == 4
     session.close()
+
+
+def test_migrate_training_logs_moves_only_inactive_runs(tmp_path: Path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'logs.db'}")
+    Base.metadata.create_all(engine)
+    local_session = sessionmaker(bind=engine, expire_on_commit=False)
+    old_root = tmp_path / "runtime"
+    log_root = tmp_path / "log"
+    old_root.mkdir()
+    completed_log = old_root / "completed.log"
+    running_log = old_root / "running.log"
+    completed_log.write_text("completed output", encoding="utf-8")
+    running_log.write_text("running output", encoding="utf-8")
+    with local_session() as session:
+        completed_task = make_task("task-completed", status="completed", log_path=str(completed_log))
+        running_task = make_task("task-running", status="running", log_path=str(running_log))
+        completed_run = TrainingRun(
+            id="run-completed", task=completed_task, attempt_number=1, launch_mode="fresh", status="completed",
+            model_path="model.pt", data_path="data.yaml", log_path=str(completed_log), parameter_snapshot={},
+        )
+        running_run = TrainingRun(
+            id="run-running", task=running_task, attempt_number=1, launch_mode="fresh", status="running",
+            model_path="model.pt", data_path="data.yaml", log_path=str(running_log), parameter_snapshot={},
+        )
+        completed_task.current_run_id = completed_run.id
+        running_task.current_run_id = running_run.id
+        session.add_all([completed_task, running_task, completed_run, running_run])
+        session.commit()
+    monkeypatch.setattr(services_module, "SessionLocal", local_session)
+    monkeypatch.setattr(services_module, "LOG_ROOT", log_root)
+
+    assert migrate_training_logs() == 1
+
+    with local_session() as session:
+        completed_run = session.get(TrainingRun, "run-completed")
+        running_run = session.get(TrainingRun, "run-running")
+        destination = Path(completed_run.log_path)
+        assert destination.parent == log_root
+        assert destination.name.endswith("_task-completed_attempt-001.log")
+        assert destination.read_text(encoding="utf-8") == "completed output"
+        assert not completed_log.exists()
+        assert running_run.log_path == str(running_log)
+        assert running_log.exists()
 
 
 def test_same_epoch_is_stored_for_each_run(tmp_path: Path):
@@ -270,18 +321,23 @@ def test_historical_run_api_returns_selected_attempt(tmp_path: Path):
 def test_permanent_delete_removes_only_run_and_runtime_directories(tmp_path: Path, monkeypatch):
     runs_root = tmp_path / "runs"
     runtime_root = tmp_path / "runtime"
+    log_root = tmp_path / "log"
     run_dir = runs_root / "detect" / "task-files" / "attempt-001"
     run_dir.mkdir(parents=True)
     (run_dir / "weights").mkdir()
     (run_dir / "weights" / "best.pt").write_bytes(b"weights")
     (runtime_root / "task-files" / "attempt-001").mkdir(parents=True)
     (runtime_root / "task-files" / "attempt-001" / "platform.log").write_text("log", encoding="utf-8")
+    log_root.mkdir()
+    log_file = log_root / "20261010_task-files_attempt-001.log"
+    log_file.write_text("training log", encoding="utf-8")
     monkeypatch.setattr(services_module, "RUNS_ROOT", runs_root)
     monkeypatch.setattr(services_module, "RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(services_module, "LOG_ROOT", log_root)
     task = make_task("task-files", run_dir=str(run_dir))
     task.runs = [TrainingRun(
         id="run-files", task_id=task.id, attempt_number=1, launch_mode="fresh", status="completed",
-        model_path="/models/base.pt", data_path="/datasets/data.yaml", run_dir=str(run_dir),
+        model_path="/models/base.pt", data_path="/datasets/data.yaml", run_dir=str(run_dir), log_path=str(log_file),
         parameter_snapshot={},
     )]
 
@@ -290,6 +346,7 @@ def test_permanent_delete_removes_only_run_and_runtime_directories(tmp_path: Pat
     assert str(run_dir.resolve()) in deleted
     assert not run_dir.exists()
     assert not (runtime_root / "task-files").exists()
+    assert not log_file.exists()
 
 
 def test_permanent_delete_rejects_outside_run_directory(tmp_path: Path, monkeypatch):

@@ -3,7 +3,7 @@ import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Upload, X }
 import { api } from '../api'
 import type { DatasetUploadResult, Resources, TaskCreatePayload, TrainingTask } from '../types'
 import { UploadDatasetModal } from './UploadDatasetModal'
-import { analyzeImportedParameters, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
+import { analyzeImportedParameters, definitionsFromCatalog, importDefinitions, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
 
 interface Props {
   open: boolean
@@ -32,6 +32,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
   const [detectedParameters, setDetectedParameters] = useState<DetectedParameter[]>([])
   const [importDiagnostics, setImportDiagnostics] = useState<ImportDiagnostic[]>([])
   const [selectedImportKeys, setSelectedImportKeys] = useState<string[]>([])
+  const [parameterDefinitions, setParameterDefinitions] = useState(importDefinitions)
 
   useEffect(() => {
     if (!open) return
@@ -44,6 +45,17 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
         device: data.gpus.length > 1 ? data.gpus.map((gpu) => gpu.index).join(',') : String(data.gpus[0]?.index ?? 'cpu'),
       }))
     }).catch((reason) => setError(reason.message))
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    let active = true
+    api.trainingParameters().then((result) => {
+      if (active) setParameterDefinitions(result.parameters.length ? definitionsFromCatalog(result.parameters) : importDefinitions)
+    }).catch(() => {
+      if (active) setParameterDefinitions(importDefinitions)
+    })
+    return () => { active = false }
   }, [open])
 
   if (!open) return null
@@ -59,7 +71,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
 
   function openImport() { setImportText(''); setDetectedParameters([]); setImportDiagnostics([]); setSelectedImportKeys([]); setImportOpen(true) }
   function changeImportText(value: string) {
-    const analysis = analyzeImportedParameters(value)
+    const analysis = analyzeImportedParameters(value, parameterDefinitions)
     setImportText(value); setDetectedParameters(analysis.parameters); setImportDiagnostics(analysis.diagnostics); setSelectedImportKeys(analysis.parameters.map((item) => item.key))
   }
   function applyImportedParameters() {

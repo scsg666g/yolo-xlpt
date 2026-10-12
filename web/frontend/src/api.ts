@@ -1,4 +1,4 @@
-import type { Artifact, ComputeResources, DatasetUploadResult, MetricPoint, Resources, TaskCreatePayload, TaskEvent, TrainingRun, TrainingTask } from './types'
+import type { Artifact, ComputeResources, DatasetUploadResult, MetricPoint, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -57,6 +57,7 @@ export const api = {
   runLogs: (id: string, runId: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`),
   resources: () => request<Resources>('/api/resources'),
   compute: () => request<ComputeResources>('/api/compute'),
+  trainingParameters: () => request<{ source: string; parameters: TrainingParameterDefinition[] }>('/api/training-parameters'),
   importRuns: () => request<{ imported: number }>('/api/import', { method: 'POST' }),
 }
 

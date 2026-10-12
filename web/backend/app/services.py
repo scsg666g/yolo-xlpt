@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import (
     DATASET_ROOTS,
+    LOG_ROOT,
     MODEL_ROOTS,
     NVIDIA_SMI_BIN,
     RUNTIME_ROOT,
@@ -33,6 +34,7 @@ from .config import (
 )
 from .database import SessionLocal
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .parameter_catalog import training_parameter_keys
 
 
 TRAINING_KEYS = {
@@ -45,6 +47,12 @@ TRAINING_KEYS = {
     "warmup_momentum", "warmup_bias_lr", "cls_pw", "pose", "kobj", "rle", "angle", "dlog", "dgrad",
     "dlam", "nbs", "bgr", "cutmix", "copy_paste_mode", "auto_augment", "erasing",
 }
+
+
+def supported_training_keys() -> set[str]:
+    """Use the installed Ultralytics config, retaining a safe fallback."""
+    return training_parameter_keys() or TRAINING_KEYS
+
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -105,6 +113,12 @@ def mirror_run_to_task(task: TrainingTask, run: TrainingRun) -> None:
     task.finished_at = run.finished_at
 
 
+def log_path_for_run(task_id: str, attempt_number: int, when: datetime | None = None) -> Path:
+    """Return a collision-resistant log name with a YYYYMMDD date prefix."""
+    date_stamp = (when or datetime.now()).strftime("%Y%m%d")
+    return LOG_ROOT / f"{date_stamp}_{task_id}_attempt-{attempt_number:03d}.log"
+
+
 def current_run(db, task: TrainingTask) -> TrainingRun | None:
     if task.current_run_id:
         run = db.get(TrainingRun, task.current_run_id)
@@ -131,7 +145,7 @@ def create_training_run(
         data_path=task.data_path,
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
         run_dir=str(RUNS_ROOT / task.task_type / task.id / attempt_name),
-        log_path=str(RUNTIME_ROOT / task.id / attempt_name / "platform.log"),
+        log_path=str(log_path_for_run(task.id, attempt)),
         completed_epochs=task.completed_epochs if launch_mode == "resume" else 0,
         progress=task.progress if launch_mode == "resume" else 0.0,
         latest_metrics=dict(task.latest_metrics or {}) if launch_mode == "resume" else {},
@@ -194,6 +208,31 @@ def backfill_training_runs() -> int:
     return created
 
 
+def migrate_training_logs() -> int:
+    """Move inactive legacy run logs into LOG_ROOT and update stored paths."""
+    migrated = 0
+    active_statuses = {"queued", "starting", "running", "stopping"}
+    with SessionLocal() as db:
+        runs = db.scalars(select(TrainingRun).order_by(TrainingRun.task_id, TrainingRun.attempt_number)).all()
+        for run in runs:
+            if not run.log_path or run.status in active_statuses:
+                continue
+            source = Path(run.log_path).expanduser().resolve()
+            if path_is_within(source, [LOG_ROOT]) or not source.is_file():
+                continue
+            destination = log_path_for_run(run.task_id, run.attempt_number, run.started_at or run.created_at).resolve()
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if not destination.exists():
+                source.replace(destination)
+            run.log_path = str(destination)
+            task = db.get(TrainingTask, run.task_id)
+            if task and task.current_run_id == run.id:
+                task.log_path = run.log_path
+            migrated += 1
+        db.commit()
+    return migrated
+
+
 def path_is_within(path: Path, roots: list[Path]) -> bool:
     resolved = path.expanduser().resolve()
     return any(resolved == root.resolve() or root.resolve() in resolved.parents for root in roots)
@@ -216,11 +255,14 @@ def _safe_delete_directory(path: Path, roots: list[Path]) -> None:
 def permanently_delete_task_files(task: TrainingTask) -> list[str]:
     """Remove only task-owned run/runtime directories; model and dataset paths are never targets."""
     run_dirs = {Path(run.run_dir) for run in task.runs if run.run_dir}
+    log_files = {Path(run.log_path) for run in task.runs if run.log_path}
     if task.run_dir:
         run_dirs.add(Path(task.run_dir))
+    if task.log_path:
+        log_files.add(Path(task.log_path))
     runtime_dir = RUNTIME_ROOT / task.id
-    deletion_roots = [RUNS_ROOT, ULTRALYTICS_ROOT / "runs", RUNTIME_ROOT]
-    targets = sorted(run_dirs | {runtime_dir}, key=lambda path: len(str(path)), reverse=True)
+    deletion_roots = [RUNS_ROOT, ULTRALYTICS_ROOT / "runs", RUNTIME_ROOT, LOG_ROOT]
+    targets = sorted(run_dirs | log_files | {runtime_dir}, key=lambda path: len(str(path)), reverse=True)
     for target in targets:
         candidate = target.expanduser().resolve()
         allowed = [root.expanduser().resolve() for root in deletion_roots]
@@ -660,8 +702,9 @@ class TrainingScheduler:
         ]
         if run.checkpoint_path:
             command.extend([f"resume={run.checkpoint_path}", f"save_dir={run.run_dir}"])
+        supported_keys = supported_training_keys()
         for key, value in config.items():
-            if key in TRAINING_KEYS and value is not None:
+            if key in supported_keys and value is not None:
                 command.append(f"{key}={value}")
         for key, value in (config.get("custom_args") or {}).items():
             command.append(f"{key}={value}")
@@ -669,9 +712,10 @@ class TrainingScheduler:
 
     def _launch(self, db, task: TrainingTask, run: TrainingRun) -> None:
         run_dir = Path(run.run_dir or RUNS_ROOT / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
-        runtime_dir = Path(run.log_path).parent if run.log_path else RUNTIME_ROOT / task.id / f"attempt-{run.attempt_number:03d}"
+        runtime_dir = RUNTIME_ROOT / task.id / f"attempt-{run.attempt_number:03d}"
         runtime_dir.mkdir(parents=True, exist_ok=True)
-        log_path = runtime_dir / "platform.log"
+        log_path = Path(run.log_path) if run.log_path else log_path_for_run(task.id, run.attempt_number)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             dataset_path = prepare_dataset_config(run.data_path, runtime_dir / "dataset.yaml")
         except (OSError, ValueError, yaml.YAMLError) as exc:
