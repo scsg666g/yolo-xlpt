@@ -14,6 +14,7 @@ export function Dashboard() {
   const [filter, setFilter] = useState('all')
   const [creating, setCreating] = useState(false)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<TrainingTask | null>(null)
   const [renameTarget, setRenameTarget] = useState<TrainingTask | null>(null)
@@ -25,17 +26,61 @@ export function Dashboard() {
   const [ordering, setOrdering] = useState(false)
   const dragMoved = useRef(false)
   const orderRequest = useRef(false)
+  const taskRequest = useRef<{ controller: AbortController; timer: number } | null>(null)
+  const taskDataVersion = useRef(0)
   const navigate = useNavigate()
 
   const refresh = useCallback(async () => {
-    try { setTasks(await api.tasks()); setError('') } catch (reason) { setError(reason instanceof Error ? reason.message : '加载失败') } finally { setLoading(false) }
+    if (taskRequest.current) {
+      window.clearTimeout(taskRequest.current.timer)
+      taskRequest.current.controller.abort()
+    }
+    const controller = new AbortController()
+    const dataVersion = taskDataVersion.current
+    let timedOut = false
+    const request = {
+      controller,
+      timer: window.setTimeout(() => { timedOut = true; controller.abort() }, 15_000),
+    }
+    taskRequest.current = request
+    setLoadError('')
+    if (dataVersion === 0) setLoading(true)
+    try {
+      const incoming = await api.tasks(controller.signal)
+      if (taskRequest.current !== request) return
+      // A newer stream update must not be replaced by an older HTTP response.
+      if (taskDataVersion.current === dataVersion) {
+        taskDataVersion.current += 1
+        setTasks(incoming)
+      }
+      setLoadError('')
+      setError('')
+    } catch (reason) {
+      if (taskRequest.current !== request || taskDataVersion.current !== dataVersion) return
+      setLoadError(timedOut ? '任务加载超时，请检查网络后重试' : reason instanceof Error ? reason.message : '任务加载失败，请重试')
+    } finally {
+      window.clearTimeout(request.timer)
+      if (taskRequest.current === request) {
+        taskRequest.current = null
+        setLoading(false)
+      }
+    }
   }, [])
 
   useEffect(() => {
     refresh()
     const source = new EventSource('/api/stream')
     source.addEventListener('tasks', (event) => {
-      const incoming = JSON.parse((event as MessageEvent).data) as TrainingTask[]
+      let incoming: TrainingTask[]
+      try {
+        incoming = JSON.parse((event as MessageEvent).data) as TrainingTask[]
+        if (!Array.isArray(incoming)) return
+      } catch {
+        return
+      }
+      taskDataVersion.current += 1
+      setLoading(false)
+      setLoadError('')
       setTasks((current) => {
         if (!current.length) return incoming
         if (orderRequest.current) return current
@@ -49,7 +94,14 @@ export function Dashboard() {
       })
     })
     source.onerror = () => undefined
-    return () => source.close()
+    return () => {
+      source.close()
+      if (taskRequest.current) {
+        window.clearTimeout(taskRequest.current.timer)
+        taskRequest.current.controller.abort()
+        taskRequest.current = null
+      }
+    }
   }, [refresh])
 
   const filtered = useMemo(() => tasks.filter((task) => {
@@ -167,7 +219,8 @@ export function Dashboard() {
         <div className="toolbar-actions"><div className="search"><Search size={16} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索任务或模型" /></div><select value={filter} onChange={(e) => setFilter(e.target.value)}><option value="all">全部状态</option><option value="active">进行中</option><option value="completed">已完成</option><option value="interrupted">已中断</option><option value="failed">失败</option><option value="draft">草稿</option></select></div>
       </div>
       {error && <div className="alert error">{error}</div>}
-      {loading ? <div className="empty">正在加载任务…</div> : filtered.length === 0 ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>创建任务后，每一次训练都会拥有独立画布。</span></div> :
+      {loadError && <div className="alert error" role="alert">{loadError}<button type="button" className="button ghost compact" onClick={() => void refresh()}>重新加载</button></div>}
+      {loading ? <div className="empty">正在加载任务…</div> : loadError && !tasks.length ? <div className="empty">暂时无法获取任务列表，请重新加载。</div> : filtered.length === 0 ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>创建任务后，每一次训练都会拥有独立画布。</span></div> :
         <div className="task-grid">{filtered.map((task) => <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
           <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整顺序" aria-label="按住拖动调整顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span><button className="icon-button" onClick={(event) => event.stopPropagation()}><MoreHorizontal size={18} /></button></div>
           <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>

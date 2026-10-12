@@ -26,7 +26,7 @@ export const api = {
   completeDatasetUpload: (id: string, names: string[], signal: AbortSignal) =>
     request<DatasetUploadResult>(`/api/datasets/uploads/${id}/complete`, { method: 'POST', body: JSON.stringify({ names }), signal }),
   cancelDatasetUpload: (id: string) => request<void>(`/api/datasets/uploads/${id}`, { method: 'DELETE' }),
-  tasks: () => request<TrainingTask[]>('/api/tasks'),
+  tasks: (signal?: AbortSignal) => request<TrainingTask[]>('/api/tasks', { signal }),
   reorderTasks: (task_ids: string[]) => request<void>('/api/tasks/order', { method: 'PATCH', body: JSON.stringify({ task_ids }) }),
   deletedTasks: () => request<TrainingTask[]>('/api/tasks?include_deleted=true').then((tasks) => tasks.filter((task) => task.deleted_at)),
   task: (id: string) => request<TrainingTask>(`/api/tasks/${id}`),
