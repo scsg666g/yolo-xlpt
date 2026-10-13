@@ -424,3 +424,134 @@ button { color: inherit; }
 .weight-mini-card > .artifact-download-control { margin-left: auto; }
 .weight-mini-card .artifact-download-control a, .weight-mini-card .artifact-download-control button { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; padding: 5px; border: 1px solid #31445b; border-radius: 8px; color: #9cbcff; background: transparent; cursor: pointer; }
 .weight-mini-card .artifact-download-control button:disabled { cursor: wait; }
+
+/* Theme-matched mouse and keyboard interaction feedback. */
+.theme-picker button,
+.sidebar nav a,
+.icon-text,
+.button,
+.icon-button,
+.search,
+.toolbar-actions select,
+.task-card footer button {
+  transition: color .18s ease, background-color .18s ease, border-color .18s ease,
+    box-shadow .18s ease, transform .18s ease;
+}
+
+.theme-picker button:hover {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 32%, transparent);
+  background: color-mix(in srgb, var(--green) 9%, transparent);
+  transform: translateY(-1px);
+}
+.theme-picker button:active { transform: translateY(0) scale(.97); }
+.theme-picker button.active:hover {
+  border-color: color-mix(in srgb, var(--green) 58%, transparent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 9%, transparent);
+}
+
+.sidebar nav a:hover {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+  transform: translateX(3px);
+}
+.sidebar nav a:active { transform: translateX(1px) scale(.985); }
+.sidebar nav a.active:hover {
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+  box-shadow: inset 3px 0 var(--green);
+}
+.icon-text:hover {
+  color: var(--green);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--green) 8%, transparent);
+  transform: translateX(2px);
+}
+.icon-text:active { transform: translateX(0) scale(.98); }
+
+.button:hover {
+  border-color: color-mix(in srgb, var(--green) 46%, #3c4c59);
+  box-shadow: 0 6px 16px rgba(21, 154, 120, .12);
+}
+.button:active { transform: translateY(0) scale(.97); box-shadow: none; }
+.button.primary:hover {
+  border-color: color-mix(in srgb, var(--green) 82%, white);
+  background: color-mix(in srgb, var(--green) 88%, white);
+  box-shadow: 0 8px 20px color-mix(in srgb, var(--green) 24%, transparent);
+}
+.button.danger:hover { border-color: #d36d74; background: #432329; box-shadow: 0 6px 16px rgba(165,71,78,.14); }
+
+.search:hover { border-color: color-mix(in srgb, var(--green) 38%, var(--line)); }
+.search:focus-within {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 72%, var(--line));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 12%, transparent);
+}
+.toolbar-actions select:hover {
+  color: var(--green);
+  border-color: color-mix(in srgb, var(--green) 46%, #263541);
+  cursor: pointer;
+}
+.toolbar-actions select:focus-visible {
+  border-color: color-mix(in srgb, var(--green) 72%, #263541);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 12%, transparent);
+  outline: none;
+}
+
+.icon-button:hover,
+.task-card footer button:hover {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+  transform: translateY(-1px);
+}
+.icon-button:active,
+.task-card footer button:active { transform: translateY(0) scale(.9); }
+.theme-picker button:focus-visible,
+.sidebar nav a:focus-visible,
+.icon-text:focus-visible,
+.button:focus-visible,
+.icon-button:focus-visible,
+.task-card footer button:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--green) 78%, white);
+  outline-offset: 2px;
+}
+
+:root[data-theme='light'] .theme-picker button:hover,
+:root[data-theme='light'] .sidebar nav a:hover,
+:root[data-theme='light'] .icon-text:hover,
+:root[data-theme='light'] .icon-button:hover,
+:root[data-theme='light'] .task-card footer button:hover {
+  color: #087e61;
+  background: rgba(21, 154, 120, .08);
+}
+:root[data-theme='light'] .sidebar nav a.active:hover { background: #d9f1e9; }
+:root[data-theme='light'] .button:hover { border-color: #80bca9; background: #f5fbf9; }
+:root[data-theme='light'] .button.primary:hover { color: #fff; border-color: #087e61; background: #087e61; box-shadow: 0 8px 20px rgba(8,126,97,.2); }
+:root[data-theme='light'] .button.danger:hover { color: #a53f47; border-color: #d7a4a8; background: #fff3f4; }
+:root[data-theme='light'] .search:hover,
+:root[data-theme='light'] .toolbar-actions select:hover { border-color: #80bca9; }
+:root[data-theme='light'] .search:focus-within,
+:root[data-theme='light'] .toolbar-actions select:focus-visible { border-color: #159a78; box-shadow: 0 0 0 3px rgba(21,154,120,.12); }
+
+:root[data-theme='dark'] .theme-picker button:hover,
+:root[data-theme='dark'] .sidebar nav a:hover,
+:root[data-theme='dark'] .icon-text:hover,
+:root[data-theme='dark'] .icon-button:hover,
+:root[data-theme='dark'] .task-card footer button:hover {
+  color: #8cebc5;
+  background: rgba(118, 233, 186, .09);
+}
+:root[data-theme='dark'] .sidebar nav a.active:hover { color: #90f2ca; background: #21453b; }
+:root[data-theme='dark'] .button:hover { color: #e8eff4; border-color: #5d8276; background: #22342f; }
+:root[data-theme='dark'] .button.primary:hover { color: #0b1b16; border-color: #9af2cf; background: #8cebc5; box-shadow: 0 8px 20px rgba(118,233,186,.16); }
+:root[data-theme='dark'] .button.danger:hover { color: #ffc3c5; border-color: #b96168; background: #43242a; }
+:root[data-theme='dark'] .search:hover,
+:root[data-theme='dark'] .toolbar-actions select:hover { color: #8cebc5; border-color: #557c70; }
+:root[data-theme='dark'] .search:focus-within,
+:root[data-theme='dark'] .toolbar-actions select:focus-visible { color: #8cebc5; border-color: #76e9ba; box-shadow: 0 0 0 3px rgba(118,233,186,.11); }
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-picker button, .sidebar nav a, .icon-text, .button, .icon-button,
+  .search, .toolbar-actions select, .task-card footer button { transition: none; }
+  .theme-picker button:hover, .sidebar nav a:hover, .icon-text:hover, .button:hover,
+  .icon-button:hover, .task-card footer button:hover { transform: none; }
+}
