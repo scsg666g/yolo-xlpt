@@ -3,7 +3,11 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
+import os
+import platform
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -146,16 +150,48 @@ class RemoteRunUpdate(BaseModel):
 
 
 _local_lock = threading.Lock()
-_local_cache: dict = {}
+_logger = logging.getLogger("yolo-platform.compute")
+_local_cache: dict = {
+    "available": False,
+    "provider": None,
+    "message": "本机算力信息正在采样",
+    "sampled_at": utcnow().isoformat(),
+    "host": {
+        "hostname": socket.gethostname(),
+        "platform": platform.platform(),
+        "cpu_count": os.cpu_count(),
+        "load_average": [],
+        "memory_total": None,
+        "memory_used": None,
+    },
+    "gpus": [],
+}
 _local_sampled = 0.0
+_local_refreshing = False
+
+
+def _refresh_local_snapshot() -> None:
+    global _local_cache, _local_sampled, _local_refreshing
+    try:
+        snapshot = compute_inventory()
+    except Exception:
+        _logger.exception("local_compute_sampling_failed")
+        snapshot = {**_local_cache, "sampled_at": utcnow().isoformat(),
+                    "message": "本机算力信息采集失败，请稍后刷新"}
+    with _local_lock:
+        _local_cache = snapshot
+        _local_sampled = time.monotonic()
+        _local_refreshing = False
 
 
 def local_snapshot() -> dict:
-    global _local_cache, _local_sampled
+    global _local_refreshing
     with _local_lock:
-        if not _local_cache or time.monotonic() - _local_sampled >= 5:
-            _local_cache = compute_inventory()
-            _local_sampled = time.monotonic()
+        if not _local_refreshing and time.monotonic() - _local_sampled >= 5:
+            # nvidia-smi may block for several seconds. Serve the last sample now
+            # and refresh in the background so monitoring never holds an API worker.
+            _local_refreshing = True
+            threading.Thread(target=_refresh_local_snapshot, name="local-compute-sampler", daemon=True).start()
         return _local_cache
 
 

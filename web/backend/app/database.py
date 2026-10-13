@@ -4,7 +4,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -15,8 +15,24 @@ class Base(DeclarativeBase):
     pass
 
 
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+is_sqlite = DATABASE_URL.startswith("sqlite")
+connect_args = {"check_same_thread": False, "timeout": 5.0} if is_sqlite else {}
 engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
+
+
+def configure_sqlite_connection(connection, _record=None) -> None:
+    """Enable concurrent readers and a bounded wait for SQLite writers."""
+    cursor = connection.cursor()
+    cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
+
+if is_sqlite:
+    event.listen(engine, "connect", configure_sqlite_connection)
+
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 

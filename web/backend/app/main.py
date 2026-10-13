@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import mimetypes
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,17 +18,17 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
-from .compute_nodes import ensure_local_node, router as compute_nodes_router
+from .compute_nodes import ensure_local_node, local_snapshot, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .local_deletions import local_deletion_worker, queue_local_delete
 from .parameter_catalog import load_parameter_catalog
 from .remote_operations import matching_fetch, operation_file, queue_delete, queue_scan, router as remote_operations_router
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
     add_event,
     backfill_training_runs,
-    compute_inventory,
     create_training_run,
     current_run,
     discover_files,
@@ -35,14 +37,16 @@ from .services import (
     migrate_training_logs,
     mirror_run_to_task,
     path_is_within,
-    permanently_delete_task_files,
     resume_checkpoint,
     scheduler,
-    sync_artifacts,
     sync_metrics,
     validate_dataset_config,
     validate_input_path,
 )
+
+logger = logging.getLogger("yolo-platform.requests")
+_task_snapshot = ""
+_task_stream_subscribers: set[asyncio.Queue[str]] = set()
 
 EDITABLE_TRAINING_KEYS = {
     "patience", "lr0", "pretrained", "cache", "amp", "close_mosaic", "cos_lr", "weight_decay",
@@ -68,6 +72,7 @@ RESERVED_CUSTOM_KEYS = {
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _task_snapshot
     migrate_database()
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
@@ -76,8 +81,19 @@ async def lifespan(_: FastAPI):
     backfill_training_runs()
     migrate_training_logs()
     scheduler.start()
-    yield
-    scheduler.stop()
+    local_deletion_worker.start()
+    _task_snapshot = await asyncio.to_thread(load_task_snapshot)
+    snapshot_task = asyncio.create_task(task_snapshot_pump(), name="task-snapshot-pump")
+    try:
+        yield
+    finally:
+        snapshot_task.cancel()
+        try:
+            await snapshot_task
+        except asyncio.CancelledError:
+            pass
+        local_deletion_worker.stop()
+        scheduler.stop()
 
 
 app = FastAPI(title="YOLO 模型训练平台", version="0.1.0", lifespan=lifespan)
@@ -91,6 +107,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_slow_requests(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        return await call_next(request)
+    finally:
+        elapsed = time.perf_counter() - started
+        if elapsed >= 1.0 and request.url.path.startswith("/api/"):
+            logger.warning("slow_request method=%s path=%s duration_ms=%.1f", request.method,
+                           request.url.path, elapsed * 1000)
 
 
 def get_task_or_404(db: Session, task_id: str, *, include_deleted: bool = False) -> TrainingTask:
@@ -109,7 +137,16 @@ def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "scheduler": "running", "runs_root": str(RUNS_ROOT)}
+    started = time.perf_counter()
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1").scalar_one()
+    except Exception as exc:
+        logger.warning("health_database_error error=%s", type(exc).__name__)
+        raise HTTPException(503, "数据库暂不可用") from exc
+    return {"status": "ok", "scheduler": "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped",
+            "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
+            "runs_root": str(RUNS_ROOT)}
 
 
 @app.get("/api/resources")
@@ -123,7 +160,7 @@ def resources():
 
 @app.get("/api/compute")
 def compute_resources():
-    return compute_inventory()
+    return local_snapshot()
 
 
 @app.get("/api/training-parameters")
@@ -145,12 +182,9 @@ def list_tasks(status: str | None = Query(default=None), include_deleted: bool =
         query = query.where(TrainingTask.deleted_at.is_(None))
     if status:
         query = query.where(TrainingTask.status == status)
-    tasks = db.scalars(query).all()
-    for task in tasks:
-        if not task.deleted_at and task.status not in {"running", "starting"}:
-            sync_metrics(db, task)
-    db.commit()
-    return tasks
+    # Listing tasks must stay a pure read: disk scans and metric writes belong in
+    # the scheduler/sync worker, never in the request serving the dashboard.
+    return db.scalars(query).all()
 
 
 @app.patch("/api/tasks/order", status_code=204)
@@ -418,6 +452,10 @@ def restore_task(task_id: str, db: Session = Depends(get_db)):
         raise HTTPException(409, "远程文件清理已提交，不能恢复；请等待 Agent 返回结果")
     if task.deleted_reason == "remote_delete_failed":
         raise HTTPException(409, "远程清理可能已删除部分文件，请重试清理；该任务不能恢复")
+    if task.deleted_reason == "local_delete_pending":
+        raise HTTPException(409, "本机文件清理已提交，不能恢复；请等待清理结果")
+    if task.deleted_reason == "local_delete_failed":
+        raise HTTPException(409, "本机文件可能已部分清理，请重试清理；该任务不能恢复")
     task.deleted_at = None
     task.deleted_reason = None
     add_event(db, task.id, "restored", "任务已从回收站恢复")
@@ -426,7 +464,7 @@ def restore_task(task_id: str, db: Session = Depends(get_db)):
     return task
 
 
-@app.delete("/api/tasks/{task_id}/permanent", status_code=204)
+@app.delete("/api/tasks/{task_id}/permanent", status_code=202)
 def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id, include_deleted=True)
     if task.status in {"queued", "starting", "running", "stopping"}:
@@ -435,12 +473,9 @@ def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
         queue_delete(db, task)
         db.commit()
         return JSONResponse(status_code=202, content={"status": "pending", "message": "等待远程 Agent 清理文件；确认后删除任务记录"})
-    try:
-        permanently_delete_task_files(task)
-    except (OSError, ValueError) as exc:
-        raise HTTPException(409, f"训练文件未删除，已保留数据库记录：{exc}") from exc
-    db.delete(task)
+    queue_local_delete(db, task)
     db.commit()
+    return JSONResponse(status_code=202, content={"status": "pending", "message": "已提交本机文件清理；可在回收站查看进度"})
 
 
 @app.patch("/api/tasks/{task_id}/layout", response_model=TaskRead)
@@ -529,8 +564,6 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
 def task_metrics(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     run = current_run(db, task)
-    sync_metrics(db, task, run)
-    db.commit()
     if not run:
         return []
     return db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id).order_by(MetricPoint.epoch)).all()
@@ -542,9 +575,9 @@ def task_artifacts(task_id: str, db: Session = Depends(get_db)):
     run = current_run(db, task)
     if not run:
         return []
-    sync_artifacts(db, task, run)
-    queue_scan(db, task, run)
-    db.commit()
+    if run.execution_node_id:
+        queue_scan(db, task, run)
+        db.commit()
     return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
 
 
@@ -584,8 +617,6 @@ def task_run(task_id: str, run_id: str, db: Session = Depends(get_db)):
 def run_metrics(task_id: str, run_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     run = get_run_or_404(db, task_id, run_id)
-    sync_metrics(db, task, run)
-    db.commit()
     return db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id).order_by(MetricPoint.epoch)).all()
 
 
@@ -593,9 +624,9 @@ def run_metrics(task_id: str, run_id: str, db: Session = Depends(get_db)):
 def run_artifacts(task_id: str, run_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     run = get_run_or_404(db, task_id, run_id)
-    sync_artifacts(db, task, run)
-    queue_scan(db, task, run)
-    db.commit()
+    if run.execution_node_id:
+        queue_scan(db, task, run)
+        db.commit()
     return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
 
 
@@ -644,17 +675,72 @@ def import_runs():
     return {"imported": import_existing_runs()}
 
 
+def load_task_snapshot() -> str:
+    with SessionLocal() as db:
+        tasks = db.scalars(select(TrainingTask).where(TrainingTask.deleted_at.is_(None)).order_by(
+            TrainingTask.display_order, TrainingTask.created_at.desc(), TrainingTask.id
+        )).all()
+        payload = [TaskRead.model_validate(task).model_dump(mode="json") for task in tasks]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+async def task_snapshot_pump() -> None:
+    """Read task state once per interval and broadcast only changed snapshots."""
+    global _task_snapshot
+    while True:
+        try:
+            # There is no reason to poll SQLite while nobody has an open stream.
+            # A new stream performs one fresh read below before subscribing.
+            if not _task_stream_subscribers:
+                await asyncio.sleep(5)
+                continue
+            snapshot = await asyncio.to_thread(load_task_snapshot)
+            if snapshot != _task_snapshot:
+                _task_snapshot = snapshot
+                for subscriber in tuple(_task_stream_subscribers):
+                    if subscriber.full():
+                        try:
+                            subscriber.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                    try:
+                        subscriber.put_nowait(snapshot)
+                    except asyncio.QueueFull:
+                        pass
+        except Exception:
+            logger.exception("task_snapshot_refresh_failed")
+        await asyncio.sleep(2)
+
+
 @app.get("/api/stream")
 async def stream():
     async def events():
-        while True:
-            with SessionLocal() as db:
-                tasks = db.scalars(select(TrainingTask).where(TrainingTask.deleted_at.is_(None)).order_by(TrainingTask.display_order, TrainingTask.created_at.desc(), TrainingTask.id)).all()
-                payload = [TaskRead.model_validate(task).model_dump(mode="json") for task in tasks]
-            yield f"event: tasks\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(2)
+        subscriber: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
+        _task_stream_subscribers.add(subscriber)
+        last_sent = ""
+        try:
+            # Always load once on connect so a stream opened after an idle period
+            # cannot receive a stale in-memory snapshot.
+            snapshot = await asyncio.to_thread(load_task_snapshot)
+            global _task_snapshot
+            _task_snapshot = snapshot
+            last_sent = snapshot
+            yield f"event: tasks\ndata: {snapshot}\n\n"
+            while True:
+                try:
+                    snapshot = await asyncio.wait_for(subscriber.get(), timeout=15)
+                except TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if snapshot != last_sent:
+                    last_sent = snapshot
+                    yield f"event: tasks\ndata: {snapshot}\n\n"
+        finally:
+            _task_stream_subscribers.discard(subscriber)
 
-    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return StreamingResponse(events(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+    })
 
 
 frontend_dist = WEB_ROOT / "frontend" / "dist"

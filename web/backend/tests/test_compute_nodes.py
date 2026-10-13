@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import os
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -53,6 +55,37 @@ def create(client, name="Remote"):
 
 def headers(credential):
     return {"Authorization": "Bearer " + credential["token"]}
+
+
+def test_local_compute_sampling_does_not_block_api_caller(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+    expected = sample()["compute"]
+    expected["sampled_at"] = utcnow().isoformat()
+
+    def slow_sample():
+        started.set()
+        release.wait(timeout=2)
+        return expected
+
+    monkeypatch.setattr(monitoring, "compute_inventory", slow_sample)
+    monkeypatch.setattr(monitoring, "_local_cache", {"available": False, "gpus": [], "host": {},
+                                                       "sampled_at": utcnow().isoformat()})
+    monkeypatch.setattr(monitoring, "_local_sampled", 0.0)
+    monkeypatch.setattr(monitoring, "_local_refreshing", False)
+    try:
+        started_at = time.monotonic()
+        cached = monitoring.local_snapshot()
+        assert time.monotonic() - started_at < 0.2
+        assert cached["available"] is False
+        assert started.wait(timeout=1)
+        release.set()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and monitoring.local_snapshot() is not expected:
+            time.sleep(0.01)
+        assert monitoring.local_snapshot() == expected
+    finally:
+        release.set()
 
 
 def test_node_credentials_isolation_and_persistence(monitoring_client):

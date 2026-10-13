@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 
 import yaml
 from fastapi.testclient import TestClient
@@ -7,9 +8,11 @@ from sqlalchemy.orm import sessionmaker
 
 import app.database as database_module
 import app.services as services_module
-from app.database import Base
+from app.database import Base, configure_sqlite_connection
 from app.database import get_db
 from app.main import app
+import app.main as main_module
+from app.local_deletions import LocalDeletionWorker
 from app.models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.schemas import TaskRead
 from app.services import (
@@ -46,6 +49,18 @@ def make_task(task_id: str = "task-test", **values):
     )
     defaults.update(values)
     return TrainingTask(**defaults)
+
+
+def test_sqlite_connection_uses_wal_and_bounded_busy_timeout(tmp_path: Path):
+    connection = sqlite3.connect(tmp_path / "sqlite-pragmas.db")
+    try:
+        configure_sqlite_connection(connection)
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert connection.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+    finally:
+        connection.close()
 
 
 def test_rename_task_preserves_training_state(tmp_path: Path):
@@ -464,6 +479,73 @@ def test_soft_delete_filters_task_list_and_restore(tmp_path: Path):
         session.close()
 
 
+def test_task_listing_does_not_scan_or_write_metrics(tmp_path: Path, monkeypatch):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "runs" / "attempt-001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "results.csv").write_text("epoch,time,metrics/mAP50(B)\n1,2,0.5\n", encoding="utf-8")
+    task = make_task("task-read-only", status="completed", run_dir=str(run_dir))
+    run = TrainingRun(id="run-read-only", task=task, attempt_number=1, launch_mode="fresh",
+                      status="completed", model_path=task.model_path, data_path=task.data_path,
+                      run_dir=str(run_dir), parameter_snapshot={"epochs": 10})
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+
+    def override_db():
+        yield session
+
+    def forbidden_sync(*_args, **_kwargs):
+        raise AssertionError("dashboard list endpoint must not scan training files")
+
+    monkeypatch.setattr(main_module, "sync_metrics", forbidden_sync)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        response = TestClient(app).get("/api/tasks")
+        assert response.status_code == 200
+        assert response.json()[0]["completed_epochs"] == 0
+        assert session.scalar(select(MetricPoint).where(MetricPoint.run_id == run.id)) is None
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
+def test_read_only_run_endpoints_do_not_scan_local_files(tmp_path: Path, monkeypatch):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "runs" / "attempt-001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "results.csv").write_text("epoch,time,metrics/mAP50(B)\n1,2,0.5\n", encoding="utf-8")
+    (run_dir / "best.pt").write_bytes(b"weights")
+    task = make_task("task-read-only-runs", status="completed", run_dir=str(run_dir))
+    run = TrainingRun(id="run-read-only-runs", task=task, attempt_number=1, launch_mode="fresh",
+                      status="completed", model_path=task.model_path, data_path=task.data_path,
+                      run_dir=str(run_dir), parameter_snapshot={"epochs": 10})
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+
+    def forbidden_sync(*_args, **_kwargs):
+        raise AssertionError("read endpoints must not scan training files")
+
+    monkeypatch.setattr(main_module, "sync_metrics", forbidden_sync)
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        for suffix in ("metrics", "artifacts", f"runs/{run.id}/metrics", f"runs/{run.id}/artifacts"):
+            response = client.get(f"/api/tasks/{task.id}/{suffix}")
+            assert response.status_code == 200, response.text
+            assert response.json() == []
+        assert session.scalar(select(MetricPoint).where(MetricPoint.run_id == run.id)) is None
+        assert session.scalar(select(Artifact).where(Artifact.run_id == run.id)) is None
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
 def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_path: Path, monkeypatch):
     runs_root = tmp_path / "runs"
     runtime_root = tmp_path / "runtime"
@@ -506,7 +588,11 @@ def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_
     app.dependency_overrides[get_db] = override_db
     try:
         response = TestClient(app).delete(f"/api/tasks/{task.id}/permanent")
-        assert response.status_code == 204
+        assert response.status_code == 202
+        assert response.json()["status"] == "pending"
+        assert task.deleted_reason == "local_delete_pending"
+        worker = LocalDeletionWorker(session_factory=lambda: session)
+        assert worker.process_one()
         assert session.get(TrainingTask, task.id) is None
         assert session.get(TrainingRun, run.id) is None
         assert session.scalar(select(MetricPoint).where(MetricPoint.task_id == task.id)) is None

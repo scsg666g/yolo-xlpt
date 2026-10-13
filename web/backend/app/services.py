@@ -491,12 +491,12 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
     csv_path = Path(run.run_dir) / "results.csv"
     if not csv_path.exists():
         return
-    existing = set(db.scalars(select(MetricPoint.epoch).where(MetricPoint.run_id == run.id)).all())
     try:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
     except (OSError, csv.Error):
         return
+    existing = set(db.scalars(select(MetricPoint.epoch).where(MetricPoint.run_id == run.id)).all())
     latest: dict[str, Any] = {}
     latest_epoch = run.completed_epochs
     for row in rows:
@@ -516,10 +516,15 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
         latest, latest_epoch = values, max(latest_epoch, epoch)
     if rows:
         epochs = int((run.parameter_snapshot or {}).get("epochs") or task.epochs)
-        run.completed_epochs = latest_epoch
-        run.progress = min(100.0, round(latest_epoch / max(epochs, 1) * 100, 2))
-        run.latest_metrics = latest
-        if task.current_run_id == run.id:
+        progress = min(100.0, round(latest_epoch / max(epochs, 1) * 100, 2))
+        changed = (run.completed_epochs != latest_epoch or run.progress != progress or run.latest_metrics != latest)
+        if run.completed_epochs != latest_epoch:
+            run.completed_epochs = latest_epoch
+        if run.progress != progress:
+            run.progress = progress
+        if run.latest_metrics != latest:
+            run.latest_metrics = latest
+        if changed and task.current_run_id == run.id:
             mirror_run_to_task(task, run)
 
 
@@ -537,6 +542,13 @@ def artifact_kind(path: Path) -> str:
     return "file"
 
 
+def _artifact_timestamp(value: datetime | None) -> datetime | None:
+    """Normalize SQLite's naive DateTime values before comparing file mtimes."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
+
+
 def resume_checkpoint(task: TrainingTask) -> Path | None:
     """Return the checkpoint written by the latest incomplete run, if available."""
     if not task.run_dir:
@@ -549,30 +561,37 @@ def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> No
     run = run or current_run(db, task)
     if not run or run.execution_node_id or not run.run_dir or not Path(run.run_dir).exists():
         return
+    root = Path(run.run_dir)
+    discovered = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        try:
+            raw = str(path.resolve())
+            stat = path.stat()
+        except OSError:
+            continue
+        discovered.append((path, raw, stat.st_size, datetime.fromtimestamp(stat.st_mtime, timezone.utc)))
     known = {
         artifact.path: artifact
         for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id)).all()
     }
-    for path in Path(run.run_dir).rglob("*"):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        raw = str(path.resolve())
-        stat = path.stat()
-        modified_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+    for path, raw, size, modified_at in discovered:
+        name = str(path.relative_to(root))
         existing = known.get(raw)
         if existing:
-            existing.kind = artifact_kind(path)
-            existing.name = str(path.relative_to(run.run_dir))
-            existing.size = stat.st_size
-            existing.modified_at = modified_at
+            values = (artifact_kind(path), name, size, modified_at)
+            existing_values = (existing.kind, existing.name, existing.size, _artifact_timestamp(existing.modified_at))
+            if existing_values != values:
+                existing.kind, existing.name, existing.size, existing.modified_at = values
             continue
         values = {
             "task_id": task.id,
             "run_id": run.id,
             "kind": artifact_kind(path),
-            "name": str(path.relative_to(run.run_dir)),
+            "name": name,
             "path": raw,
-            "size": stat.st_size,
+            "size": size,
             "modified_at": modified_at,
         }
         # The scheduler and API can discover the same file concurrently. A savepoint
@@ -657,6 +676,7 @@ def import_existing_runs() -> int:
 class TrainingScheduler:
     def __init__(self) -> None:
         self.processes: dict[str, tuple[str, subprocess.Popen]] = {}
+        self._last_artifact_scan: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -823,6 +843,10 @@ class TrainingScheduler:
             sync_metrics(db, task, run)
             code = process.poll()
             if code is None:
+                now = time.monotonic()
+                if now - self._last_artifact_scan.get(run_id, 0.0) >= 10:
+                    sync_artifacts(db, task, run)
+                    self._last_artifact_scan[run_id] = now
                 continue
             run.exit_code = code
             run.pid = None
@@ -843,6 +867,7 @@ class TrainingScheduler:
                 message, level = run.error_message, "error"
             mirror_run_to_task(task, run)
             sync_artifacts(db, task, run)
+            self._last_artifact_scan.pop(run_id, None)
             add_event(db, task.id, run.status, message, level, run_id=run.id)
             self.processes.pop(task_id, None)
 
