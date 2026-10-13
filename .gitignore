@@ -202,6 +202,10 @@ calibration_*.npy
 *.jpg
 *.jpeg
 *.png
+
+# README product screenshots
+!docs/screenshots/
+!docs/screenshots/*.png
 *.bmp
 *.tiff
 *.gif

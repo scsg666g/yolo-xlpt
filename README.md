@@ -4,6 +4,32 @@
 
 平台使用 FastAPI 调用服务器上的 `yolo` CLI 执行训练，使用 React Flow 展示训练画布，使用 ECharts 绘制指标曲线。中心平台管理本机训练；其他服务器通过独立 Agent 汇总算力数据，显式启用训练后可从同一界面管理远程任务。训练使用执行服务器自己的环境，输出保存在对应服务器。
 
+## 界面预览
+
+<p align="center">
+  <img src="docs/screenshots/training-canvas.png" alt="YOLO Forge 可视化训练画布" width="100%">
+</p>
+<p align="center"><sub>可视化训练画布 · 数据集、模型、参数、训练状态、指标、日志与产物集中呈现</sub></p>
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src="docs/screenshots/dashboard.png" alt="训练任务中心">
+      <br><sub>训练任务中心</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src="docs/screenshots/compute-monitor.png" alt="多服务器算力监控">
+      <br><sub>多服务器算力监控</sub>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="docs/screenshots/experiment-compare.png" alt="实验指标对比" width="76%">
+      <br><sub>实验配置与指标对比</sub>
+    </td>
+  </tr>
+</table>
+
 ## 主要功能
 
 | 功能 | 说明 |
@@ -34,6 +60,7 @@
 ```text
 .
 ├── README.md                 # 项目首页说明
+├── docs/screenshots/         # README 使用的项目界面截图
 ├── ultralytics/              # 训练框架源码、配置及框架文档
 ├── web/
 │   ├── frontend/             # Web 界面
