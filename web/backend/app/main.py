@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .config import DATASET_ROOTS, MODEL_ROOTS, RUNS_ROOT, WEB_ROOT
+from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, RUNS_ROOT, WEB_ROOT
 from .compute_nodes import ensure_local_node, local_snapshot, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
@@ -144,7 +144,8 @@ def health():
     except Exception as exc:
         logger.warning("health_database_error error=%s", type(exc).__name__)
         raise HTTPException(503, "数据库暂不可用") from exc
-    return {"status": "ok", "scheduler": "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped",
+    return {"status": "ok", "instance": PLATFORM_INSTANCE_NAME,
+            "scheduler": "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped",
             "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "runs_root": str(RUNS_ROOT)}
 

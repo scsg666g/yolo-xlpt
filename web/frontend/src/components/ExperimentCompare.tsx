@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import ReactECharts from 'echarts-for-react'
 import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Layers3, Minus, Search, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import type { MetricPoint, TrainingRun, TrainingTask } from '../types'
+import { LineChartView } from './LineChart'
 
 interface ComparisonRun {
   id: string
@@ -200,8 +200,12 @@ export function ExperimentCompare() {
 
   useEffect(() => {
     load()
+    const mountedRequestVersion = requestVersion.current
     const timer = window.setInterval(load, 5000)
-    return () => { window.clearInterval(timer); requestVersion.current++ }
+    return () => {
+      window.clearInterval(timer)
+      requestVersion.current = mountedRequestVersion + 1
+    }
   }, [load])
 
   function setSelection(ids: string[]) {
@@ -287,7 +291,7 @@ export function ExperimentCompare() {
           </tbody>
         </table></div>
       </section>
-      <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={metricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header><ReactECharts option={chart} style={{ height: 390 }} /></section>
+      <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={metricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header><LineChartView option={chart} style={{ height: 390 }} /></section>
       <section className="compare-panel parameter-panel"><header><div><Layers3 size={17} /><div><h2>训练参数差异</h2><span>来自每次运行的固化参数快照</span></div></div></header><div className="comparison-table"><table><thead><tr><th>参数</th>{selected.map((item, index) => <th key={item.id}><i style={{ background: palette[index] }} />{item.task.name} · A{String(item.run.attempt_number).padStart(3, '0')}</th>)}</tr></thead><tbody>{parameterRows.map((parameter) => { const values = selected.map((item) => parameter.value(item.view)); const different = new Set(values.map(String)).size > 1; return <tr className={different ? 'different' : ''} key={parameter.label}><td>{parameter.label}{different && <em>不同</em>}</td>{values.map((value, index) => <td key={`${parameter.label}-${selected[index].id}`}>{value}</td>)}</tr> })}</tbody></table></div></section>
     </>}
   </div>

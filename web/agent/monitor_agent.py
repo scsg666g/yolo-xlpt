@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import fcntl
 import hashlib
 import json
 import logging
@@ -28,7 +29,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 LOGGER = logging.getLogger("yolo-monitor-agent")
 
 
@@ -158,11 +159,46 @@ def load_config(path: Path) -> dict:
     if not isinstance(yolo_bin, str) or not yolo_bin or not isinstance(training_cwd, str) or not Path(training_cwd).is_absolute():
         raise ValueError("yolo_bin/training_cwd 配置无效")
     cwd_path = Path(training_cwd).resolve(strict=True) if enabled else Path(training_cwd).resolve()
+    lock_value = config.get("training_lock_file", str(cwd_path / ".yolo-forge-training.lock"))
+    if not isinstance(lock_value, str) or not Path(lock_value).is_absolute():
+        raise ValueError("training_lock_file 必须是绝对路径")
+    lock_path = Path(lock_value).resolve()
+    if enabled and not lock_path.parent.is_dir():
+        raise ValueError("training_lock_file 的父目录必须已存在")
     return {"center_url": center, "node_id": node_id, "token": token,
             "report_interval_seconds": interval, "nvidia_smi_bin": binary,
             "enable_training": enabled, "allowed_training_roots": [str(Path(item).resolve()) for item in roots],
             "yolo_bin": yolo_bin, "training_cwd": str(cwd_path),
+            "training_lock_file": str(lock_path),
             "training_state_dir": str(path.resolve().parent / ".training-state")}
+
+
+def acquire_training_lock(config: dict):
+    """Try to reserve this physical training workspace across Agent processes."""
+    lock_path = Path(config.get("training_lock_file") or Path(config["training_cwd"]) / ".yolo-forge-training.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    os.chmod(lock_path, 0o660)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    json.dump({"pid": os.getpid(), "node_id": config["node_id"],
+               "acquired_at": datetime.now(timezone.utc).isoformat()}, handle)
+    handle.flush()
+    return handle
+
+
+def release_training_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -508,7 +544,7 @@ def retry_pending_finals(config: dict) -> bool:
     return ready
 
 
-def run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
+def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
     run_id = task["run_id"]
     manifest_payload = {**task, "output_root": task["parameters"]["remote_output_root"]}
     last_manifest_at = 0.0
@@ -646,6 +682,18 @@ def run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
         LOGGER.error("远程训练任务失败：%s", exc)
 
 
+def run_remote_task(config: dict, task: dict, stop: threading.Event, training_lock=None) -> None:
+    """Run one task while holding the server-wide lock until all final reporting finishes."""
+    lock = training_lock or acquire_training_lock(config)
+    if lock is None:
+        LOGGER.warning("本机已有另一个 Agent 在训练，拒绝并发启动任务 %s", task.get("run_id"))
+        return
+    try:
+        _run_remote_task(config, task, stop)
+    finally:
+        release_training_lock(lock)
+
+
 def send(config: dict, payload: dict) -> int:
     request = Request(config["center_url"] + "/api/compute/nodes/" + config["node_id"] + "/report",
                       data=json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(), method="POST",
@@ -697,20 +745,28 @@ def main() -> int:
                 except (HTTPError, URLError, OSError, ValueError, TypeError):
                     LOGGER.warning("远程文件操作轮询失败，下次心跳重试")
             if config["enable_training"] and not args.once and (active_training is None or not active_training.is_alive()):
+                training_lock = None
                 try:
                     if not retry_pending_finals(config):
                         stop.wait(delay)
+                        continue
+                    training_lock = acquire_training_lock(config)
+                    if training_lock is None:
+                        stop.wait(min(delay, 5))
                         continue
                     response = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/poll", "POST", {})
                     task = response.get("task")
                     if task:
                         training_stop = threading.Event()
-                        active_training = threading.Thread(target=run_remote_task, args=(config, task, training_stop),
+                        active_training = threading.Thread(target=run_remote_task, args=(config, task, training_stop, training_lock),
                                                           name="remote-training", daemon=True)
                         active_training.start()
+                        training_lock = None  # ownership transferred to the training thread
                         LOGGER.info("已领取远程任务 %s / Attempt %s", task.get("task_id"), task.get("attempt_number"))
                 except (HTTPError, URLError, OSError, ValueError, TypeError):
                     LOGGER.warning("远程任务轮询失败，将在下次心跳重试")
+                finally:
+                    release_training_lock(training_lock)
         except HTTPError as exc:
             # Do not log response bodies, headers or configuration containing secrets.
             LOGGER.warning("上报返回 HTTP %s。401 请检查 Token；403 请检查节点是否禁用；422 请检查采样与时钟。", exc.code)

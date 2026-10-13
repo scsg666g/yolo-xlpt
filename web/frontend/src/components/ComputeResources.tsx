@@ -172,7 +172,12 @@ export function ComputeResources() {
 
   useEffect(() => {
     void load()
-    return () => { controller.current?.abort(); requestId.current++; inFlight.current = false }
+    const mountedRequestId = requestId.current
+    return () => {
+      controller.current?.abort()
+      requestId.current = mountedRequestId + 1
+      inFlight.current = false
+    }
   }, [load])
 
   useEffect(() => {

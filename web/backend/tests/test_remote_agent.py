@@ -182,3 +182,16 @@ def test_external_log_symlink_cannot_escape_allowed_root(agent, training, tmp_pa
     with pytest.raises(ValueError, match="日志路径"):
         agent.build_training_command(config, task)
     assert not Path(task["run_dir"]).exists()
+
+
+def test_training_lock_is_shared_by_agents_for_same_workspace(agent, training):
+    config, _ = training
+    first = agent.acquire_training_lock(config)
+    assert first is not None
+    try:
+        assert agent.acquire_training_lock(config) is None
+    finally:
+        agent.release_training_lock(first)
+    second = agent.acquire_training_lock(config)
+    assert second is not None
+    agent.release_training_lock(second)

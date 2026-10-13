@@ -1,0 +1,25 @@
+[Unit]
+Description=YOLO Training Platform (production, port 18089)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/data/yolo-模型训练平台开发/yolo使用版/yolo/web/backend
+EnvironmentFile=-/data/yolo-模型训练平台开发/yolo使用版/yolo/web/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PLATFORM_INSTANCE_NAME=production
+ExecStartPre=/usr/bin/test -d /data/yolo-模型训练平台开发/yolo使用版/yolo/web/backend/app
+ExecStartPre=/usr/bin/test -r /data/yolo-模型训练平台开发/yolo使用版/yolo/web/.env
+ExecStart=/data/conda/envs/yolo/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 18089 --workers 1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

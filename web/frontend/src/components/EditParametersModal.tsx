@@ -1,3 +1,4 @@
+/* eslint-disable react-refresh/only-export-components -- parameter helpers are shared with import dialogs */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Plus, Search, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { api } from '../api'
@@ -146,7 +147,7 @@ function parseImportValue(raw: string, type: DetectedParameter['type']): ImportV
   let value = raw.trim().replace(/[;,]+$/, '').trim()
   if (!value) return null
   value = value.replace(/\s+#.*$/, '').trim()
-  if ((value.startsWith('\"') && value.endsWith('\"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1)
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1)
   if (type === 'boolean') {
     if (/^(true|yes|on)$/i.test(value)) return true
     if (/^(false|no|off)$/i.test(value)) return false

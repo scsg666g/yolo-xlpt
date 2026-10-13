@@ -1,9 +1,9 @@
 import { useEffect, useMemo } from 'react'
 import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
-import ReactECharts from 'echarts-for-react'
 import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
+import { LineChartView } from './LineChart'
 
 export type CanvasDetailKind = 'runtime' | 'status' | 'metrics' | 'artifacts' | 'weights'
 
@@ -162,8 +162,8 @@ function MetricsDetails({ metrics, task }: Pick<Props, 'metrics' | 'task'>) {
   if (!metrics.length) return <div className="canvas-detail-empty large">训练产生首个 Epoch 后，这里会显示完整指标曲线。</div>
   return <div className="canvas-detail-sections">
     <div className="metric-summary-strip">{summaryKeys.map((key) => <div key={key}><span>{key.replace('metrics/', '').replace('train/', '').replace('val/', '')}</span><strong>{displayValue(latest?.values[key] ?? task.latest_metrics[key])}</strong></div>)}</div>
-    <section className="canvas-detail-chart"><h3>精度与召回趋势</h3><ReactECharts option={accuracyOption} style={{ height: 330, width: '100%' }} /></section>
-    <section className="canvas-detail-chart"><h3>训练与验证损失</h3><ReactECharts option={lossOption} style={{ height: 330, width: '100%' }} /></section>
+    <section className="canvas-detail-chart"><h3>精度与召回趋势</h3><LineChartView option={accuracyOption} style={{ height: 330, width: '100%' }} /></section>
+    <section className="canvas-detail-chart"><h3>训练与验证损失</h3><LineChartView option={lossOption} style={{ height: 330, width: '100%' }} /></section>
     <section className="canvas-detail-section">
       <h3>最新 Epoch 完整数据 <span>Epoch {latest?.epoch}</span></h3>
       <div className="metric-value-grid">{Object.entries(latest?.values || {}).map(([key, value]) => <div key={key}><span title={key}>{key}</span><strong>{displayValue(value)}</strong></div>)}</div>

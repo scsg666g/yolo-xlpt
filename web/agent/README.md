@@ -28,24 +28,28 @@ python3 monitor_agent.py --config agent-config.json
   "enable_training": false,
   "allowed_training_roots": [],
   "yolo_bin": "/data/conda/envs/yolo/bin/yolo",
-  "training_cwd": "/data/yolo/yolo"
+  "training_cwd": "/data/yolo/yolo",
+  "training_lock_file": "/data/yolo/yolo/.yolo-forge-training.lock"
 }
 ```
 
 ## 启用远程训练
 
-推荐使用 **Agent 1.3.0 和配套新版中台**，且 `center_url` 能从远程机器访问，再编辑远程配置文件。1.2.0 仍可领取从头训练任务；断点续训、远程文件清理和产物传输需要 1.3.0。更旧版本只能上报算力，不能领取新训练任务：
+推荐使用 **Agent 1.4.0 和配套新版中台**，且 `center_url` 能从远程机器访问，再编辑远程配置文件。1.4.0 增加同一物理服务器上的跨平台训练互斥；断点续训、远程文件清理和产物传输仍兼容 1.3.0。更旧版本只能上报算力，不能领取新训练任务：
 
 ```json
 {
   "enable_training": true,
   "allowed_training_roots": ["/data/yolo/yolo", "/data/yolo/datasets", "/data/yolo/runs"],
   "yolo_bin": "/data/conda/envs/yolo/bin/yolo",
-  "training_cwd": "/data/yolo/yolo"
+  "training_cwd": "/data/yolo/yolo",
+  "training_lock_file": "/data/yolo/yolo/.yolo-forge-training.lock"
 }
 ```
 
 这些字段须加到现有 JSON 对象中，保留原来的 `center_url`、`node_id`、`token` 等字段。示例路径需要与 **10.180.0.123** 上实际的模型、数据目录和 Conda 环境一致，不要照搬中台路径。`allowed_training_roots` 应仅列模型文件、数据 YAML、输出根目录所在的最小目录；输出根目录须事先存在且运行 Agent 的用户有写权限。训练产物位于 `<输出根目录>/<任务类型>/<任务 ID>/attempt-001`。启动前 Agent 检查文件是否存在以及路径是否落在允许目录内；不执行任意 Shell。建议用具有训练目录写入权、但不是 root 的专用用户运行 Agent。
+
+`training_lock_file` 可省略，默认位于 `training_cwd/.yolo-forge-training.lock`。同一服务器若同时运行开发版和使用版的两个 Agent，应让它们使用相同的 `training_cwd` 或显式配置同一个锁文件，并使用同一系统账户或有该文件读写权限的同组账户。Agent 只在持有操作系统文件锁时领取任务，进程退出会自动释放；锁文件本身保留不代表仍被占用。这样可以避免两套平台同时占用同一组 GPU，但两套平台仍需各自的节点 ID、Token 和 Agent 目录。
 
 在新建任务弹窗选择已注册的远程服务器，再输入远程机器上真实的模型文件、数据集 YAML 和输出根目录的绝对路径。数据集须已在远程服务器可用；中台不会上传或复制它们。任务按节点隔离排队，同一节点一次领取一项训练；Agent 在线时主动领取；可在平台请求停止，Agent 收到指令后终止对应进程。指标和最近 100 行日志回传到中台，完整日志与权重保存在远程机器。
 
@@ -90,7 +94,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `1.3.0` 后，再替换并验证连接：
+确认输出为 `1.4.0` 后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py

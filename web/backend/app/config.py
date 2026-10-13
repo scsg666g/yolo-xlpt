@@ -8,6 +8,7 @@ from sqlalchemy.engine import make_url
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = BACKEND_ROOT.parent
 SOURCE_PROJECT_ROOT = WEB_ROOT.parent
+PLATFORM_INSTANCE_NAME = os.getenv("PLATFORM_INSTANCE_NAME", SOURCE_PROJECT_ROOT.name).strip()[:80] or SOURCE_PROJECT_ROOT.name
 
 
 def project_path(value: str | Path, *, base: Path = SOURCE_PROJECT_ROOT) -> Path:

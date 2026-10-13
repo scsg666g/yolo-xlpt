@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArtifactDownload } from './ArtifactDownload'
-import ReactECharts from 'echarts-for-react'
 import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, type Connection, type Edge, type Node } from '@xyflow/react'
 import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, SlidersHorizontal, Square, Terminal, Trophy, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -8,6 +7,7 @@ import { api, formatBytes, metricValue, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { CanvasNode, type PanelNodeData } from './CanvasNode'
 import { CanvasDetailModal, type CanvasDetailKind } from './CanvasDetailModal'
+import { LineChartView } from './LineChart'
 import { EditParametersModal } from './EditParametersModal'
 import { EditResourceModal } from './EditResourceModal'
 import { LogViewerModal } from './LogViewerModal'
@@ -235,7 +235,7 @@ function TaskCanvasInner() {
       finished_at: selectedRun.finished_at,
     } satisfies TrainingTask
   }, [selectedRun, task])
-  const latest = viewTask?.latest_metrics || {}
+  const latest = useMemo(() => viewTask?.latest_metrics || {}, [viewTask])
   const weightArtifacts = useMemo(() => artifacts.filter((artifact) => artifact.kind === 'weight'), [artifacts])
   const regularArtifacts = useMemo(() => artifacts.filter((artifact) => artifact.kind !== 'weight'), [artifacts])
   const bestWeight = weightArtifacts.find((artifact) => artifact.name.split('/').pop() === 'best.pt')
@@ -258,7 +258,7 @@ function TaskCanvasInner() {
     runtime: { title: `GPU ${viewTask.device}`, kicker: 'RUNTIME · 双击查看', icon: <Cpu size={17} />, accent: '#ffba6b', activity: nodeActivity, content: <>{row('进程 PID', viewTask.pid || '—')}{row('输出目录', viewTask.run_dir ? viewTask.run_dir.split('/').slice(-4).join('/') : '等待创建')}{row('训练环境', 'PyTorch · CUDA')}</> },
     weights: { title: '模型权重', kicker: 'CHECKPOINTS · 双击查看', icon: <Save size={17} />, accent: '#7da8ff', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: <div className="weight-node-list">{[{ artifact: bestWeight, label: '最佳模型', name: 'best.pt', Icon: Trophy }, { artifact: lastWeight, label: '最新模型', name: 'last.pt', Icon: History }].map(({ artifact, label, name, Icon }) => <div className={`weight-mini-card ${artifact ? '' : 'pending'}`} key={name}><div className="weight-mini-icon"><Icon size={15} /></div><div><span>{label}</span><strong>{artifact?.name.split('/').pop() || name}</strong><small>{artifact ? formatBytes(artifact.size) : '等待训练生成'}</small></div>{artifact && <ArtifactDownload artifact={artifact} className="nodrag nowheel" title={`下载 ${name}`}><Download size={15} /></ArtifactDownload>}</div>)}</div> },
     status: { title: statusLabel(viewTask.status), kicker: selectedRun ? `ATTEMPT ${String(selectedRun.attempt_number).padStart(3, '0')} · 双击查看` : 'TRAINING STATUS · 双击查看', icon: viewTask.status === 'running' ? <Zap size={17} /> : <Gauge size={17} />, activity: nodeActivity, pulse: isCurrentRun && motionAllowed ? epochPulse : undefined, content: <><div className="big-progress"><strong>{Math.round(viewTask.progress)}%</strong><span>Epoch {viewTask.completed_epochs} / {viewTask.epochs}</span></div><div className="progress"><i style={{ width: `${viewTask.progress}%` }} /></div><div className="node-grid metrics-mini">{row('mAP50', metricValue(viewTask, ['metrics/mAP50(B)']))}{row('Precision', metricValue(viewTask, ['metrics/precision(B)']))}{row('Recall', metricValue(viewTask, ['metrics/recall(B)']))}{row('Box loss', typeof latest['train/box_loss'] === 'number' ? latest['train/box_loss'].toFixed(4) : '—')}</div>{viewTask.error_message && <p className="node-error">{viewTask.error_message}</p>}</> },
-    metrics: { title: '验证指标趋势', kicker: 'METRICS · 双击查看', icon: <Activity size={17} />, accent: '#53d6e8', pulse: isCurrentRun && motionAllowed ? epochPulse : undefined, content: metrics.length ? <ReactECharts option={chartOption(metrics, motionAllowed && isCurrentRun && viewTask.status === 'running')} style={{ height: 220, width: 380 }} /> : <div className="node-empty">训练产生首个 Epoch 后显示曲线</div> },
+    metrics: { title: '验证指标趋势', kicker: 'METRICS · 双击查看', icon: <Activity size={17} />, accent: '#53d6e8', pulse: isCurrentRun && motionAllowed ? epochPulse : undefined, content: metrics.length ? <LineChartView option={chartOption(metrics, motionAllowed && isCurrentRun && viewTask.status === 'running')} style={{ height: 220, width: 380 }} /> : <div className="node-empty">训练产生首个 Epoch 后显示曲线</div> },
     logs: { title: '实时训练日志', kicker: 'LIVE OUTPUT · 双击放大', icon: <Terminal size={17} />, accent: '#95a3b3', pulse: isCurrentRun && motionAllowed ? logPulse : undefined, content: <><pre className="log-view">{logs.length ? logs.slice(-18).map((line, index, visibleLines) => <span key={index} className={index === visibleLines.length - 1 && isCurrentRun && logPulse ? `log-new-line log-flash-${logPulse}` : ''}>{line}{index < visibleLines.length - 1 ? '\n' : ''}</span>) : '等待训练日志…'}</pre><div className="node-edit-hint"><Maximize size={12} />双击打开大屏日志</div></> },
     artifacts: { title: '训练产物', kicker: 'ARTIFACTS · 双击查看', icon: <FileArchive size={17} />, accent: '#ffd56d', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: regularArtifacts.length ? <div className="artifact-list">{regularArtifacts.slice(0, 12).map((item) => <div key={item.id} className={isCurrentRun && newArtifactIds.includes(item.id) ? `artifact-updated artifact-flash-${artifactPulse}` : ''}><FileText size={14} /><span>{item.name}{isCurrentRun && newArtifactIds.includes(item.id) && <em>已更新</em>}</span><small>{formatBytes(item.size)}</small></div>)}</div> : <div className="node-empty">暂无训练产物</div> },
   } : null, [viewTask, isCurrentRun, selectedRun, metrics, regularArtifacts, logs, latest, nodeActivity, epochPulse, logPulse, artifactPulse, motionAllowed, newArtifactIds, bestWeight, lastWeight])
