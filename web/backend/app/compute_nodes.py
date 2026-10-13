@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from .config import WEB_ROOT
 from .database import get_db
 from .models import ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
-from .services import add_event, compute_inventory, mirror_run_to_task
+from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
 
 router = APIRouter(prefix="/api/compute", tags=["compute nodes"])
 MAX_REPORT_BYTES = 1024 * 1024
@@ -128,6 +128,7 @@ class RemoteRunUpdate(BaseModel):
     log_tail: list[str] = Field(default_factory=list, max_length=200)
     exit_code: int | None = None
     error_message: str | None = Field(default=None, max_length=4000)
+    stop_reason: str | None = Field(default=None, pattern=r"^(platform_stop|agent_shutdown)$")
     run_dir: str | None = Field(default=None, max_length=2000)
     command: list[str] = Field(default_factory=list, max_length=256)
 
@@ -328,13 +329,27 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
 
 @router.post("/nodes/{node_id}/agent/poll")
 def poll_training(node_id: str, request: Request, db: Session = Depends(get_db)):
-    authenticated_agent(node_id, request, db)
+    node = authenticated_agent(node_id, request, db)
+    # Older Agents require platform.log inside save_dir, which DDP deletes.
+    try:
+        version = tuple(int(part) for part in (node.agent_version or "0").split("."))
+    except ValueError:
+        version = (0,)
+    if version < (1, 2, 0):
+        return {"task": None, "poll_interval_seconds": 5, "required_agent_version": "1.2.0",
+                "message": "请升级 Agent 至 1.2.0 或以上版本后领取训练任务"}
+    if db.scalar(select(TrainingRun.id).where(TrainingRun.execution_node_id == node_id,
+                                            TrainingRun.status.in_(["starting", "running", "stopping"]))):
+        return {"task": None, "poll_interval_seconds": 5}
     # A task is delivered once, by atomically switching queued -> starting.
     run = db.scalar(select(TrainingRun).where(
         TrainingRun.execution_node_id == node_id, TrainingRun.status == "queued"
     ).order_by(TrainingRun.queued_at, TrainingRun.id).limit(1))
     if not run:
         return {"task": None, "poll_interval_seconds": 5}
+    if run.launch_mode == "resume" and version < (1, 3, 0):
+        return {"task": None, "poll_interval_seconds": 5, "required_agent_version": "1.3.0",
+                "message": "断点续训需要 Agent 1.3.0 或以上版本"}
     task = db.get(TrainingTask, run.task_id)
     if not task or task.deleted_at or task.current_run_id != run.id:
         run.status = "failed"
@@ -345,10 +360,16 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     snapshot = run.parameter_snapshot or {}
     run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
     claimed_at = utcnow()
+    # Check node occupancy again in the atomic claim, since another poll may
+    # start a different queued run between the earlier SELECTs.
+    occupied = select(TrainingRun.id).where(
+        TrainingRun.execution_node_id == node_id,
+        TrainingRun.status.in_(["starting", "running", "stopping"]),
+    ).exists()
     claimed = db.execute(update(TrainingRun).where(
-        TrainingRun.id == run.id, TrainingRun.status == "queued",
+        TrainingRun.id == run.id, TrainingRun.status == "queued", ~occupied,
     ).values(status="starting", started_at=claimed_at, process_started_at=claimed_at,
-             run_dir=run_dir, log_path=str(Path(run_dir) / "platform.log")))
+             run_dir=run_dir, log_path=str(remote_log_path(snapshot["remote_output_root"], task.id, run.attempt_number))))
     if claimed.rowcount != 1:
         db.rollback()
         return {"task": None, "poll_interval_seconds": 5}
@@ -361,6 +382,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         "task_type": task.task_type, "launch_mode": run.launch_mode,
         "model_path": run.model_path, "data_path": run.data_path,
         "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir,
+        "completed_epochs": run.completed_epochs, "progress": run.progress, "latest_metrics": run.latest_metrics,
         "log_path": run.log_path, "parameters": snapshot,
     }}
 
@@ -413,8 +435,16 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
             run.progress = 100
             run.exit_code = payload.exit_code if payload.exit_code is not None else 0
         if effective_status == "stopped" and not run.error_message:
-            run.error_message = "由用户请求停止"
-        add_event(db, task.id, effective_status, run.error_message or f"远程训练{effective_status}", "error" if effective_status == "failed" else "info", run_id=run.id)
+            if payload.stop_reason == "agent_shutdown":
+                run.error_message = "Agent 退出，训练进程已停止"
+            elif run.stop_requested or payload.stop_reason == "platform_stop":
+                run.error_message = "收到平台停止指令，训练进程已停止"
+            else:
+                run.error_message = "远程训练已停止，Agent 未提供停止原因"
+        add_event(db, task.id, effective_status, run.error_message or f"远程训练{effective_status}",
+                  "error" if effective_status == "failed" else "info",
+                  payload={"exit_code": run.exit_code, "stop_reason": payload.stop_reason,
+                           "stop_requested": bool(run.stop_requested)}, run_id=run.id)
     elif effective_status != prior_status:
         add_event(db, task.id, effective_status, f"远程训练状态：{effective_status}", run_id=run.id)
     mirror_run_to_task(task, run)

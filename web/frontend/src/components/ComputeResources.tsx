@@ -89,6 +89,7 @@ function ComputeDetails({ data, tasks, remote }: { data: ComputeData; tasks: Tra
 
 const statusNames = { online: '在线', offline: '离线', pending: '等待接入', disabled: '已禁用' }
 const storageKey = 'yolo-compute-expanded-nodes'
+const refreshIntervalMs = 5000
 
 function dateLabel(value: string | null): string {
   return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未上报'
@@ -102,6 +103,8 @@ export function ComputeResources() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
+  const [countdown, setCountdown] = useState(refreshIntervalMs / 1000)
+  const [pageVisible, setPageVisible] = useState(() => !document.hidden)
   const [error, setError] = useState('')
   const [query, setQuery] = useState('')
   const [status, setStatus] = useState('all')
@@ -118,6 +121,7 @@ export function ComputeResources() {
   const controller = useRef<AbortController | null>(null)
   const requestId = useRef(0)
   const inFlight = useRef(false)
+  const nextRefreshAt = useRef(0)
 
   const visible = useMemo(() => nodes.filter((node) => (status === 'all' || node.status === status)
     && `${node.name} ${node.address} ${node.hostname || ''} ${node.notes}`.toLowerCase().includes(query.trim().toLowerCase())), [nodes, query, status])
@@ -133,7 +137,7 @@ export function ComputeResources() {
     controller.current = current
     const version = ++requestId.current
     inFlight.current = true
-    if (manual) setRefreshing(true)
+    setRefreshing(true)
     try {
       const list = await api.computeNodes(current.signal)
       if (version !== requestId.current) return
@@ -151,22 +155,44 @@ export function ComputeResources() {
       })
       setDetails((previous) => ({ ...previous, ...successful })); setDetailErrors(errors)
       if (ids.includes('local')) {
-        try { const latest = await api.tasks(); if (version === requestId.current) setTasks(latest) } catch { /* GPU data remains available. */ }
+        try { const latest = await api.tasks(current.signal); if (version === requestId.current) setTasks(latest) } catch { /* GPU data remains available. */ }
       }
     } catch (reason) {
       if (current.signal.aborted) return
       setError(reason instanceof SyntaxError ? '算力接口尚未就绪，请重启后端以加载新功能。' : reason instanceof Error ? reason.message : '算力信息加载失败')
     } finally {
-      if (version === requestId.current) { inFlight.current = false; setLoading(false); setRefreshing(false) }
+      if (version === requestId.current) {
+        inFlight.current = false
+        nextRefreshAt.current = performance.now() + refreshIntervalMs
+        setCountdown(refreshIntervalMs / 1000)
+        setLoading(false); setRefreshing(false)
+      }
     }
   }, [])
 
   useEffect(() => {
     void load()
-    const timer = autoRefresh ? window.setInterval(() => { if (!document.hidden) void load() }, 5000) : undefined
-    const focusRefresh = () => { if (autoRefresh && !document.hidden) void load() }
+    return () => { controller.current?.abort(); requestId.current++; inFlight.current = false }
+  }, [load])
+
+  useEffect(() => {
+    // Count down to the actual request deadline, rather than decrementing a counter.
+    // Each completed request starts a fresh interval so slow requests never overlap.
+    nextRefreshAt.current = performance.now() + refreshIntervalMs
+    setCountdown(refreshIntervalMs / 1000)
+    const tick = () => {
+      if (document.hidden || inFlight.current) return
+      const remaining = Math.max(0, Math.ceil((nextRefreshAt.current - performance.now()) / 1000))
+      setCountdown(remaining)
+      if (remaining === 0) void load()
+    }
+    const timer = autoRefresh ? window.setInterval(tick, 100) : undefined
+    const focusRefresh = () => {
+      setPageVisible(!document.hidden)
+      if (autoRefresh && !document.hidden) void load()
+    }
     document.addEventListener('visibilitychange', focusRefresh)
-    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', focusRefresh); controller.current?.abort(); requestId.current++; inFlight.current = false }
+    return () => { window.clearInterval(timer); document.removeEventListener('visibilitychange', focusRefresh) }
   }, [load, autoRefresh])
 
   useEffect(() => {
@@ -203,7 +229,7 @@ export function ComputeResources() {
     <header className="page-header compute-header">
       <div><span className="eyebrow">COMPUTE MONITOR</span><h1>算力资源</h1><p>按服务器查看 GPU 负载、显存、功耗和计算进程，点击名称展开详情。</p></div>
       <div className="compute-actions">
-        <button className={`auto-refresh ${autoRefresh ? 'active' : ''}`} onClick={() => setAutoRefresh((value) => !value)}><i />自动刷新 5s</button>
+        <button className={`auto-refresh ${autoRefresh ? 'active' : ''}`} aria-pressed={autoRefresh} title={autoRefresh ? '点击暂停自动刷新' : '点击开启自动刷新'} onClick={() => setAutoRefresh((value) => !value)}><i />{!autoRefresh ? '自动刷新已暂停' : !pageVisible ? '后台暂停刷新' : refreshing ? '刷新中…' : `下次刷新 ${countdown}s`}</button>
         <button className="button" disabled={refreshing} onClick={() => void load(true)}><RefreshCw size={15} className={refreshing ? 'spin' : ''} />立即刷新</button>
         <button className="button primary" onClick={() => setModal({})}><Plus size={16} />添加服务器</button>
       </div>

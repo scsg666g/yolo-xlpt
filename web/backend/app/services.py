@@ -130,6 +130,11 @@ def current_run(db, task: TrainingTask) -> TrainingRun | None:
     )
 
 
+def remote_log_path(output_root: str, task_id: str, attempt_number: int, when: datetime | None = None) -> Path:
+    date_stamp = (when or datetime.now()).strftime("%Y%m%d")
+    return Path(output_root) / ".platform-logs" / date_stamp / task_id / f"attempt-{attempt_number:03d}.log"
+
+
 def create_training_run(
     db, task: TrainingTask, launch_mode: str, checkpoint_path: Path | None = None,
 ) -> TrainingRun:
@@ -148,7 +153,7 @@ def create_training_run(
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
         run_dir=(str(Path((task.config or {}).get("remote_output_root")) / task.task_type / task.id / attempt_name)
                  if task.execution_node_id and (task.config or {}).get("remote_output_root") else str(RUNS_ROOT / task.task_type / task.id / attempt_name)),
-        log_path=(str(Path((task.config or {}).get("remote_output_root")) / task.task_type / task.id / attempt_name / "platform.log")
+        log_path=(str(remote_log_path((task.config or {})["remote_output_root"], task.id, attempt))
                   if task.execution_node_id and (task.config or {}).get("remote_output_root") else str(log_path_for_run(task.id, attempt))),
         completed_epochs=task.completed_epochs if launch_mode == "resume" else 0,
         progress=task.progress if launch_mode == "resume" else 0.0,

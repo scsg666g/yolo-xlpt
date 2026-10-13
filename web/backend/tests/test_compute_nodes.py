@@ -12,7 +12,8 @@ from sqlalchemy.orm import sessionmaker
 import app.compute_nodes as monitoring
 from app.database import Base, get_db
 from app.main import app
-from app.models import ComputeNode, TrainingRun, TrainingTask, utcnow
+from app.models import ComputeNode, TaskEvent, TrainingRun, TrainingTask, utcnow
+from sqlalchemy import select
 from app.services import create_training_run
 
 
@@ -182,9 +183,19 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
     assert client.post(poll_url).status_code == 401
     assert client.post(poll_url, headers=headers(second)).status_code == 401
     assert client.post(f"/api/compute/nodes/{second['node']['id']}/agent/poll", headers=headers(second)).json()["task"] is None
+    blocked = client.post(poll_url, headers=headers(first)).json()
+    assert blocked["task"] is None and blocked["required_agent_version"] == "1.2.0"
+    with factory() as db:
+        assert db.get(TrainingRun, run_id).status == "queued"
+    report = sample()
+    report["agent_version"] = "1.2.0"
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(first), json=report).status_code == 200
     claimed = client.post(poll_url, headers=headers(first)).json()["task"]
     assert claimed["run_id"] == run_id
     assert claimed["run_dir"] == "/remote/runs/detect/remote-test/attempt-001"
+    log_path = Path(claimed["log_path"])
+    assert log_path.parent.parent.parent == Path("/remote/runs/.platform-logs")
+    assert log_path.name == "attempt-001.log" and log_path.parent.name == "remote-test"
     assert client.post(poll_url, headers=headers(first)).json()["task"] is None
     update_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update"
     assert client.post(update_url, headers=headers(second), json={"status": "running"}).status_code == 401
@@ -202,6 +213,11 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
     assert client.post(update_url, headers=headers(first), json={"status": "stopped", "exit_code": -15}).status_code == 200
     with factory() as db:
         assert db.get(TrainingRun, run_id).status == "stopped"
+        assert db.get(TrainingRun, run_id).error_message == "收到平台停止指令，训练进程已停止"
+        event = db.scalar(select(TaskEvent).where(TaskEvent.run_id == run_id, TaskEvent.event_type == "stop_requested"))
+        assert event.payload["source_ip"] == "testclient"
+        assert event.payload["run_id"] == run_id
+        assert "请求来源：testclient" in event.message
 
 
 def test_agent_rejects_outside_paths_and_keeps_training_disabled_by_default(monitoring_client, tmp_path):
@@ -241,7 +257,9 @@ def test_remote_command_uses_allowed_files_and_separate_attempt_directory(tmp_pa
     run_dir = root / "runs" / "detect" / "task-id" / "attempt-001"
     run_dir.parent.mkdir(parents=True)
     payload = {"model_path": str(model), "data_path": str(dataset), "run_dir": str(run_dir),
-               "log_path": str(run_dir / "platform.log"), "task_type": "detect", "checkpoint_path": None,
+               "task_id": "task-id", "attempt_number": 1,
+               "log_path": str(root / "runs/.platform-logs/20261012/task-id/attempt-001.log"),
+               "task_type": "detect", "checkpoint_path": None,
                "parameters": {"epochs": 2, "batch": 1, "imgsz": 640, "device": "0", "workers": 2,
                               "optimizer": "auto", "remote_output_root": str(root / "runs"),
                               "config": {"custom_args": {"label_smoothing": 0.1}}}}
@@ -253,10 +271,40 @@ def test_remote_command_uses_allowed_files_and_separate_attempt_directory(tmp_pa
     with pytest.raises(ValueError, match="已存在"):
         agent.build_training_command(config, payload)
     payload["run_dir"] = str(root / "runs" / "detect" / "task-id" / "attempt-002")
-    payload["log_path"] = str(Path(payload["run_dir"]) / "platform.log")
+    payload["attempt_number"] = 2
+    payload["log_path"] = str(Path(payload["log_path"]).with_name("attempt-002.log"))
     payload["parameters"]["config"]["custom_args"] = {"project": "/tmp/elsewhere"}
     with pytest.raises(ValueError, match="不允许"):
         agent.build_training_command(config, payload)
+    assert not Path(payload["run_dir"]).exists()
+    payload["parameters"]["config"]["custom_args"] = {}
+    payload["log_path"] = str(Path(payload["run_dir"]) / "platform.log")
+    with pytest.raises(ValueError, match="日志"):
+        agent.build_training_command(config, payload)
+
+
+@pytest.mark.parametrize("reason, expected", [
+    ("agent_shutdown", "Agent 退出，训练进程已停止"),
+    (None, "远程训练已停止，Agent 未提供停止原因"),
+])
+def test_remote_stop_does_not_invent_user_request(monitoring_client, reason, expected):
+    client, factory = monitoring_client
+    credential = create(client)
+    with factory() as db:
+        task = TrainingTask(id="shutdown", name="remote", task_type="detect",
+                            execution_node_id=credential["node"]["id"], model_path="/remote/model.pt",
+                            data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run.status = "running"
+        run_id = run.id
+        db.commit()
+    response = client.post(f"/api/compute/nodes/{credential['node']['id']}/agent/runs/{run_id}/update",
+                           headers=headers(credential), json={"status": "stopped", "stop_reason": reason, "exit_code": -15})
+    assert response.status_code == 200
+    with factory() as db:
+        assert db.get(TrainingRun, run_id).error_message == expected
 
 
 def test_active_remote_run_blocks_node_disabling_and_token_rotation(monitoring_client):

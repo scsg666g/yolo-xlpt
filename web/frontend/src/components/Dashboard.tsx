@@ -17,10 +17,17 @@ export function Dashboard() {
   const [loadError, setLoadError] = useState('')
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<TrainingTask | null>(null)
+  const [deleteFromTrash, setDeleteFromTrash] = useState(false)
+  const [confirmPermanent, setConfirmPermanent] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
   const [renameTarget, setRenameTarget] = useState<TrainingTask | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
+  const [trashLoading, setTrashLoading] = useState(false)
+  const [trashError, setTrashError] = useState('')
+  const [operationNotice, setOperationNotice] = useState('')
+  const [nodeNames, setNodeNames] = useState<Record<string, string>>({})
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const [dragOverId, setDragOverId] = useState<string | null>(null)
   const [ordering, setOrdering] = useState(false)
@@ -28,7 +35,18 @@ export function Dashboard() {
   const orderRequest = useRef(false)
   const taskRequest = useRef<{ controller: AbortController; timer: number } | null>(null)
   const taskDataVersion = useRef(0)
+  const trashRequest = useRef<AbortController | null>(null)
+  const trashDataVersion = useRef(0)
+  const deleteRequest = useRef(false)
   const navigate = useNavigate()
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void api.computeNodes(controller.signal).then((nodes) => {
+      if (!controller.signal.aborted) setNodeNames(Object.fromEntries(nodes.map((node) => [node.id, node.name])))
+    }).catch(() => undefined)
+    return () => controller.abort()
+  }, [])
 
   const refresh = useCallback(async () => {
     if (taskRequest.current) {
@@ -54,7 +72,6 @@ export function Dashboard() {
         setTasks(incoming)
       }
       setLoadError('')
-      setError('')
     } catch (reason) {
       if (taskRequest.current !== request || taskDataVersion.current !== dataVersion) return
       setLoadError(timedOut ? '任务加载超时，请检查网络后重试' : reason instanceof Error ? reason.message : '任务加载失败，请重试')
@@ -109,6 +126,45 @@ export function Dashboard() {
     const state = filter === 'all' || task.status === filter || (filter === 'active' && ['queued', 'starting', 'running', 'stopping'].includes(task.status))
     return matches && state
   }), [tasks, search, filter])
+
+  const refreshTrash = useCallback(async () => {
+    trashRequest.current?.abort()
+    const controller = new AbortController()
+    const version = trashDataVersion.current
+    trashRequest.current = controller
+    setTrashLoading(true)
+    try {
+      const incoming = await api.deletedTasks(controller.signal)
+      if (trashRequest.current !== controller || trashDataVersion.current !== version) return
+      setTrashTasks(incoming)
+      setTrashError('')
+    } catch (reason) {
+      if (trashRequest.current !== controller || controller.signal.aborted) return
+      setTrashError(reason instanceof Error ? reason.message : '回收站加载失败')
+    } finally {
+      if (trashRequest.current === controller) {
+        trashRequest.current = null
+        setTrashLoading(false)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!trashOpen) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    async function reload() {
+      await refreshTrash()
+      if (!cancelled) timer = setTimeout(reload, 3000)
+    }
+    void reload()
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+      trashRequest.current?.abort()
+      trashRequest.current = null
+    }
+  }, [trashOpen, refreshTrash])
 
   const active = tasks.filter((task) => ['queued', 'starting', 'running', 'stopping'].includes(task.status)).length
   const completed = tasks.filter((task) => task.status === 'completed').length
@@ -170,34 +226,81 @@ export function Dashboard() {
     try { await action(); await refresh() } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败') }
   }
 
+  function openDeletion(task: TrainingTask, fromTrash = false) {
+    if (deleteRequest.current) return
+    setDeleteTarget(task)
+    setDeleteFromTrash(fromTrash)
+    setConfirmPermanent(fromTrash)
+    setDeleteError('')
+  }
+
   async function deleteTask(permanent: boolean) {
-    if (!deleteTarget) return
-    if (permanent && !window.confirm(`确认永久删除“${deleteTarget.name}”及其全部训练文件吗？此操作无法撤销。`)) return
-    setDeleting(true); setError('')
+    if (!deleteTarget || deleteRequest.current) return
+    const target = deleteTarget
+    deleteRequest.current = true
+    setDeleting(true); setDeleteError(''); setError('')
+    let succeeded = false
+    let pending = false
     try {
-      if (permanent) await api.permanentRemove(deleteTarget.id)
-      else await api.remove(deleteTarget.id)
+      if (permanent) {
+        const result = await api.permanentRemove(target.id)
+        pending = result?.status === 'pending'
+        setOperationNotice(result?.message || '任务已永久删除')
+      } else {
+        await api.remove(target.id)
+        setOperationNotice('任务已移入回收站，训练文件已保留')
+      }
+      // Acknowledgement releases the modal; refresh requests must not hold its lock.
+      succeeded = true
+      taskDataVersion.current += 1
+      trashDataVersion.current += 1
+      setTasks((current) => current.filter((task) => task.id !== target.id))
+      setTrashTasks((current) => {
+        const remaining = current.filter((task) => task.id !== target.id)
+        return pending || !permanent ? [...remaining, {
+          ...target, deleted_at: target.deleted_at || new Date().toISOString(),
+          deleted_reason: pending ? 'remote_delete_pending' : 'user',
+        }] : remaining
+      })
       setDeleteTarget(null)
-      await refresh()
+      if (pending) setTrashOpen(true)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '删除失败')
-    } finally { setDeleting(false) }
+      setDeleteError(reason instanceof Error ? reason.message : '删除失败，请检查任务状态后重试')
+    } finally {
+      deleteRequest.current = false
+      setDeleting(false)
+    }
+    if (succeeded) {
+      void refresh()
+      if (trashOpen) void refreshTrash()
+    }
   }
 
-  async function openTrash() {
-    try { setTrashTasks(await api.deletedTasks()); setTrashOpen(true) } catch (reason) { setError(reason instanceof Error ? reason.message : '回收站加载失败') }
+  function openTrash() {
+    setTrashError('')
+    setTrashLoading(true)
+    setTrashOpen(true)
   }
 
-  async function trashAction(task: TrainingTask, permanent: boolean) {
-    if (permanent && !window.confirm(`确认永久删除“${task.name}”及其全部训练文件吗？此操作无法撤销。`)) return
-    setDeleting(true); setError('')
+  async function restoreTask(task: TrainingTask) {
+    if (deleteRequest.current) return
+    deleteRequest.current = true
+    setDeleting(true); setTrashError('')
+    let succeeded = false
     try {
-      if (permanent) await api.permanentRemove(task.id); else await api.restore(task.id)
-      const remaining = await api.deletedTasks()
-      setTrashTasks(remaining)
-      if (!remaining.length) setTrashOpen(false)
-      await refresh()
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败') } finally { setDeleting(false) }
+      await api.restore(task.id)
+      succeeded = true
+      taskDataVersion.current += 1
+      trashDataVersion.current += 1
+      setTrashTasks((current) => current.filter((item) => item.id !== task.id))
+      setOperationNotice('任务已恢复')
+    } catch (reason) {
+      setTrashError(reason instanceof Error ? reason.message : '恢复失败')
+    } finally {
+      deleteRequest.current = false
+      setDeleting(false)
+    }
+    if (succeeded) { void refresh(); void refreshTrash() }
   }
 
   return <div className="page dashboard-page">
@@ -224,17 +327,18 @@ export function Dashboard() {
         <div className="task-grid">{filtered.map((task) => <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
           <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整顺序" aria-label="按住拖动调整顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span><button className="icon-button" onClick={(event) => event.stopPropagation()}><MoreHorizontal size={18} /></button></div>
           <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
+          <p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p>
           <div className="progress-heading"><span>Epoch {task.completed_epochs} / {task.epochs}</span><strong>{Math.round(task.progress)}%</strong></div>
           <div className="progress"><i style={{ width: `${task.progress}%` }} /></div>
           <div className="metric-strip"><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>GPU {task.device}</strong></div></div>
           {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
           <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
             {['draft', 'failed'].includes(task.status) && <button title="启动" onClick={(e) => taskAction(e, () => api.start(task.id))}><Zap size={15} /></button>}
-            {!task.execution_node_id && ['stopped', 'interrupted'].includes(task.status) && <button title="继续训练" onClick={(e) => taskAction(e, () => api.resume(task.id))}><RefreshCw size={15} /></button>}
+            {['stopped', 'interrupted'].includes(task.status) && <button title="继续训练" onClick={(e) => taskAction(e, () => api.resume(task.id))}><RefreshCw size={15} /></button>}
             {['queued', 'starting', 'running'].includes(task.status) && <button title="停止" onClick={(e) => taskAction(e, () => api.stop(task.id))}><Square size={14} /></button>}
             <button title="克隆" onClick={(e) => taskAction(e, () => api.clone(task.id))}><Copy size={15} /></button>
             <button title="加入实验对比" onClick={(e) => { e.stopPropagation(); navigate(`/compare?tasks=${task.id}`) }}><GitCompareArrows size={15} /></button>
-            {!['queued', 'starting', 'running', 'stopping'].includes(task.status) && <button title="删除" onClick={(e) => { e.stopPropagation(); setDeleteTarget(task) }}><Trash2 size={15} /></button>}
+            {!['queued', 'starting', 'running', 'stopping'].includes(task.status) && <button title="删除" onClick={(e) => { e.stopPropagation(); openDeletion(task) }}><Trash2 size={15} /></button>}
             <button title="打开画布"><ArrowUpRight size={15} /></button>
           </div></footer>
         </article>)}</div>}
@@ -243,14 +347,14 @@ export function Dashboard() {
     {renameTarget && <RenameTaskModal task={renameTarget} onClose={() => setRenameTarget(null)} onSaved={(updated) => { setTasks((current) => current.map((task) => task.id === updated.id ? { ...task, name: updated.name } : task)); setRenameTarget(null) }} />}
     {deleteTarget && <div className="modal-backdrop delete-choice-backdrop" onMouseDown={() => !deleting && setDeleteTarget(null)}>
       <div className="modal delete-choice-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><span className="eyebrow">DELETE TRAINING TASK</span><h2>删除训练任务</h2><p>{deleteTarget.name}</p></div><button type="button" className="icon-button" disabled={deleting} onClick={() => setDeleteTarget(null)}>×</button></header>
-        <div className="delete-choice-body"><p>请选择删除方式。移入回收站不会删除训练权重和日志；永久删除会清理数据库记录及该任务的训练文件。</p><div className="delete-choice-grid"><button type="button" className="delete-choice soft" disabled={deleting} onClick={() => deleteTask(false)}><strong>移入回收站</strong><span>从平台隐藏，保留训练记录和文件，可恢复。</span></button><button type="button" className="delete-choice permanent" disabled={deleting} onClick={() => deleteTask(true)}><strong>永久删除</strong><span>删除任务、Attempt、日志、权重和图表，无法撤销。</span></button></div><small>基础模型和数据集文件不会被删除。</small></div>
+        <header><div><span className="eyebrow">DELETE TRAINING TASK</span><h2>{deleteFromTrash ? '确认永久删除' : '删除训练任务'}</h2><p>{deleteTarget.name}</p></div><button type="button" className="icon-button" disabled={deleting} onClick={() => setDeleteTarget(null)}>×</button></header>
+        <div className="delete-choice-body">{deleteFromTrash ? <p>此操作将清理全部 Attempt、日志、权重和图表，且无法恢复。请确认继续。</p> : <><p>请选择删除方式。移入回收站保留文件，可恢复。永久删除将清理该任务的训练文件；远程任务等待 Agent 确认成功后才删除记录，提交后不能恢复。</p><div className="delete-choice-grid"><button type="button" className="delete-choice soft" disabled={deleting} onClick={() => void deleteTask(false)}><strong>移入回收站</strong><span>从平台隐藏，保留训练记录和文件，可恢复。</span></button><button type="button" className="delete-choice permanent" disabled={deleting} onClick={() => setConfirmPermanent(true)}><strong>永久删除</strong><span>清理全部 Attempt、日志、权重和图表，无法撤销。</span></button></div><small>基础模型和数据集文件不会被删除。</small></>}{deleteError && <div className="alert error" role="alert">{deleteError}</div>}{confirmPermanent && <div className="delete-confirm" role="alertdialog" aria-label="确认永久删除"><strong>最后确认</strong><span>永久删除后不能恢复，是否继续？</span><div><button type="button" className="button ghost" disabled={deleting} onClick={() => setConfirmPermanent(false)}>返回</button><button type="button" className="button danger" disabled={deleting} onClick={() => { setConfirmPermanent(false); void deleteTask(true) }}>{deleting ? '提交中…' : '确认永久删除'}</button></div></div>}</div>
         <footer><span>任务当前状态：{statusLabel(deleteTarget.status)}</span><button type="button" className="button ghost" disabled={deleting} onClick={() => setDeleteTarget(null)}>取消</button></footer>
       </div>
     </div>}
     {trashOpen && <div className="modal-backdrop" onMouseDown={() => !deleting && setTrashOpen(false)}><div className="modal trash-modal" onMouseDown={(event) => event.stopPropagation()}>
       <header><div><span className="eyebrow">RECYCLE BIN</span><h2>训练任务回收站</h2><p>共 {trashTasks.length} 条已删除任务</p></div><button type="button" className="icon-button" disabled={deleting} onClick={() => setTrashOpen(false)}>×</button></header>
-      <div className="trash-list">{trashTasks.map((task) => <article key={task.id}><div><strong>{task.name}</strong><span>{task.model_path.split('/').pop()} · {statusLabel(task.status)}</span><small>删除时间：{task.deleted_at ? new Date(task.deleted_at).toLocaleString('zh-CN') : '—'}</small></div><button type="button" className="button ghost compact" disabled={deleting} onClick={() => trashAction(task, false)}><RotateCcw size={14} />恢复</button><button type="button" className="button danger compact" disabled={deleting} onClick={() => trashAction(task, true)}><Trash2 size={14} />永久删除</button></article>)}{!trashTasks.length && <div className="empty">回收站为空</div>}</div>
+      <div className="trash-list">{operationNotice && <p role="status">{operationNotice}</p>}{trashError && <p className="alert error" role="alert">{trashError}</p>}{trashLoading && !trashTasks.length && <div className="empty">正在加载回收站…</div>}{trashTasks.map((task) => <article key={task.id}><div><strong>{task.name}</strong><span>{task.execution_node_id ? '远程服务器' : '本机服务器'} · {statusLabel(task.status)}</span><small>删除时间：{task.deleted_at ? new Date(task.deleted_at).toLocaleString('zh-CN') : '—'}</small>{task.deleted_reason === 'remote_delete_pending' && <small role="status">等待远程 Agent 清理；离线时保留记录，联网后执行</small>}{task.deleted_reason === 'remote_delete_failed' && <small role="alert">{task.error_message}</small>}</div><button type="button" className="button ghost compact" disabled={deleting || ['remote_delete_pending', 'remote_delete_failed'].includes(task.deleted_reason || '')} onClick={() => void restoreTask(task)}><RotateCcw size={14} />恢复</button><button type="button" className="button danger compact" disabled={deleting || task.deleted_reason === 'remote_delete_pending'} onClick={() => openDeletion(task, true)}><Trash2 size={14} />{task.deleted_reason === 'remote_delete_pending' ? '清理中' : task.deleted_reason === 'remote_delete_failed' ? '重试清理' : '永久删除'}</button></article>)}{!trashLoading && !trashTasks.length && <div className="empty">回收站为空</div>}</div>
       <footer><span>移入回收站的任务不会被历史同步重新导入</span><button type="button" className="button ghost" disabled={deleting} onClick={() => setTrashOpen(false)}>关闭</button></footer>
     </div></div>}
     <CreateTaskModal open={creating} onClose={() => setCreating(false)} onCreated={(task) => { setCreating(false); navigate(`/tasks/${task.id}/canvas`) }} />

@@ -8,9 +8,9 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -21,6 +21,7 @@ from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .parameter_catalog import load_parameter_catalog
+from .remote_operations import matching_fetch, operation_file, queue_delete, queue_scan, router as remote_operations_router
 from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
     add_event,
@@ -82,6 +83,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="YOLO 模型训练平台", version="0.1.0", lifespan=lifespan)
 app.include_router(dataset_upload_router)
 app.include_router(compute_nodes_router)
+app.include_router(remote_operations_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -134,15 +136,18 @@ def training_parameters():
 
 
 @app.get("/api/tasks", response_model=list[TaskRead])
-def list_tasks(status: str | None = Query(default=None), include_deleted: bool = Query(default=False), db: Session = Depends(get_db)):
+def list_tasks(status: str | None = Query(default=None), include_deleted: bool = Query(default=False),
+               deleted_only: bool = Query(default=False), db: Session = Depends(get_db)):
     query = select(TrainingTask).order_by(TrainingTask.display_order, TrainingTask.created_at.desc(), TrainingTask.id)
-    if not include_deleted:
+    if deleted_only:
+        query = query.where(TrainingTask.deleted_at.is_not(None))
+    elif not include_deleted:
         query = query.where(TrainingTask.deleted_at.is_(None))
     if status:
         query = query.where(TrainingTask.status == status)
     tasks = db.scalars(query).all()
     for task in tasks:
-        if task.status not in {"running", "starting"}:
+        if not task.deleted_at and task.status not in {"running", "starting"}:
             sync_metrics(db, task)
     db.commit()
     return tasks
@@ -240,13 +245,23 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/resume", response_model=TaskRead)
 def resume_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    if task.execution_node_id:
-        raise HTTPException(409, "远程断点续训尚未支持；可使用重新训练创建独立 Attempt")
     if task.status not in {"stopped", "interrupted"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
-    checkpoint = resume_checkpoint(task)
+    if task.execution_node_id:
+        previous = current_run(db, task)
+        if previous and (task.epochs != previous.parameter_snapshot.get("epochs") or task.data_path != previous.data_path):
+            raise HTTPException(409, "断点续训沿用检查点的总轮数和数据集，请恢复原配置或选择重新训练")
+        checkpoint_artifact = db.scalar(select(Artifact).where(
+            Artifact.run_id == previous.id, Artifact.name == "weights/last.pt", Artifact.size > 0,
+        )) if previous else None
+        checkpoint = Path(checkpoint_artifact.path) if checkpoint_artifact else None
+        if previous:
+            queue_scan(db, task, previous)
+            db.commit()
+    else:
+        checkpoint = resume_checkpoint(task)
     if not checkpoint:
-        raise HTTPException(409, "该任务没有可用的断点检查点 last.pt，无法继续训练")
+        raise HTTPException(409, "尚未发现可用的 last.pt 检查点；远程任务请等待 Agent 同步产物后重试")
     if not task.execution_node_id and not Path(task.data_path).exists():
         raise HTTPException(409, "数据集路径已经失效，无法继续训练")
     if not task.execution_node_id:
@@ -255,6 +270,8 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     if task.epochs <= task.completed_epochs:
+        if task.execution_node_id:
+            raise HTTPException(409, f"断点已经完成全部 {task.completed_epochs} 个 Epoch，请选择重新训练")
         raise HTTPException(409, f"断点已经完成 {task.completed_epochs} 个 Epoch，请增加训练轮数或选择重新训练")
     run = create_training_run(db, task, "resume", checkpoint)
     add_event(
@@ -289,7 +306,7 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/api/tasks/{task_id}/stop", response_model=TaskRead)
-def stop_task(task_id: str, db: Session = Depends(get_db)):
+def stop_task(task_id: str, request: Request, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.execution_node_id:
         run = current_run(db, task)
@@ -297,12 +314,18 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
             raise HTTPException(409, "该远程任务当前无法停止")
         if run.status == "queued":
             run.status = "stopped"
+            run.stop_requested = True
+            run.error_message = "平台取消排队，训练尚未启动"
             run.finished_at = utcnow()
         else:
             run.stop_requested = True
             run.status = "stopping"
         mirror_run_to_task(task, run)
-        add_event(db, task.id, "stop_requested", "已向远程 Agent 请求停止", run_id=run.id)
+        source_ip = request.client.host if request.client else "unknown"
+        message = "已取消远程训练排队" if run.status == "stopped" else "已向远程 Agent 请求停止"
+        add_event(db, task.id, "stop_requested", f"{message}；请求来源：{source_ip}",
+                  payload={"source_ip": source_ip, "method": request.method, "path": request.url.path,
+                           "requested_at": utcnow().isoformat(), "run_id": run.id}, run_id=run.id)
         db.commit()
         db.refresh(task)
         return task
@@ -391,6 +414,10 @@ def restore_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id, include_deleted=True)
     if not task.deleted_at:
         raise HTTPException(409, "任务当前不在回收站")
+    if task.deleted_reason == "remote_delete_pending":
+        raise HTTPException(409, "远程文件清理已提交，不能恢复；请等待 Agent 返回结果")
+    if task.deleted_reason == "remote_delete_failed":
+        raise HTTPException(409, "远程清理可能已删除部分文件，请重试清理；该任务不能恢复")
     task.deleted_at = None
     task.deleted_reason = None
     add_event(db, task.id, "restored", "任务已从回收站恢复")
@@ -404,6 +431,10 @@ def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id, include_deleted=True)
     if task.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "运行中或排队中的任务不能永久删除")
+    if task.execution_node_id:
+        queue_delete(db, task)
+        db.commit()
+        return JSONResponse(status_code=202, content={"status": "pending", "message": "等待远程 Agent 清理文件；确认后删除任务记录"})
     try:
         permanently_delete_task_files(task)
     except (OSError, ValueError) as exc:
@@ -512,6 +543,7 @@ def task_artifacts(task_id: str, db: Session = Depends(get_db)):
     if not run:
         return []
     sync_artifacts(db, task, run)
+    queue_scan(db, task, run)
     db.commit()
     return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
 
@@ -562,6 +594,7 @@ def run_artifacts(task_id: str, run_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     run = get_run_or_404(db, task_id, run_id)
     sync_artifacts(db, task, run)
+    queue_scan(db, task, run)
     db.commit()
     return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
 
@@ -590,11 +623,15 @@ def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
     artifact = db.get(Artifact, artifact_id)
     if not artifact:
         raise HTTPException(404, "产物不存在")
-    path = Path(artifact.path).resolve()
     task = get_task_or_404(db, artifact.task_id)
     run = db.get(TrainingRun, artifact.run_id) if artifact.run_id else current_run(db, task)
     if run and run.execution_node_id:
-        raise HTTPException(409, "远程产物保存在执行服务器，当前不支持通过中台下载")
+        operation = matching_fetch(db, artifact)
+        if not operation or operation.status != "succeeded" or not operation_file(operation).is_file():
+            raise HTTPException(409, "远程文件尚未传输完成，请先准备下载")
+        return FileResponse(operation_file(operation), filename=Path(artifact.name).name,
+                            media_type=mimetypes.guess_type(artifact.name)[0])
+    path = Path(artifact.path).resolve()
     if not run or not run.run_dir or not path_is_within(path, [Path(run.run_dir)]):
         raise HTTPException(403, "产物路径不受信任")
     if not path.exists():

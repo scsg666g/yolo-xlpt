@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import hashlib
 import json
 import logging
 import math
@@ -12,6 +14,7 @@ import platform
 import random
 import re
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -25,7 +28,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 LOGGER = logging.getLogger("yolo-monitor-agent")
 
 
@@ -158,7 +161,8 @@ def load_config(path: Path) -> dict:
     return {"center_url": center, "node_id": node_id, "token": token,
             "report_interval_seconds": interval, "nvidia_smi_bin": binary,
             "enable_training": enabled, "allowed_training_roots": [str(Path(item).resolve()) for item in roots],
-            "yolo_bin": yolo_bin, "training_cwd": str(cwd_path)}
+            "yolo_bin": yolo_bin, "training_cwd": str(cwd_path),
+            "training_state_dir": str(path.resolve().parent / ".training-state")}
 
 
 def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -206,11 +210,26 @@ def build_training_command(config: dict, task: dict) -> list[str]:
         raise ValueError("训练输出根目录不在 Agent 允许目录内")
     if output_root not in run_dir.parents:
         raise ValueError("训练运行目录必须位于配置的输出根目录内")
-    if Path(task["log_path"]).resolve() != run_dir / "platform.log":
-        raise ValueError("日志路径必须是当前 Attempt 的 platform.log")
+    task_id = task["task_id"]
+    attempt_name = f"attempt-{int(task['attempt_number']):03d}"
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,160}", task_id):
+        raise ValueError("任务 ID 无效")
+    if task["task_type"] not in {"detect", "segment", "classify", "pose", "obb"}:
+        raise ValueError("训练任务类型无效")
+    if run_dir != output_root / task["task_type"] / task_id / attempt_name:
+        raise ValueError("训练运行目录必须对应当前任务和 Attempt")
+    log_path = Path(task["log_path"])
+    try:
+        datetime.strptime(log_path.parent.parent.name, "%Y%m%d")
+    except ValueError:
+        raise ValueError("日志目录必须包含年月日") from None
+    expected_log = output_root / ".platform-logs" / log_path.parent.parent.name / task_id / f"{attempt_name}.log"
+    if log_path != expected_log or log_path.resolve() != expected_log:
+        raise ValueError("日志路径必须位于输出根目录的独立 .platform-logs 目录内")
+    if log_path.exists():
+        raise ValueError("训练日志已存在，禁止覆盖旧日志")
     if run_dir.exists():
         raise ValueError("训练 Attempt 目录已存在，禁止覆盖旧训练产物")
-    run_dir.mkdir(parents=True, exist_ok=False)
     yolo_bin = str(Path(config["yolo_bin"]).resolve(strict=True)) if "/" in config["yolo_bin"] else config["yolo_bin"]
     if "/" in yolo_bin and not os.access(yolo_bin, os.X_OK):
         raise ValueError("配置的 yolo_bin 不存在或不可执行")
@@ -221,7 +240,14 @@ def build_training_command(config: dict, task: dict) -> list[str]:
     checkpoint = task.get("checkpoint_path")
     if checkpoint:
         checkpoint_path = within_allowed(checkpoint, roots)
-        command.extend([f"model={checkpoint_path}", "resume=True"])
+        if (checkpoint_path.name != "last.pt" or checkpoint_path.parent.name != "weights" or
+                checkpoint_path.parent.parent.parent.name != task_id or
+                checkpoint_path.parent.parent.parent.parent.name != task["task_type"] or
+                not re.fullmatch(r"attempt-\d{3,}", checkpoint_path.parent.parent.name) or
+                int(checkpoint_path.parent.parent.name[8:]) >= int(task["attempt_number"])):
+            raise ValueError("续训检查点必须属于该任务的历史 Attempt")
+        # Ultralytics reloads saved args on resume; explicit save_dir preserves history.
+        command.extend([f"resume={checkpoint_path}", f"save_dir={run_dir}"])
     extras = params.get("config", {})
     for key, value in extras.items():
         if key in TRAINING_KEYS and value is not None:
@@ -230,7 +256,161 @@ def build_training_command(config: dict, task: dict) -> list[str]:
         if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key) or key in RESERVED_KEYS or key in TRAINING_KEYS:
             raise ValueError(f"不允许的自定义训练参数：{key}")
         command.append(f"{key}={scalar_parameter(value)}")
+    run_dir.mkdir(parents=True, exist_ok=False)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     return command
+
+
+def operation_paths(config: dict, payload: dict) -> tuple[Path, Path | None]:
+    """Validate all deletion/scan/fetch targets against an exact task/Attempt layout."""
+    task_id, task_type = payload["task_id"], payload["task_type"]
+    attempt = payload["attempt_number"]
+    if (not re.fullmatch(r"[a-zA-Z0-9_-]{1,160}", task_id) or
+            task_type not in {"detect", "segment", "classify", "pose", "obb"} or
+            type(attempt) is not int or attempt < 1):
+        raise ValueError("远程文件操作任务信息无效")
+    root = Path(payload["output_root"])
+    if not root.is_absolute() or root.resolve() != root or not root.is_dir():
+        raise ValueError("输出根目录无效或包含符号链接")
+    if not any(root == Path(item) or Path(item) in root.parents for item in config["allowed_training_roots"]):
+        raise ValueError("输出根目录不在 Agent 允许目录内")
+    run_dir = Path(payload["run_dir"])
+    expected = root / task_type / task_id / f"attempt-{attempt:03d}"
+    if run_dir != expected or run_dir.resolve() != expected or run_dir.is_symlink():
+        raise ValueError("只能操作该任务的独立 Attempt 目录")
+    log = Path(payload["log_path"]) if payload.get("log_path") else None
+    if log is not None:
+        legacy = run_dir / "platform.log"
+        date = log.parent.parent.name
+        expected_log = root / ".platform-logs" / date / task_id / f"attempt-{attempt:03d}.log"
+        if log != legacy:
+            datetime.strptime(date, "%Y%m%d")
+            if log != expected_log:
+                raise ValueError("只能操作该任务的独立日志")
+        if log.resolve() != log or log.is_symlink():
+            raise ValueError("日志路径包含符号链接")
+    return run_dir, log
+
+
+def report_manifest(config: dict, payload: dict) -> None:
+    run_dir, _ = operation_paths(config, payload)
+    items = []
+    if run_dir.is_dir():
+        for path in run_dir.rglob("*"):
+            relative = path.relative_to(run_dir)
+            if any(part.startswith(".") for part in relative.parts) or path.is_symlink() or not path.is_file():
+                continue
+            if path.resolve() != path or run_dir not in path.resolve().parents:
+                continue
+            info = path.stat()
+            items.append({"name": relative.as_posix(), "size": info.st_size,
+                          "modified_at": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat()})
+            if len(items) > 1024:
+                raise ValueError("产物数量超过单次同步上限 1024")
+    api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/runs/{payload['run_id']}/artifacts", "POST", {"items": items})
+
+
+def delete_remote_files(config: dict, payload: dict) -> None:
+    # Validate the complete plan before deleting the first file. rmtree never follows
+    # directory symlinks inside the owned Attempt; the Attempt itself cannot be one.
+    targets = [operation_paths(config, run) for run in payload["runs"]]
+    protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
+    protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
+    for run_dir, log in targets:
+        if (run_dir.exists() and not run_dir.is_dir()) or (log and log.exists() and not log.is_file()):
+            raise ValueError("Attempt 或日志的文件类型不正确，已拒绝清理")
+        for path in protected:
+            if path == run_dir or run_dir in path.parents or (log and path == log):
+                raise ValueError("任务目录包含仍被引用的模型、数据或训练程序，已拒绝清理")
+    for run_dir, log in targets:
+        if run_dir.exists():
+            if not run_dir.is_dir():
+                raise ValueError("Attempt 路径不是目录")
+            shutil.rmtree(run_dir)
+        if log:
+            log.unlink(missing_ok=True)
+        for parent in {run_dir.parent, log.parent if log else run_dir.parent}:
+            try:
+                parent.rmdir()  # remove empty task directory only
+            except OSError:
+                pass
+
+
+def execute_operation(config: dict, operation: dict, stop: threading.Event) -> None:
+    endpoint = f"/api/compute/nodes/{config['node_id']}/agent/operations/{operation['id']}"
+    result = {"lease": operation["lease"], "success": True}
+    try:
+        payload = operation["payload"]
+        if operation["kind"] == "delete":
+            delete_remote_files(config, payload)
+        elif operation["kind"] == "scan":
+            report_manifest(config, payload)
+        elif operation["kind"] == "fetch":
+            run_dir, _ = operation_paths(config, payload)
+            relative = Path(payload["name"])
+            if (relative.is_absolute() or relative.as_posix() != payload["name"] or
+                    any(p in {".", ".."} or p.startswith(".") for p in relative.parts)):
+                raise ValueError("产物路径无效")
+            path = run_dir / relative
+            if path.resolve() != path or not path.is_file():
+                raise ValueError("产物不存在或包含符号链接")
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                expected_time = datetime.fromisoformat(payload["modified_at"]).timestamp()
+                if info.st_size != payload["size"] or abs(info.st_mtime - expected_time) > 0.00001:
+                    raise ValueError("产物已更新，请刷新列表后重试下载")
+                digest, offset = hashlib.sha256(), 0
+                while not stop.is_set():
+                    data = handle.read(512 * 1024)
+                    digest.update(data)
+                    final = offset + len(data) == info.st_size
+                    current = path.stat()
+                    if final and (current.st_mtime_ns != info.st_mtime_ns or current.st_size != info.st_size or current.st_ino != info.st_ino):
+                        raise ValueError("传输期间产物发生变化，请重试下载")
+                    chunk = {"lease": operation["lease"], "offset": offset,
+                             "data": base64.b64encode(data).decode("ascii"), "final": final,
+                             "sha256": digest.hexdigest() if final else None}
+                    # Repeat exactly the same block after a timeout; center verifies retries.
+                    for retry in range(3):
+                        try:
+                            response = api_json(config, endpoint + "/chunk", "POST", chunk)
+                            break
+                        except (OSError, URLError):
+                            if retry == 2 or stop.wait(2):
+                                raise
+                    if response.get("status") == "succeeded":
+                        return
+                    offset += len(data)
+                    if not data:
+                        raise ValueError("文件读取不完整")
+                return  # lease expires and a restarted Agent can retry from zero
+        else:
+            raise ValueError("未知远程操作")
+    except Exception as exc:
+        result.update(success=False, error=str(exc)[:2000])
+        LOGGER.warning("远程文件操作失败 %s：%s", operation["kind"], type(exc).__name__)
+    # Lost ACKs are recovered by the lease timeout; deletion is idempotent.
+    try:
+        api_json(config, endpoint + "/result", "POST", result)
+    except (OSError, ValueError, HTTPError, URLError):
+        LOGGER.warning("远程操作结果尚未确认，联网后平台将重新下发：%s", operation["id"])
+
+
+def run_operations(config: dict, operation: dict, stop: threading.Event) -> None:
+    # Drain small scans/previews without adding one heartbeat interval per file.
+    for index in range(32):
+        if stop.is_set():
+            return
+        execute_operation(config, operation, stop)
+        if index == 31:
+            return
+        try:
+            operation = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/operations/poll", "POST", {}).get("operation")
+        except (OSError, ValueError, HTTPError, URLError):
+            return
+        if not operation:
+            return
 
 
 def read_remote_progress(run_dir: Path) -> tuple[int, dict, list[dict]]:
@@ -239,7 +419,7 @@ def read_remote_progress(run_dir: Path) -> tuple[int, dict, list[dict]]:
         return 0, {}, []
     try:
         with csv_path.open(encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))[-256:]
+            rows = list(csv.DictReader(handle))
     except (OSError, csv.Error):
         return 0, {}, []
     metrics = []
@@ -277,70 +457,166 @@ def recent_log_lines(path: Path) -> list[str]:
         return []
 
 
+def save_pending_final(config: dict, run_id: str, payload: dict) -> Path:
+    """Keep terminal results on disk until the center acknowledges them; no credentials."""
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise ValueError("运行 ID 无效")
+    directory = Path(config["training_state_dir"])
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / f"{run_id}.json"
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        os.chmod(temporary, 0o600)
+        json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    return path
+
+
+def deliver_pending_final(config: dict, path: Path) -> bool:
+    run_id = path.stem
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise ValueError("运行 ID 无效")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("status") not in {"completed", "stopped", "failed"}:
+        raise ValueError("本地最终状态无效")
+    metrics = payload.get("metrics", [])
+    batch = dict(payload, metrics=metrics[:256])
+    if len(metrics) > 256:
+        batch["status"] = "stopping" if payload["status"] == "stopped" else "running"
+        for key in ("error_message", "exit_code", "stop_reason"):
+            batch.pop(key, None)
+    endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}/update"
+    response = api_json(config, endpoint, "POST", batch)
+    if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed"}:
+        save_pending_final(config, run_id, dict(payload, metrics=metrics[256:]))
+        return False
+    path.unlink()
+    return True
+
+
+def retry_pending_finals(config: dict) -> bool:
+    """Recover finished runs after an Agent restart before accepting more work."""
+    ready = True
+    for path in sorted(Path(config["training_state_dir"]).glob("*.json")):
+        try:
+            ready = deliver_pending_final(config, path) and ready
+        except (OSError, ValueError, HTTPError, URLError):
+            LOGGER.warning("最终训练结果仍待补传：%s；请检查网络、节点配置及本地状态文件", path.stem)
+            ready = False
+    return ready
+
+
 def run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
     run_id = task["run_id"]
+    manifest_payload = {**task, "output_root": task["parameters"]["remote_output_root"]}
+    last_manifest_at = 0.0
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}"
     log_lines: list[str] = []
     process = None
+    requested_stop = False
+    stop_reason = None
+    last_warning = 0.0
+    last_metrics: set[int] = set()
+    command_reported = False
+
+    def request_stop(reason: str) -> None:
+        nonlocal requested_stop, stop_reason
+        if not requested_stop:
+            requested_stop = True
+            stop_reason = reason
+            LOGGER.info("停止远程训练 %s，原因：%s", run_id, reason)
+            if process and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+    def report_progress(payload: dict) -> None:
+        nonlocal command_reported, last_warning
+        if not command_reported:
+            payload["command"] = command
+        try:
+            response = api_json(config, endpoint + "/update", "POST", payload)
+        except (OSError, ValueError, HTTPError, URLError):
+            if time.monotonic() - last_warning >= 30 or not last_warning:
+                LOGGER.warning("训练 %s 状态上报失败；训练继续运行，日志与指标将在连接恢复后补传", run_id)
+                last_warning = time.monotonic()
+            return
+        command_reported = True
+        last_metrics.update(item["epoch"] for item in payload.get("metrics", []))
+        if response.get("stop_requested"):
+            request_stop("platform_stop")
+
     try:
         command = build_training_command(config, task)
         log_path = Path(task["log_path"])
-        with log_path.open("a", encoding="utf-8", buffering=1) as log_handle:
+        with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
             log_handle.write(f"\n[{datetime.now(timezone.utc).isoformat()}] REMOTE COMMAND {shlex.join(command)}\n")
             environment = os.environ.copy()
             environment["MKL_THREADING_LAYER"] = "GNU"
+            environment["PYTHONUNBUFFERED"] = "1"
             process = subprocess.Popen(command, cwd=config["training_cwd"], env=environment, stdout=log_handle,
                                        stderr=subprocess.STDOUT, text=True, start_new_session=True)
-            response = api_json(config, endpoint + "/update", "POST", {"status": "running", "pid": process.pid,
-                                "run_dir": task["run_dir"], "command": command})
-            requested_stop = bool(response.get("stop_requested"))
-            last_metrics: set[int] = set()
+            report_progress({"status": "running", "pid": process.pid, "run_dir": task["run_dir"],
+                             "completed_epochs": task.get("completed_epochs", 0),
+                             "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {})})
             while process.poll() is None and not stop.is_set():
-                time.sleep(2)
+                if stop.wait(2):
+                    break
                 try:
                     control = api_json(config, endpoint + "/control")
-                    if control.get("stop") and not requested_stop:
-                        requested_stop = True
-                        os.killpg(process.pid, signal.SIGTERM)
+                    if control.get("stop"):
+                        request_stop("platform_stop")
                 except (OSError, ValueError, HTTPError, URLError):
                     pass
                 completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
-                new_metrics = [item for item in metrics if item["epoch"] not in last_metrics]
-                last_metrics.update(item["epoch"] for item in new_metrics)
+                completed = max(completed, task.get("completed_epochs", 0))
+                latest = latest or task.get("latest_metrics", {})
+                if time.monotonic() - last_manifest_at >= 30:
+                    try:
+                        report_manifest(config, manifest_payload)
+                        last_manifest_at = time.monotonic()
+                    except (OSError, ValueError, HTTPError, URLError):
+                        last_manifest_at = time.monotonic()
+                new_metrics = [item for item in metrics if item["epoch"] not in last_metrics][:256]
                 log_lines = recent_log_lines(log_path)
                 status = "stopping" if stop.is_set() or requested_stop else "running"
-                try:
-                    response = api_json(config, endpoint + "/update", "POST", {"status": status, "pid": process.pid,
+                report_progress({"status": status, "pid": process.pid,
                              "completed_epochs": completed, "progress": min(99.99, completed / max(1, int(task['parameters']['epochs'])) * 100),
                              "latest_metrics": latest, "metrics": new_metrics, "log_tail": log_lines,
                              "run_dir": task["run_dir"]})
-                    if response.get("stop_requested") and not requested_stop:
-                        requested_stop = True
-                        os.killpg(process.pid, signal.SIGTERM)
-                except (OSError, ValueError, HTTPError, URLError):
-                    pass
             if stop.is_set() and process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
+                request_stop("agent_shutdown")
             try:
                 exit_code = process.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 exit_code = process.wait()
         completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+        completed = max(completed, task.get("completed_epochs", 0))
+        latest = latest or task.get("latest_metrics", {})
+        try:
+            report_manifest(config, manifest_payload)
+        except (OSError, ValueError, HTTPError, URLError):
+            LOGGER.warning("产物清单暂未同步，平台下次查询时将请求补传")
         log_lines = recent_log_lines(Path(task["log_path"]))
-        final_status = "stopped" if stop.is_set() or requested_stop else "completed" if exit_code == 0 else "failed"
+        final_status = "stopped" if requested_stop else "completed" if exit_code == 0 else "failed"
         error = None if final_status != "failed" else f"训练进程异常退出，退出码 {exit_code}"
         final_payload = {"status": final_status, "completed_epochs": completed,
                          "progress": 100 if final_status == "completed" else min(99.99, completed / max(1, int(task['parameters']['epochs'])) * 100),
-                         "latest_metrics": latest, "metrics": metrics, "log_tail": log_lines, "exit_code": exit_code,
-                         "error_message": error, "run_dir": task["run_dir"]}
+                         "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in last_metrics],
+                         "log_tail": log_lines, "exit_code": exit_code, "command": command,
+                         "error_message": error, "stop_reason": stop_reason, "run_dir": task["run_dir"]}
+        pending_path = save_pending_final(config, run_id, final_payload)
         while True:
             try:
-                api_json(config, endpoint + "/update", "POST", final_payload)
-                break
+                if deliver_pending_final(config, pending_path):
+                    break
             except HTTPError as exc:
                 if exc.code in {401, 403, 404, 422}:
-                    LOGGER.error("最终训练状态无法上报，HTTP %s；本地退出码 %s", exc.code, exit_code)
+                    LOGGER.error("最终训练状态无法上报，HTTP %s；本地退出码 %s；已保存 %s", exc.code, exit_code, pending_path)
                     break
                 LOGGER.warning("最终训练状态上报失败，稍后重试：HTTP %s", exc.code)
             except (OSError, ValueError, URLError) as exc:
@@ -352,10 +628,19 @@ def run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
         if process and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
             except OSError:
                 pass
         try:
-            api_json(config, endpoint + "/update", "POST", {"status": "failed", "error_message": str(exc)[:4000], "exit_code": 1})
+            pending_path = save_pending_final(config, run_id, {"status": "failed", "error_message": str(exc)[:4000], "exit_code": 1,
+                                                             "completed_epochs": task.get("completed_epochs", 0),
+                                                             "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
+                                                             "log_tail": recent_log_lines(Path(task["log_path"]))})
+            deliver_pending_final(config, pending_path)
         except Exception:
             LOGGER.exception("远程训练错误状态上报失败")
         LOGGER.error("远程训练任务失败：%s", exc)
@@ -389,6 +674,7 @@ def main() -> int:
     failures = 0
     interval = config["report_interval_seconds"]
     active_training: threading.Thread | None = None
+    active_operation: threading.Thread | None = None
     training_stop = threading.Event()
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
                 "已启用" if config["enable_training"] else "未启用")
@@ -401,8 +687,20 @@ def main() -> int:
                             sum(len(gpu["processes"]) for gpu in payload["compute"]["gpus"]))
             failures = 0
             delay = interval
+            if config["enable_training"] and not args.once and (active_operation is None or not active_operation.is_alive()):
+                try:
+                    work = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/operations/poll", "POST", {}).get("operation")
+                    if work:
+                        active_operation = threading.Thread(target=run_operations, args=(config, work, stop),
+                                                            name="remote-file-operation", daemon=True)
+                        active_operation.start()
+                except (HTTPError, URLError, OSError, ValueError, TypeError):
+                    LOGGER.warning("远程文件操作轮询失败，下次心跳重试")
             if config["enable_training"] and not args.once and (active_training is None or not active_training.is_alive()):
                 try:
+                    if not retry_pending_finals(config):
+                        stop.wait(delay)
+                        continue
                     response = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/poll", "POST", {})
                     task = response.get("task")
                     if task:
@@ -432,6 +730,8 @@ def main() -> int:
     if active_training and active_training.is_alive():
         training_stop.set()
         active_training.join(timeout=20)
+    if active_operation and active_operation.is_alive():
+        active_operation.join(timeout=20)
     LOGGER.info("Agent 已停止")
     return 0
 

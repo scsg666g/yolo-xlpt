@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from 'react'
+import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
 import ReactECharts from 'echarts-for-react'
-import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Image, Save, Terminal, Trophy, X } from 'lucide-react'
+import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 
@@ -175,10 +176,10 @@ function ArtifactsDetails({ artifacts }: Pick<Props, 'artifacts'>) {
   const images = files.filter((item) => item.kind === 'image')
   if (!files.length) return <div className="canvas-detail-empty large">当前运行暂未生成训练产物。</div>
   return <div className="canvas-detail-sections">
-    {images.length > 0 && <section className="canvas-detail-section"><h3>图片预览 <span>{images.length}</span></h3><div className="artifact-gallery">{images.map((item) => <a key={item.id} href={`/api/artifacts/${item.id}/download`} target="_blank" rel="noreferrer" title={`打开 ${item.name}`}><img src={`/api/artifacts/${item.id}/download`} alt={item.name} loading="lazy" /><span><Image size={13} />{item.name}</span></a>)}</div></section>}
+    {images.length > 0 && <section className="canvas-detail-section"><h3>图片预览 <span>{images.length}</span></h3><div className="artifact-gallery">{images.map((item) => <ArtifactPreview key={item.id} artifact={item} />)}</div></section>}
     <section className="canvas-detail-section">
       <h3>全部文件 <span>{files.length}</span></h3>
-      <div className="artifact-detail-list">{files.map((item) => <article key={item.id}><div className={`artifact-kind kind-${item.kind}`}><FileText size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{item.kind.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified_at)}</small><a href={`/api/artifacts/${item.id}/download`} title={`下载 ${item.name}`} aria-label={`下载 ${item.name}`}><Download size={16} /></a></article>)}</div>
+      <div className="artifact-detail-list">{files.map((item) => <article key={item.id}><div className={`artifact-kind kind-${item.kind}`}><FileText size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{item.kind.toUpperCase()} · {formatBytes(item.size)} · {formatDate(item.modified_at)}</small><ArtifactDownload artifact={item} title={`下载 ${item.name}`}><Download size={16} /></ArtifactDownload></article>)}</div>
     </section>
   </div>
 }
@@ -198,10 +199,10 @@ function WeightsDetails({ artifacts, task, run }: Pick<Props, 'artifacts' | 'tas
         <p>{description}</p>
         <div className="weight-card-meta"><div><HardDrive size={14} /><span>文件大小</span><strong>{artifact ? formatBytes(artifact.size) : '—'}</strong></div><div><History size={14} /><span>更新时间</span><strong>{artifact ? formatDate(artifact.modified_at) : '—'}</strong></div></div>
         <div className="weight-card-path" title={artifact?.path}>{artifact?.path || `${task.run_dir || '训练输出目录'}/weights/${name}`}</div>
-        {artifact ? <a className="button primary weight-download" href={`/api/artifacts/${artifact.id}/download`}><Download size={16} />下载 {name}</a> : <button className="button ghost weight-download" disabled><Download size={16} />暂不可下载</button>}
+        {artifact ? <ArtifactDownload artifact={artifact} className="button primary weight-download"><Download size={16} />下载 {name}</ArtifactDownload> : <button className="button ghost weight-download" disabled><Download size={16} />暂不可下载</button>}
       </article>
     })}</div>
-    {weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).length > 0 && <section className="canvas-detail-section"><h3>其他模型权重</h3><div className="artifact-detail-list">{weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).map((item) => <article key={item.id}><div className="artifact-kind kind-weight"><Save size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{formatBytes(item.size)} · {formatDate(item.modified_at)}</small><a href={`/api/artifacts/${item.id}/download`} title={`下载 ${item.name}`}><Download size={16} /></a></article>)}</div></section>}
+    {weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).length > 0 && <section className="canvas-detail-section"><h3>其他模型权重</h3><div className="artifact-detail-list">{weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).map((item) => <article key={item.id}><div className="artifact-kind kind-weight"><Save size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{formatBytes(item.size)} · {formatDate(item.modified_at)}</small><ArtifactDownload artifact={item} title={`下载 ${item.name}`}><Download size={16} /></ArtifactDownload></article>)}</div></section>}
   </div>
 }
 

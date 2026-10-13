@@ -18,6 +18,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function requestWithTimeout<T>(path: string, init?: RequestInit, timeoutMs = 15_000,
+  timeoutMessage = '请求超时，请检查网络后重试'): Promise<T> {
+  const controller = new AbortController()
+  let timedOut = false
+  const abort = () => controller.abort()
+  if (init?.signal?.aborted) controller.abort()
+  init?.signal?.addEventListener('abort', abort, { once: true })
+  const timer = window.setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
+  try {
+    // Include response body decoding in the timeout, not just response headers.
+    return await request<T>(path, { ...init, signal: controller.signal })
+  } catch (reason) {
+    if (timedOut) throw new Error(timeoutMessage)
+    throw reason
+  } finally {
+    window.clearTimeout(timer)
+    init?.signal?.removeEventListener('abort', abort)
+  }
+}
+
+const deletionTimeout = '删除请求超时，后台可能已经受理。请关闭弹窗，查看任务列表或回收站确认状态后再操作。'
+
 export const api = {
   createDatasetUpload: (name: string, files: Array<{ path: string; size: number }>, signal: AbortSignal) =>
     request<{ upload_id: string; destination: string }>('/api/datasets/uploads', { method: 'POST', body: JSON.stringify({ name, files }), signal }),
@@ -28,7 +50,7 @@ export const api = {
   cancelDatasetUpload: (id: string) => request<void>(`/api/datasets/uploads/${id}`, { method: 'DELETE' }),
   tasks: (signal?: AbortSignal) => request<TrainingTask[]>('/api/tasks', { signal }),
   reorderTasks: (task_ids: string[]) => request<void>('/api/tasks/order', { method: 'PATCH', body: JSON.stringify({ task_ids }) }),
-  deletedTasks: () => request<TrainingTask[]>('/api/tasks?include_deleted=true').then((tasks) => tasks.filter((task) => task.deleted_at)),
+  deletedTasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks?deleted_only=true', { signal }).then((tasks) => tasks.filter((task) => task.deleted_at)),
   task: (id: string) => request<TrainingTask>(`/api/tasks/${id}`),
   create: (payload: TaskCreatePayload) => request<TrainingTask>('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }),
   start: (id: string) => request<TrainingTask>(`/api/tasks/${id}/start`, { method: 'POST' }),
@@ -37,9 +59,11 @@ export const api = {
   stop: (id: string) => request<TrainingTask>(`/api/tasks/${id}/stop`, { method: 'POST' }),
   clone: (id: string) => request<TrainingTask>(`/api/tasks/${id}/clone`, { method: 'POST' }),
   rename: (id: string, name: string) => request<TrainingTask>(`/api/tasks/${id}/name`, { method: 'PATCH', body: JSON.stringify({ name }) }),
-  remove: (id: string) => request<void>(`/api/tasks/${id}/trash`, { method: 'POST' }),
-  restore: (id: string) => request<TrainingTask>(`/api/tasks/${id}/restore`, { method: 'POST' }),
-  permanentRemove: (id: string) => request<void>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }),
+  remove: (id: string) => requestWithTimeout<void>(`/api/tasks/${id}/trash`, { method: 'POST' }, 30_000, deletionTimeout),
+  restore: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/restore`, { method: 'POST' }, 30_000,
+    '恢复请求超时，后台可能已经受理。请刷新任务列表和回收站确认状态。'),
+  permanentRemove: (id: string) => requestWithTimeout<{ status: string; message: string } | undefined>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }, 30_000, deletionTimeout),
+  prepareArtifact: (id: number, retry = false) => request<{ status: string; message?: string }>(`/api/artifacts/${id}/prepare?retry=${retry}`, { method: 'POST' }),
   saveLayout: (id: string, layout: TrainingTask['canvas_layout']) =>
     request<TrainingTask>(`/api/tasks/${id}/layout`, { method: 'PATCH', body: JSON.stringify({ layout }) }),
   updateConfig: (id: string, payload: {
