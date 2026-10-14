@@ -1,6 +1,6 @@
 import { useEffect, useMemo } from 'react'
 import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
-import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, Terminal, Trophy, X } from 'lucide-react'
+import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, ScanEye, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { LineChartView } from './LineChart'
@@ -15,6 +15,8 @@ type Props = {
   artifacts: Artifact[]
   events: TaskEvent[]
   onClose: () => void
+  onTest: (artifact: Artifact) => void
+  testDisabledReason: string | null
 }
 
 const detailMeta = {
@@ -184,7 +186,7 @@ function ArtifactsDetails({ artifacts }: Pick<Props, 'artifacts'>) {
   </div>
 }
 
-function WeightsDetails({ artifacts, task, run }: Pick<Props, 'artifacts' | 'task' | 'run'>) {
+function WeightsDetails({ artifacts, task, run, onTest, testDisabledReason }: Pick<Props, 'artifacts' | 'task' | 'run' | 'onTest' | 'testDisabledReason'>) {
   const weights = artifacts.filter((item) => item.kind === 'weight')
   const knownWeights = [
     { name: 'best.pt', label: '最佳模型', description: '训练过程中验证指标表现最好的检查点，通常用于部署、推理和导出。', icon: Trophy },
@@ -200,13 +202,14 @@ function WeightsDetails({ artifacts, task, run }: Pick<Props, 'artifacts' | 'tas
         <div className="weight-card-meta"><div><HardDrive size={14} /><span>文件大小</span><strong>{artifact ? formatBytes(artifact.size) : '—'}</strong></div><div><History size={14} /><span>更新时间</span><strong>{artifact ? formatDate(artifact.modified_at) : '—'}</strong></div></div>
         <div className="weight-card-path" title={artifact?.path}>{artifact?.path || `${task.run_dir || '训练输出目录'}/weights/${name}`}</div>
         {artifact ? <ArtifactDownload artifact={artifact} className="button primary weight-download"><Download size={16} />下载 {name}</ArtifactDownload> : <button className="button ghost weight-download" disabled><Download size={16} />暂不可下载</button>}
+        {artifact && name === 'best.pt' && <button className="button ghost weight-download" disabled={!!testDisabledReason} title={testDisabledReason || '测试模型'} onClick={() => onTest(artifact)}><ScanEye size={16} />{testDisabledReason || '测试模型'}</button>}
       </article>
     })}</div>
     {weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).length > 0 && <section className="canvas-detail-section"><h3>其他模型权重</h3><div className="artifact-detail-list">{weights.filter((item) => !['best.pt', 'last.pt'].includes(item.name.split('/').pop() || '')).map((item) => <article key={item.id}><div className="artifact-kind kind-weight"><Save size={16} /></div><div><strong>{item.name}</strong><span title={item.path}>{item.path}</span></div><small>{formatBytes(item.size)} · {formatDate(item.modified_at)}</small><ArtifactDownload artifact={item} title={`下载 ${item.name}`}><Download size={16} /></ArtifactDownload></article>)}</div></section>}
   </div>
 }
 
-export function CanvasDetailModal({ kind, task, run, metrics, artifacts, events, onClose }: Props) {
+export function CanvasDetailModal({ kind, task, run, metrics, artifacts, events, onClose, onTest, testDisabledReason }: Props) {
   useEffect(() => {
     if (!kind) return
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
@@ -225,7 +228,7 @@ export function CanvasDetailModal({ kind, task, run, metrics, artifacts, events,
         {kind === 'status' && <StatusDetails task={task} run={run} events={events} />}
         {kind === 'metrics' && <MetricsDetails task={task} metrics={metrics} />}
         {kind === 'artifacts' && <ArtifactsDetails artifacts={artifacts} />}
-        {kind === 'weights' && <WeightsDetails task={task} run={run} artifacts={artifacts} />}
+        {kind === 'weights' && <WeightsDetails task={task} run={run} artifacts={artifacts} onTest={onTest} testDisabledReason={testDisabledReason} />}
       </div>
       <footer><span>双击画布中的其他节点可切换查看对应内容</span><button className="button ghost" onClick={onClose}>关闭</button></footer>
     </div>

@@ -220,3 +220,11 @@ export interface TrainingParameterDefinition {
   default: string | number | boolean | null
   section: string
 }
+export interface ModelTest {
+  id: string
+  status: 'uploading' | 'preparing' | 'queued' | 'running' | 'completed' | 'failed'
+  confidence: number
+  error: string | null
+  expires_at: number
+  files: Array<{ name: string; size: number; uploaded: boolean; detections: number | null }>
+}

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArtifactDownload } from './ArtifactDownload'
 import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, type Connection, type Edge, type Node } from '@xyflow/react'
-import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, SlidersHorizontal, Square, Terminal, Trophy, Zap } from 'lucide-react'
+import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, ScanEye, SlidersHorizontal, Square, Terminal, Trophy, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue, statusLabel } from '../api'
 import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
@@ -11,17 +11,19 @@ import { LineChartView } from './LineChart'
 import { EditParametersModal } from './EditParametersModal'
 import { EditResourceModal } from './EditResourceModal'
 import { LogViewerModal } from './LogViewerModal'
+import { ModelTestModal } from './ModelTestModal'
 
 const nodeTypes = { panel: CanvasNode }
 const initialEdges: Edge[] = [
   ['dataset', 'config'], ['model', 'config'], ['config', 'status'], ['runtime', 'status'],
-  ['status', 'metrics'], ['status', 'logs'], ['status', 'weights'], ['metrics', 'artifacts'],
+  ['status', 'metrics'], ['status', 'logs'], ['status', 'weights'], ['metrics', 'artifacts'], ['weights', 'inference'],
 ].map(([source, target], index) => ({
   id: `edge-${index}`, source, target, markerEnd: { type: MarkerType.ArrowClosed },
 }))
 const positions: Record<string, { x: number; y: number }> = {
   dataset: { x: 20, y: 80 }, model: { x: 20, y: 420 }, config: { x: 400, y: 60 }, runtime: { x: 400, y: 430 },
   weights: { x: 800, y: -150 }, status: { x: 800, y: 170 }, metrics: { x: 1180, y: 20 }, logs: { x: 1180, y: 430 }, artifacts: { x: 1580, y: 180 },
+  inference: { x: 1180, y: -250 },
 }
 
 function row(label: string, value: React.ReactNode) { return <div className="node-row"><span>{label}</span><strong>{value}</strong></div> }
@@ -70,6 +72,7 @@ function TaskCanvasInner() {
   const [editingResource, setEditingResource] = useState<'dataset' | 'model' | null>(null)
   const [viewingLogs, setViewingLogs] = useState(false)
   const [detailKind, setDetailKind] = useState<CanvasDetailKind | null>(null)
+  const [testingArtifact, setTestingArtifact] = useState<Artifact | null>(null)
   const [pageVisible, setPageVisible] = useState(() => document.visibilityState !== 'hidden')
   const [reduceMotion, setReduceMotion] = useState(() => window.matchMedia('(prefers-reduced-motion: reduce)').matches)
   const [lastSyncedAt, setLastSyncedAt] = useState(Date.now())
@@ -240,6 +243,8 @@ function TaskCanvasInner() {
   const regularArtifacts = useMemo(() => artifacts.filter((artifact) => artifact.kind !== 'weight'), [artifacts])
   const bestWeight = weightArtifacts.find((artifact) => artifact.name.split('/').pop() === 'best.pt')
   const lastWeight = weightArtifacts.find((artifact) => artifact.name.split('/').pop() === 'last.pt')
+  const testDisabledReason = viewTask?.task_type !== 'detect' ? '目前支持目标检测模型'
+    : ['queued', 'starting', 'running', 'stopping'].includes(viewTask?.status || '') ? '训练结束或停止后可测试' : null
   const syncAge = Math.max(0, Math.floor((clock - lastSyncedAt) / 1000))
   const outputAge = Math.max(0, Math.floor((clock - lastOutputAt) / 1000))
   const syncDelayed = pageVisible && syncAge > 15
@@ -256,12 +261,13 @@ function TaskCanvasInner() {
     model: { title: viewTask.model_path.split('/').pop() || '基础模型', kicker: `MODEL${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Box size={17} />, accent: '#6da8ff', content: <><p className="mono path-value">{viewTask.model_path}</p>{row('任务类型', viewTask.task_type)}{row('预训练', viewTask.config.pretrained === false ? '关闭' : '启用')}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换基础模型</div>}</> },
     config: { title: '超参数配置', kicker: `CONFIGURATION${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Braces size={17} />, accent: '#d99cff', content: <><div className="node-grid">{row('Epochs', viewTask.epochs)}{row('Batch', viewTask.batch)}{row('Image', viewTask.imgsz)}{row('Optimizer', viewTask.optimizer)}{row('Workers', viewTask.workers)}{row('Patience', String(viewTask.config.patience ?? '—'))}</div>{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击添加或修改训练参数</div>}</> },
     runtime: { title: `GPU ${viewTask.device}`, kicker: 'RUNTIME · 双击查看', icon: <Cpu size={17} />, accent: '#ffba6b', activity: nodeActivity, content: <>{row('进程 PID', viewTask.pid || '—')}{row('输出目录', viewTask.run_dir ? viewTask.run_dir.split('/').slice(-4).join('/') : '等待创建')}{row('训练环境', 'PyTorch · CUDA')}</> },
-    weights: { title: '模型权重', kicker: 'CHECKPOINTS · 双击查看', icon: <Save size={17} />, accent: '#7da8ff', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: <div className="weight-node-list">{[{ artifact: bestWeight, label: '最佳模型', name: 'best.pt', Icon: Trophy }, { artifact: lastWeight, label: '最新模型', name: 'last.pt', Icon: History }].map(({ artifact, label, name, Icon }) => <div className={`weight-mini-card ${artifact ? '' : 'pending'}`} key={name}><div className="weight-mini-icon"><Icon size={15} /></div><div><span>{label}</span><strong>{artifact?.name.split('/').pop() || name}</strong><small>{artifact ? formatBytes(artifact.size) : '等待训练生成'}</small></div>{artifact && <ArtifactDownload artifact={artifact} className="nodrag nowheel" title={`下载 ${name}`}><Download size={15} /></ArtifactDownload>}</div>)}</div> },
+    weights: { title: '模型权重', kicker: 'CHECKPOINTS · 双击查看', icon: <Save size={17} />, accent: '#7da8ff', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: <div className="weight-node-list">{[{ artifact: bestWeight, label: '最佳模型', name: 'best.pt', Icon: Trophy }, { artifact: lastWeight, label: '最新模型', name: 'last.pt', Icon: History }].map(({ artifact, label, name, Icon }) => <div className={`weight-mini-card ${artifact ? '' : 'pending'}`} key={name}><div className="weight-mini-icon"><Icon size={15} /></div><div><span>{label}</span><strong>{artifact?.name.split('/').pop() || name}</strong><small>{artifact ? formatBytes(artifact.size) : '等待训练生成'}</small></div>{artifact && <ArtifactDownload artifact={artifact} className="nodrag nowheel" title={`下载 ${name}`}><Download size={15} /></ArtifactDownload>}{artifact && name === 'best.pt' && <button className="weight-test-button nodrag nowheel" disabled={!!testDisabledReason} title={testDisabledReason || '测试模型'} onDoubleClick={(event) => event.stopPropagation()} onClick={() => setTestingArtifact(artifact)}><ScanEye size={12} />测试模型</button>}</div>)}</div> },
     status: { title: statusLabel(viewTask.status), kicker: selectedRun ? `ATTEMPT ${String(selectedRun.attempt_number).padStart(3, '0')} · 双击查看` : 'TRAINING STATUS · 双击查看', icon: viewTask.status === 'running' ? <Zap size={17} /> : <Gauge size={17} />, activity: nodeActivity, pulse: isCurrentRun && motionAllowed ? epochPulse : undefined, content: <><div className="big-progress"><strong>{Math.round(viewTask.progress)}%</strong><span>Epoch {viewTask.completed_epochs} / {viewTask.epochs}</span></div><div className="progress"><i style={{ width: `${viewTask.progress}%` }} /></div><div className="node-grid metrics-mini">{row('mAP50', metricValue(viewTask, ['metrics/mAP50(B)']))}{row('Precision', metricValue(viewTask, ['metrics/precision(B)']))}{row('Recall', metricValue(viewTask, ['metrics/recall(B)']))}{row('Box loss', typeof latest['train/box_loss'] === 'number' ? latest['train/box_loss'].toFixed(4) : '—')}</div>{viewTask.error_message && <p className="node-error">{viewTask.error_message}</p>}</> },
     metrics: { title: '验证指标趋势', kicker: 'METRICS · 双击查看', icon: <Activity size={17} />, accent: '#53d6e8', pulse: isCurrentRun && motionAllowed ? epochPulse : undefined, content: metrics.length ? <LineChartView option={chartOption(metrics, motionAllowed && isCurrentRun && viewTask.status === 'running')} style={{ height: 220, width: 380 }} /> : <div className="node-empty">训练产生首个 Epoch 后显示曲线</div> },
     logs: { title: '实时训练日志', kicker: 'LIVE OUTPUT · 双击放大', icon: <Terminal size={17} />, accent: '#95a3b3', pulse: isCurrentRun && motionAllowed ? logPulse : undefined, content: <><pre className="log-view">{logs.length ? logs.slice(-18).map((line, index, visibleLines) => <span key={index} className={index === visibleLines.length - 1 && isCurrentRun && logPulse ? `log-new-line log-flash-${logPulse}` : ''}>{line}{index < visibleLines.length - 1 ? '\n' : ''}</span>) : '等待训练日志…'}</pre><div className="node-edit-hint"><Maximize size={12} />双击打开大屏日志</div></> },
     artifacts: { title: '训练产物', kicker: 'ARTIFACTS · 双击查看', icon: <FileArchive size={17} />, accent: '#ffd56d', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: regularArtifacts.length ? <div className="artifact-list">{regularArtifacts.slice(0, 12).map((item) => <div key={item.id} className={isCurrentRun && newArtifactIds.includes(item.id) ? `artifact-updated artifact-flash-${artifactPulse}` : ''}><FileText size={14} /><span>{item.name}{isCurrentRun && newArtifactIds.includes(item.id) && <em>已更新</em>}</span><small>{formatBytes(item.size)}</small></div>)}</div> : <div className="node-empty">暂无训练产物</div> },
-  } : null, [viewTask, isCurrentRun, selectedRun, metrics, regularArtifacts, logs, latest, nodeActivity, epochPulse, logPulse, artifactPulse, motionAllowed, newArtifactIds, bestWeight, lastWeight])
+    inference: { title: '模型测试', kicker: 'MODEL TEST · 双击打开', icon: <ScanEye size={17} />, accent: '#b3a0ff', content: <>{row('测试权重', bestWeight ? 'best.pt' : '等待训练生成')}{row('检测方式', '图片 · 置信度筛选')}<div className="node-edit-hint"><Maximize size={12} />原图对比 · 双击放大 · 下载结果</div><button className="button ghost nodrag nowheel model-test-node-button" disabled={!bestWeight || !!testDisabledReason} title={testDisabledReason || '打开模型测试'} onDoubleClick={(event) => event.stopPropagation()} onClick={() => bestWeight && setTestingArtifact(bestWeight)}><ScanEye size={14} />{testDisabledReason || '测试模型'}</button></> },
+  } : null, [viewTask, isCurrentRun, selectedRun, metrics, regularArtifacts, logs, latest, nodeActivity, epochPulse, logPulse, artifactPulse, motionAllowed, newArtifactIds, bestWeight, lastWeight, testDisabledReason])
 
   useEffect(() => {
     if (!task || !nodeData) return
@@ -337,7 +343,7 @@ function TaskCanvasInner() {
       </div>
     </header>
     <div className={`canvas-wrap flow-${isCurrentRun ? viewTask.status : 'history'}`}>
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeDoubleClick={(_, node) => { if (isCurrentRun && node.id === 'config') setEditingParameters(true); if (isCurrentRun && (node.id === 'dataset' || node.id === 'model')) setEditingResource(node.id); if (node.id === 'logs') setViewingLogs(true); if (['runtime', 'status', 'metrics', 'artifacts', 'weights'].includes(node.id)) setDetailKind(node.id as CanvasDetailKind) }} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeDoubleClick={(_, node) => { if (isCurrentRun && node.id === 'config') setEditingParameters(true); if (isCurrentRun && (node.id === 'dataset' || node.id === 'model')) setEditingResource(node.id); if (node.id === 'logs') setViewingLogs(true); if (node.id === 'inference') { if (bestWeight && !testDisabledReason) setTestingArtifact(bestWeight); else setNotice(testDisabledReason || '请等待 best.pt 权重生成'); } if (['runtime', 'status', 'metrics', 'artifacts', 'weights'].includes(node.id)) setDetailKind(node.id as CanvasDetailKind) }} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
         <Background color="#24313d" gap={24} size={1} />
         <MiniMap pannable zoomable nodeColor={(node) => node.id === 'status' ? '#70f0bd' : '#344657'} maskColor="rgba(5,9,13,.72)" />
         <Controls showInteractive={false} />
@@ -347,7 +353,8 @@ function TaskCanvasInner() {
     <EditParametersModal task={task} open={editingParameters} onClose={() => setEditingParameters(false)} onSaved={(updated) => { setTask(updated); setEditingParameters(false); setNotice('训练参数已保存'); window.setTimeout(() => setNotice(''), 1800) }} />
     <EditResourceModal task={task} mode={editingResource} onClose={() => setEditingResource(null)} onSaved={(updated) => { setTask(updated); setEditingResource(null); setNotice('训练资源已更新'); window.setTimeout(() => setNotice(''), 1800) }} />
     <LogViewerModal task={viewTask} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
-    <CanvasDetailModal kind={detailKind} task={viewTask} run={selectedRun} metrics={metrics} artifacts={artifacts} events={events} onClose={() => setDetailKind(null)} />
+    <CanvasDetailModal kind={detailKind} task={viewTask} run={selectedRun} metrics={metrics} artifacts={artifacts} events={events} onClose={() => setDetailKind(null)} onTest={(artifact) => { setDetailKind(null); setTestingArtifact(artifact) }} testDisabledReason={testDisabledReason} />
+    {testingArtifact && <ModelTestModal key={testingArtifact.id} artifact={testingArtifact} taskName={task.name} onClose={() => setTestingArtifact(null)} />}
   </div>
 }
 

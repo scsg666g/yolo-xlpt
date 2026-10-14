@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, MetricPoint, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, MetricPoint, ModelTest, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -41,6 +41,13 @@ async function requestWithTimeout<T>(path: string, init?: RequestInit, timeoutMs
 const deletionTimeout = '删除请求超时，后台可能已经受理。请关闭弹窗，查看任务列表或回收站确认状态后再操作。'
 
 export const api = {
+  createModelTest: (artifact_id: number, confidence: number, files: File[], signal: AbortSignal) =>
+    requestWithTimeout<ModelTest>('/api/model-tests', { method: 'POST', body: JSON.stringify({ artifact_id, confidence, files: files.map(({ name, size }) => ({ name, size })) }), signal }),
+  uploadModelTestImage: (id: string, index: number, file: File, signal: AbortSignal) =>
+    requestWithTimeout<void>(`/api/model-tests/${id}/images/${index}`, { method: 'PUT', body: file, headers: { 'Content-Type': 'application/octet-stream' }, signal }, 120_000),
+  startModelTest: (id: string, signal: AbortSignal) => requestWithTimeout<ModelTest>(`/api/model-tests/${id}/start`, { method: 'POST', signal }, 120_000),
+  modelTest: (id: string, signal: AbortSignal) => requestWithTimeout<ModelTest>(`/api/model-tests/${id}`, { signal }),
+  deleteModelTest: (id: string) => requestWithTimeout<void>(`/api/model-tests/${id}`, { method: 'DELETE' }),
   createDatasetUpload: (name: string, files: Array<{ path: string; size: number }>, signal: AbortSignal) =>
     request<{ upload_id: string; destination: string }>('/api/datasets/uploads', { method: 'POST', body: JSON.stringify({ name, files }), signal }),
   datasetUploadStatus: (id: string, signal: AbortSignal) =>
@@ -63,7 +70,7 @@ export const api = {
   restore: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/restore`, { method: 'POST' }, 30_000,
     '恢复请求超时，后台可能已经受理。请刷新任务列表和回收站确认状态。'),
   permanentRemove: (id: string) => requestWithTimeout<{ status: string; message: string } | undefined>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }, 30_000, deletionTimeout),
-  prepareArtifact: (id: number, retry = false) => request<{ status: string; message?: string }>(`/api/artifacts/${id}/prepare?retry=${retry}`, { method: 'POST' }),
+  prepareArtifact: (id: number, retry = false, signal?: AbortSignal) => requestWithTimeout<{ status: string; message?: string }>(`/api/artifacts/${id}/prepare?retry=${retry}`, { method: 'POST', signal }),
   saveLayout: (id: string, layout: TrainingTask['canvas_layout']) =>
     request<TrainingTask>(`/api/tasks/${id}/layout`, { method: 'PATCH', body: JSON.stringify({ layout }) }),
   updateConfig: (id: string, payload: {

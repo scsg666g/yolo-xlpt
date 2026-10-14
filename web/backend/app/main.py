@@ -21,6 +21,7 @@ from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, RUNS_ROO
 from .compute_nodes import ensure_local_node, local_snapshot, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
+from .inference import router as inference_router, worker as inference_worker
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete
 from .parameter_catalog import load_parameter_catalog
@@ -82,6 +83,7 @@ async def lifespan(_: FastAPI):
     migrate_training_logs()
     scheduler.start()
     local_deletion_worker.start()
+    inference_worker.start()
     _task_snapshot = await asyncio.to_thread(load_task_snapshot)
     snapshot_task = asyncio.create_task(task_snapshot_pump(), name="task-snapshot-pump")
     try:
@@ -93,11 +95,13 @@ async def lifespan(_: FastAPI):
         except asyncio.CancelledError:
             pass
         local_deletion_worker.stop()
+        inference_worker.stop()
         scheduler.stop()
 
 
 app = FastAPI(title="YOLO 模型训练平台", version="0.1.0", lifespan=lifespan)
 app.include_router(dataset_upload_router)
+app.include_router(inference_router)
 app.include_router(compute_nodes_router)
 app.include_router(remote_operations_router)
 app.add_middleware(
