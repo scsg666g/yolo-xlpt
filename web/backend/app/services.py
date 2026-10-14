@@ -709,7 +709,10 @@ class TrainingScheduler:
 
     def _available(self, db, task: TrainingTask) -> bool:
         wanted = self.requested_gpus(task.device)
-        active = db.scalars(select(TrainingTask).where(TrainingTask.status.in_(["starting", "running", "stopping"]))).all()
+        active = db.scalars(select(TrainingTask).where(
+            TrainingTask.execution_node_id.is_(None),
+            TrainingTask.status.in_(["starting", "running", "stopping"]),
+        )).all()
         used: set[str] = set()
         for other in active:
             if other.id != task.id:

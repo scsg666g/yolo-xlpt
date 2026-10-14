@@ -1,6 +1,7 @@
 from pathlib import Path
 import sqlite3
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select, text
@@ -49,6 +50,27 @@ def make_task(task_id: str = "task-test", **values):
     )
     defaults.update(values)
     return TrainingTask(**defaults)
+
+
+@pytest.mark.parametrize("status", ["starting", "running", "stopping"])
+@pytest.mark.parametrize("node_id,active_device,requested_device,available", [
+    ("remote-server", "0", "0", True),
+    (None, "0", "0", False),
+    (None, "0", "1", True),
+    (None, "0,1", "1", False),
+    (None, "0", "cpu", True),
+    (None, "cpu", "0", True),
+])
+def test_local_scheduler_gpu_occupancy_is_scoped_to_local_tasks(
+    tmp_path: Path, status, node_id, active_device, requested_device, available,
+):
+    with make_session(tmp_path) as session:
+        queued = make_task("queued-local", status="queued", device=requested_device)
+        active = make_task("active-task", status=status, execution_node_id=node_id, device=active_device)
+        session.add_all([queued, active])
+        session.commit()
+
+        assert TrainingScheduler()._available(session, queued) is available
 
 
 def test_sqlite_connection_uses_wal_and_bounded_busy_timeout(tmp_path: Path):
