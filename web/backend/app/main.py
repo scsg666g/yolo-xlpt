@@ -150,6 +150,7 @@ def health():
         raise HTTPException(503, "数据库暂不可用") from exc
     return {"status": "ok", "instance": PLATFORM_INSTANCE_NAME,
             "scheduler": "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped",
+            "local_deletion_worker": "running" if local_deletion_worker.is_alive else "stopped",
             "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "runs_root": str(RUNS_ROOT)}
 
@@ -652,6 +653,38 @@ def run_logs(task_id: str, run_id: str, tail: int = Query(default=400, ge=20, le
         return {"lines": [], "path": run.log_path}
     lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
     return {"lines": lines[-tail:], "path": run.log_path}
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/trace")
+def run_training_trace(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    if run.execution_node_id or run.task_id != task_id or not run.run_dir:
+        return {"available": False, "reason": "仅支持本机目标检测训练的过程采集", "samples": []}
+    trace_path = Path(run.run_dir) / "training-trace" / "trace.json"
+    if not trace_path.is_file():
+        return {"available": False, "reason": "该运行尚未产生过程采集数据，请启动新的本机目标检测训练", "samples": []}
+    try:
+        payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(503, f"训练过程数据暂不可读：{exc}") from exc
+    for sample in payload.get("samples", []):
+        if sample.get("image"):
+            sample["image_url"] = f"/api/tasks/{task_id}/runs/{run_id}/trace/images/{sample['image']}"
+    return payload
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/trace/images/{name}")
+def run_training_trace_image(task_id: str, run_id: str, name: str, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    if run.execution_node_id or not run.run_dir or Path(name).name != name:
+        raise HTTPException(404, "训练过程图片不存在")
+    image = (Path(run.run_dir) / "training-trace" / name).resolve()
+    trace_root = (Path(run.run_dir) / "training-trace").resolve()
+    if trace_root not in image.parents or not image.is_file():
+        raise HTTPException(404, "训练过程图片不存在")
+    return FileResponse(image)
 
 
 @app.get("/api/artifacts/{artifact_id}/download")

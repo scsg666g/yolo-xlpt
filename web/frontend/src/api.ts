@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, MetricPoint, ModelTest, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, MetricPoint, ModelTest, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -87,6 +87,7 @@ export const api = {
   runArtifacts: (id: string, runId: string) => request<Artifact[]>(`/api/tasks/${id}/runs/${runId}/artifacts`),
   runEvents: (id: string, runId: string) => request<TaskEvent[]>(`/api/tasks/${id}/runs/${runId}/events`),
   runLogs: (id: string, runId: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`),
+  trainingTrace: (id: string, runId: string) => request<TrainingTrace>(`/api/tasks/${id}/runs/${runId}/trace`),
   resources: () => request<Resources>('/api/resources'),
   compute: () => request<ComputeResources>('/api/compute'),
   computeNodes: (signal?: AbortSignal) => request<ComputeNode[]>('/api/compute/nodes', { signal }),

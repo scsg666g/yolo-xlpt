@@ -97,6 +97,30 @@ export interface TaskEvent {
   created_at: string
 }
 
+export interface TrainingTraceSample {
+  epoch: number
+  batch: number
+  images: { shape?: number[]; numel?: number; mean?: number; std?: number; min?: number; max?: number } | null
+  labels: number | null
+  loss: Record<string, number>
+  learning_rate: number[]
+  layers: Record<string, { shape?: number[]; numel?: number; mean?: number; std?: number; min?: number; max?: number }>
+  updates: Record<string, { gradient_mean: number; gradient_max: number; weight_mean_before: number; weight_mean_after?: number; weight_delta_mean?: number }>
+  image?: string
+  image_url?: string
+}
+
+export interface TrainingTrace {
+  available: boolean
+  reason?: string
+  source?: string
+  updated_at?: number
+  sample_count?: number
+  maximum?: number
+  interval?: number
+  samples: TrainingTraceSample[]
+}
+
 export interface ResourceFile {
   name: string
   path: string

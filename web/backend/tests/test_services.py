@@ -196,6 +196,16 @@ def test_failure_detail_prefers_root_error(tmp_path: Path):
     assert failure_detail(str(log)) == "Error: mkl-service is incompatible with libgomp.so.1"
 
 
+def test_failure_detail_recognizes_ddp_rank_prefix(tmp_path: Path):
+    log = tmp_path / "ddp.log"
+    log.write_text(
+        "[rank1]: FileNotFoundError: trace.json.tmp\n"
+        "subprocess.CalledProcessError: distributed worker failed\n",
+        encoding="utf-8",
+    )
+    assert failure_detail(str(log)) == "FileNotFoundError: trace.json.tmp"
+
+
 def test_sync_artifacts_is_idempotent(tmp_path: Path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()

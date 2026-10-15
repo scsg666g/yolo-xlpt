@@ -10,6 +10,7 @@ import signal
 import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -73,7 +74,8 @@ def failure_detail(log_path: str | None) -> str:
         if line.strip()
     ]
     root_markers = ("Error:", "RuntimeError:", "ValueError:", "FileNotFoundError:", "OutOfMemoryError:")
-    detail = next((line for line in reversed(lines) if line.startswith(root_markers)), "")
+    normalized = [re.sub(r"^\[rank\d+\]:\s*", "", line) for line in lines]
+    detail = next((line for line in reversed(normalized) if line.startswith(root_markers)), "")
     return detail or (lines[-1] if lines else "")
 
 
@@ -745,6 +747,18 @@ class TrainingScheduler:
                 command.append(f"{key}={value}")
         for key, value in (config.get("custom_args") or {}).items():
             command.append(f"{key}={value}")
+        if task.task_type == "detect" and not run.execution_node_id:
+            trace_dir = Path(run.run_dir or RUNS_ROOT / task.task_type / task.id / f"attempt-{run.attempt_number:03d}") / "training-trace"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            python_bin = YOLO_BIN.parent / "python"
+            if not python_bin.is_file():
+                python_bin = Path(sys.executable)
+            return [
+                str(python_bin), str(Path(__file__).with_name("training_trace.py")),
+                "--trace-dir", str(trace_dir), "--maximum", "24", "--interval", "10",
+                "--command-json", json.dumps(command, ensure_ascii=False),
+                *command,
+            ]
         return command
 
     def _launch(self, db, task: TrainingTask, run: TrainingRun) -> None:
