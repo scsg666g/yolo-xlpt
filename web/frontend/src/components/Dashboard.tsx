@@ -66,10 +66,22 @@ export function Dashboard() {
     try {
       const incoming = await api.tasks(controller.signal)
       if (taskRequest.current !== request) return
-      // A newer stream update must not be replaced by an older HTTP response.
+      // A newer poll response must not be replaced by an older HTTP response.
       if (taskDataVersion.current === dataVersion) {
         taskDataVersion.current += 1
-        setTasks(incoming)
+        setTasks((current) => {
+          if (orderRequest.current) return current
+          // Keep the user's current order stable while still incorporating new,
+          // removed, or updated tasks from the polling response.
+          if (!current.length) return incoming
+          const incomingById = new Map(incoming.map((task) => [task.id, task]))
+          const currentIds = current.map((task) => task.id)
+          const orderedIds = [
+            ...currentIds.filter((id) => incomingById.has(id)),
+            ...incoming.map((task) => task.id).filter((id) => !currentIds.includes(id)),
+          ]
+          return orderedIds.map((id) => incomingById.get(id)!).filter(Boolean)
+        })
       }
       setLoadError('')
     } catch (reason) {
@@ -85,34 +97,16 @@ export function Dashboard() {
   }, [])
 
   useEffect(() => {
-    refresh()
-    const source = new EventSource('/api/stream')
-    source.addEventListener('tasks', (event) => {
-      let incoming: TrainingTask[]
-      try {
-        incoming = JSON.parse((event as MessageEvent).data) as TrainingTask[]
-        if (!Array.isArray(incoming)) return
-      } catch {
-        return
-      }
-      taskDataVersion.current += 1
-      setLoading(false)
-      setLoadError('')
-      setTasks((current) => {
-        if (!current.length) return incoming
-        if (orderRequest.current) return current
-        const incomingById = new Map(incoming.map((task) => [task.id, task]))
-        const currentIds = current.map((task) => task.id)
-        const orderedIds = [
-          ...currentIds.filter((id) => incomingById.has(id)),
-          ...incoming.map((task) => task.id).filter((id) => !currentIds.includes(id)),
-        ]
-        return orderedIds.map((id) => incomingById.get(id)!).filter(Boolean)
-      })
-    })
-    source.onerror = () => undefined
+    let cancelled = false
+    let timer: ReturnType<typeof window.setTimeout> | undefined
+    async function poll() {
+      await refresh()
+      if (!cancelled) timer = window.setTimeout(poll, 3000)
+    }
+    void poll()
     return () => {
-      source.close()
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
       if (taskRequest.current) {
         window.clearTimeout(taskRequest.current.timer)
         taskRequest.current.controller.abort()
