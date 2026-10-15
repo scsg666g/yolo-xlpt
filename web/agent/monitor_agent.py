@@ -20,6 +20,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -29,8 +30,120 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
+TRACE_VERSION = 1
+TRACE_MAXIMUM = 24
+TRACE_INTERVAL = 10
 LOGGER = logging.getLogger("yolo-monitor-agent")
+
+
+REMOTE_TRACE_RUNNER = r'''#!/usr/bin/env python3
+import argparse, json, os, sys, time
+from pathlib import Path
+
+def stats(value):
+    if not hasattr(value, "detach"):
+        return None
+    value = value.detach().float()
+    shape = [int(x) for x in getattr(value, "shape", [])]
+    if not value.numel(): return {"shape": shape, "numel": 0}
+    return {"shape": shape, "numel": int(value.numel()), "mean": round(float(value.mean().cpu()), 7),
+            "std": round(float(value.std().cpu()), 7) if value.numel() > 1 else 0.0,
+            "min": round(float(value.min().cpu()), 7), "max": round(float(value.max().cpu()), 7)}
+
+class Collector:
+    def __init__(self, root, maximum, interval):
+        self.root, self.maximum, self.interval = Path(root), maximum, max(1, interval)
+        self.samples, self.step, self.layers, self.before, self.updates = [], -1, {}, {}, {}
+        self.last_batch, self.disabled = {}, False
+    def primary(self): return os.getenv("RANK", "-1") in {"-1", "0"}
+    def write(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "available": bool(self.samples), "source": "remote training callback",
+                   "updated_at": time.time(), "sample_count": len(self.samples), "maximum": self.maximum,
+                   "interval": self.interval, "samples": self.samples}
+        tmp = self.root / ("trace.json.%s.tmp" % os.getpid())
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.root / "trace.json")
+    def hook(self, name):
+        def capture(_module, _inputs, output):
+            if self.disabled or not self.primary() or self.step < 0 or self.step % self.interval or len(self.samples) >= self.maximum: return
+            try:
+                if isinstance(output, (list, tuple)): output = next((x for x in output if hasattr(x, "detach")), None)
+                value = stats(output)
+                if value: self.layers[name] = value
+            except Exception: self.disabled = True
+        return capture
+    def start(self, trainer):
+        if not self.primary(): return
+        try:
+            original = trainer.preprocess_batch
+            def preprocess(batch):
+                self.last_batch = original(batch); return self.last_batch
+            trainer.preprocess_batch = preprocess
+            for index, (name, module) in enumerate(trainer.model.named_modules()):
+                if index > 40 or not name or list(module.children()): continue
+                module.register_forward_hook(self.hook(name))
+            optimizer = getattr(trainer, "optimizer", None)
+            if optimizer is not None and hasattr(optimizer, "register_step_pre_hook"):
+                optimizer.register_step_pre_hook(self.before_step); optimizer.register_step_post_hook(self.after_step)
+        except Exception: self.disabled = True
+    def before_step(self, optimizer, _args, _kwargs):
+        self.before = {}
+        for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
+            if index >= 12 or parameter.grad is None: continue
+            gradient, value = parameter.grad.detach().float(), parameter.detach().float()
+            self.before[str(index)] = {"gradient_mean": round(float(gradient.abs().mean().cpu()), 8), "gradient_max": round(float(gradient.abs().max().cpu()), 8), "weight_mean_before": round(float(value.mean().cpu()), 8)}
+    def after_step(self, optimizer, _args, _kwargs):
+        self.updates = {}
+        for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
+            before = self.before.get(str(index))
+            if index >= 12 or before is None: continue
+            after = float(parameter.detach().float().mean().cpu())
+            self.updates[str(index)] = {**before, "weight_mean_after": round(after, 8), "weight_delta_mean": round(abs(after - before["weight_mean_before"]), 8)}
+    def batch_start(self, _trainer):
+        if self.primary() and not self.disabled: self.step += 1
+    def batch_end(self, trainer):
+        if self.disabled or not self.primary() or self.step % self.interval or len(self.samples) >= self.maximum: return
+        try:
+            batch = self.last_batch; image = batch.get("img") if isinstance(batch, dict) else None
+            sample = {"epoch": int(getattr(trainer, "epoch", 0)) + 1, "batch": self.step,
+                      "images": stats(image), "labels": int(batch.get("cls").shape[0]) if isinstance(batch, dict) and hasattr(batch.get("cls"), "shape") else None,
+                      "loss": {k: round(float(v), 7) for k, v in (getattr(trainer, "loss_items", {}) or {}).items()},
+                      "learning_rate": [round(float(g.get("lr", 0)), 10) for g in getattr(trainer, "optimizer", None).param_groups] if getattr(trainer, "optimizer", None) else [],
+                      "layers": dict(self.layers), "updates": dict(self.updates)}
+            if hasattr(image, "detach") and getattr(image, "ndim", 0) == 4:
+                try:
+                    from PIL import Image
+                    pixels = image[0].detach().float().clamp(0, 1).mul(255).byte().permute(1, 2, 0).cpu().numpy()
+                    name = "batch-%05d.jpg" % self.step
+                    Image.fromarray(pixels).save(self.root / name, quality=88); sample["image"] = name
+                except Exception: pass
+            self.samples.append(sample); self.write()
+        except Exception: self.disabled = True
+    def end(self, _trainer):
+        if self.primary() and not self.disabled:
+            try: self.write()
+            except Exception: pass
+
+def main():
+    parser = argparse.ArgumentParser(); parser.add_argument("--trace-dir", required=True); parser.add_argument("--maximum", type=int, default=24); parser.add_argument("--interval", type=int, default=10); parser.add_argument("--command-json", required=True)
+    args, _ = parser.parse_known_args()
+    from ultralytics import YOLO
+    command = json.loads(args.command_json); values = {}
+    for item in command[3:]:
+        if "=" in item:
+            key, value = item.split("=", 1)
+            try:
+                from ultralytics.cfg import smart_value; value = smart_value(value)
+            except Exception: pass
+            values[key] = value
+    model = YOLO(str(values.pop("model")), task=str(values.pop("task", command[1])))
+    values.pop("mode", None); collector = Collector(args.trace_dir, args.maximum, args.interval)
+    model.add_callback("on_train_start", collector.start); model.add_callback("on_train_batch_start", collector.batch_start); model.add_callback("on_train_batch_end", collector.batch_end); model.add_callback("on_train_end", collector.end)
+    model.train(**values)
+if __name__ == "__main__": main()
+'''
 
 
 def number(value: str, integer: bool = False):
@@ -154,6 +267,9 @@ def load_config(path: Path) -> dict:
         raise ValueError("allowed_training_roots 必须是绝对路径列表")
     if enabled and not roots:
         raise ValueError("启用训练时必须配置 allowed_training_roots")
+    trace_enabled = config.get("enable_training_trace", True)
+    if type(trace_enabled) is not bool:
+        raise ValueError("enable_training_trace 必须为布尔值")
     yolo_bin = config.get("yolo_bin", "yolo")
     training_cwd = config.get("training_cwd", "/data/yolo/yolo")
     if not isinstance(yolo_bin, str) or not yolo_bin or not isinstance(training_cwd, str) or not Path(training_cwd).is_absolute():
@@ -170,7 +286,8 @@ def load_config(path: Path) -> dict:
             "enable_training": enabled, "allowed_training_roots": [str(Path(item).resolve()) for item in roots],
             "yolo_bin": yolo_bin, "training_cwd": str(cwd_path),
             "training_lock_file": str(lock_path),
-            "training_state_dir": str(path.resolve().parent / ".training-state")}
+            "training_state_dir": str(path.resolve().parent / ".training-state"),
+            "enable_training_trace": trace_enabled}
 
 
 def acquire_training_lock(config: dict):
@@ -334,6 +451,8 @@ def report_manifest(config: dict, payload: dict) -> None:
     if run_dir.is_dir():
         for path in run_dir.rglob("*"):
             relative = path.relative_to(run_dir)
+            if relative.parts and relative.parts[0] == "training-trace":
+                continue
             if any(part.startswith(".") for part in relative.parts) or path.is_symlink() or not path.is_file():
                 continue
             if path.resolve() != path or run_dir not in path.resolve().parents:
@@ -544,6 +663,46 @@ def retry_pending_finals(config: dict) -> bool:
     return ready
 
 
+def prepare_trace_command(config: dict, task: dict, command: list[str]) -> list[str]:
+    """Wrap remote detect training with the bundled real-batch collector."""
+    if not config.get("enable_training_trace", False) or task.get("task_type") != "detect":
+        return command
+    trace_dir = Path(task["run_dir"]) / "training-trace"
+    state_dir = Path(config["training_state_dir"])
+    state_dir.mkdir(parents=True, exist_ok=True)
+    runner = state_dir / "training_trace_runner.py"
+    if not runner.is_file() or runner.read_text(encoding="utf-8") != REMOTE_TRACE_RUNNER:
+        runner.write_text(REMOTE_TRACE_RUNNER, encoding="utf-8")
+        os.chmod(runner, 0o700)
+    yolo_bin = str(config.get("yolo_bin", ""))
+    python_bin = str(Path(yolo_bin).parent / "python") if "/" in yolo_bin else sys.executable
+    if not Path(python_bin).is_file():
+        python_bin = sys.executable
+    return [python_bin, str(runner), "--trace-dir", str(trace_dir),
+            "--maximum", str(TRACE_MAXIMUM), "--interval", str(TRACE_INTERVAL),
+            "--command-json", json.dumps(command, ensure_ascii=False), *command]
+
+
+def report_training_trace(config: dict, task: dict, sent_images: set[str]) -> None:
+    trace_path = Path(task["run_dir"]) / "training-trace" / "trace.json"
+    if not trace_path.is_file():
+        return
+    payload = json.loads(trace_path.read_text(encoding="utf-8"))
+    payload["samples"] = payload.get("samples", [])[-TRACE_MAXIMUM:]
+    image_name = next((sample.get("image") for sample in payload["samples"] if sample.get("image") and sample.get("image") not in sent_images), None)
+    image_base64 = None
+    if image_name:
+        image_path = trace_path.parent / Path(image_name).name
+        if image_path.is_file() and image_path.stat().st_size <= 512 * 1024:
+            image_base64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        else:
+            image_name = None
+    api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/runs/{task['run_id']}/trace", "POST",
+             {"trace": payload, "image_name": image_name, "image_base64": image_base64})
+    if image_name:
+        sent_images.add(image_name)
+
+
 def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
     run_id = task["run_id"]
     manifest_payload = {**task, "output_root": task["parameters"]["remote_output_root"]}
@@ -556,6 +715,8 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
     last_warning = 0.0
     last_metrics: set[int] = set()
     command_reported = False
+    sent_trace_images: set[str] = set()
+    last_trace_at = 0.0
 
     def request_stop(reason: str) -> None:
         nonlocal requested_stop, stop_reason
@@ -586,7 +747,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
             request_stop("platform_stop")
 
     try:
-        command = build_training_command(config, task)
+        command = prepare_trace_command(config, task, build_training_command(config, task))
         log_path = Path(task["log_path"])
         with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
             log_handle.write(f"\n[{datetime.now(timezone.utc).isoformat()}] REMOTE COMMAND {shlex.join(command)}\n")
@@ -617,6 +778,12 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
                     except (OSError, ValueError, HTTPError, URLError):
                         last_manifest_at = time.monotonic()
                 new_metrics = [item for item in metrics if item["epoch"] not in last_metrics][:256]
+                if time.monotonic() - last_trace_at >= 10:
+                    try:
+                        report_training_trace(config, task, sent_trace_images)
+                    except (OSError, ValueError, HTTPError, URLError, json.JSONDecodeError):
+                        pass
+                    last_trace_at = time.monotonic()
                 log_lines = recent_log_lines(log_path)
                 status = "stopping" if stop.is_set() or requested_stop else "running"
                 report_progress({"status": status, "pid": process.pid,
@@ -637,6 +804,10 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
             report_manifest(config, manifest_payload)
         except (OSError, ValueError, HTTPError, URLError):
             LOGGER.warning("产物清单暂未同步，平台下次查询时将请求补传")
+        try:
+            report_training_trace(config, task, sent_trace_images)
+        except (OSError, ValueError, HTTPError, URLError, json.JSONDecodeError):
+            LOGGER.warning("训练过程采样暂未同步")
         log_lines = recent_log_lines(Path(task["log_path"]))
         final_status = "stopped" if requested_stop else "completed" if exit_code == 0 else "failed"
         error = None if final_status != "failed" else f"训练进程异常退出，退出码 {exit_code}"

@@ -70,6 +70,20 @@ def test_real_directory_cleanup_keeps_external_log(agent, training, monkeypatch)
     assert not list(Path(config["training_state_dir"]).glob("*.json"))
 
 
+def test_remote_detect_command_includes_training_trace_runner(agent, training, tmp_path):
+    config, task = training
+    config["enable_training_trace"] = True
+    config["yolo_bin"] = str(tmp_path / "yolo")
+    Path(config["yolo_bin"]).write_text("#!/bin/sh\n")
+    Path(config["yolo_bin"]).chmod(0o700)
+    command = [config["yolo_bin"], "detect", "train", "model=/tmp/model.pt", "data=/tmp/data.yaml"]
+    wrapped = agent.prepare_trace_command(config, task, command)
+    assert wrapped[1].endswith("training_trace_runner.py")
+    assert "--trace-dir" in wrapped and str(Path(task["run_dir"]) / "training-trace") in wrapped
+    assert wrapped[-len(command):] == command
+    assert (Path(config["training_state_dir"]) / "training_trace_runner.py").is_file()
+
+
 @pytest.mark.parametrize("stop_mode", [None, "platform_stop", "agent_shutdown"])
 def test_failed_updates_retry_metrics_and_explicit_stop(agent, training, monkeypatch, stop_mode):
     config, task = training

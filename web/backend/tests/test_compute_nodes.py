@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import json
 import os
 import threading
@@ -251,6 +252,38 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
         assert event.payload["source_ip"] == "testclient"
         assert event.payload["run_id"] == run_id
         assert "请求来源：testclient" in event.message
+
+
+def test_remote_training_trace_upload_is_authenticated_and_stored(monitoring_client, tmp_path, monkeypatch):
+    client, factory = monitoring_client
+    monkeypatch.setattr(monitoring, "DATA_ROOT", tmp_path)
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        task = TrainingTask(id="remote-trace", name="trace", task_type="detect", execution_node_id=node_id,
+                            model_path="/remote/model.pt", data_path="/remote/data.yaml",
+                            config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run.status = "running"
+        run.run_dir = "/remote/runs/detect/remote-trace/attempt-001"
+        run_id = run.id
+        db.commit()
+    payload = {"trace": {"updated_at": 1, "maximum": 24, "interval": 10, "samples": [
+        {"epoch": 1, "batch": 10, "images": {"shape": [2, 3, 640, 640]}, "loss": {"box": 1.2}, "layers": {}, "updates": {},
+         "image": "batch-00010.jpg"}
+    ]}, "image_name": "batch-00010.jpg", "image_base64": base64.b64encode(b"\xff\xd8\xfftrace").decode()}
+    url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/trace"
+    assert client.post(url, json=payload).status_code == 401
+    response = client.post(url, headers=headers(credential), json=payload)
+    assert response.status_code == 200, response.text
+    trace = client.get(f"/api/tasks/remote-trace/runs/{run_id}/trace")
+    assert trace.status_code == 200 and trace.json()["available"]
+    assert trace.json()["samples"][0]["image_url"].endswith("/batch-00010.jpg")
+    image = client.get(f"/api/tasks/remote-trace/runs/{run_id}/trace/images/batch-00010.jpg")
+    assert image.status_code == 200 and image.content.startswith(b"\xff\xd8\xff")
+    assert client.post(url, headers=headers(credential), json={**payload, "image_name": "../escape.jpg"}).status_code == 422
 
 
 def test_agent_rejects_outside_paths_and_keeps_training_disabled_by_default(monitoring_client, tmp_path):

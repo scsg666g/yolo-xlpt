@@ -18,7 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, RUNS_ROOT, WEB_ROOT
-from .compute_nodes import ensure_local_node, local_snapshot, router as compute_nodes_router
+from .compute_nodes import ensure_local_node, local_snapshot, remote_trace_root, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import router as dataset_upload_router
 from .inference import router as inference_router, worker as inference_worker
@@ -659,11 +659,12 @@ def run_logs(task_id: str, run_id: str, tail: int = Query(default=400, ge=20, le
 def run_training_trace(task_id: str, run_id: str, db: Session = Depends(get_db)):
     get_task_or_404(db, task_id)
     run = get_run_or_404(db, task_id, run_id)
-    if run.execution_node_id or run.task_id != task_id or not run.run_dir:
-        return {"available": False, "reason": "仅支持本机目标检测训练的过程采集", "samples": []}
-    trace_path = Path(run.run_dir) / "training-trace" / "trace.json"
+    if run.task_id != task_id:
+        return {"available": False, "reason": "训练运行与任务不匹配", "samples": []}
+    trace_path = remote_trace_root(run.id) / "trace.json" if run.execution_node_id else Path(run.run_dir or "") / "training-trace" / "trace.json"
     if not trace_path.is_file():
-        return {"available": False, "reason": "该运行尚未产生过程采集数据，请启动新的本机目标检测训练", "samples": []}
+        source = "远程 Agent" if run.execution_node_id else "本机训练"
+        return {"available": False, "reason": f"该运行尚未产生过程采集数据，请确认{source}已升级并重新打开", "samples": []}
     try:
         payload = json.loads(trace_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -678,10 +679,10 @@ def run_training_trace(task_id: str, run_id: str, db: Session = Depends(get_db))
 def run_training_trace_image(task_id: str, run_id: str, name: str, db: Session = Depends(get_db)):
     get_task_or_404(db, task_id)
     run = get_run_or_404(db, task_id, run_id)
-    if run.execution_node_id or not run.run_dir or Path(name).name != name:
+    if Path(name).name != name:
         raise HTTPException(404, "训练过程图片不存在")
-    image = (Path(run.run_dir) / "training-trace" / name).resolve()
-    trace_root = (Path(run.run_dir) / "training-trace").resolve()
+    trace_root = (remote_trace_root(run.id) if run.execution_node_id else Path(run.run_dir or "") / "training-trace").resolve()
+    image = (trace_root / name).resolve()
     if trace_root not in image.parents or not image.is_file():
         raise HTTPException(404, "训练过程图片不存在")
     return FileResponse(image)

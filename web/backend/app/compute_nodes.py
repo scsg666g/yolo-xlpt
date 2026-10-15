@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import base64
+import json
 import logging
 import os
 import platform
@@ -22,13 +24,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from .config import WEB_ROOT
+from .config import DATA_ROOT, WEB_ROOT
 from .database import get_db
 from .models import ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
 
 router = APIRouter(prefix="/api/compute", tags=["compute nodes"])
 MAX_REPORT_BYTES = 1024 * 1024
+MAX_TRACE_BYTES = 4 * 1024 * 1024
+MAX_TRACE_SAMPLES = 24
+MAX_TRACE_IMAGE_BYTES = 512 * 1024
 LOCAL_ID = "local"
 Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Percentage = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
@@ -147,6 +152,21 @@ class RemoteRunUpdate(BaseModel):
     @classmethod
     def clean_logs(cls, value: list[str]) -> list[str]:
         return [line[:4000] for line in value]
+
+
+def remote_trace_root(run_id: str) -> Path:
+    return DATA_ROOT / "remote-traces" / run_id
+
+
+def _trace_sample_key(sample: dict) -> str:
+    return f"{sample.get('epoch', '')}:{sample.get('batch', '')}"
+
+
+class RemoteTraceUpload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    trace: dict[str, Any] = Field(default_factory=dict)
+    image_name: str | None = Field(default=None, max_length=80, pattern=r"^batch-[0-9]{5}\.jpg$")
+    image_base64: str | None = Field(default=None, max_length=MAX_TRACE_IMAGE_BYTES * 2)
 
 
 _local_lock = threading.Lock()
@@ -486,6 +506,63 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
     mirror_run_to_task(task, run)
     db.commit()
     return {"status": run.status, "stop_requested": bool(run.stop_requested)}
+
+
+@router.post("/nodes/{node_id}/agent/runs/{run_id}/trace")
+def upload_remote_trace(node_id: str, run_id: str, payload: RemoteTraceUpload, request: Request, db: Session = Depends(get_db)):
+    authenticated_agent(node_id, request, db)
+    run = db.get(TrainingRun, run_id)
+    if not run or run.execution_node_id != node_id:
+        raise HTTPException(404, "远程训练运行不存在")
+    samples = payload.trace.get("samples", [])
+    if not isinstance(samples, list) or len(samples) > MAX_TRACE_SAMPLES:
+        raise HTTPException(422, "训练过程采样数量超出限制")
+    if len(json.dumps(payload.model_dump(mode="json"), ensure_ascii=False)) > MAX_TRACE_BYTES:
+        raise HTTPException(413, "训练过程数据不能超过 4 MB")
+    clean_samples = []
+    for sample in samples:
+        if not isinstance(sample, dict) or not isinstance(sample.get("epoch"), int) or not isinstance(sample.get("batch"), int):
+            raise HTTPException(422, "训练过程采样格式错误")
+        clean_samples.append(sample)
+    encoded = payload.image_base64
+    image_name = payload.image_name
+    if bool(encoded) != bool(image_name):
+        raise HTTPException(422, "训练过程图片必须同时提供文件名和内容")
+    trace_root = remote_trace_root(run_id)
+    trace_root.mkdir(parents=True, exist_ok=True)
+    previous = {}
+    previous_path = trace_root / "trace.json"
+    if previous_path.is_file():
+        try:
+            previous = json.loads(previous_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+    if encoded and image_name:
+        try:
+            image = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            raise HTTPException(422, "训练过程图片编码无效") from None
+        if len(image) > MAX_TRACE_IMAGE_BYTES or not image.startswith(b"\xff\xd8\xff"):
+            raise HTTPException(422, "训练过程图片大小或格式不符合要求")
+        temporary = trace_root / f".{image_name}.tmp"
+        temporary.write_bytes(image)
+        temporary.replace(trace_root / image_name)
+    merged = {"version": 1, "available": bool(clean_samples), "source": "remote training callback",
+              "updated_at": payload.trace.get("updated_at"), "sample_count": len(clean_samples),
+              "maximum": min(int(payload.trace.get("maximum", MAX_TRACE_SAMPLES)), MAX_TRACE_SAMPLES),
+              "interval": max(1, int(payload.trace.get("interval", 10))), "samples": clean_samples}
+    if not isinstance(merged["updated_at"], (int, float)):
+        merged["updated_at"] = time.time()
+    for sample in merged["samples"]:
+        if sample.get("image"):
+            image_path = trace_root / Path(str(sample["image"])).name
+            if not image_path.is_file():
+                old = next((item for item in previous.get("samples", []) if _trace_sample_key(item) == _trace_sample_key(sample)), {})
+                sample["image"] = old.get("image") if old.get("image") and (trace_root / Path(str(old["image"])).name).is_file() else None
+    temporary = trace_root / ".trace.json.tmp"
+    temporary.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(trace_root / "trace.json")
+    return {"status": "ok", "sample_count": len(clean_samples)}
 
 
 @router.get("/nodes/{node_id}/agent/runs/{run_id}/control")

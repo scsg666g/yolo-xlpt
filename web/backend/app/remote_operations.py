@@ -5,6 +5,7 @@ import base64
 import hashlib
 import os
 import secrets
+import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -16,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import DATA_ROOT
-from .compute_nodes import as_utc, authenticated_agent
+from .compute_nodes import as_utc, authenticated_agent, remote_trace_root
 from .database import get_db
 from .models import Artifact, RemoteOperation, TrainingRun, TrainingTask, utcnow
 from .services import add_event, artifact_kind
@@ -195,6 +196,8 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
         if task.status in ACTIVE or task.deleted_reason != "remote_delete_pending":
             raise HTTPException(409, "任务当前不能永久删除")
         if payload.success:
+            for historical in task.runs:
+                shutil.rmtree(remote_trace_root(historical.id), ignore_errors=True)
             for other in db.scalars(select(RemoteOperation).where(RemoteOperation.task_id == task.id)):
                 if other.id != operation.id:
                     other.status = "cancelled"

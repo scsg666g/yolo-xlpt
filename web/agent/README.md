@@ -37,13 +37,14 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-推荐使用 **Agent 1.4.0 和配套新版中台**，且 `center_url` 能从远程机器访问，再编辑远程配置文件。当前中心按 Agent 上报的版本检查能力：
+推荐使用 **Agent 1.5.0 和配套新版中台**，且 `center_url` 能从远程机器访问，再编辑远程配置文件。当前中心按 Agent 上报的版本检查能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
 | 基础远程训练、状态、指标与日志尾部 | 1.2.0 | 显式启用训练，设置环境和允许目录 |
 | 远程断点续训、产物扫描传输及永久删除 | 1.3.0 | 检查点或目标文件可用，节点保持接入 |
 | 多 Agent 共享训练锁 | 1.4.0 | 必须使用同一锁文件，不能仅凭版本保证互斥 |
+| 远程 YOLO 训练过程解析 | 1.5.0 | 仅目标检测任务；按批次采样真实输入、层统计和损失摘要 |
 
 低于 1.2.0 的旧 Agent 不能领取新训练任务；1.2.x 可以进行基础训练，但不具备完整的续训和文件管理能力。配置示例：
 
@@ -53,7 +54,8 @@ python3 monitor_agent.py --config agent-config.json
   "allowed_training_roots": ["/data/yolo/yolo", "/data/yolo/datasets", "/data/yolo/runs"],
   "yolo_bin": "/data/conda/envs/yolo/bin/yolo",
   "training_cwd": "/data/yolo/yolo",
-  "training_lock_file": "/data/yolo/yolo/.yolo-forge-training.lock"
+  "training_lock_file": "/data/yolo/yolo/.yolo-forge-training.lock",
+  "enable_training_trace": true
 }
 ```
 
@@ -65,7 +67,9 @@ python3 monitor_agent.py --config agent-config.json
 
 在新建任务弹窗选择已注册的远程服务器，再输入远程机器上真实的模型文件、数据集 YAML 和输出根目录的绝对路径。数据集须已在远程服务器可用；中台不会上传或复制它们。任务按节点隔离排队，同一节点一次领取一项训练；Agent 在线时主动领取；可在平台请求停止，Agent 收到指令后终止对应进程。指标和最近 100 行日志回传到中台，完整日志与权重保存在远程机器。
 
-中心从源码配置动态生成参数目录，Agent 1.4.0 的 `TRAINING_KEYS` 是固定集合。例如中心已有 `cls_remap`，Agent 的预设白名单尚未包含，作为预设参数时不会加入远程命令。Agent 参数序列化只接受标量，列表和字典可能被拒绝；不能假定本机与远程的参数完全等价。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
+Agent 1.5.0 会在远程目标检测训练中自动采集最多 24 个真实 Batch 的输入张量、网络层统计、损失和采样图片，并增量上传到中台的过程解析接口。平台不会上传完整特征图、模型权重或数据集；采样图片单张最多 512 KiB。采集失败不会中断训练，网络暂时不可用时会在下一次轮询重试。若远程服务器资源紧张，可在配置中设置 `"enable_training_trace": false`，关闭过程采集但保留普通训练、指标和日志回传。替换 Agent 后需重新领取或重新启动训练，已经运行的旧 Attempt 不会补采历史 Batch。
+
+中心从源码配置动态生成参数目录，Agent 1.5.0 的 `TRAINING_KEYS` 是固定集合。例如中心已有 `cls_remap`，Agent 的预设白名单尚未包含，作为预设参数时不会加入远程命令。Agent 参数序列化只接受标量，列表和字典可能被拒绝；不能假定本机与远程的参数完全等价。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
 
 ### 远程任务与文件操作（Agent 1.3.0）
 
@@ -112,7 +116,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `1.4.0` 后，再替换并验证连接：
+确认输出为 `1.5.0` 后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
