@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -26,6 +27,7 @@ from app.services import (
     path_is_within,
     permanently_delete_task_files,
     prepare_dataset_config,
+    process_matches_training,
     resume_checkpoint,
     sync_artifacts,
     sync_metrics,
@@ -71,6 +73,137 @@ def test_local_scheduler_gpu_occupancy_is_scoped_to_local_tasks(
         session.commit()
 
         assert TrainingScheduler()._available(session, queued) is available
+
+
+def test_process_match_requires_command_and_start_time(monkeypatch):
+    started_at = utcnow()
+    monkeypatch.setattr(
+        services_module, "_process_identity",
+        lambda _pid: (["python", "train.py", "task-1"], started_at),
+    )
+
+    assert process_matches_training(123, ["python", "train.py", "task-1"], started_at)
+    assert not process_matches_training(123, ["python", "train.py", "task-2"], started_at)
+    assert not process_matches_training(123, ["python", "train.py", "task-1"], started_at.replace(year=2025))
+
+
+def test_scheduler_recovers_training_process_after_restart(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'recovery.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    started_at = utcnow()
+    with session_factory() as db:
+        task = make_task("task-recovery", status="interrupted", pid=None)
+        run = TrainingRun(
+            id="run-recovery", task=task, attempt_number=2, launch_mode="retry", status="interrupted",
+            model_path=task.model_path, data_path=task.data_path, command=["python", "train.py", "task-recovery"],
+            parameter_snapshot={"epochs": 20}, process_started_at=started_at,
+            error_message="平台服务重启后未发现受管训练进程",
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    monkeypatch.setattr(scheduler, "_find_run_process", lambda _run: 4321)
+    scheduler._recover_processes()
+
+    with session_factory() as db:
+        recovered = db.get(TrainingRun, "run-recovery")
+        recovered_task = db.get(TrainingTask, "task-recovery")
+        event = db.scalar(select(TaskEvent).where(TaskEvent.task_id == "task-recovery", TaskEvent.event_type == "reattached"))
+        assert (recovered.status, recovered.pid, recovered.error_message) == ("running", 4321, None)
+        assert (recovered_task.status, recovered_task.pid) == ("running", 4321)
+        assert event is not None
+    assert scheduler.processes["task-recovery"].adopted
+    assert scheduler.processes["task-recovery"].pid == 4321
+
+
+def test_scheduler_resumes_pending_stop_after_restart(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'recover-stopping.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    started_at = utcnow()
+    with session_factory() as db:
+        task = make_task("task-recover-stopping", status="stopping", pid=4321)
+        run = TrainingRun(
+            id="run-recover-stopping", task=task, attempt_number=1, launch_mode="fresh", status="stopping", pid=4321,
+            model_path=task.model_path, data_path=task.data_path,
+            command=["python", "train.py", "task-recover-stopping"],
+            parameter_snapshot={"epochs": 20}, process_started_at=started_at,
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    signals = []
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    monkeypatch.setattr(scheduler, "_find_run_process", lambda _run: 4321)
+    monkeypatch.setattr(services_module.os, "killpg", lambda pid, sent_signal: signals.append((pid, sent_signal)))
+
+    scheduler._recover_processes()
+
+    with session_factory() as db:
+        recovered = db.get(TrainingRun, "run-recover-stopping")
+        recovered_task = db.get(TrainingTask, "task-recover-stopping")
+        assert (recovered.status, recovered.pid) == ("stopping", 4321)
+        assert (recovered_task.status, recovered_task.pid) == ("stopping", 4321)
+    assert signals == [(4321, services_module.signal.SIGTERM)]
+    assert scheduler.processes["task-recover-stopping"].adopted
+
+
+def test_scheduler_marks_missing_active_process_interrupted(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'missing-process.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with session_factory() as db:
+        task = make_task("task-missing", status="running", pid=9876)
+        run = TrainingRun(
+            id="run-missing", task=task, attempt_number=1, launch_mode="fresh", status="running", pid=9876,
+            model_path=task.model_path, data_path=task.data_path, command=["python", "train.py", "task-missing"],
+            parameter_snapshot={"epochs": 20}, process_started_at=utcnow(),
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    monkeypatch.setattr(scheduler, "_find_run_process", lambda _run: None)
+    scheduler._recover_processes()
+
+    with session_factory() as db:
+        missing = db.get(TrainingRun, "run-missing")
+        assert missing.status == "interrupted"
+        assert missing.pid is None
+        assert missing.error_message == "平台服务重启后未发现受管训练进程"
+    assert "task-missing" not in scheduler.processes
+
+
+@pytest.mark.parametrize("completed_epochs,expected_status", [(3, "interrupted"), (20, "completed")])
+def test_adopted_process_exit_uses_recorded_epochs_without_faking_exit_code(
+    tmp_path, completed_epochs, expected_status,
+):
+    session = make_session(tmp_path)
+    task = make_task("task-adopted-exit", status="running", completed_epochs=completed_epochs)
+    run = TrainingRun(
+        id="run-adopted-exit", task=task, attempt_number=1, launch_mode="fresh", status="running",
+        model_path=task.model_path, data_path=task.data_path, completed_epochs=completed_epochs,
+        parameter_snapshot={"epochs": 20}, process_started_at=utcnow(),
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+    scheduler = TrainingScheduler()
+    scheduler.processes[task.id] = SimpleNamespace(run_id=run.id, adopted=True, poll=lambda: 0)
+
+    scheduler._poll_processes(session)
+
+    assert run.status == expected_status
+    assert run.exit_code is None
+    assert run.pid is None
+    if expected_status == "interrupted":
+        assert "无法取得原进程退出码" in run.error_message
+    session.close()
 
 
 def test_sqlite_connection_uses_wal_and_bounded_busy_timeout(tmp_path: Path):

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,53 @@ def training_environment() -> dict[str, str]:
     environment = os.environ.copy()
     environment["MKL_THREADING_LAYER"] = TRAINING_MKL_THREADING_LAYER
     return environment
+
+
+def _process_identity(pid: int) -> tuple[list[str], datetime] | None:
+    """Read a Linux process command and start time without adding a runtime dependency."""
+    if pid <= 0:
+        return None
+    proc = Path("/proc") / str(pid)
+    try:
+        stat_fields = (proc / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        if not stat_fields or stat_fields[0] == "Z":
+            return None
+        command = [part.decode("utf-8", errors="replace") for part in (proc / "cmdline").read_bytes().split(b"\0") if part]
+        boot_line = next(line for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines() if line.startswith("btime "))
+        boot_time = int(boot_line.split()[1])
+        clock_ticks = os.sysconf("SC_CLK_TCK")
+        # stat field 22 is index 19 after removing pid and the parenthesized command.
+        started_at = datetime.fromtimestamp(boot_time + int(stat_fields[19]) / clock_ticks, timezone.utc)
+    except (FileNotFoundError, PermissionError, OSError, StopIteration, ValueError, IndexError):
+        return None
+    return command, started_at
+
+
+def process_matches_training(pid: int, command: list[str], started_at: datetime | None) -> bool:
+    """Reject stale/reused PIDs by matching both argv and process creation time."""
+    identity = _process_identity(pid)
+    if not identity or not command or not started_at:
+        return False
+    actual_command, actual_started_at = identity
+    expected_started_at = started_at if started_at.tzinfo else started_at.replace(tzinfo=timezone.utc)
+    return actual_command == [str(part) for part in command] and abs(
+        (actual_started_at - expected_started_at.astimezone(timezone.utc)).total_seconds()
+    ) <= 10
+
+
+@dataclass
+class ManagedTrainingProcess:
+    run_id: str
+    pid: int
+    command: list[str]
+    started_at: datetime
+    popen: subprocess.Popen | None = None
+    adopted: bool = False
+
+    def poll(self) -> int | None:
+        if self.popen is not None:
+            return self.popen.poll()
+        return None if process_matches_training(self.pid, self.command, self.started_at) else 0
 
 
 def failure_detail(log_path: str | None) -> str:
@@ -676,20 +724,60 @@ def import_existing_runs() -> int:
 
 
 class TrainingScheduler:
-    def __init__(self) -> None:
-        self.processes: dict[str, tuple[str, subprocess.Popen]] = {}
+    def __init__(self, session_factory=SessionLocal) -> None:
+        self.session_factory = session_factory
+        self.processes: dict[str, ManagedTrainingProcess] = {}
         self._last_artifact_scan: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def start(self) -> None:
-        with SessionLocal() as db:
-            running = db.scalars(select(TrainingRun).where(
-                TrainingRun.status.in_(["starting", "running", "stopping"]),
+    @staticmethod
+    def _find_run_process(run: TrainingRun) -> int | None:
+        candidates = [run.pid] if run.pid else []
+        try:
+            candidates.extend(int(path.name) for path in Path("/proc").iterdir() if path.name.isdigit())
+        except OSError:
+            pass
+        for pid in dict.fromkeys(candidates):
+            if pid and process_matches_training(pid, list(run.command or []), run.process_started_at):
+                return pid
+        return None
+
+    def _recover_processes(self) -> None:
+        with self.session_factory() as db:
+            candidates = db.scalars(select(TrainingRun).where(
                 TrainingRun.execution_node_id.is_(None),
+                (
+                    TrainingRun.status.in_(["starting", "running", "stopping"])
+                    | ((TrainingRun.status == "interrupted") & (TrainingRun.error_message == "平台服务重启后未发现受管训练进程"))
+                ),
             )).all()
-            for run in running:
+            for run in candidates:
                 task = db.get(TrainingTask, run.task_id)
+                pid = self._find_run_process(run)
+                if pid and task and run.process_started_at:
+                    previous_status = run.status
+                    run.status = "stopping" if previous_status == "stopping" else "running"
+                    run.pid = pid
+                    run.error_message = None
+                    run.finished_at = None
+                    mirror_run_to_task(task, run)
+                    self.processes[task.id] = ManagedTrainingProcess(
+                        run_id=run.id, pid=pid, command=list(run.command or []),
+                        started_at=run.process_started_at, adopted=True,
+                    )
+                    add_event(
+                        db, task.id, "reattached", f"平台重启后已重新接管 Attempt {run.attempt_number:03d}，PID {pid}",
+                        payload={"pid": pid, "previous_status": previous_status}, run_id=run.id,
+                    )
+                    if previous_status == "stopping":
+                        try:
+                            os.killpg(pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+                    continue
+                if run.status == "interrupted":
+                    continue
                 run.status = "interrupted"
                 run.pid = None
                 run.error_message = "平台服务重启后未发现受管训练进程"
@@ -697,6 +785,10 @@ class TrainingScheduler:
                     mirror_run_to_task(task, run)
                     add_event(db, task.id, "interrupted", run.error_message, "warning", run_id=run.id)
             db.commit()
+
+    def start(self) -> None:
+        self._recover_processes()
+        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="training-scheduler", daemon=True)
         self._thread.start()
 
@@ -816,11 +908,14 @@ class TrainingScheduler:
         run.log_path = str(log_path)
         run.error_message = None
         mirror_run_to_task(task, run)
-        self.processes[task.id] = (run.id, process)
+        self.processes[task.id] = ManagedTrainingProcess(
+            run_id=run.id, pid=process.pid, command=command,
+            started_at=run.process_started_at, popen=process,
+        )
         add_event(db, task.id, "started", f"Attempt {run.attempt_number:03d} 已启动，PID {process.pid}", payload={"command": command}, run_id=run.id)
 
     def stop_task(self, task_id: str) -> bool:
-        with SessionLocal() as db:
+        with self.session_factory() as db:
             task = db.get(TrainingTask, task_id)
             if not task:
                 return False
@@ -837,8 +932,7 @@ class TrainingScheduler:
             managed = self.processes.get(task_id)
             if task.status not in {"starting", "running"} or not managed:
                 return False
-            run_id, process = managed
-            run = db.get(TrainingRun, run_id)
+            run = db.get(TrainingRun, managed.run_id)
             if not run:
                 return False
             run.status = "stopping"
@@ -846,31 +940,36 @@ class TrainingScheduler:
             add_event(db, task.id, "stopping", "正在停止训练进程", run_id=run.id)
             db.commit()
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(managed.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             return True
 
     def _poll_processes(self, db) -> None:
-        for task_id, (run_id, process) in list(self.processes.items()):
+        for task_id, managed in list(self.processes.items()):
+            run_id = managed.run_id
             task = db.get(TrainingTask, task_id)
             run = db.get(TrainingRun, run_id)
             if not task or not run:
                 continue
             sync_metrics(db, task, run)
-            code = process.poll()
+            code = managed.poll()
             if code is None:
                 now = time.monotonic()
                 if now - self._last_artifact_scan.get(run_id, 0.0) >= 10:
                     sync_artifacts(db, task, run)
                     self._last_artifact_scan[run_id] = now
                 continue
-            run.exit_code = code
+            run.exit_code = None if managed.adopted else code
             run.pid = None
             run.finished_at = utcnow()
             if run.status == "stopping":
                 run.status = "stopped"
                 message, level = "训练已停止", "info"
+            elif managed.adopted and run.completed_epochs < int((run.parameter_snapshot or {}).get("epochs") or task.epochs):
+                run.status = "interrupted"
+                run.error_message = "平台接管的训练进程已退出，无法取得原进程退出码"
+                message, level = run.error_message, "warning"
             elif code == 0:
                 run.status = "completed"
                 run.progress = 100.0
@@ -891,7 +990,7 @@ class TrainingScheduler:
     def _loop(self) -> None:
         while not self._stop.wait(2):
             try:
-                with SessionLocal() as db:
+                with self.session_factory() as db:
                     self._poll_processes(db)
                     queued = db.scalars(select(TrainingRun).where(TrainingRun.status == "queued", TrainingRun.execution_node_id.is_(None)).order_by(TrainingRun.queued_at)).all()
                     for run in queued:

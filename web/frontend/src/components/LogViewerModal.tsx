@@ -21,6 +21,7 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
   const [search, setSearch] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
   const [copied, setCopied] = useState(false)
+  const [actionMessage, setActionMessage] = useState('')
   const outputRef = useRef<HTMLDivElement>(null)
   const visibleLines = useMemo(() => search ? lines.filter((line) => line.toLowerCase().includes(search.toLowerCase())) : lines, [lines, search])
 
@@ -28,12 +29,34 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
     if (open && autoScroll && outputRef.current) outputRef.current.scrollTop = outputRef.current.scrollHeight
   }, [open, autoScroll, visibleLines])
 
-  useEffect(() => { if (open) { setSearch(''); setCopied(false) } }, [open])
+  useEffect(() => { if (open) { setSearch(''); setCopied(false); setActionMessage('') } }, [open])
   if (!open || !task) return null
 
   async function copyLogs() {
-    await navigator.clipboard.writeText(lines.join('\n'))
-    setCopied(true); window.setTimeout(() => setCopied(false), 1600)
+    const text = lines.join('\n')
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = text
+        textarea.setAttribute('readonly', '')
+        textarea.style.position = 'fixed'
+        textarea.style.opacity = '0'
+        document.body.appendChild(textarea)
+        try {
+          textarea.select()
+          if (!document.execCommand('copy')) throw new Error('浏览器拒绝了复制操作')
+        } finally {
+          textarea.remove()
+        }
+      }
+      setCopied(true); setActionMessage('日志已复制到剪贴板')
+      window.setTimeout(() => { setCopied(false); setActionMessage('') }, 1600)
+    } catch (reason) {
+      setCopied(false)
+      setActionMessage(reason instanceof Error ? `${reason.message}，请手动选择日志文本复制` : '复制失败，请手动选择日志文本复制')
+    }
   }
 
   function downloadLogs() {
@@ -41,8 +64,14 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
     const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
-    anchor.href = url; anchor.download = `${task.name}-training.log`; anchor.click()
-    URL.revokeObjectURL(url)
+    anchor.href = url
+    anchor.download = `${task.name.replace(/[\\/:*?"<>|]+/g, '_') || 'training'}-training.log`
+    anchor.style.display = 'none'
+    document.body.appendChild(anchor)
+    anchor.click()
+    window.setTimeout(() => { anchor.remove(); URL.revokeObjectURL(url) }, 1000)
+    setActionMessage('日志下载已开始')
+    window.setTimeout(() => setActionMessage(''), 1600)
   }
 
   return <div className="modal-backdrop log-backdrop" onMouseDown={onClose}>
@@ -56,6 +85,7 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
         <label className="auto-scroll"><input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />自动滚动</label>
         <button className="log-action-button" title="复制当前日志内容" aria-label="复制当前日志内容" onClick={copyLogs}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? '已复制' : '复制全部'}</button>
         <button className="log-action-button" title="下载当前日志文件" aria-label="下载当前日志文件" onClick={downloadLogs}><Download size={15} />下载日志</button>
+        {actionMessage && <span className="log-action-message" role="status">{actionMessage}</span>}
       </div>
       <div className="terminal-window">
         <div className="terminal-chrome"><span className="red" /><span className="yellow" /><span className="green" /><code>yolo://training/{task.id}</code><em>{visibleLines.length} lines</em></div>

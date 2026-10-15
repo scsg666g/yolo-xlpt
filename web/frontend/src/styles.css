@@ -276,6 +276,13 @@ button { color: inherit; }
 .log-action-button:focus-visible { outline: 2px solid #70f0bd; outline-offset: 2px; }
 .log-action-button svg { transition: transform .18s ease; }
 .log-action-button:hover svg { transform: scale(1.12); }
+.log-action-message { max-width: 300px; color: #70f0bd; font-size: 9px; line-height: 1.5; }
+@media (max-width: 760px) {
+  .log-tool-row { flex-wrap: wrap; }
+  .log-search { min-width: min(310px, 100%); flex: 1 1 100%; }
+  .auto-scroll { margin-left: 0; }
+  .log-action-message { flex-basis: 100%; }
+}
 .artifact-list > div { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; padding: 7px 8px; border-radius: 5px; color: #97a6b2; font-size: 8px; }
 .artifact-list > div:hover { color: var(--green); background: #14211f; }
 :root[data-theme='light'] .artifact-list > div { color: #527080; }
