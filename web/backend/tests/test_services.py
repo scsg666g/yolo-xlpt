@@ -753,6 +753,67 @@ def test_read_only_run_endpoints_do_not_scan_local_files(tmp_path: Path, monkeyp
         session.close()
 
 
+def test_effective_best_weight_follows_exact_resume_chain(tmp_path: Path):
+    session = make_session(tmp_path)
+    task = make_task("task-effective-best", status="completed")
+    run_one = TrainingRun(
+        id="run-best-1", task=task, attempt_number=1, launch_mode="fresh", status="interrupted",
+        model_path=task.model_path, data_path=task.data_path, run_dir="runs/attempt-001", parameter_snapshot={},
+    )
+    run_two = TrainingRun(
+        id="run-best-2", task=task, attempt_number=2, launch_mode="resume", status="interrupted",
+        model_path=task.model_path, data_path=task.data_path, run_dir="runs/attempt-002",
+        checkpoint_path="runs/attempt-001/weights/last.pt", parameter_snapshot={},
+    )
+    run_three = TrainingRun(
+        id="run-best-3", task=task, attempt_number=3, launch_mode="resume", status="completed",
+        model_path=task.model_path, data_path=task.data_path, run_dir="runs/attempt-003",
+        checkpoint_path="runs/attempt-002/weights/last.pt", parameter_snapshot={},
+    )
+    unrelated = TrainingRun(
+        id="run-best-4", task=task, attempt_number=4, launch_mode="retry", status="completed",
+        model_path=task.model_path, data_path=task.data_path, run_dir="runs/attempt-004", parameter_snapshot={},
+    )
+    task.current_run_id = run_three.id
+    session.add_all([task, run_one, run_two, run_three, unrelated])
+    session.flush()
+    session.add_all([
+        Artifact(task_id=task.id, run_id=run_one.id, kind="weight", name="weights/best.pt",
+                 path="runs/attempt-001/weights/best.pt", size=100),
+        Artifact(task_id=task.id, run_id=run_one.id, kind="weight", name="weights/last.pt",
+                 path=run_two.checkpoint_path, size=110),
+        Artifact(task_id=task.id, run_id=run_two.id, kind="weight", name="weights/last.pt",
+                 path=run_three.checkpoint_path, size=120),
+        Artifact(task_id=task.id, run_id=unrelated.id, kind="weight", name="weights/best.pt",
+                 path="runs/attempt-004/weights/best.pt", size=400),
+    ])
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        current = client.get(f"/api/tasks/{task.id}/runs/{run_three.id}/effective-best-weight")
+        assert current.status_code == 200
+        assert current.json()["artifact"]["path"] == "runs/attempt-001/weights/best.pt"
+        assert current.json()["source_run_id"] == run_one.id
+        assert current.json()["source_attempt_number"] == 1
+        assert current.json()["inherited"] is True
+
+        direct = client.get(f"/api/tasks/{task.id}/runs/{run_one.id}/effective-best-weight").json()
+        assert direct["source_run_id"] == run_one.id
+        assert direct["inherited"] is False
+
+        isolated = client.get(f"/api/tasks/{task.id}/runs/{unrelated.id}/effective-best-weight").json()
+        assert isolated["source_run_id"] == unrelated.id
+        assert isolated["inherited"] is False
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
 def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_path: Path, monkeypatch):
     runs_root = tmp_path / "runs"
     runtime_root = tmp_path / "runtime"

@@ -26,13 +26,14 @@ from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, 
 from .local_deletions import local_deletion_worker, queue_local_delete
 from .parameter_catalog import load_parameter_catalog
 from .remote_operations import matching_fetch, operation_file, queue_delete, queue_scan, router as remote_operations_router
-from .schemas import ArtifactRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
+from .schemas import ArtifactRead, EffectiveBestWeightRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
     add_event,
     backfill_training_runs,
     create_training_run,
     current_run,
     discover_files,
+    effective_best_weight,
     gpu_inventory,
     import_existing_runs,
     migrate_training_logs,
@@ -634,6 +635,19 @@ def run_artifacts(task_id: str, run_id: str, db: Session = Depends(get_db)):
         queue_scan(db, task, run)
         db.commit()
     return db.scalars(select(Artifact).where(Artifact.run_id == run.id).order_by(Artifact.kind, Artifact.name)).all()
+
+
+@app.get("/api/tasks/{task_id}/runs/{run_id}/effective-best-weight", response_model=EffectiveBestWeightRead)
+def run_effective_best_weight(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    artifact, source_run = effective_best_weight(db, run)
+    return {
+        "artifact": artifact,
+        "source_run_id": source_run.id if source_run else None,
+        "source_attempt_number": source_run.attempt_number if source_run else None,
+        "inherited": bool(source_run and source_run.id != run.id),
+    }
 
 
 @app.get("/api/tasks/{task_id}/runs/{run_id}/events", response_model=list[EventRead])

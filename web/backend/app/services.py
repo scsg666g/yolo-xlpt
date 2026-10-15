@@ -607,6 +607,34 @@ def resume_checkpoint(task: TrainingTask) -> Path | None:
     return checkpoint if checkpoint.is_file() else None
 
 
+def effective_best_weight(db, run: TrainingRun) -> tuple[Artifact | None, TrainingRun | None]:
+    """Find best.pt on this run or on the exact checkpoint ancestry of a resumed run."""
+    visited: set[str] = set()
+    candidate: TrainingRun | None = run
+    while candidate and candidate.id not in visited:
+        visited.add(candidate.id)
+        weights = db.scalars(select(Artifact).where(
+            Artifact.run_id == candidate.id,
+            Artifact.kind == "weight",
+            Artifact.size > 0,
+        )).all()
+        best = next((artifact for artifact in weights if Path(artifact.name).name == "best.pt"), None)
+        if best:
+            return best, candidate
+        if candidate.launch_mode != "resume" or not candidate.checkpoint_path:
+            break
+        checkpoint = db.scalar(select(Artifact).where(
+            Artifact.task_id == candidate.task_id,
+            Artifact.path == candidate.checkpoint_path,
+            Artifact.run_id.is_not(None),
+        ))
+        source = db.get(TrainingRun, checkpoint.run_id) if checkpoint and checkpoint.run_id else None
+        if not source or source.task_id != candidate.task_id or source.attempt_number >= candidate.attempt_number:
+            break
+        candidate = source
+    return None, None
+
+
 def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> None:
     run = run or current_run(db, task)
     if not run or run.execution_node_id or not run.run_dir or not Path(run.run_dir).exists():

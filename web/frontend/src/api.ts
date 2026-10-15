@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, MetricPoint, ModelTest, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, MetricPoint, ModelTest, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -85,6 +85,7 @@ export const api = {
   runs: (id: string) => request<TrainingRun[]>(`/api/tasks/${id}/runs`),
   runMetrics: (id: string, runId: string) => request<MetricPoint[]>(`/api/tasks/${id}/runs/${runId}/metrics`),
   runArtifacts: (id: string, runId: string) => request<Artifact[]>(`/api/tasks/${id}/runs/${runId}/artifacts`),
+  runEffectiveBestWeight: (id: string, runId: string) => request<EffectiveBestWeight>(`/api/tasks/${id}/runs/${runId}/effective-best-weight`),
   runEvents: (id: string, runId: string) => request<TaskEvent[]>(`/api/tasks/${id}/runs/${runId}/events`),
   runLogs: (id: string, runId: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`),
   trainingTrace: (id: string, runId: string) => request<TrainingTrace>(`/api/tasks/${id}/runs/${runId}/trace`),

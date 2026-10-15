@@ -88,6 +88,13 @@ export interface Artifact {
   modified_at: string | null
 }
 
+export interface EffectiveBestWeight {
+  artifact: Artifact | null
+  source_run_id: string | null
+  source_attempt_number: number | null
+  inherited: boolean
+}
+
 export interface TaskEvent {
   id: number
   level: string

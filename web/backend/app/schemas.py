@@ -171,6 +171,13 @@ class ArtifactRead(BaseModel):
     modified_at: datetime | None
 
 
+class EffectiveBestWeightRead(BaseModel):
+    artifact: ArtifactRead | None = None
+    source_run_id: str | None = None
+    source_attempt_number: int | None = None
+    inherited: bool = False
+
+
 class EventRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int

@@ -2,7 +2,7 @@ import { useEffect, useMemo } from 'react'
 import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
 import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, ScanEye, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
-import type { Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
+import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { LineChartView } from './LineChart'
 
 export type CanvasDetailKind = 'runtime' | 'status' | 'metrics' | 'artifacts' | 'weights'
@@ -13,6 +13,7 @@ type Props = {
   run: TrainingRun | null
   metrics: MetricPoint[]
   artifacts: Artifact[]
+  effectiveBestWeight: EffectiveBestWeight | null
   events: TaskEvent[]
   onClose: () => void
   onTest: (artifact: Artifact) => void
@@ -186,18 +187,22 @@ function ArtifactsDetails({ artifacts }: Pick<Props, 'artifacts'>) {
   </div>
 }
 
-function WeightsDetails({ artifacts, task, run, onTest, testDisabledReason }: Pick<Props, 'artifacts' | 'task' | 'run' | 'onTest' | 'testDisabledReason'>) {
+function WeightsDetails({ artifacts, effectiveBestWeight, task, run, onTest, testDisabledReason }: Pick<Props, 'artifacts' | 'effectiveBestWeight' | 'task' | 'run' | 'onTest' | 'testDisabledReason'>) {
   const weights = artifacts.filter((item) => item.kind === 'weight')
+  const currentBestWeight = weights.find((item) => item.name.split('/').pop() === 'best.pt')
+  const inheritedBestWeight = !currentBestWeight && effectiveBestWeight?.inherited ? effectiveBestWeight.artifact : null
   const knownWeights = [
     { name: 'best.pt', label: '最佳模型', description: '训练过程中验证指标表现最好的检查点，通常用于部署、推理和导出。', icon: Trophy },
     { name: 'last.pt', label: '最新模型', description: '最后一个 Epoch 保存的检查点，保留训练状态，通常用于中断后继续训练。', icon: History },
   ]
   return <div className="canvas-detail-sections">
-    <div className="weight-detail-summary"><div><span>运行批次</span><strong>{run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '—'}</strong></div><div><span>训练状态</span><strong>{statusLabel(task.status)}</strong></div><div><span>权重数量</span><strong>{weights.length}</strong></div><div><span>输出目录</span><strong title={task.run_dir || ''}>{task.run_dir?.split('/').slice(-3).join('/') || '等待创建'}</strong></div></div>
+    <div className="weight-detail-summary"><div><span>运行批次</span><strong>{run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '—'}</strong></div><div><span>训练状态</span><strong>{statusLabel(task.status)}</strong></div><div><span>可用权重</span><strong>{weights.length + (inheritedBestWeight ? 1 : 0)}</strong></div><div><span>输出目录</span><strong title={task.run_dir || ''}>{task.run_dir?.split('/').slice(-3).join('/') || '等待创建'}</strong></div></div>
     <div className="weight-card-grid">{knownWeights.map(({ name, label, description, icon: Icon }) => {
-      const artifact = weights.find((item) => item.name.split('/').pop() === name)
+      const currentArtifact = weights.find((item) => item.name.split('/').pop() === name)
+      const inherited = name === 'best.pt' && !currentArtifact && effectiveBestWeight?.inherited
+      const artifact = currentArtifact || (name === 'best.pt' ? inheritedBestWeight : null)
       return <article className={`weight-detail-card ${artifact ? '' : 'pending'}`} key={name}>
-        <div className="weight-card-top"><div className="weight-card-icon"><Icon size={24} /></div><div><span>{label}</span><h3>{name}</h3></div><em>{artifact ? '已生成' : '等待生成'}</em></div>
+        <div className="weight-card-top"><div className="weight-card-icon"><Icon size={24} /></div><div><span>{label}</span><h3>{name}</h3></div><em>{inherited && effectiveBestWeight?.source_attempt_number != null ? `继承自 Attempt ${String(effectiveBestWeight.source_attempt_number).padStart(3, '0')}` : artifact ? '已生成' : '等待生成'}</em></div>
         <p>{description}</p>
         <div className="weight-card-meta"><div><HardDrive size={14} /><span>文件大小</span><strong>{artifact ? formatBytes(artifact.size) : '—'}</strong></div><div><History size={14} /><span>更新时间</span><strong>{artifact ? formatDate(artifact.modified_at) : '—'}</strong></div></div>
         <div className="weight-card-path" title={artifact?.path}>{artifact?.path || `${task.run_dir || '训练输出目录'}/weights/${name}`}</div>
@@ -209,7 +214,7 @@ function WeightsDetails({ artifacts, task, run, onTest, testDisabledReason }: Pi
   </div>
 }
 
-export function CanvasDetailModal({ kind, task, run, metrics, artifacts, events, onClose, onTest, testDisabledReason }: Props) {
+export function CanvasDetailModal({ kind, task, run, metrics, artifacts, effectiveBestWeight, events, onClose, onTest, testDisabledReason }: Props) {
   useEffect(() => {
     if (!kind) return
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
@@ -228,7 +233,7 @@ export function CanvasDetailModal({ kind, task, run, metrics, artifacts, events,
         {kind === 'status' && <StatusDetails task={task} run={run} events={events} />}
         {kind === 'metrics' && <MetricsDetails task={task} metrics={metrics} />}
         {kind === 'artifacts' && <ArtifactsDetails artifacts={artifacts} />}
-        {kind === 'weights' && <WeightsDetails task={task} run={run} artifacts={artifacts} onTest={onTest} testDisabledReason={testDisabledReason} />}
+        {kind === 'weights' && <WeightsDetails task={task} run={run} artifacts={artifacts} effectiveBestWeight={effectiveBestWeight} onTest={onTest} testDisabledReason={testDisabledReason} />}
       </div>
       <footer><span>双击画布中的其他节点可切换查看对应内容</span><button className="button ghost" onClick={onClose}>关闭</button></footer>
     </div>
