@@ -156,12 +156,16 @@ def test_scheduler_marks_missing_active_process_interrupted(tmp_path, monkeypatc
     engine = create_engine(f"sqlite:///{tmp_path / 'missing-process.db'}")
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    run_dir = tmp_path / "run-missing"
+    checkpoint = run_dir / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"completed-checkpoint")
     with session_factory() as db:
-        task = make_task("task-missing", status="running", pid=9876)
+        task = make_task("task-missing", status="running", pid=9876, run_dir=str(run_dir))
         run = TrainingRun(
             id="run-missing", task=task, attempt_number=1, launch_mode="fresh", status="running", pid=9876,
             model_path=task.model_path, data_path=task.data_path, command=["python", "train.py", "task-missing"],
-            parameter_snapshot={"epochs": 20}, process_started_at=utcnow(),
+            parameter_snapshot={"epochs": 20}, process_started_at=utcnow(), run_dir=str(run_dir),
         )
         task.current_run_id = run.id
         db.add_all([task, run])
@@ -176,7 +180,45 @@ def test_scheduler_marks_missing_active_process_interrupted(tmp_path, monkeypatc
         assert missing.status == "interrupted"
         assert missing.pid is None
         assert missing.error_message == "平台服务重启后未发现受管训练进程"
+        artifact = db.scalar(select(Artifact).where(Artifact.run_id == missing.id, Artifact.name == "weights/best.pt"))
+        assert artifact is not None
+        assert artifact.path == str(checkpoint.resolve())
     assert "task-missing" not in scheduler.processes
+
+
+def test_scheduler_reconciles_artifacts_for_previously_interrupted_run(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'interrupted-artifacts.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    run_dir = tmp_path / "run-interrupted"
+    checkpoint = run_dir / "weights" / "best.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"completed-checkpoint")
+    with session_factory() as db:
+        task = make_task(
+            "task-interrupted-artifacts", status="interrupted", run_dir=str(run_dir),
+            error_message="平台服务重启后未发现受管训练进程",
+        )
+        run = TrainingRun(
+            id="run-interrupted-artifacts", task=task, attempt_number=1, launch_mode="fresh",
+            status="interrupted", model_path=task.model_path, data_path=task.data_path,
+            command=["python", "train.py", task.id], parameter_snapshot={"epochs": 20},
+            process_started_at=utcnow(), run_dir=str(run_dir),
+            error_message="平台服务重启后未发现受管训练进程",
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    monkeypatch.setattr(scheduler, "_find_run_process", lambda _run: None)
+    scheduler._recover_processes()
+
+    with session_factory() as db:
+        artifact = db.scalar(select(Artifact).where(Artifact.run_id == "run-interrupted-artifacts"))
+        assert artifact is not None
+        assert artifact.name == "weights/best.pt"
+        assert artifact.path == str(checkpoint.resolve())
 
 
 @pytest.mark.parametrize("completed_epochs,expected_status", [(3, "interrupted"), (20, "completed")])

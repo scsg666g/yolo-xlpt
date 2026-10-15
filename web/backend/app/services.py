@@ -754,6 +754,12 @@ class TrainingScheduler:
             )).all()
             for run in candidates:
                 task = db.get(TrainingTask, run.task_id)
+                # A training process can finish writing checkpoints while the platform is
+                # restarting. Reconcile the run directory before deciding whether the
+                # process can be reattached so completed checkpoints do not remain
+                # invisible after the run is marked interrupted.
+                if task:
+                    sync_artifacts(db, task, run)
                 pid = self._find_run_process(run)
                 if pid and task and run.process_started_at:
                     previous_status = run.status
