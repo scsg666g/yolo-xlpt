@@ -191,6 +191,16 @@ export interface ComputeNode extends ComputeNodeSettings {
   last_seen_at: string | null
   sampled_at: string | null
   agent_version: string | null
+  training: {
+    enabled: boolean
+    ready: boolean
+    reason: string | null
+    supported_parameters: string[]
+    yolo_version: string | null
+    python_version: string | null
+    output_writable: boolean
+    lock_occupied: boolean
+  } | null
   hostname: string | null
   summary: {
     gpu_count: number

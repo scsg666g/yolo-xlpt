@@ -266,6 +266,10 @@ export function ComputeResources() {
         </div>
         {open && <div className="node-content" id={`node-${node.id}`}>
           <div className="node-meta"><span>最后接收：{dateLabel(node.last_seen_at)}</span>{node.kind === 'agent' && <span>上报间隔：{node.report_interval_seconds}s · 超过 {node.offline_after_seconds}s 无新数据显示离线</span>}{node.agent_version && <span>Agent v{node.agent_version}</span>}</div>
+          {node.kind === 'agent' && <div className={`node-training-state ${node.training?.ready ? 'ready' : 'not-ready'}`} role="status">
+            <strong>{node.training ? (node.training.ready ? '训练已就绪' : node.training.enabled ? '训练环境未就绪' : '训练未启用') : '训练能力未知'}</strong>
+            <span>{node.training?.reason || (node.training ? '可接受远程训练任务' : '请升级 Agent 至 1.6.0 以上以获取训练能力诊断')}</span>
+          </div>}
           {node.status === 'offline' && <div className="node-warning">服务器已离线。下方为最后一次采样，当前 GPU 负载和进程状态待确认。</div>}
           {node.status === 'disabled' && <div className="node-warning">监控已禁用，Agent 上报将被拒绝。下方为此前保存的数据。</div>}
           {node.status === 'pending' && <div className="node-info">等待 Agent 接入。点击右侧“接入配置”，在对应服务器启动只读 Agent。</div>}

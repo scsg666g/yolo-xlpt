@@ -254,6 +254,34 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
         assert "请求来源：testclient" in event.message
 
 
+def test_remote_claim_lease_requires_confirmation(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Leased Agent")
+    node_id = credential["node"]["id"]
+    task = TrainingTask(id="leased-remote", name="leased", task_type="detect", execution_node_id=node_id,
+                        model_path="/remote/model.pt", data_path="/remote/data.yaml",
+                        config={"remote_output_root": "/remote/runs"})
+    with factory() as db:
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run_id = run.id
+        db.commit()
+    report = sample()
+    report["agent_version"] = "1.6.0"
+    report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=report).status_code == 200
+    task_payload = client.post(f"/api/compute/nodes/{node_id}/agent/poll", headers=headers(credential)).json()["task"]
+    lease = task_payload["claim_lease"]
+    update_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update"
+    assert client.post(update_url, headers=headers(credential), json={"status": "running"}).status_code == 409
+    assert client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm", headers=headers(credential),
+                       json={"lease": "0" * 32}).status_code == 409
+    assert client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm", headers=headers(credential),
+                       json={"lease": lease}).status_code == 200
+    update = client.post(update_url, headers={**headers(credential), "X-Training-Lease": lease},
+                         json={"status": "running", "pid": 1234})
+    assert update.status_code == 200
 def test_remote_training_trace_upload_is_authenticated_and_stored(monitoring_client, tmp_path, monkeypatch):
     client, factory = monitoring_client
     monkeypatch.setattr(monitoring, "DATA_ROOT", tmp_path)

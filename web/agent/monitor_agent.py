@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
@@ -204,7 +204,41 @@ def collect_gpus(binary: str) -> tuple[list[dict], str | None]:
     return result[:128], message
 
 
-def collect(binary: str = "nvidia-smi") -> dict:
+def training_capability(config: dict) -> dict:
+    """Report whether this Agent can safely accept a remote training run."""
+    enabled = bool(config.get("enable_training"))
+    if not enabled:
+        return {"enabled": False, "ready": False, "reason": "远程训练未启用",
+                "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
+                "python_version": platform.python_version(), "output_writable": False,
+                "lock_occupied": False}
+    try:
+        cwd = Path(config["training_cwd"])
+        roots = [Path(item) for item in config["allowed_training_roots"]]
+        if not cwd.is_dir():
+            raise ValueError("训练工作目录不存在")
+        if not roots:
+            raise ValueError("未配置允许的训练目录")
+        output_root = roots[0]
+        output_root.mkdir(parents=True, exist_ok=True)
+        probe = output_root / ".platform-write-check"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        yolo = config["yolo_bin"]
+        if "/" in yolo and (not Path(yolo).is_file() or not os.access(yolo, os.X_OK)):
+            raise ValueError("YOLO 可执行文件不存在或不可执行")
+        return {"enabled": True, "ready": True, "reason": None,
+                "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
+                "python_version": platform.python_version(), "output_writable": True,
+                "lock_occupied": False}
+    except (OSError, ValueError, KeyError) as exc:
+        return {"enabled": True, "ready": False, "reason": str(exc)[:400],
+                "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
+                "python_version": platform.python_version(), "output_writable": False,
+                "lock_occupied": False}
+
+
+def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
     memory: dict[str, int] = {}
     try:
         for line in Path("/proc/meminfo").read_text().splitlines():
@@ -218,7 +252,7 @@ def collect(binary: str = "nvidia-smi") -> dict:
     except (AttributeError, OSError):
         load_average = []
     gpus, message = collect_gpus(binary)
-    return {
+    payload = {
         "agent_version": VERSION,
         "compute": {
             "available": bool(gpus), "provider": "NVIDIA" if gpus else None,
@@ -229,6 +263,9 @@ def collect(binary: str = "nvidia-smi") -> dict:
             "gpus": gpus,
         },
     }
+    if config is not None:
+        payload["training"] = training_capability(config)
+    return payload
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -318,10 +355,12 @@ def release_training_lock(handle) -> None:
         handle.close()
 
 
-def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None) -> dict:
+def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None,
+             extra_headers: dict[str, str] | None = None) -> dict:
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode() if payload is not None else None
-    request = Request(config["center_url"] + path, data=data, method=method,
-                      headers={"Authorization": "Bearer " + config["token"], "Content-Type": "application/json"})
+    headers = {"Authorization": "Bearer " + config["token"], "Content-Type": "application/json"}
+    headers.update(extra_headers or {})
+    request = Request(config["center_url"] + path, data=data, method=method, headers=headers)
     with build_opener(NoRedirect()).open(request, timeout=20) as response:
         body = response.read(2 * 1024 * 1024)
     return json.loads(body or b"{}")
@@ -643,7 +682,10 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
         for key in ("error_message", "exit_code", "stop_reason"):
             batch.pop(key, None)
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}/update"
-    response = api_json(config, endpoint, "POST", batch)
+    lease = payload.get("_claim_lease")
+    batch.pop("_claim_lease", None)
+    response = (api_json(config, endpoint, "POST", batch, {"X-Training-Lease": lease})
+                if lease else api_json(config, endpoint, "POST", batch))
     if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed"}:
         save_pending_final(config, run_id, dict(payload, metrics=metrics[256:]))
         return False
@@ -705,6 +747,7 @@ def report_training_trace(config: dict, task: dict, sent_images: set[str]) -> No
 
 def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
     run_id = task["run_id"]
+    lease = task.get("claim_lease")
     manifest_payload = {**task, "output_root": task["parameters"]["remote_output_root"]}
     last_manifest_at = 0.0
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}"
@@ -735,7 +778,9 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
         if not command_reported:
             payload["command"] = command
         try:
-            response = api_json(config, endpoint + "/update", "POST", payload)
+            response = (api_json(config, endpoint + "/update", "POST", payload,
+                                 {"X-Training-Lease": lease})
+                        if lease else api_json(config, endpoint + "/update", "POST", payload))
         except (OSError, ValueError, HTTPError, URLError):
             if time.monotonic() - last_warning >= 30 or not last_warning:
                 LOGGER.warning("训练 %s 状态上报失败；训练继续运行，日志与指标将在连接恢复后补传", run_id)
@@ -811,7 +856,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
         log_lines = recent_log_lines(Path(task["log_path"]))
         final_status = "stopped" if requested_stop else "completed" if exit_code == 0 else "failed"
         error = None if final_status != "failed" else f"训练进程异常退出，退出码 {exit_code}"
-        final_payload = {"status": final_status, "completed_epochs": completed,
+        final_payload = {"_claim_lease": lease, "status": final_status, "completed_epochs": completed,
                          "progress": 100 if final_status == "completed" else min(99.99, completed / max(1, int(task['parameters']['epochs'])) * 100),
                          "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in last_metrics],
                          "log_tail": log_lines, "exit_code": exit_code, "command": command,
@@ -843,7 +888,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
             except OSError:
                 pass
         try:
-            pending_path = save_pending_final(config, run_id, {"status": "failed", "error_message": str(exc)[:4000], "exit_code": 1,
+            pending_path = save_pending_final(config, run_id, {"_claim_lease": lease, "status": "failed", "error_message": str(exc)[:4000], "exit_code": 1,
                                                              "completed_epochs": task.get("completed_epochs", 0),
                                                              "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
                                                              "log_tail": recent_log_lines(Path(task["log_path"]))})
@@ -860,6 +905,10 @@ def run_remote_task(config: dict, task: dict, stop: threading.Event, training_lo
         LOGGER.warning("本机已有另一个 Agent 在训练，拒绝并发启动任务 %s", task.get("run_id"))
         return
     try:
+        lease = task.get("claim_lease")
+        if lease:
+            api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/runs/{task['run_id']}/confirm",
+                     "POST", {"lease": lease})
         _run_remote_task(config, task, stop)
     finally:
         release_training_lock(lock)
@@ -899,7 +948,7 @@ def main() -> int:
                 "已启用" if config["enable_training"] else "未启用")
     while not stop.is_set():
         try:
-            payload = collect(config["nvidia_smi_bin"])
+            payload = collect(config["nvidia_smi_bin"], config)
             interval = send(config, payload)
             if failures or args.once:
                 LOGGER.info("采样上报成功：GPU %s，进程 %s", len(payload["compute"]["gpus"]),

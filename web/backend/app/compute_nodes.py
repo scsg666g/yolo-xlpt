@@ -15,7 +15,7 @@ import time
 import uuid
 import math
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -121,9 +121,21 @@ class ComputeReport(BaseModel):
         return value
 
 
+class TrainingCapability(BaseModel):
+    enabled: bool
+    ready: bool
+    reason: str | None = Field(default=None, max_length=400)
+    supported_parameters: list[str] = Field(default_factory=list, max_length=256)
+    yolo_version: str | None = Field(default=None, max_length=100)
+    python_version: str | None = Field(default=None, max_length=100)
+    output_writable: bool = False
+    lock_occupied: bool = False
+
+
 class AgentReport(BaseModel):
     agent_version: str = Field(default="1.0.0", max_length=40)
     compute: ComputeReport
+    training: TrainingCapability | None = None
 
 
 class RemoteRunUpdate(BaseModel):
@@ -259,6 +271,7 @@ def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
         "last_seen_at": as_utc(last_seen).isoformat() if last_seen else None,
         "sampled_at": snapshot.get("sampled_at"), "agent_version": node.agent_version,
         "hostname": snapshot.get("host", {}).get("hostname"),
+        "training": snapshot.get("training") if node.kind == "agent" else None,
         "summary": {
             "gpu_count": len(gpus), "utilization": round(sum(utils) / len(utils)) if utils else None,
             "memory_used": sum(gpu.get("memory_used") or 0 for gpu in gpus),
@@ -376,7 +389,8 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
     previous = (node.snapshot or {}).get("sampled_at")
     if previous and payload.compute.sampled_at < datetime.fromisoformat(previous):
         raise HTTPException(409, "采样数据早于上次采样，已忽略")
-    node.snapshot = payload.compute.model_dump(mode="json")
+    node.snapshot = {**payload.compute.model_dump(mode="json"),
+                     **({"training": payload.training.model_dump(mode="json")} if payload.training else {})}
     node.agent_version = payload.agent_version
     node.last_seen_at = utcnow()
     db.commit()
@@ -394,11 +408,18 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     if version < (1, 2, 0):
         return {"task": None, "poll_interval_seconds": 5, "required_agent_version": "1.2.0",
                 "message": "请升级 Agent 至 1.2.0 或以上版本后领取训练任务"}
+    now = utcnow()
+    expired = db.scalar(select(TrainingRun).where(
+        TrainingRun.execution_node_id == node_id, TrainingRun.status == "starting",
+        TrainingRun.claim_lease.is_not(None), TrainingRun.claim_confirmed.is_(False),
+        TrainingRun.claim_expires_at < now,
+    ).order_by(TrainingRun.queued_at).limit(1))
     if db.scalar(select(TrainingRun.id).where(TrainingRun.execution_node_id == node_id,
-                                            TrainingRun.status.in_(["starting", "running", "stopping"]))):
+        TrainingRun.status.in_(["starting", "running", "stopping"]),
+        TrainingRun.id != (expired.id if expired else ""))):
         return {"task": None, "poll_interval_seconds": 5}
     # A task is delivered once, by atomically switching queued -> starting.
-    run = db.scalar(select(TrainingRun).where(
+    run = expired or db.scalar(select(TrainingRun).where(
         TrainingRun.execution_node_id == node_id, TrainingRun.status == "queued"
     ).order_by(TrainingRun.queued_at, TrainingRun.id).limit(1))
     if not run:
@@ -416,15 +437,22 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     snapshot = run.parameter_snapshot or {}
     run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
     claimed_at = utcnow()
+    lease = secrets.token_hex(16) if version >= (1, 6, 0) else None
     # Check node occupancy again in the atomic claim, since another poll may
     # start a different queued run between the earlier SELECTs.
     occupied = select(TrainingRun.id).where(
         TrainingRun.execution_node_id == node_id,
         TrainingRun.status.in_(["starting", "running", "stopping"]),
+        TrainingRun.id != run.id,
     ).exists()
     claimed = db.execute(update(TrainingRun).where(
-        TrainingRun.id == run.id, TrainingRun.status == "queued", ~occupied,
+        TrainingRun.id == run.id,
+        ((TrainingRun.status == "queued") | ((TrainingRun.status == "starting") &
+          TrainingRun.claim_confirmed.is_(False) & (TrainingRun.claim_expires_at < claimed_at))),
+        ~occupied,
     ).values(status="starting", started_at=claimed_at, process_started_at=claimed_at,
+             claim_lease=lease, claim_expires_at=claimed_at + timedelta(seconds=90) if lease else None,
+             claim_confirmed=False,
              run_dir=run_dir, log_path=str(remote_log_path(snapshot["remote_output_root"], task.id, run.attempt_number))))
     if claimed.rowcount != 1:
         db.rollback()
@@ -437,10 +465,31 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
         "task_type": task.task_type, "launch_mode": run.launch_mode,
         "model_path": run.model_path, "data_path": run.data_path,
-        "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir,
+        "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir, "claim_lease": lease,
         "completed_epochs": run.completed_epochs, "progress": run.progress, "latest_metrics": run.latest_metrics,
         "log_path": run.log_path, "parameters": snapshot,
     }}
+
+
+class ClaimConfirmation(BaseModel):
+    lease: str = Field(min_length=32, max_length=32)
+
+
+@router.post("/nodes/{node_id}/agent/runs/{run_id}/confirm")
+def confirm_remote_claim(node_id: str, run_id: str, payload: ClaimConfirmation,
+                         request: Request, db: Session = Depends(get_db)):
+    authenticated_agent(node_id, request, db)
+    run = db.get(TrainingRun, run_id)
+    now = utcnow()
+    if not run or run.execution_node_id != node_id or run.claim_lease != payload.lease:
+        raise HTTPException(409, "训练领取已失效，请等待下一次任务轮询")
+    if run.claim_confirmed:
+        return {"confirmed": True, "stop": bool(run.stop_requested)}
+    if run.status != "starting" or not run.claim_expires_at or as_utc(run.claim_expires_at) < now:
+        raise HTTPException(409, "训练领取已过期，请等待下一次任务轮询")
+    run.claim_confirmed = True
+    db.commit()
+    return {"confirmed": True, "stop": bool(run.stop_requested)}
 
 
 @router.post("/nodes/{node_id}/agent/runs/{run_id}/update")
@@ -449,6 +498,10 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
     run = db.get(TrainingRun, run_id)
     if not run or run.execution_node_id != node_id:
         raise HTTPException(404, "远程训练运行不存在")
+    if run.claim_lease and request.headers.get("X-Training-Lease") != run.claim_lease:
+        raise HTTPException(409, "训练领取已失效")
+    if run.claim_lease and not run.claim_confirmed:
+        raise HTTPException(409, "请先确认训练领取")
     task = db.get(TrainingTask, run.task_id)
     if not task:
         raise HTTPException(404, "训练任务不存在")

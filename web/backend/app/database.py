@@ -66,6 +66,9 @@ def migrate_database() -> Path | None:
         or (bool(run_columns) and "execution_node_id" not in run_columns)
         or (bool(run_columns) and "stop_requested" not in run_columns)
         or (bool(run_columns) and "remote_log_tail" not in run_columns)
+        or (bool(run_columns) and "claim_lease" not in run_columns)
+        or (bool(run_columns) and "claim_expires_at" not in run_columns)
+        or (bool(run_columns) and "claim_confirmed" not in run_columns)
     )
     if not needs_migration:
         return None
@@ -88,6 +91,12 @@ def migrate_database() -> Path | None:
             connection.execute(text("ALTER TABLE training_runs ADD COLUMN stop_requested BOOLEAN NOT NULL DEFAULT 0"))
         if run_columns and "remote_log_tail" not in run_columns:
             connection.execute(text("ALTER TABLE training_runs ADD COLUMN remote_log_tail JSON NOT NULL DEFAULT '[]'"))
+        if run_columns and "claim_lease" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN claim_lease VARCHAR(32)"))
+        if run_columns and "claim_expires_at" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN claim_expires_at DATETIME"))
+        if run_columns and "claim_confirmed" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN claim_confirmed BOOLEAN NOT NULL DEFAULT 0"))
         # Existing cards keep their current newest-first order. Repair rows left at
         # the SQL default as well, which covers databases migrated by an older build.
         order_timestamp = "created_at DESC," if "created_at" in task_columns else ""

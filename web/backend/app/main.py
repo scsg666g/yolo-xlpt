@@ -214,6 +214,9 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
     if payload.execution_node_id:
         if not node or node.kind != "agent" or not node.enabled:
             raise HTTPException(422, "请选择已启用的远程 Agent 服务器")
+        capability = (node.snapshot or {}).get("training")
+        if capability and not capability.get("ready"):
+            raise HTTPException(422, f"远程 Agent 当前不可训练：{capability.get('reason') or '训练能力未就绪'}")
         model_path, data_path = payload.model_path.strip(), payload.data_path.strip()
         output_root = (payload.remote_output_root or "").strip()
         if not Path(model_path).is_absolute() or not Path(data_path).is_absolute() or not Path(output_root).is_absolute():
@@ -497,6 +500,13 @@ def save_layout(task_id: str, payload: LayoutUpdate, db: Session = Depends(get_d
 @app.patch("/api/tasks/{task_id}/config", response_model=TaskRead)
 def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
+    if task.execution_node_id:
+        node = db.get(ComputeNode, task.execution_node_id)
+        capability = (node.snapshot or {}).get("training") if node else None
+        if capability:
+            unsupported = set(payload.config) - set(capability.get("supported_parameters") or [])
+            if unsupported:
+                raise HTTPException(422, f"远程 Agent 不支持参数 {', '.join(sorted(unsupported))}，请升级 Agent 或移除该参数")
     if task.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "任务正在运行或排队，不能修改训练参数")
     supported_keys = editable_training_keys()
