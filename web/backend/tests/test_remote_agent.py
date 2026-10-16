@@ -198,6 +198,27 @@ def test_external_log_symlink_cannot_escape_allowed_root(agent, training, tmp_pa
     assert not Path(task["run_dir"]).exists()
 
 
+def test_missing_remote_training_paths_report_the_full_input(agent, training, tmp_path):
+    config, task = training
+    missing_model = tmp_path / "center-only/models/best.pt"
+    task["model_path"] = str(missing_model)
+    with pytest.raises(ValueError) as missing_model_error:
+        agent.build_training_command(config, task)
+    assert str(missing_model) in str(missing_model_error.value)
+    assert "远程服务器" in str(missing_model_error.value)
+    assert "不是中心平台路径" in str(missing_model_error.value)
+
+    task["model_path"] = str(Path(config["training_cwd"]) / "model.pt")
+    missing_output = tmp_path / "remote-runs-missing"
+    task["parameters"]["remote_output_root"] = str(missing_output)
+    task["run_dir"] = str(missing_output / "detect/task-id/attempt-001")
+    task["log_path"] = str(missing_output / ".platform-logs/20261012/task-id/attempt-001.log")
+    with pytest.raises(ValueError) as missing_output_error:
+        agent.build_training_command(config, task)
+    assert str(missing_output) in str(missing_output_error.value)
+    assert "训练输出根目录" in str(missing_output_error.value)
+
+
 def test_training_lock_is_shared_by_agents_for_same_workspace(agent, training):
     config, _ = training
     first = agent.acquire_training_lock(config)

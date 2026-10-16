@@ -1,4 +1,5 @@
 """Remote lifecycle integration with a real Agent and files isolated in tmp_path."""
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -168,6 +169,38 @@ def test_agent_delete_validates_entire_plan_and_symlinks(agent, training, tmp_pa
     Path(run["run_dir"]).symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError):
         agent.operation_paths(config, run)
+
+
+def test_remote_delete_succeeds_when_failed_launch_created_no_files(monitoring_client, agent, tmp_path, monkeypatch):
+    client, factory = monitoring_client
+    credential, config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    output_root = Path(payload["output_root"])
+    task_id = payload["task_id"]
+    shutil.rmtree(output_root)
+    config["allowed_training_roots"] = [str(tmp_path / "this-server-only")]
+
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+    work = claim(client, credential)
+    agent.execute_operation(config, work, threading.Event())
+    with factory() as db:
+        assert db.get(TrainingTask, task_id) is None
+
+    # Scan/fetch still reject a missing root, and an existing root outside the
+    # current server's configured roots must never become a delete target.
+    with pytest.raises(ValueError, match="输出根目录无效"):
+        agent.operation_paths(config, payload)
+    output_root.mkdir()
+    with pytest.raises(ValueError, match="允许目录"):
+        agent.delete_remote_files(config, {"runs": [payload]})
+    output_root.rmdir()
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    output_root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="符号链接"):
+        agent.delete_remote_files(config, {"runs": [payload]})
 
 
 def test_operation_lease_and_bad_artifact_paths(monitoring_client, tmp_path):

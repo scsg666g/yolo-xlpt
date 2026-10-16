@@ -370,14 +370,21 @@ TRAINING_KEYS = {"patience", "lr0", "pretrained", "cache", "amp", "close_mosaic"
 RESERVED_KEYS = {"model", "data", "project", "name", "device", "epochs", "batch", "imgsz", "workers", "optimizer", "task", "mode", "exist_ok", "save_dir", "resume", "source"}
 
 
-def within_allowed(path: str, roots: list[str], *, file_required: bool = True) -> Path:
-    candidate = Path(path).resolve(strict=True)
+def within_allowed(path: str, roots: list[str], *, file_required: bool = True,
+                   label: str = "路径") -> Path:
+    try:
+        candidate = Path(path).resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        raise ValueError(
+            f"远程服务器上的{label}不存在：{path}。"
+            "请填写所选远程服务器上的路径，不是中心平台路径"
+        ) from None
     if file_required and not candidate.is_file():
-        raise ValueError(f"要求文件不存在：{candidate}")
+        raise ValueError(f"远程服务器上的{label}不是文件：{candidate}")
     if not file_required and not candidate.is_dir():
-        raise ValueError(f"要求目录不存在：{candidate}")
+        raise ValueError(f"远程服务器上的{label}不是目录：{candidate}")
     if not any(candidate == Path(root) or Path(root) in candidate.parents for root in roots):
-        raise ValueError(f"路径不在 Agent 允许目录内：{candidate}")
+        raise ValueError(f"远程服务器上的{label}不在 Agent 允许目录内：{candidate}")
     return candidate
 
 
@@ -394,12 +401,11 @@ def scalar_parameter(value) -> str:
 def build_training_command(config: dict, task: dict) -> list[str]:
     params = task["parameters"]
     roots = config["allowed_training_roots"]
-    model = within_allowed(task["model_path"], roots)
-    dataset = within_allowed(task["data_path"], roots)
+    model = within_allowed(task["model_path"], roots, label="基础模型文件")
+    dataset = within_allowed(task["data_path"], roots, label="数据集 YAML 文件")
     run_dir = Path(task["run_dir"]).resolve()
-    output_root = Path(params["remote_output_root"]).resolve(strict=True)
-    if not output_root.is_dir() or not any(output_root == Path(root) or Path(root) in output_root.parents for root in roots):
-        raise ValueError("训练输出根目录不在 Agent 允许目录内")
+    output_root = within_allowed(params["remote_output_root"], roots, file_required=False,
+                                 label="训练输出根目录")
     if output_root not in run_dir.parents:
         raise ValueError("训练运行目录必须位于配置的输出根目录内")
     task_id = task["task_id"]
@@ -431,7 +437,7 @@ def build_training_command(config: dict, task: dict) -> list[str]:
                f"optimizer={scalar_parameter(params['optimizer'])}", f"project={run_dir.parent}", f"name={run_dir.name}", "exist_ok=True"]
     checkpoint = task.get("checkpoint_path")
     if checkpoint:
-        checkpoint_path = within_allowed(checkpoint, roots)
+        checkpoint_path = within_allowed(checkpoint, roots, label="续训检查点")
         if (checkpoint_path.name != "last.pt" or checkpoint_path.parent.name != "weights" or
                 checkpoint_path.parent.parent.parent.name != task_id or
                 checkpoint_path.parent.parent.parent.parent.name != task["task_type"] or
@@ -453,7 +459,7 @@ def build_training_command(config: dict, task: dict) -> list[str]:
     return command
 
 
-def operation_paths(config: dict, payload: dict) -> tuple[Path, Path | None]:
+def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = False) -> tuple[Path, Path | None] | None:
     """Validate all deletion/scan/fetch targets against an exact task/Attempt layout."""
     task_id, task_type = payload["task_id"], payload["task_type"]
     attempt = payload["attempt_number"]
@@ -462,10 +468,10 @@ def operation_paths(config: dict, payload: dict) -> tuple[Path, Path | None]:
             type(attempt) is not int or attempt < 1):
         raise ValueError("远程文件操作任务信息无效")
     root = Path(payload["output_root"])
-    if not root.is_absolute() or root.resolve() != root or not root.is_dir():
+    root_missing = not root.exists()
+    if (not root.is_absolute() or root.is_symlink() or root.resolve() != root or
+            (not root_missing and not root.is_dir()) or (root_missing and not allow_missing_root)):
         raise ValueError("输出根目录无效或包含符号链接")
-    if not any(root == Path(item) or Path(item) in root.parents for item in config["allowed_training_roots"]):
-        raise ValueError("输出根目录不在 Agent 允许目录内")
     run_dir = Path(payload["run_dir"])
     expected = root / task_type / task_id / f"attempt-{attempt:03d}"
     if run_dir != expected or run_dir.resolve() != expected or run_dir.is_symlink():
@@ -481,11 +487,19 @@ def operation_paths(config: dict, payload: dict) -> tuple[Path, Path | None]:
                 raise ValueError("只能操作该任务的独立日志")
         if log.resolve() != log or log.is_symlink():
             raise ValueError("日志路径包含符号链接")
+    # A task created for another server may reference a root that has never
+    # existed here. A delete can safely become a no-op, but scan/fetch cannot.
+    if root_missing:
+        return None
+    if not any(root == Path(item) or Path(item) in root.parents for item in config["allowed_training_roots"]):
+        raise ValueError("输出根目录不在 Agent 允许目录内")
     return run_dir, log
 
 
 def report_manifest(config: dict, payload: dict) -> None:
-    run_dir, _ = operation_paths(config, payload)
+    paths = operation_paths(config, payload)
+    assert paths is not None
+    run_dir, _ = paths
     items = []
     if run_dir.is_dir():
         for path in run_dir.rglob("*"):
@@ -507,7 +521,10 @@ def report_manifest(config: dict, payload: dict) -> None:
 def delete_remote_files(config: dict, payload: dict) -> None:
     # Validate the complete plan before deleting the first file. rmtree never follows
     # directory symlinks inside the owned Attempt; the Attempt itself cannot be one.
-    targets = [operation_paths(config, run) for run in payload["runs"]]
+    # A failed launch may not have created the output root yet. Treat that
+    # exact no-file state as already cleaned while retaining all path checks.
+    plans = [operation_paths(config, run, allow_missing_root=True) for run in payload["runs"]]
+    targets = [paths for paths in plans if paths is not None]
     protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
     protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
     for run_dir, log in targets:
@@ -540,7 +557,9 @@ def execute_operation(config: dict, operation: dict, stop: threading.Event) -> N
         elif operation["kind"] == "scan":
             report_manifest(config, payload)
         elif operation["kind"] == "fetch":
-            run_dir, _ = operation_paths(config, payload)
+            paths = operation_paths(config, payload)
+            assert paths is not None
+            run_dir, _ = paths
             relative = Path(payload["name"])
             if (relative.is_absolute() or relative.as_posix() != payload["name"] or
                     any(p in {".", ".."} or p.startswith(".") for p in relative.parts)):
