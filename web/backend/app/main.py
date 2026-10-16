@@ -100,7 +100,7 @@ async def lifespan(_: FastAPI):
         scheduler.stop()
 
 
-app = FastAPI(title="YOLO 模型训练平台", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="YOLO 模型训练平台", version="1.0.0", lifespan=lifespan)
 app.include_router(dataset_upload_router)
 app.include_router(inference_router)
 app.include_router(compute_nodes_router)

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Activity, Boxes, Cpu, LayoutDashboard, Moon, Settings2, Sun } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
+import packageMetadata from '../../package.json'
 
 export function Layout() {
   const [theme, setTheme] = useState<'light' | 'dark'>(() =>
@@ -18,7 +19,13 @@ export function Layout() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Boxes size={19} /></div>
-          <div><strong>YOLO Forge</strong><span>训练控制台</span></div>
+          <div className="brand-copy">
+            <div className="brand-title">
+              <strong>YOLO Forge</strong>
+              <span className="brand-version" title={`平台版本 ${packageMetadata.version}`}>v{packageMetadata.version}</span>
+            </div>
+            <span>训练控制台</span>
+          </div>
         </div>
         <div className="theme-picker" aria-label="界面主题">
           <span>界面主题</span>
