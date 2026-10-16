@@ -12,11 +12,12 @@ Agent 默认仅采集 GPU、计算进程和主机信息。只有在远程配置�
 
 ```bash
 chmod 600 agent-config.json
+python3 monitor_agent.py --config agent-config.json --check-config
 python3 monitor_agent.py --config agent-config.json --once
 python3 monitor_agent.py --config agent-config.json
 ```
 
-`--once` 只执行一次算力采样与上报，不领取或验证训练任务；成功返回 0，失败返回非零退出码。持续运行时连接失败会退避重试；网络恢复后上报新采样。Agent 不会补传过期算力数据。终端关闭会结束前台 Agent，长期使用建议配置 systemd。
+`--check-config` 只在本机检查配置、YOLO 程序、输出写入、状态目录和共享锁，不连接中心、不打印 Token。`--once` 执行一次算力采样与上报，不领取训练任务；成功返回 0，失败返回非零退出码。持续运行时连接失败会退避重试；网络恢复后上报新采样。Agent 不会补传过期算力数据。终端关闭会结束前台 Agent，长期使用建议配置 systemd。
 
 配置示例（真实 Token 只在创建或重置时提供一次）：
 
@@ -29,6 +30,7 @@ python3 monitor_agent.py --config agent-config.json
   "nvidia_smi_bin": "nvidia-smi",
   "enable_training": false,
   "allowed_training_roots": [],
+  "training_output_roots": [],
   "yolo_bin": "/data/conda/envs/yolo/bin/yolo",
   "training_cwd": "/data/yolo/yolo",
   "training_lock_file": "/data/yolo/yolo/.yolo-forge-training.lock"
@@ -37,7 +39,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-推荐使用 **Agent 1.6.0 和配套新版中台**，且 `center_url` 能从远程机器访问，再编辑远程配置文件。当前中心按 Agent 上报的版本检查能力：
+推荐使用 **Agent 1.7.0 和配套新版中台**，且 `center_url` 能从远程机器访问，再编辑远程配置文件。当前中心按 Agent 上报的版本检查能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -46,13 +48,15 @@ python3 monitor_agent.py --config agent-config.json
 | 多 Agent 共享训练锁 | 1.4.0 | 必须使用同一锁文件，不能仅凭版本保证互斥 |
 | 远程 YOLO 训练过程解析 | 1.5.0 | 仅目标检测任务；按批次采样真实输入、层统计和损失摘要 |
 | 训练领取租约与启动确认 | 1.6.0 | 未确认领取在 90 秒后可重新分发，降低响应丢失导致的长期“启动中” |
+| 确认重试、活动运行恢复与单实例 | 1.7.0 | 配合新版中心处理确认响应丢失、确认前停止和 Agent 异常退出 |
 
-低于 1.2.0 的旧 Agent 不能领取新训练任务；1.2.x 可以进行基础训练，但不具备完整的续训和文件管理能力。1.2.0～1.5.x 领取训练时没有 1.6.0 的租约保护，因此完整远程功能应统一升级到 1.6.0。配置示例：
+低于 1.2.0 的旧 Agent 不能领取新训练任务；1.2.x 可以进行基础训练，但不具备完整的续训和文件管理能力。1.2.0～1.5.x 没有租约保护，1.6.0 没有活动进程恢复，因此完整远程功能应统一升级到 1.7.0。配置示例：
 
 ```json
 {
   "enable_training": true,
   "allowed_training_roots": ["/data/yolo/yolo", "/data/yolo/datasets", "/data/yolo/runs"],
+  "training_output_roots": ["/data/yolo/runs"],
   "yolo_bin": "/data/conda/envs/yolo/bin/yolo",
   "training_cwd": "/data/yolo/yolo",
   "training_lock_file": "/data/yolo/yolo/.yolo-forge-training.lock",
@@ -62,7 +66,9 @@ python3 monitor_agent.py --config agent-config.json
 
 这些字段须加到现有 JSON 对象中，保留原来的 `center_url`、`node_id`、`token` 等字段。示例路径需要与执行服务器实际的模型、数据目录和 Conda 环境一致。`allowed_training_roots` 应仅列模型文件、数据 YAML、输出根目录所在的最小目录；工作目录和输出根目录须事先存在，运行 Agent 的用户须有相应写权限。训练产物位于 `<输出根目录>/<任务类型>/<任务 ID>/attempt-001`。启动前 Agent 检查模型文件和数据 YAML 是否存在、路径是否落在允许目录内；它不会逐一检查 YAML 引用的全部图片路径是否也在允许目录内。命令通过参数数组执行，不执行任意 Shell。建议用具有训练目录写入权的专用非 root 用户运行 Agent。
 
-`training_lock_file` 可省略，默认位于 `training_cwd/.yolo-forge-training.lock`。同一服务器若同时运行开发版和使用版的两个 Agent，应让它们使用相同的 `training_cwd` 或显式配置同一个锁文件，推荐使用同一系统账户。Agent 尝试将锁文件权限设为 `660`；不同账户共用时还需核对文件所有权、组、父目录访问权限及修改权限。Agent 只在持有操作系统文件锁时领取任务，进程退出会自动释放；锁文件本身保留不代表仍被占用。两套平台仍需各自的节点 ID、Token 和 Agent 目录。
+`training_output_roots` 明确哪些允许目录可作为训练输出，每一项必须位于 `allowed_training_roots` 内。旧配置未填写时 Agent 会兼容运行，但只能判断允许目录中是否至少有一个可写；每次启动仍会对任务实际输出根目录再做写入检查。
+
+`training_lock_file` 可省略，默认位于 `training_cwd/.yolo-forge-training.lock`。同一服务器若同时运行开发版和使用版的两个 Agent，应让它们使用相同的 `training_cwd` 或显式配置同一个锁文件，推荐使用同一系统账户。Agent 尝试将锁文件权限设为 `660`；不同账户共用时还需核对文件所有权、组、父目录访问权限及修改权限。Agent 只在持有操作系统文件锁时领取任务，并让 YOLO 训练子进程继承这把锁；即使 Agent 被强制结束，只要训练子进程仍存活，锁也不会提前释放。Agent 重启后会识别子进程持有的锁并接管它，不会再启动一个训练。锁文件本身保留不代表仍被占用。同一配置目录下只允许一个 Agent 实例运行。两套平台仍需各自的节点 ID、Token 和 Agent 目录。
 
 锁只约束访问同一锁文件的 Agent，不约束中心本机调度器、不同锁路径下的 Agent 或平台外启动的 YOLO 进程。共用锁文件会串行化整项训练，即使两个任务选择不同 GPU，也不会并行领取；它不是按 GPU 分配的全主机资源调度器。
 
@@ -70,7 +76,7 @@ python3 monitor_agent.py --config agent-config.json
 
 Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Batch 的输入张量、网络层统计、损失和采样图片，并增量上传到中台的过程解析接口。平台不会上传完整特征图、模型权重或数据集；采样图片单张最多 512 KiB。采集失败不会中断训练，网络暂时不可用时会在下一次轮询重试。若远程服务器资源紧张，可在配置中设置 `"enable_training_trace": false`，关闭过程采集但保留普通训练、指标和日志回传。替换 Agent 后需重新领取或重新启动训练，已经运行的旧 Attempt 不会补采历史 Batch。
 
-中心从源码配置动态生成参数目录，Agent 1.6.0 的 `TRAINING_KEYS` 是固定集合。例如中心已有 `cls_remap`，Agent 的预设白名单尚未包含，作为预设参数时不会加入远程命令。Agent 参数序列化只接受标量，列表和字典可能被拒绝；不能假定本机与远程的参数完全等价。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
+中心从源码配置动态生成参数目录，Agent 1.7.0 已补齐发布时的目录，包括 `channels_last`、`cls_remap`、`distill_model`、`quantize` 和 `time` 等参数。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
 
 ### 远程任务与文件操作（Agent 1.3.0）
 
@@ -79,7 +85,7 @@ Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Ba
 - **断点续训**：任务须已停止或中断，Agent 已同步该运行的 `weights/last.pt`。续训生成新 Attempt，保留旧运行的文件和指标；使用检查点内的优化器与训练状态。总轮数和数据集必须保持与上次运行一致；想改总轮数或数据集时使用重新训练。
 - **产物列表、图片和下载**：Agent 周期上报文件元数据，打开历史运行会排队扫描。预览或下载时才从对应服务器分块传输到中台缓存，校验大小和 SHA256 后提供文件。断网时显示准备中或重试，不会读取中台上的同名远程路径。中心接受的单文件元数据大小上限为 8 GiB；扫描发现超过 1024 个文件会报错，不是只同步前 1024 个。缓存位于中台 `PLATFORM_DATA_ROOT/remote-artifacts/`，永久删除任务时一并清理。
 - **移入回收站和恢复**：仅隐藏或恢复平台记录，不立即删除远程文件。活动任务须先停止。
-- **永久删除**：提交后显示“远程清理中”，由 Agent 清理该任务各次 Attempt 和对应独立日志，成功确认后中台才删除任务记录。离线时保留记录等待连接；失败显示原因，允许重试清理。提交永久删除后不能恢复，包括已经部分清理的失败任务。
+- **永久删除**：提交后显示“远程清理中”，由 Agent 清理该任务各次 Attempt 和对应独立日志，成功确认后中台才删除任务记录。离线时保留记录等待连接；失败显示原因，允许重试清理。提交永久删除后不能恢复，包括已经部分清理的失败任务。Attempt 记录的输出根目录不存在、允许目录失效或磁盘挂载离线时，Agent 会返回可重试失败，不会把“无法核验”当成“已删除”。
 
 文件操作仅限配置允许目录内、精确匹配任务及 Attempt 的路径，拒绝路径逃逸及链接目录；清理前核对全部目标，保护训练项目、YOLO 程序以及平台已登记的模型和数据 YAML 输入。没有向平台登记的外部文件引用不在这份保护清单内，应避免把共享训练输入放在任务输出目录中。文件操作通过独立工作线程执行，不阻塞算力心跳或停止指令查询。
 
@@ -99,13 +105,17 @@ Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Ba
 
 Agent 1.6.0 领取任务时使用随机租约，并在启动 YOLO 前向中心确认。若领取响应没有到达 Agent，中心会在 90 秒租约过期后重新分发；过期租约不能继续更新运行，避免旧响应导致重复接管。1.2.0～1.5.x 为兼容模式，没有训练领取租约；中心仍允许它们领取相应版本支持的任务，但不具备这一恢复保护。
 
+Agent 1.7.0 会用同一租约重试启动确认。网络响应丢失时不启动 YOLO，而是保留活动记录后继续确认；平台明确拒绝过期租约时才放弃。用户在领取和确认之间点击停止时，新版中心会确认租约并返回 `stop=true`，Agent 不创建训练进程，直接回传已停止。这需要 Agent 1.7.0 与配套新版中心同时使用。
+
 训练结束时先将最终状态、日志尾部及未确认指标写到 **Agent 配置文件旁的 `.training-state/<运行 ID>.json`**，收到中台确认后才删除。Agent 重启后也会重试这些文件，补传完成前不领取下一项训练。此目录不含 Token，但含训练日志，应保持私有权限，并在升级时保留；认证或路径错误需修正后才能补传。
 
 平台停止指令和 Agent 退出会分别显示对应原因，不再统一标记为用户停止。平台停止事件记录请求时间、运行 ID 和连接来源 IP；经网关访问时可能记录网关地址，来源 IP 不能直接代表具体操作者。网络失联不自动判定训练失败或停止。
 
-**Agent 正常退出或服务重启仍会终止正在运行的训练。** 本版本只恢复已落盘的最终结果，不接管因断电、强制结束 Agent 而遗留的训练进程，也不自动恢复训练；升级前应确认没有运行中的训练，避免重复执行。
+Agent 将活动任务、启动命令、PID、Linux 进程启动时刻、命令行哈希和 boot ID 写入 `.training-state/active/`，不写入 Token。强制结束 Agent 后训练进程仍存活时，新 Agent 只在进程身份完全匹配时接管进度和停止指令，不启动重复训练。原 Agent 无法提供孤儿进程的退出码，因此该进程自然结束后会将 Attempt 明确标记为失败并保留产物，用户可核对后重新训练。正常收到 SIGINT/SIGTERM 时 Agent 仍会先停止它管理的训练并回传状态。
 
-每台远程服务器可以配置不同的 `training_cwd` 和 `allowed_training_roots`，平台不会把某一台服务器的绝对路径当作所有节点的固定路径。训练、产物扫描和下载始终按当前 Agent 的允许目录严格校验。如果历史失败任务引用了其他服务器的根目录，且该根目录在当前服务器上完全不存在，永久删除会作为“无文件可清理”成功返回；目录真实存在时，仍必须位于本 Agent 的允许目录内，符号链接和越界路径仍会被拒绝。
+远程任务停止后长时间保持 `stopping` 时，先登录对应训练服务器，根据 Attempt、命令和 PID 确认该 YOLO 进程已经结束。停止状态持续至少 30 秒后，当前训练画布才显示“解除占用”；再按页面提示明确确认远程进程已停止。该操作只将当前 Attempt 标记为 `interrupted` 并解除中心的节点占用，**不会向远程进程发送终止信号**。若旧进程仍在运行就解除占用，新任务可能与它同时占用 GPU。当前 Attempt 已变化或停止状态刚刚更新时，中心会拒绝这次操作，应刷新后重新核对。
+
+每台远程服务器可以配置不同的 `training_cwd`、`allowed_training_roots` 和 `training_output_roots`，平台不会把某一台服务器的绝对路径当作所有节点的固定路径。训练、产物扫描和下载始终按当前 Agent 的允许目录严格校验。永久删除时，不存在的 Attempt 只有在其输出根目录仍位于当前可用的允许目录内时才视为已清理；配置外路径、允许目录消失或挂载离线都会返回可重试错误，不删除中心记录。
 
 ### 更新 Agent
 
@@ -119,11 +129,12 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `1.6.0` 后，再替换并验证连接：
+确认输出为 `1.7.0` 后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
 chmod 600 agent-config.json
+python3 monitor_agent.py --config agent-config.json --check-config
 python3 monitor_agent.py --config agent-config.json --once
 python3 monitor_agent.py --config agent-config.json
 ```
@@ -189,8 +200,9 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 先确认 Agent 为 1.6.0、服务器时钟正常并检查 Agent 日志；1.6.0 未确认领取会在 90 秒后重新分发，旧 Agent 没有该保护 |
+| 节点在线但任务一直“启动中” | 确认中心与 Agent 均为 1.7.0 配套版本、服务器时钟正常，再检查 Agent 日志与 `.training-state/active/` |
 | 任务不领取、锁一直被占用 | 检查其他共用锁文件的 Agent 和锁文件权限；文件存在本身不表示锁仍被持有 |
+| 远程任务长时间“正在停止” | 先到远程服务器确认当前 Attempt 的 YOLO 进程已结束；停止超过 30 秒后才可在训练画布使用“解除占用”，该操作不会终止远程进程 |
 | 页面参数与远程命令不同 | 对照固定 `TRAINING_KEYS`、标量限制和远程 YOLO 版本，再检查实际命令与 `args.yaml` |
 | 产物扫描失败 | 检查允许目录、链接路径、文件数是否超过 1024、单文件元数据是否超过 8 GiB |
 | 禁用后停止或最终回传不生效 | 禁用会阻断 Agent 接口；恢复节点接入后确认状态，停止操作不应由禁用代替 |
@@ -202,6 +214,7 @@ sudo journalctl -u yolo-monitor-agent -f
 ```bash
 python3 --version
 nvidia-smi
+python3 monitor_agent.py --config agent-config.json --check-config
 python3 monitor_agent.py --config agent-config.json --once
 ```
 

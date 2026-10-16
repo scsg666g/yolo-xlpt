@@ -365,6 +365,31 @@ function TaskCanvasInner() {
     }
   }
 
+  async function forceInterrupt() {
+    const runId = task?.current_run_id
+    if (!runId || mutationPending.current) return
+    const confirmed = window.confirm('仅在已登录远程服务器并确认该 Attempt 的 YOLO 进程已经结束时使用。错误确认可能让新任务与旧进程同时占用 GPU。\n\n确认将任务标记为已中断并解除节点占用吗？')
+    if (!confirmed) return
+    mutationPending.current = true
+    cancelPendingRefresh()
+    setWorking(true); setNotice('')
+    try {
+      const updated = await api.forceInterrupt(taskId, runId)
+      cancelPendingRefresh()
+      setTask(updated)
+      setNotice('已解除远程节点占用，任务标记为中断')
+    } catch (reason) {
+      setNotice(reason instanceof Error ? reason.message : '解除节点占用失败')
+    } finally {
+      try {
+        await refresh({ allowDuringMutation: true, preferredRunId: runId })
+      } finally {
+        mutationPending.current = false
+        setWorking(false)
+      }
+    }
+  }
+
   async function saveLayout() {
     if (!task || layoutSavePending.current) return
     layoutSavePending.current = true
@@ -398,6 +423,10 @@ function TaskCanvasInner() {
   const canStart = task.status === 'draft'
   const canResume = ['stopped', 'interrupted'].includes(task.status)
   const canStop = ['queued', 'starting', 'running'].includes(task.status)
+  const stopRequestedAt = new Date(events.find((event) => event.event_type === 'stop_requested')?.created_at
+    || selectedRun?.updated_at || task.updated_at).getTime()
+  const canForceInterrupt = Boolean(task.execution_node_id && task.status === 'stopping'
+    && Number.isFinite(stopRequestedAt) && clock - stopRequestedAt >= 30_000)
   const canRetry = ['failed', 'stopped', 'interrupted', 'completed'].includes(task.status)
   const launchModeLabel = { fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[selectedRun?.launch_mode || 'fresh']
   const heartbeatLabel = !isCurrentRun ? '历史快照' : syncDelayed ? '同步延迟' : outputWaiting ? '等待新输出' : currentIsActive ? '实时同步' : '数据已同步'
@@ -425,6 +454,7 @@ function TaskCanvasInner() {
         {isCurrentRun && canResume && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
         {isCurrentRun && canRetry && <button className="button ghost compact" disabled={working} onClick={() => action('retry')}><RotateCcw size={15} />重新训练</button>}
         {isCurrentRun && canStop && <button className="button danger compact" disabled={working} onClick={() => action('stop')}><Square size={14} />停止</button>}
+        {isCurrentRun && canForceInterrupt && <button className="button danger compact" disabled={working} title="仅在远程 YOLO 进程已确认结束时解除占用" onClick={() => void forceInterrupt()}><AlertCircle size={14} />解除占用</button>}
       </div>
     </header>
     <div className={`canvas-wrap flow-${isCurrentRun ? viewTask.status : 'history'}`}>

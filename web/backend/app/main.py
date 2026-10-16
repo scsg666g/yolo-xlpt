@@ -8,17 +8,18 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
+from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, RUNS_ROOT, WEB_ROOT
-from .compute_nodes import ensure_local_node, local_snapshot, remote_trace_root, router as compute_nodes_router
+from .compute_nodes import as_utc, ensure_local_node, local_snapshot, remote_trace_root, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import (
     cleanup_managed_dataset_workdirs,
@@ -30,8 +31,15 @@ from .inference import router as inference_router, worker as inference_worker
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete
 from .parameter_catalog import load_parameter_catalog
-from .remote_operations import matching_fetch, operation_file, queue_delete, queue_scan, router as remote_operations_router
-from .schemas import ArtifactRead, EffectiveBestWeightRead, EventRead, LayoutUpdate, MetricRead, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
+from .remote_operations import (
+    active_remote_delete,
+    matching_fetch,
+    operation_file,
+    queue_delete,
+    queue_scan,
+    router as remote_operations_router,
+)
+from .schemas import ArtifactRead, EffectiveBestWeightRead, EventRead, LayoutUpdate, MetricRead, RemoteInterruptConfirmation, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
     add_event,
     backfill_training_runs,
@@ -156,6 +164,33 @@ def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
     return run
 
 
+def reject_active_remote_delete(db: Session, node_id: str) -> None:
+    if active_remote_delete(db, node_id):
+        raise HTTPException(
+            409,
+            "该远程服务器正在清理任务文件，暂不能新建、克隆或更换模型和数据集；请等待清理完成后重试",
+        )
+
+
+def reject_unsupported_remote_parameters(node: ComputeNode | None, config: dict, status_code: int = 422) -> None:
+    capability = (node.snapshot or {}).get("training") if node else None
+    if not isinstance(capability, dict) or "supported_parameters" not in capability:
+        return
+    reported = capability.get("supported_parameters")
+    if not isinstance(reported, list):
+        return
+    requested = {
+        key for key, value in config.items()
+        if key in editable_training_keys() and value is not None
+    }
+    unsupported = requested - {key for key in reported if isinstance(key, str)}
+    if unsupported:
+        raise HTTPException(
+            status_code,
+            f"远程 Agent 不支持参数 {', '.join(sorted(unsupported))}，请升级 Agent 或移除该参数",
+        )
+
+
 @app.get("/api/health")
 def health():
     started = time.perf_counter()
@@ -249,6 +284,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
                 raise HTTPException(422, "远程模型、数据 YAML 和输出目录都必须是远程服务器上的绝对路径")
             if any("\x00" in value for value in (model_path, data_path, output_root)):
                 raise HTTPException(422, "路径不能包含空字符")
+            reject_active_remote_delete(db, node.id)
         else:
             try:
                 model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
@@ -261,6 +297,8 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             config["remote_output_root"] = payload.remote_output_root.strip()
         supported_keys = editable_training_keys()
         config.update({key: value for key, value in payload.advanced.items() if key in supported_keys})
+        if node:
+            reject_unsupported_remote_parameters(node, config)
         task = TrainingTask(
             id=task_id,
             name=payload.name.strip(),
@@ -298,7 +336,9 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.status != "draft":
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
-    if not task.execution_node_id:
+    if task.execution_node_id:
+        reject_unsupported_remote_parameters(db.get(ComputeNode, task.execution_node_id), task.config, 409)
+    else:
         if not Path(task.model_path).exists() or not Path(task.data_path).exists():
             raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
         try:
@@ -318,6 +358,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     if task.status not in {"stopped", "interrupted"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
     if task.execution_node_id:
+        reject_unsupported_remote_parameters(db.get(ComputeNode, task.execution_node_id), task.config, 409)
         previous = current_run(db, task)
         if previous and (task.epochs != previous.parameter_snapshot.get("epochs") or task.data_path != previous.data_path):
             raise HTTPException(409, "断点续训沿用检查点的总轮数和数据集，请恢复原配置或选择重新训练")
@@ -362,7 +403,9 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.status not in {"failed", "stopped", "interrupted", "completed"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能重新训练")
-    if not task.execution_node_id:
+    if task.execution_node_id:
+        reject_unsupported_remote_parameters(db.get(ComputeNode, task.execution_node_id), task.config, 409)
+    else:
         try:
             validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
             validate_dataset_config(task.data_path)
@@ -380,22 +423,44 @@ def stop_task(task_id: str, request: Request, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.execution_node_id:
         run = current_run(db, task)
-        if not run or run.status not in {"queued", "starting", "running", "stopping"}:
+        if not run or (run.status not in {"queued", "starting", "running", "stopping"}
+                       and not (run.status == "stopped" and run.stop_requested)):
             raise HTTPException(409, "该远程任务当前无法停止")
-        if run.status == "queued":
-            run.status = "stopped"
-            run.stop_requested = True
-            run.error_message = "平台取消排队，训练尚未启动"
-            run.finished_at = utcnow()
+        requested_at = utcnow()
+        transition = None
+        cancelled = db.execute(update(TrainingRun).where(
+            TrainingRun.id == run.id,
+            TrainingRun.status == "queued",
+        ).values(
+            status="stopped", stop_requested=True, pid=None,
+            error_message="平台取消排队，训练尚未启动", finished_at=requested_at,
+        ))
+        if cancelled.rowcount == 1:
+            transition = "stopped"
         else:
-            run.stop_requested = True
-            run.status = "stopping"
+            stopping = db.execute(update(TrainingRun).where(
+                TrainingRun.id == run.id,
+                TrainingRun.status.in_(["starting", "running", "stopping"]),
+                TrainingRun.stop_requested.is_(False) | (TrainingRun.status != "stopping"),
+            ).values(status="stopping", stop_requested=True))
+            if stopping.rowcount == 1:
+                transition = "stopping"
+
+        # A repeated request is successful but must not create duplicate events.
+        # Conditional updates also prevent a concurrent poll from overwriting a
+        # queued cancellation, or a stale queued view from cancelling a claim.
+        db.expire_all()
+        run = db.get(TrainingRun, run.id)
+        if not run or (transition is None and not (run.stop_requested and run.status in {"stopping", "stopped"})):
+            db.rollback()
+            raise HTTPException(409, "该远程任务当前无法停止")
         mirror_run_to_task(task, run)
-        source_ip = request.client.host if request.client else "unknown"
-        message = "已取消远程训练排队" if run.status == "stopped" else "已向远程 Agent 请求停止"
-        add_event(db, task.id, "stop_requested", f"{message}；请求来源：{source_ip}",
-                  payload={"source_ip": source_ip, "method": request.method, "path": request.url.path,
-                           "requested_at": utcnow().isoformat(), "run_id": run.id}, run_id=run.id)
+        if transition is not None:
+            source_ip = request.client.host if request.client else "unknown"
+            message = "已取消远程训练排队" if transition == "stopped" else "已向远程 Agent 请求停止"
+            add_event(db, task.id, "stop_requested", f"{message}；请求来源：{source_ip}",
+                      payload={"source_ip": source_ip, "method": request.method, "path": request.url.path,
+                               "requested_at": requested_at.isoformat(), "run_id": run.id}, run_id=run.id)
         db.commit()
         db.refresh(task)
         return task
@@ -403,6 +468,59 @@ def stop_task(task_id: str, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(409, "该任务当前无法停止")
     with SessionLocal() as refreshed_db:
         return get_task_or_404(refreshed_db, task_id)
+
+
+@app.post("/api/tasks/{task_id}/force-interrupt", response_model=TaskRead)
+def force_interrupt_remote_task(task_id: str, payload: RemoteInterruptConfirmation,
+                                request: Request, db: Session = Depends(get_db)):
+    """Release a remote node only after an operator verifies its process is gone."""
+    task = get_task_or_404(db, task_id)
+    if not task.execution_node_id:
+        raise HTTPException(409, "该操作只用于无法完成停止的远程训练")
+    run = current_run(db, task)
+    if not run or run.id != payload.run_id:
+        raise HTTPException(409, "当前 Attempt 已变化，请刷新页面后重试")
+    if run.status != "stopping" or not run.stop_requested:
+        raise HTTPException(409, "请先停止远程训练，再确认远程进程已经结束")
+    requested_at = utcnow()
+    stop_requested_at = db.scalar(select(TaskEvent.created_at).where(
+        TaskEvent.run_id == run.id,
+        TaskEvent.event_type == "stop_requested",
+    ).order_by(TaskEvent.id.desc()).limit(1))
+    # Agent heartbeats update run.updated_at while a stop is pending. The
+    # recovery delay starts from the operator's stop request, not the latest
+    # heartbeat; old imported rows without an event retain a safe fallback.
+    recovery_started_at = as_utc(stop_requested_at or run.updated_at)
+    if requested_at - recovery_started_at < timedelta(seconds=30):
+        raise HTTPException(409, "停止请求仍在处理，请等待 30 秒；若仍未结束，再到远程服务器确认进程状态")
+    interrupted = db.execute(update(TrainingRun).where(
+        TrainingRun.id == run.id,
+        TrainingRun.status == "stopping",
+        TrainingRun.stop_requested.is_(True),
+        TrainingRun.updated_at == run.updated_at,
+    ).values(
+        status="interrupted", pid=None, finished_at=requested_at,
+        error_message="人工确认远程训练进程已结束，节点占用已解除",
+    ))
+    if interrupted.rowcount != 1:
+        db.rollback()
+        raise HTTPException(409, "远程训练状态刚刚发生变化，请刷新页面后确认")
+    db.expire_all()
+    run = db.get(TrainingRun, payload.run_id)
+    task = db.get(TrainingTask, task_id)
+    if not run or not task:
+        db.rollback()
+        raise HTTPException(409, "训练记录已变化，请刷新页面")
+    mirror_run_to_task(task, run)
+    source_ip = request.client.host if request.client else "unknown"
+    add_event(
+        db, task.id, "force_interrupted", run.error_message, "warning",
+        payload={"source_ip": source_ip, "confirmed_at": requested_at.isoformat(), "run_id": run.id},
+        run_id=run.id,
+    )
+    db.commit()
+    db.refresh(task)
+    return task
 
 
 def clone_name_parts(name: str) -> tuple[str, int]:
@@ -440,6 +558,8 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     with guard:
         if not source.execution_node_id:
             db.refresh(source)
+        else:
+            reject_active_remote_delete(db, source.execution_node_id)
         clone = TrainingTask(
             id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
             execution_node_id=source.execution_node_id,
@@ -532,11 +652,7 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     task = get_task_or_404(db, task_id)
     if task.execution_node_id:
         node = db.get(ComputeNode, task.execution_node_id)
-        capability = (node.snapshot or {}).get("training") if node else None
-        if capability:
-            unsupported = set(payload.config) - set(capability.get("supported_parameters") or [])
-            if unsupported:
-                raise HTTPException(422, f"远程 Agent 不支持参数 {', '.join(sorted(unsupported))}，请升级 Agent 或移除该参数")
+        reject_unsupported_remote_parameters(node, payload.config)
     if task.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "任务正在运行或排队，不能修改训练参数")
     supported_keys = editable_training_keys()
@@ -577,6 +693,8 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
             raise HTTPException(409, "任务正在运行或排队，不能更换模型或数据集")
         if payload.model_path is None and payload.data_path is None:
             raise HTTPException(422, "至少需要提供一个模型或数据集路径")
+        if task.execution_node_id:
+            reject_active_remote_delete(db, task.execution_node_id)
         try:
             if payload.model_path is not None:
                 if task.execution_node_id:

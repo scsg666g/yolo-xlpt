@@ -68,6 +68,9 @@ export const api = {
   resume: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/resume`, { method: 'POST' }),
   retry: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/retry`, { method: 'POST' }),
   stop: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/stop`, { method: 'POST' }),
+  forceInterrupt: (id: string, runId: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/force-interrupt`, {
+    method: 'POST', body: JSON.stringify({ run_id: runId, confirm_process_stopped: true }),
+  }),
   clone: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/clone`, { method: 'POST' }),
   rename: (id: string, name: string) => request<TrainingTask>(`/api/tasks/${id}/name`, { method: 'PATCH', body: JSON.stringify({ name }) }),
   remove: (id: string) => requestWithTimeout<void>(`/api/tasks/${id}/trash`, { method: 'POST' }, 30_000, deletionTimeout),

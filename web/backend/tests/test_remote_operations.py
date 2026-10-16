@@ -105,6 +105,121 @@ def test_remote_delete_confirm_retry_and_local_isolation(monitoring_client, agen
     assert client.post(endpoint, json=result, headers=headers(credential)).json()["status"] == "succeeded"
 
 
+def test_remote_delete_refreshes_references_before_dispatch(monitoring_client, agent, tmp_path, monkeypatch):
+    client, factory = monitoring_client
+    credential, config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    task_id = payload["task_id"]
+    best = Path(payload["run_dir"]) / "weights/best.pt"
+    best.parent.mkdir(parents=True, exist_ok=True)
+    best.write_bytes(b"referenced model")
+
+    assert client.post(f"/api/tasks/{task_id}/trash").status_code == 204
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+
+    # The Agent is offline while another task starts referencing this model.
+    # The queued payload is deliberately stale until the operation is claimed.
+    with factory() as db:
+        operation = db.scalar(select(RemoteOperation).where(RemoteOperation.task_id == task_id))
+        assert str(best) not in operation.payload["protected_paths"]
+        dependent = TrainingTask(
+            id="new-dependent-task", name="Dependent", task_type="detect",
+            execution_node_id=credential["node"]["id"], model_path=str(best),
+            data_path=str(tmp_path / "data.yaml"), epochs=1,
+            config={"remote_output_root": str(tmp_path / "dependent-output")},
+        )
+        db.add(dependent)
+        db.flush()
+        dependent_run = create_training_run(db, dependent, "fresh")
+        dependent_run.checkpoint_path = str(best)
+        dependent_run.status = dependent.status = "stopped"
+        db.commit()
+
+    work = claim(client, credential)
+    assert str(best) in work["payload"]["protected_paths"]
+    agent.execute_operation(config, work, threading.Event())
+
+    assert best.read_bytes() == b"referenced model"
+    with factory() as db:
+        assert db.get(TrainingTask, task_id).deleted_reason == "remote_delete_failed"
+
+
+def test_remote_delete_serializes_same_node_references_until_completion(monitoring_client, tmp_path):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    task_id = payload["task_id"]
+    best = Path(payload["run_dir"]) / "weights/best.pt"
+    best.parent.mkdir(parents=True, exist_ok=True)
+    best.write_bytes(b"model scheduled for deletion")
+
+    assert client.post(f"/api/tasks/{task_id}/trash").status_code == 204
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+
+    # The center cannot resolve symlinks on a remote server. Treat this
+    # lexically unrelated path as a possible alias and serialize all new
+    # references on the node while deletion is pending.
+    possible_alias = str(tmp_path / "mounted-alias/weights/best.pt")
+    create_response = client.post("/api/tasks", json={
+        "name": "Pending alias dependency",
+        "execution_node_id": credential["node"]["id"],
+        "model_path": possible_alias,
+        "data_path": str(tmp_path / "data.yaml"),
+        "remote_output_root": str(tmp_path / "dependent-output"),
+    })
+    assert create_response.status_code == 409
+    assert "正在清理任务文件" in create_response.json()["detail"]
+
+    with factory() as db:
+        editable = TrainingTask(
+            id="editable-dependent", name="Editable", task_type="detect",
+            execution_node_id=credential["node"]["id"], model_path=str(tmp_path / "model.pt"),
+            data_path=str(tmp_path / "data.yaml"), config={"remote_output_root": str(tmp_path / "editable")},
+        )
+        clone_source = TrainingTask(
+            id="clone-dependent", name="Clone source", task_type="detect",
+            execution_node_id=credential["node"]["id"], model_path=str(tmp_path / "unrelated-model.pt"),
+            data_path=str(tmp_path / "data.yaml"), config={"remote_output_root": str(tmp_path / "clone")},
+        )
+        db.add_all([editable, clone_source])
+        db.commit()
+
+    update_response = client.patch("/api/tasks/editable-dependent/resources", json={"model_path": possible_alias})
+    clone_response = client.post("/api/tasks/clone-dependent/clone")
+    assert update_response.status_code == 409
+    assert clone_response.status_code == 409
+    assert "正在清理任务文件" in update_response.json()["detail"]
+    assert "正在清理任务文件" in clone_response.json()["detail"]
+
+    # Deletion on one server must not pause normal work on another server.
+    other = create(client, "Other deletion-independent node")
+    other_response = client.post("/api/tasks", json={
+        "name": "Other node task",
+        "execution_node_id": other["node"]["id"],
+        "model_path": possible_alias,
+        "data_path": str(tmp_path / "data.yaml"),
+        "remote_output_root": str(tmp_path / "other-output"),
+    })
+    assert other_response.status_code == 201, other_response.text
+
+    work = claim(client, credential)
+    assert work["kind"] == "delete"
+    running_response = client.post("/api/tasks", json={
+        "name": "Running alias dependency",
+        "execution_node_id": credential["node"]["id"],
+        "model_path": str(tmp_path / "another-alias/model.pt"),
+        "data_path": str(tmp_path / "another-alias/data.yaml"),
+        "remote_output_root": str(tmp_path / "another-output"),
+    })
+    assert running_response.status_code == 409
+    assert "正在清理任务文件" in running_response.json()["detail"]
+
+    with factory() as db:
+        assert db.get(TrainingTask, "editable-dependent").model_path == str(tmp_path / "model.pt")
+        assert db.get(RemoteOperation, work["id"]).status == "running"
+    assert best.is_file()
+
+
 def test_manifest_resume_and_chunked_download(monitoring_client, agent, tmp_path, monkeypatch):
     client, factory = monitoring_client
     credential, config, payload = remote_run(client, factory, tmp_path)
@@ -171,7 +286,7 @@ def test_agent_delete_validates_entire_plan_and_symlinks(agent, training, tmp_pa
         agent.operation_paths(config, run)
 
 
-def test_remote_delete_succeeds_when_failed_launch_created_no_files(monitoring_client, agent, tmp_path, monkeypatch):
+def test_remote_delete_rejects_missing_or_unmounted_output_root(monitoring_client, agent, tmp_path, monkeypatch):
     client, factory = monitoring_client
     credential, config, payload = remote_run(client, factory, tmp_path)
     monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
@@ -185,11 +300,14 @@ def test_remote_delete_succeeds_when_failed_launch_created_no_files(monitoring_c
     work = claim(client, credential)
     agent.execute_operation(config, work, threading.Event())
     with factory() as db:
-        assert db.get(TrainingTask, task_id) is None
+        task = db.get(TrainingTask, task_id)
+        assert task is not None and task.deleted_reason == "remote_delete_failed"
+        assert "输出根目录不存在" in (task.error_message or "")
 
-    # Scan/fetch still reject a missing root, and an existing root outside the
-    # current server's configured roots must never become a delete target.
-    with pytest.raises(ValueError, match="输出根目录无效"):
+    # A missing or unmounted root cannot prove that remote data was cleaned.
+    # Scan/fetch also reject it, and a root outside the current server's
+    # configured roots must never become a delete target.
+    with pytest.raises(ValueError, match="输出根目录不存在"):
         agent.operation_paths(config, payload)
     output_root.mkdir()
     with pytest.raises(ValueError, match="允许目录"):

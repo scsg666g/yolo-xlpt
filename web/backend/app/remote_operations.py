@@ -68,15 +68,41 @@ def queue_delete(db: Session, task: TrainingTask) -> None:
         return
     # Freeze the exact set of Attempts; a pending deletion cannot be restored or launched.
     runs = [run_payload(run, task) for run in task.runs if run.execution_node_id]
-    protected = []
-    for other in db.scalars(select(TrainingTask).where(TrainingTask.execution_node_id == task.execution_node_id)):
-        protected.extend([other.model_path, other.data_path])
-        for historical in other.runs:
-            protected.extend([historical.model_path, historical.data_path])
-    enqueue(db, task.execution_node_id, task.id, "delete", {"runs": runs, "protected_paths": protected})
+    enqueue(db, task.execution_node_id, task.id, "delete", {
+        "runs": runs,
+        "protected_paths": live_protected_paths(db, task.execution_node_id, task.id),
+    })
     task.deleted_at = task.deleted_at or utcnow()
     task.deleted_reason = "remote_delete_pending"
     add_event(db, task.id, "remote_delete_queued", "等待远程 Agent 清理该任务文件；确认后删除记录")
+
+
+def live_protected_paths(db: Session, node_id: str, deleting_task_id: str) -> list[str]:
+    """Return current references that a queued remote deletion must preserve."""
+    protected: set[str] = set()
+    tasks = db.scalars(select(TrainingTask).where(
+        TrainingTask.execution_node_id == node_id,
+        TrainingTask.id != deleting_task_id,
+    ))
+    for task in tasks:
+        protected.update(path for path in (task.model_path, task.data_path) if path)
+        for run in task.runs:
+            protected.update(path for path in (run.model_path, run.data_path, run.checkpoint_path) if path)
+    return sorted(protected)
+
+
+def active_remote_delete(db: Session, node_id: str) -> RemoteOperation | None:
+    """Return active deletion work for a node, if any.
+
+    Remote paths may contain symlink aliases that the center cannot resolve.
+    Callers must therefore serialize new references at node scope instead of
+    comparing path strings with the directories in a deletion payload.
+    """
+    return db.scalar(select(RemoteOperation).where(
+        RemoteOperation.node_id == node_id,
+        RemoteOperation.kind == "delete",
+        RemoteOperation.status.in_(["pending", "running"]),
+    ).order_by(RemoteOperation.created_at).limit(1))
 
 
 class ArtifactItem(BaseModel):
@@ -150,11 +176,32 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
     ).order_by(RemoteOperation.created_at).limit(1))
     if not operation:
         return {"operation": None}
+    operation_payload = operation.payload
+    if operation.kind == "delete":
+        task = db.get(TrainingTask, operation.task_id)
+        if (not task or task.execution_node_id != node_id or task.status in ACTIVE or
+                task.deleted_reason != "remote_delete_pending"):
+            cancelled = db.execute(update(RemoteOperation).where(
+                RemoteOperation.id == operation.id,
+                RemoteOperation.status == operation.status,
+                RemoteOperation.updated_at == operation.updated_at,
+            ).values(status="cancelled", error="任务状态已变更，删除指令已取消", updated_at=utcnow()))
+            if cancelled.rowcount != 1:
+                db.rollback()
+                return {"operation": None}
+            db.commit()
+            return {"operation": None}
+        # A node can be offline for a long time after deletion was queued. Refresh
+        # references immediately before dispatch so newly-created tasks are safe.
+        operation_payload = {
+            **operation.payload,
+            "protected_paths": live_protected_paths(db, node_id, operation.task_id),
+        }
     lease = secrets.token_hex(16)
     claimed = db.execute(update(RemoteOperation).where(
         RemoteOperation.id == operation.id, RemoteOperation.status == operation.status,
         RemoteOperation.updated_at == operation.updated_at,
-    ).values(status="running", lease=lease, updated_at=utcnow()))
+    ).values(status="running", lease=lease, payload=operation_payload, updated_at=utcnow()))
     if claimed.rowcount != 1:
         db.rollback()
         return {"operation": None}

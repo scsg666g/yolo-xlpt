@@ -4,7 +4,7 @@
 
 平台使用 FastAPI 调用服务器上的 `yolo` CLI 执行训练，使用 React Flow 展示训练画布，使用 ECharts 绘制指标曲线。中心平台管理本机训练；其他服务器通过独立 Agent 汇总算力数据，显式启用训练后可从同一界面管理远程任务。训练使用执行服务器自己的环境，输出保存在对应服务器。
 
-本文说明平台的安装与基本使用；页面操作见 [Web 平台说明](web/README.md)，远程接入见 [Agent 说明](web/agent/README.md)，服务维护见 [部署说明](web/deploy/README.md)。架构、代码职责、验证结果和当前改进建议集中记录在 [项目分析](docs/project-analysis.md)。当前平台版本为 **1.0.0**，随仓库提供的远程 Agent 为 **1.6.0**。
+本文说明平台的安装与基本使用；页面操作见 [Web 平台说明](web/README.md)，远程接入见 [Agent 说明](web/agent/README.md)，服务维护见 [部署说明](web/deploy/README.md)。架构、代码职责、验证结果和当前改进建议集中记录在 [项目分析](docs/project-analysis.md)。当前平台版本为 **1.0.0**，随仓库提供的远程 Agent 为 **1.7.0**。
 
 ## 界面预览
 
@@ -167,6 +167,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 18088 --workers 1
 
 ```bash
 chmod 600 agent-config.json
+python3 monitor_agent.py --config agent-config.json --check-config
 python3 monitor_agent.py --config agent-config.json --once
 
 # 看到“采样上报成功”后，持续运行
@@ -177,9 +178,9 @@ python3 monitor_agent.py --config agent-config.json
 
 每台远程服务器使用独立 Token，数据库只保存哈希。创建或重新生成 Token 时，应保存下载的配置；重新生成后，旧 Token 立即失效，需要更新对应 Agent 配置并重启 Agent。禁用节点会拒绝 Agent 请求，不能代替停止训练。移除节点前须先清理关联任务，移除本身不删除远程文件或停止进程。
 
-Agent 默认只监控；在远程配置启用训练并限定模型、数据 YAML 和输出目录后，可从平台创建远程训练任务，查看进度、指标和日志。当前脚本版本为 **1.6.0**：基础远程训练要求 1.2.0+，远程续训和文件操作要求 1.3.0+，共享训练锁要求 1.4.0+，训练过程解析要求 1.5.0+；1.6.0 增加训练领取租约和启动确认，能在 Agent 未收到领取响应时自动回收并重新分发。完整远程功能推荐中心与 Agent 同时使用 1.6.0。
+Agent 默认只监控；在远程配置启用训练并限定模型、数据 YAML 和输出目录后，可从平台创建远程训练任务，查看进度、指标和日志。当前脚本版本为 **1.7.0**：1.6.0 的领取租约基础上，新版增加幂等确认重试、确认前停止、活动进程身份恢复、单实例锁、训练子进程继承共享锁、真实能力上报和离线配置检查。完整远程功能推荐中心与 Agent 同时使用 1.7.0。
 
-两个 Agent 只有使用同一锁文件且具备访问权限时才会互斥；该锁不约束中心本机调度器或平台外进程。断网时不把未确认的文件清理显示为成功；清理失败可在回收站重试。远程续训沿用检查点的总轮数和数据集，调整这些配置请重新训练。部署步骤、开机启动和故障排查见 [Agent 说明](web/agent/README.md)，页面操作见 [Web 平台文档](web/README.md#多服务器算力监控)。
+两个 Agent 只有使用同一锁文件且具备访问权限时才会互斥；该锁不约束中心本机调度器或平台外进程。断网时不把未确认的文件清理显示为成功；输出根目录消失或挂载离线时，删除明确失败并保留记录供重试。远程任务停止卡住至少 30 秒后，只有在远程服务器确认对应 YOLO 进程已结束，才能在训练画布使用“解除占用”；该操作不会远程杀进程。远程续训沿用检查点的总轮数和数据集，调整这些配置请重新训练。部署步骤、开机启动和故障排查见 [Agent 说明](web/agent/README.md)，页面操作见 [Web 平台文档](web/README.md#多服务器算力监控)。
 
 ## 数据集准备
 
@@ -278,9 +279,9 @@ DATABASE_URL="sqlite:///$test_data_root/test-platform.db" \
 python -m pytest -q
 ```
 
-前端静态检查和构建在 `web/frontend/` 执行 `npm run lint`、`npm run build`。2026-10-16 的最终代码核查中，后端测试结果为 `173 passed, 1 warning`，前端 lint 和构建均通过；未启动新的真实 GPU 或跨服务器训练。后续版本以重新执行后的结果为准，检查结果和未覆盖场景见 [项目分析](docs/project-analysis.md#当前结论)。
+前端静态检查和构建在 `web/frontend/` 执行 `npm run lint`、`npm run build`。2026-10-16 的最终代码核查中，后端测试结果为 `199 passed, 1 warning`，前端 lint 和构建均通过；未启动新的真实 GPU 或跨服务器训练。后续版本以重新执行后的结果为准，检查结果和未覆盖场景见 [项目分析](docs/project-analysis.md#当前结论)。
 
-修改前端后重新执行 `npm run build`；修改后端后重启服务。后端启动会自动创建算力节点和远程文件操作队列表，并注册本机。远程完整功能推荐同步更新 Agent 至 1.6.0；升级前应确认没有运行中的训练，保留原节点配置和 `.training-state/`。当前未内置登录认证，Agent Token 仅验证对应节点的 Agent 接口；如需开放给其他用户，应在部署网关配置访问认证和 HTTPS。双实例的端口、备份及安装步骤见 [部署说明](web/deploy/README.md)。
+修改前端后重新执行 `npm run build`；修改后端后重启服务。后端启动会自动创建算力节点和远程文件操作队列表，并注册本机。远程完整功能推荐同步更新 Agent 至 1.7.0；升级前应确认没有运行中的训练，保留原节点配置和 `.training-state/`。当前未内置登录认证，Agent Token 仅验证对应节点的 Agent 接口；如需开放给其他用户，应在部署网关配置访问认证和 HTTPS。双实例的端口、备份及安装步骤见 [部署说明](web/deploy/README.md)。
 
 ## 相关文档
 

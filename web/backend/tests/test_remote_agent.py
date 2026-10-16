@@ -3,10 +3,11 @@ import importlib.util
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -120,6 +121,7 @@ def test_failed_updates_retry_metrics_and_explicit_stop(agent, training, monkeyp
             return self.stopped
 
     def popen(*args, **kwargs):
+        assert len(kwargs.get("pass_fds", ())) == 1
         run_dir = Path(task["run_dir"])
         shutil.rmtree(run_dir)
         run_dir.mkdir()
@@ -162,6 +164,7 @@ def test_terminal_backlog_survives_outage_and_retries_all_epochs(agent, training
     metrics = [{"epoch": i, "values": {"score": 0.5}} for i in range(1, 601)]
     payload = {"status": "completed", "completed_epochs": 600, "progress": 100,
                "exit_code": 0, "metrics": metrics, "log_tail": ["finished"]}
+    active_path = agent.save_active_run(config, task, "running")
     path = agent.save_pending_final(config, task["run_id"], payload)
     assert os.stat(path).st_mode & 0o077 == 0
     assert "token" not in path.read_text()
@@ -172,6 +175,7 @@ def test_terminal_backlog_survives_outage_and_retries_all_epochs(agent, training
     monkeypatch.setattr(agent, "api_json", offline)
     assert agent.retry_pending_finals(config) is False
     assert json.loads(path.read_text()) == payload
+    assert active_path.exists()
     received = []
 
     def online(_config, _path, method, payload):
@@ -186,6 +190,7 @@ def test_terminal_backlog_survives_outage_and_retries_all_epochs(agent, training
     assert [p["status"] for p in received] == ["running", "running", "completed"]
     assert [m["epoch"] for p in received for m in p["metrics"]] == list(range(1, 601))
     assert not path.exists()
+    assert agent.load_active_run(config) is None
 
 
 def test_external_log_symlink_cannot_escape_allowed_root(agent, training, tmp_path):
@@ -230,3 +235,225 @@ def test_training_lock_is_shared_by_agents_for_same_workspace(agent, training):
     second = agent.acquire_training_lock(config)
     assert second is not None
     agent.release_training_lock(second)
+
+
+def test_training_process_inherits_workspace_lock(agent, training):
+    config, _ = training
+    lock = agent.acquire_training_lock(config)
+    process = None
+    try:
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   pass_fds=(lock.fileno(),))
+        assert agent.process_holds_training_lock(config, process.pid)
+        # Simulate an Agent crash: close the parent's descriptor without an
+        # explicit LOCK_UN while the training process keeps the inherited FD.
+        lock.close()
+        lock = None
+        assert agent.acquire_training_lock(config) is None
+    finally:
+        if lock is not None:
+            agent.release_training_lock(lock)
+        if process is not None and process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+    second = agent.acquire_training_lock(config)
+    assert second is not None
+    agent.release_training_lock(second)
+
+
+def test_claim_confirmation_retries_lost_response_and_honors_stop(agent, training, monkeypatch):
+    config, task = training
+    task["claim_lease"] = "c" * 32
+    calls = []
+
+    def api(_config, path, method="GET", payload=None, extra_headers=None):
+        calls.append((path, payload, extra_headers))
+        if path.endswith("/confirm") and sum(item[0].endswith("/confirm") for item in calls) == 1:
+            raise URLError("response lost after commit")
+        if path.endswith("/confirm"):
+            return {"confirmed": True, "stop": True}
+        assert path.endswith("/update")
+        assert payload["status"] == "stopped" and payload["stop_reason"] == "platform_stop"
+        assert extra_headers == {"X-Training-Lease": task["claim_lease"]}
+        return {"status": "stopped"}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    monkeypatch.setattr(agent, "CONFIRM_RETRY_DELAYS", (0,))
+    monkeypatch.setattr(agent.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("training must not start"))
+    shutdown = threading.Event()
+    shutdown.set()
+    agent.run_remote_task(config, task, shutdown)
+    assert sum(path.endswith("/confirm") for path, *_ in calls) == 2
+    assert agent.load_active_run(config) is None
+    assert not list(Path(config["training_state_dir"]).glob("*.json"))
+
+
+def test_claim_rejection_never_starts_process_or_writes_terminal(agent, training, monkeypatch):
+    config, task = training
+    task["claim_lease"] = "d" * 32
+
+    def reject(*_args, **_kwargs):
+        raise HTTPError("confirm", 409, "expired", {}, None)
+
+    monkeypatch.setattr(agent, "api_json", reject)
+    monkeypatch.setattr(agent.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("training must not start"))
+    agent.run_remote_task(config, task, threading.Event())
+    assert agent.load_active_run(config) is None
+    assert not list(Path(config["training_state_dir"]).glob("*.json"))
+
+
+def test_unknown_claim_confirmation_is_persisted_for_same_lease_retry(agent, training, monkeypatch):
+    config, task = training
+    task["claim_lease"] = "e" * 32
+    monkeypatch.setattr(agent, "api_json", lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("offline")))
+    monkeypatch.setattr(agent, "CONFIRM_RETRY_DELAYS", ())
+    monkeypatch.setattr(agent.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("training must not start"))
+    agent.run_remote_task(config, task, threading.Event())
+    state = agent.load_active_run(config)
+    assert state["phase"] == "claimed"
+    assert state["task"]["claim_lease"] == task["claim_lease"]
+    assert not list(Path(config["training_state_dir"]).glob("*.json"))
+
+
+def test_active_state_is_private_and_rejects_reused_pid(agent, training):
+    config, task = training
+    config["token"] = "ylp_secret-that-must-not-be-persisted"
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        identity = agent.process_identity(process.pid)
+        assert identity and agent.process_identity_matches(identity)
+        path = agent.save_active_run(config, task, "running", command=[sys.executable], identity=identity)
+        assert os.stat(path).st_mode & 0o077 == 0
+        assert config["token"] not in path.read_text()
+        assert agent.load_active_run(config)["process"] == identity
+        reused = dict(identity, start_ticks=identity["start_ticks"] + 1)
+        assert not agent.process_identity_matches(reused)
+        changed_command = dict(identity, cmdline_sha256="0" * 64)
+        with pytest.raises(ValueError, match="命令行身份"):
+            agent._recovery_identity({"phase": "running", "process": changed_command,
+                                      "command": [sys.executable]})
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_training_capability_uses_explicit_output_root_version_and_lock(agent, training):
+    config, _ = training
+    model_root = Path(config["training_cwd"]) / "models"
+    output_root = Path(config["training_cwd"]) / "runs"
+    model_root.mkdir()
+    yolo = Path(config["training_cwd"]) / "fake-yolo"
+    yolo.write_text("#!/bin/sh\necho 'Ultralytics YOLO 8.3.219'\n")
+    yolo.chmod(0o700)
+    config.update(enable_training=True, allowed_training_roots=[str(model_root), str(output_root)],
+                  training_output_roots=[str(output_root)], yolo_bin=str(yolo),
+                  training_lock_file=str(Path(config["training_cwd"]) / ".shared.lock"))
+    capability = agent.training_capability(config)
+    assert capability["ready"] is True and capability["output_writable"] is True
+    assert capability["yolo_version"] == "8.3.219" and capability["lock_occupied"] is False
+    lock = agent.acquire_training_lock(config)
+    try:
+        assert agent.training_capability(config)["lock_occupied"] is True
+    finally:
+        agent.release_training_lock(lock)
+
+
+def test_current_catalog_parameters_reach_remote_command(agent, training):
+    config, task = training
+    values = {"channels_last": True, "cls_remap": False, "dis": 0.5,
+              "distill_model": "/models/teacher.pt", "dnn": True, "nms": False,
+              "quantize": "int8", "time": 2.5}
+    task["parameters"]["config"] = values
+    command = agent.build_training_command(config, task)
+    expected = {f"{key}={agent.scalar_parameter(value)}" for key, value in values.items()}
+    assert expected <= set(command)
+    assert set(values) <= agent.TRAINING_KEYS
+
+
+def test_missing_delete_root_is_always_rejected(agent, training, tmp_path):
+    config, task = training
+    allowed = Path(config["training_cwd"])
+    payload = {**task, "output_root": str(allowed / "missing-output")}
+    payload["run_dir"] = str(Path(payload["output_root"]) / "detect/task-id/attempt-001")
+    payload["log_path"] = str(Path(payload["output_root"]) / ".platform-logs/20261012/task-id/attempt-001.log")
+    with pytest.raises(ValueError, match="输出根目录不存在"):
+        agent.operation_paths(config, payload, allow_missing_root=True)
+    payload["output_root"] = str(tmp_path / "outside/missing-output")
+    payload["run_dir"] = str(Path(payload["output_root"]) / "detect/task-id/attempt-001")
+    payload["log_path"] = str(Path(payload["output_root"]) / ".platform-logs/20261012/task-id/attempt-001.log")
+    with pytest.raises(ValueError, match="输出根目录不存在"):
+        agent.operation_paths(config, payload, allow_missing_root=True)
+
+
+def test_agent_instance_lock_blocks_duplicate_config(agent, training):
+    config, _ = training
+    first = agent.acquire_agent_instance_lock(config)
+    assert first is not None
+    try:
+        assert agent.acquire_agent_instance_lock(config) is None
+    finally:
+        agent.release_training_lock(first)
+    second = agent.acquire_agent_instance_lock(config)
+    assert second is not None
+    agent.release_training_lock(second)
+
+
+def test_recovery_stops_only_identity_verified_process(agent, training, monkeypatch):
+    config, task = training
+    task["claim_lease"] = "f" * 32
+    lock = agent.acquire_training_lock(config)
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True,
+                               pass_fds=(lock.fileno(),))
+    lock.close()
+    updates = []
+    try:
+        identity = agent.process_identity(process.pid)
+        state_path = agent.save_active_run(config, task, "running",
+                                           command=[sys.executable, "-c", "import time; time.sleep(30)"],
+                                           identity=identity)
+        state = json.loads(state_path.read_text())
+        assert agent.process_holds_training_lock(config, process.pid)
+
+        def api(_config, path, method="GET", payload=None, extra_headers=None):
+            if path.endswith("/control"):
+                return {"status": "stopping", "stop": True}
+            updates.append((payload, extra_headers))
+            return {"status": payload["status"], "stop_requested": True}
+
+        monkeypatch.setattr(agent, "api_json", api)
+        monkeypatch.setattr(agent, "acquire_training_lock",
+                            lambda *_args, **_kwargs: pytest.fail("process-held recovery must not acquire the lock"))
+        monkeypatch.setattr(agent, "release_training_lock",
+                            lambda *_args, **_kwargs: pytest.fail("process-held recovery must not release the lock"))
+        agent.recover_remote_task(config, state, threading.Event(), process_holds_lock=True)
+        process.wait(timeout=5)
+        assert updates[-1][0]["status"] == "stopped"
+        assert updates[-1][1] == {"X-Training-Lease": task["claim_lease"]}
+        assert agent.load_active_run(config) is None
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+
+
+def test_check_config_is_offline_and_never_prints_token(agent, training, tmp_path):
+    root = Path(training[0]["training_cwd"])
+    yolo = root / "check-yolo"
+    yolo.write_text("#!/bin/sh\necho 'YOLO 9.0.1'\n")
+    yolo.chmod(0o700)
+    token = "ylp_" + "s" * 32
+    config_path = tmp_path / "agent-config.json"
+    config_path.write_text(json.dumps({
+        "center_url": "http://127.0.0.1:9", "node_id": "1" * 32, "token": token,
+        "report_interval_seconds": 5, "nvidia_smi_bin": "nvidia-smi", "enable_training": True,
+        "allowed_training_roots": [str(root)], "training_output_roots": [str(root / "runs")],
+        "yolo_bin": str(yolo), "training_cwd": str(root),
+    }))
+    (root / "runs").mkdir(exist_ok=True)
+    config_path.chmod(0o600)
+    script = Path(agent.__file__)
+    result = subprocess.run([sys.executable, str(script), "--config", str(config_path), "--check-config"],
+                            text=True, capture_output=True, timeout=10)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0 and "配置检查通过" in output
+    assert token not in output

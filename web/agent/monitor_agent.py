@@ -30,11 +30,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
 LOGGER = logging.getLogger("yolo-monitor-agent")
+CONFIRM_RETRY_DELAYS = (1, 2, 4, 8)
+ACTIVE_STATE_VERSION = 1
+_YOLO_VERSION_CACHE: dict[tuple[str, int | None], str | None] = {}
 
 
 REMOTE_TRACE_RUNNER = r'''#!/usr/bin/env python3
@@ -204,6 +207,59 @@ def collect_gpus(binary: str) -> tuple[list[dict], str | None]:
     return result[:128], message
 
 
+def _probe_writable_directory(path: Path) -> None:
+    """Verify a directory with an exclusive private file without clobbering user data."""
+    name = f".platform-write-check-{os.getpid()}-{threading.get_ident()}"
+    probe = path / name
+    descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, b"ok")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+        probe.unlink(missing_ok=True)
+
+
+def _configured_yolo_version(binary: str) -> str | None:
+    """Return a cached CLI version; inability to print a version does not disable training."""
+    resolved = shutil.which(binary) if "/" not in binary else str(Path(binary))
+    if not resolved:
+        return None
+    try:
+        modified = Path(resolved).stat().st_mtime_ns
+    except OSError:
+        modified = None
+    key = (resolved, modified)
+    if key in _YOLO_VERSION_CACHE:
+        return _YOLO_VERSION_CACHE[key]
+    try:
+        output = subprocess.check_output([resolved, "version"], text=True, timeout=5,
+                                         stderr=subprocess.STDOUT).strip()
+        clean = re.sub(r"\x1b\[[0-9;]*m", "", output)
+        match = re.search(r"(?<!\d)(\d+\.\d+(?:\.\d+)?(?:[-+._a-zA-Z0-9]*)?)", clean)
+        version = match.group(1)[:100] if match else clean.splitlines()[-1][:100] if clean else None
+    except (OSError, subprocess.SubprocessError):
+        version = None
+    _YOLO_VERSION_CACHE[key] = version
+    return version
+
+
+def training_lock_occupied(config: dict) -> bool:
+    """Inspect the shared lock without changing its contents."""
+    lock_path = Path(config.get("training_lock_file") or Path(config["training_cwd"]) / ".yolo-forge-training.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
+    finally:
+        handle.close()
+
+
 def training_capability(config: dict) -> dict:
     """Report whether this Agent can safely accept a remote training run."""
     enabled = bool(config.get("enable_training"))
@@ -219,18 +275,34 @@ def training_capability(config: dict) -> dict:
             raise ValueError("训练工作目录不存在")
         if not roots:
             raise ValueError("未配置允许的训练目录")
-        output_root = roots[0]
-        output_root.mkdir(parents=True, exist_ok=True)
-        probe = output_root / ".platform-write-check"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        missing = [str(root) for root in roots if not root.is_dir()]
+        if missing:
+            raise ValueError(f"允许的训练目录不存在：{missing[0]}")
+        output_roots = [Path(item) for item in config.get("training_output_roots", [])] or roots
+        output_writable = False
+        # Legacy configs do not identify output roots, so inspect their allowed
+        # roots from last to first. Every task root is checked again at launch.
+        for root in reversed(output_roots):
+            try:
+                _probe_writable_directory(root)
+                output_writable = True
+                break
+            except OSError:
+                continue
+        if not output_writable:
+            raise ValueError("允许的训练目录均不可写")
         yolo = config["yolo_bin"]
-        if "/" in yolo and (not Path(yolo).is_file() or not os.access(yolo, os.X_OK)):
+        resolved_yolo = shutil.which(yolo) if "/" not in yolo else yolo
+        if not resolved_yolo or not Path(resolved_yolo).is_file() or not os.access(resolved_yolo, os.X_OK):
             raise ValueError("YOLO 可执行文件不存在或不可执行")
+        state_dir = Path(config["training_state_dir"])
+        state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _probe_writable_directory(state_dir)
+        occupied = training_lock_occupied(config)
         return {"enabled": True, "ready": True, "reason": None,
-                "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
+                "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": _configured_yolo_version(yolo),
                 "python_version": platform.python_version(), "output_writable": True,
-                "lock_occupied": False}
+                "lock_occupied": occupied}
     except (OSError, ValueError, KeyError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
@@ -304,6 +376,15 @@ def load_config(path: Path) -> dict:
         raise ValueError("allowed_training_roots 必须是绝对路径列表")
     if enabled and not roots:
         raise ValueError("启用训练时必须配置 allowed_training_roots")
+    output_roots = config.get("training_output_roots", [])
+    if (not isinstance(output_roots, list) or
+            any(not isinstance(root, str) or not Path(root).is_absolute() for root in output_roots)):
+        raise ValueError("training_output_roots 必须是绝对路径列表")
+    resolved_roots = [Path(item).resolve() for item in roots]
+    resolved_outputs = [Path(item).resolve() for item in output_roots]
+    if any(not any(output == root or root in output.parents for root in resolved_roots)
+           for output in resolved_outputs):
+        raise ValueError("training_output_roots 必须位于 allowed_training_roots 内")
     trace_enabled = config.get("enable_training_trace", True)
     if type(trace_enabled) is not bool:
         raise ValueError("enable_training_trace 必须为布尔值")
@@ -320,7 +401,8 @@ def load_config(path: Path) -> dict:
         raise ValueError("training_lock_file 的父目录必须已存在")
     return {"center_url": center, "node_id": node_id, "token": token,
             "report_interval_seconds": interval, "nvidia_smi_bin": binary,
-            "enable_training": enabled, "allowed_training_roots": [str(Path(item).resolve()) for item in roots],
+            "enable_training": enabled, "allowed_training_roots": [str(item) for item in resolved_roots],
+            "training_output_roots": [str(item) for item in resolved_outputs],
             "yolo_bin": yolo_bin, "training_cwd": str(cwd_path),
             "training_lock_file": str(lock_path),
             "training_state_dir": str(path.resolve().parent / ".training-state"),
@@ -355,6 +437,161 @@ def release_training_lock(handle) -> None:
         handle.close()
 
 
+def process_holds_training_lock(config: dict, pid: int) -> bool:
+    """Return whether a live process has an FD for this workspace lock inode."""
+    if type(pid) is not int or pid <= 0:
+        return False
+    lock_path = Path(config.get("training_lock_file") or Path(config["training_cwd"]) / ".yolo-forge-training.lock")
+    try:
+        lock_stat = lock_path.stat()
+        descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    for descriptor in descriptors:
+        try:
+            descriptor_stat = descriptor.stat()
+        except OSError:
+            continue
+        if (descriptor_stat.st_dev, descriptor_stat.st_ino) == (lock_stat.st_dev, lock_stat.st_ino):
+            return True
+    return False
+
+
+def acquire_agent_instance_lock(config: dict):
+    """Prevent two processes from polling with the same on-disk node config."""
+    directory = Path(config["training_state_dir"])
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = directory / ".agent-instance.lock"
+    handle = path.open("a+", encoding="utf-8")
+    os.chmod(path, 0o600)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    json.dump({"pid": os.getpid(), "node_id": config["node_id"],
+               "acquired_at": datetime.now(timezone.utc).isoformat()}, handle)
+    handle.flush()
+    return handle
+
+
+def _atomic_private_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
+            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def process_identity(pid: int) -> dict | None:
+    """Read immutable Linux process identity fields, rejecting zombies."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        closing = raw.rfind(")")
+        fields = raw[closing + 2:].split()
+        if closing < 0 or len(fields) <= 19 or fields[0] == "Z":
+            return None
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if not command_line:
+            return None
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        return {"pid": pid, "start_ticks": int(fields[19]), "boot_id": boot_id,
+                "cmdline_sha256": hashlib.sha256(command_line).hexdigest()}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_identity_matches(identity: dict | None) -> bool:
+    if not isinstance(identity, dict) or type(identity.get("pid")) is not int:
+        return False
+    current = process_identity(identity["pid"])
+    return bool(current and current == identity)
+
+
+def _process_argv(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [os.fsdecode(item) for item in raw.rstrip(b"\0").split(b"\0") if item]
+    except OSError:
+        return []
+
+
+def _argv_matches_command(argv: list[str], command: list[str]) -> bool:
+    suffix = command[1:]
+    return argv == command or bool(suffix and len(argv) >= len(suffix) and argv[-len(suffix):] == suffix)
+
+
+def find_process_for_command(command: list[str]) -> list[dict]:
+    """Find exact command arguments after a possible shebang interpreter prefix."""
+    matches = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        argv = _process_argv(int(entry.name))
+        if _argv_matches_command(argv, command):
+            identity = process_identity(int(entry.name))
+            if identity:
+                matches.append(identity)
+    return matches
+
+
+def active_state_path(config: dict, run_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        raise ValueError("运行 ID 无效")
+    return Path(config["training_state_dir"]) / "active" / f"{run_id}.json"
+
+
+def save_active_run(config: dict, task: dict, phase: str, *, command: list[str] | None = None,
+                    identity: dict | None = None) -> Path:
+    if phase not in {"claimed", "confirmed", "launching", "running"}:
+        raise ValueError("活动训练阶段无效")
+    run_id = task.get("run_id", "")
+    path = active_state_path(config, run_id)
+    payload = {"version": ACTIVE_STATE_VERSION, "node_id": config["node_id"],
+               "run_id": run_id, "phase": phase, "task": task,
+               "command": command, "process": identity,
+               "updated_at": datetime.now(timezone.utc).isoformat()}
+    _atomic_private_json(path, payload)
+    return path
+
+
+def clear_active_run(config: dict, run_id: str) -> None:
+    active_state_path(config, run_id).unlink(missing_ok=True)
+
+
+def load_active_run(config: dict) -> dict | None:
+    directory = Path(config["training_state_dir"]) / "active"
+    if not directory.exists():
+        return None
+    paths = sorted(directory.glob("*.json"))
+    if len(paths) > 1:
+        raise ValueError("检测到多个活动训练状态，已阻止继续领取任务")
+    if not paths:
+        return None
+    state = json.loads(paths[0].read_text(encoding="utf-8"))
+    run_id = paths[0].stem
+    if (state.get("version") != ACTIVE_STATE_VERSION or state.get("node_id") != config["node_id"] or
+            state.get("run_id") != run_id or state.get("phase") not in {"claimed", "confirmed", "launching", "running"} or
+            not isinstance(state.get("task"), dict) or state["task"].get("run_id") != run_id):
+        raise ValueError("活动训练状态文件无效，已阻止继续领取任务")
+    # A terminal payload is authoritative if the Agent stopped between writing
+    # it and removing the active marker.
+    if (Path(config["training_state_dir"]) / f"{run_id}.json").is_file():
+        paths[0].unlink(missing_ok=True)
+        return None
+    return state
+
+
 def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None,
              extra_headers: dict[str, str] | None = None) -> dict:
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode() if payload is not None else None
@@ -366,7 +603,7 @@ def api_json(config: dict, path: str, method: str = "GET", payload: dict | None 
     return json.loads(body or b"{}")
 
 
-TRAINING_KEYS = {"patience", "lr0", "pretrained", "cache", "amp", "close_mosaic", "cos_lr", "weight_decay", "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed", "deterministic", "fraction", "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "perspective", "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl", "save", "verbose", "single_cls", "classes", "profile", "compile", "overlap_mask", "mask_ratio", "dropout", "val", "split", "save_json", "conf", "iou", "max_det", "plots", "lrf", "warmup_momentum", "warmup_bias_lr", "nbs", "bgr", "cutmix", "copy_paste_mode", "auto_augment", "erasing", "cls_pw", "pose", "kobj", "rle", "angle", "dlog", "dgrad", "dlam"}
+TRAINING_KEYS = {"patience", "lr0", "pretrained", "cache", "amp", "close_mosaic", "cos_lr", "weight_decay", "momentum", "warmup_epochs", "freeze", "multi_scale", "rect", "seed", "deterministic", "fraction", "save_period", "hsv_h", "hsv_s", "hsv_v", "degrees", "translate", "scale", "shear", "perspective", "flipud", "fliplr", "mosaic", "mixup", "copy_paste", "box", "cls", "dfl", "save", "verbose", "single_cls", "classes", "profile", "compile", "channels_last", "overlap_mask", "mask_ratio", "dropout", "val", "split", "save_json", "conf", "iou", "max_det", "plots", "lrf", "warmup_momentum", "warmup_bias_lr", "nbs", "bgr", "cutmix", "copy_paste_mode", "auto_augment", "erasing", "cls_pw", "pose", "kobj", "rle", "angle", "dlog", "dgrad", "dlam", "cls_remap", "dis", "distill_model", "dnn", "nms", "quantize", "time"}
 RESERVED_KEYS = {"model", "data", "project", "name", "device", "epochs", "batch", "imgsz", "workers", "optimizer", "task", "mode", "exist_ok", "save_dir", "resume", "source"}
 
 
@@ -406,6 +643,14 @@ def build_training_command(config: dict, task: dict) -> list[str]:
     run_dir = Path(task["run_dir"]).resolve()
     output_root = within_allowed(params["remote_output_root"], roots, file_required=False,
                                  label="训练输出根目录")
+    configured_outputs = [Path(item) for item in config.get("training_output_roots", [])]
+    if configured_outputs and not any(output_root == root or root in output_root.parents
+                                      for root in configured_outputs):
+        raise ValueError("训练输出根目录不在 training_output_roots 内")
+    try:
+        _probe_writable_directory(output_root)
+    except OSError as exc:
+        raise ValueError(f"训练输出根目录不可写：{output_root}") from exc
     if output_root not in run_dir.parents:
         raise ValueError("训练运行目录必须位于配置的输出根目录内")
     task_id = task["task_id"]
@@ -459,7 +704,7 @@ def build_training_command(config: dict, task: dict) -> list[str]:
     return command
 
 
-def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = False) -> tuple[Path, Path | None] | None:
+def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = False) -> tuple[Path, Path | None]:
     """Validate all deletion/scan/fetch targets against an exact task/Attempt layout."""
     task_id, task_type = payload["task_id"], payload["task_type"]
     attempt = payload["attempt_number"]
@@ -469,9 +714,17 @@ def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = F
         raise ValueError("远程文件操作任务信息无效")
     root = Path(payload["output_root"])
     root_missing = not root.exists()
-    if (not root.is_absolute() or root.is_symlink() or root.resolve() != root or
-            (not root_missing and not root.is_dir()) or (root_missing and not allow_missing_root)):
+    resolved_root = root.resolve()
+    if (not root.is_absolute() or root.is_symlink() or resolved_root != root or
+            (not root_missing and not root.is_dir())):
         raise ValueError("输出根目录无效或包含符号链接")
+    if root_missing:
+        raise ValueError("输出根目录不存在，无法验证或执行远程文件操作")
+    allowed_roots = [Path(item).resolve() for item in config["allowed_training_roots"]]
+    enclosing_roots = [allowed for allowed in allowed_roots
+                       if root == allowed or allowed in root.parents]
+    if not enclosing_roots:
+        raise ValueError("输出根目录不在 Agent 允许目录内")
     run_dir = Path(payload["run_dir"])
     expected = root / task_type / task_id / f"attempt-{attempt:03d}"
     if run_dir != expected or run_dir.resolve() != expected or run_dir.is_symlink():
@@ -487,12 +740,6 @@ def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = F
                 raise ValueError("只能操作该任务的独立日志")
         if log.resolve() != log or log.is_symlink():
             raise ValueError("日志路径包含符号链接")
-    # A task created for another server may reference a root that has never
-    # existed here. A delete can safely become a no-op, but scan/fetch cannot.
-    if root_missing:
-        return None
-    if not any(root == Path(item) or Path(item) in root.parents for item in config["allowed_training_roots"]):
-        raise ValueError("输出根目录不在 Agent 允许目录内")
     return run_dir, log
 
 
@@ -521,10 +768,8 @@ def report_manifest(config: dict, payload: dict) -> None:
 def delete_remote_files(config: dict, payload: dict) -> None:
     # Validate the complete plan before deleting the first file. rmtree never follows
     # directory symlinks inside the owned Attempt; the Attempt itself cannot be one.
-    # A failed launch may not have created the output root yet. Treat that
-    # exact no-file state as already cleaned while retaining all path checks.
     plans = [operation_paths(config, run, allow_missing_root=True) for run in payload["runs"]]
-    targets = [paths for paths in plans if paths is not None]
+    targets = list(plans)
     protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
     protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
     for run_dir, log in targets:
@@ -708,6 +953,7 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
     if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed"}:
         save_pending_final(config, run_id, dict(payload, metrics=metrics[256:]))
         return False
+    clear_active_run(config, run_id)
     path.unlink()
     return True
 
@@ -764,7 +1010,196 @@ def report_training_trace(config: dict, task: dict, sent_images: set[str]) -> No
         sent_images.add(image_name)
 
 
-def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
+class ClaimRejected(RuntimeError):
+    pass
+
+
+class ClaimConfirmationPending(RuntimeError):
+    pass
+
+
+def confirm_remote_claim(config: dict, task: dict, stop: threading.Event) -> bool:
+    """Confirm a lease idempotently; retry only outcomes that may hide a committed ACK."""
+    lease = task.get("claim_lease")
+    if not lease:
+        return False
+    endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{task['run_id']}/confirm"
+    attempts = len(CONFIRM_RETRY_DELAYS) + 1
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = api_json(config, endpoint, "POST", {"lease": lease})
+            if response.get("confirmed") is not True:
+                raise ValueError("平台未返回有效的确认结果")
+            return bool(response.get("stop"))
+        except HTTPError as exc:
+            if exc.code not in {408, 425, 429, 500, 502, 503, 504}:
+                raise ClaimRejected(f"平台拒绝训练领取（HTTP {exc.code}）") from None
+            last_error = exc
+        except (OSError, URLError, ValueError) as exc:
+            last_error = exc
+        if attempt == attempts - 1:
+            break
+        # A stop during an ambiguous ACK must not prevent idempotent retry: the
+        # center may already have committed the confirmation. Retry immediately
+        # on shutdown so a confirmed claim can be closed as stopped.
+        if not stop.is_set():
+            stop.wait(CONFIRM_RETRY_DELAYS[attempt])
+    raise ClaimConfirmationPending("训练领取确认尚未获得可靠响应") from last_error
+
+
+def _save_terminal_for_retry(config: dict, task: dict, payload: dict) -> Path:
+    path = save_pending_final(config, task["run_id"], {"_claim_lease": task.get("claim_lease"), **payload})
+    clear_active_run(config, task["run_id"])
+    return path
+
+
+def _deliver_terminal_once(config: dict, path: Path) -> None:
+    try:
+        deliver_pending_final(config, path)
+    except (OSError, ValueError, HTTPError, URLError):
+        LOGGER.warning("最终训练状态已落盘，将在联网后重试：%s", path.stem)
+
+
+def _terminate_recovered_process(identity: dict, *, force: bool = False) -> None:
+    if not process_identity_matches(identity):
+        return
+    try:
+        os.killpg(identity["pid"], signal.SIGKILL if force else signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
+def _recovery_identity(state: dict) -> dict | None:
+    identity = state.get("process")
+    if process_identity_matches(identity):
+        return identity
+    if isinstance(identity, dict) and type(identity.get("pid")) is int:
+        current = process_identity(identity["pid"])
+        if current and all(current.get(key) == identity.get(key) for key in ("pid", "start_ticks", "boot_id")):
+            command = state.get("command")
+            if isinstance(command, list) and _argv_matches_command(_process_argv(identity["pid"]), command):
+                return current
+            raise ValueError("原 PID 仍存活但命令行身份已变化，已保留活动记录并阻止新任务")
+    if state.get("phase") != "launching" or not isinstance(state.get("command"), list):
+        return None
+    matches = find_process_for_command(state["command"])
+    if len(matches) > 1:
+        raise ValueError("发现多个与未完成启动记录匹配的进程，已阻止自动接管")
+    return matches[0] if matches else None
+
+
+def recover_remote_task(config: dict, state: dict, stop: threading.Event, training_lock=None,
+                        process_holds_lock: bool = False) -> None:
+    """Monitor an orphaned, identity-verified process without starting a duplicate."""
+    lock = training_lock
+    release_lock = lock is not None
+    if lock is None and not process_holds_lock:
+        lock = acquire_training_lock(config)
+        release_lock = lock is not None
+    if lock is None and not process_holds_lock:
+        LOGGER.warning("共享训练锁已被占用，暂不接管活动训练记录")
+        return
+    task = state["task"]
+    run_id = task["run_id"]
+    endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}"
+    try:
+        identity = _recovery_identity(state)
+        if process_holds_lock and (identity is None or not process_holds_training_lock(config, identity["pid"])):
+            process_holds_lock = False
+            lock = acquire_training_lock(config)
+            release_lock = lock is not None
+            if lock is None:
+                LOGGER.warning("活动训练进程已不再持有共享锁，且锁已被其他 Agent 占用，暂不接管")
+                return
+            identity = _recovery_identity(state)
+        try:
+            control = api_json(config, endpoint + "/control")
+        except (OSError, ValueError, HTTPError, URLError):
+            control = {}
+        if control.get("status") in {"completed", "failed", "stopped", "interrupted"}:
+            if identity:
+                _terminate_recovered_process(identity)
+            clear_active_run(config, run_id)
+            return
+        if identity is None:
+            path = _save_terminal_for_retry(config, task, {
+                "status": "failed", "error_message": "Agent 重启时未找到身份匹配的训练进程，为避免重复训练已终止本次 Attempt",
+                "exit_code": 1, "completed_epochs": task.get("completed_epochs", 0),
+                "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
+                "metrics": [], "log_tail": recent_log_lines(Path(task["log_path"])),
+                "run_dir": task.get("run_dir")})
+            _deliver_terminal_once(config, path)
+            return
+        command = state.get("command") or []
+        save_active_run(config, task, "running", command=command, identity=identity)
+        LOGGER.info("已安全接管 Agent 重启前的训练进程 %s（PID %s）", run_id, identity["pid"])
+        requested_stop = bool(control.get("stop"))
+        stop_reason = "platform_stop" if requested_stop else None
+        sent_epochs: set[int] = set()
+        while process_identity_matches(identity) and not stop.is_set():
+            if requested_stop:
+                _terminate_recovered_process(identity)
+            try:
+                control = api_json(config, endpoint + "/control")
+                if control.get("stop"):
+                    requested_stop, stop_reason = True, "platform_stop"
+                    _terminate_recovered_process(identity)
+            except (OSError, ValueError, HTTPError, URLError):
+                pass
+            completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+            completed = max(completed, task.get("completed_epochs", 0))
+            latest = latest or task.get("latest_metrics", {})
+            new_metrics = [item for item in metrics if item["epoch"] not in sent_epochs][:256]
+            payload = {"status": "stopping" if requested_stop else "running", "pid": identity["pid"],
+                       "completed_epochs": completed,
+                       "progress": min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
+                       "latest_metrics": latest, "metrics": new_metrics,
+                       "log_tail": recent_log_lines(Path(task["log_path"])), "run_dir": task["run_dir"]}
+            if command:
+                payload["command"] = command
+            try:
+                response = api_json(config, endpoint + "/update", "POST", payload,
+                                    {"X-Training-Lease": task["claim_lease"]}) if task.get("claim_lease") else api_json(
+                                        config, endpoint + "/update", "POST", payload)
+                sent_epochs.update(item["epoch"] for item in new_metrics)
+                if response.get("stop_requested"):
+                    requested_stop, stop_reason = True, "platform_stop"
+            except (OSError, ValueError, HTTPError, URLError):
+                pass
+            stop.wait(2)
+        if stop.is_set() and process_identity_matches(identity):
+            requested_stop, stop_reason = True, "agent_shutdown"
+            _terminate_recovered_process(identity)
+        deadline = time.monotonic() + 15
+        while process_identity_matches(identity) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if process_identity_matches(identity):
+            _terminate_recovered_process(identity, force=True)
+        completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+        completed = max(completed, task.get("completed_epochs", 0))
+        latest = latest or task.get("latest_metrics", {})
+        if requested_stop:
+            status, error, exit_code = "stopped", None, None
+        else:
+            status, exit_code = "failed", 1
+            error = "Agent 重启后已接管训练监控，但无法可靠获取原进程退出码；请检查远程产物后重新训练"
+        path = _save_terminal_for_retry(config, task, {
+            "status": status, "error_message": error, "exit_code": exit_code,
+            "stop_reason": stop_reason, "completed_epochs": completed,
+            "progress": min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
+            "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in sent_epochs],
+            "log_tail": recent_log_lines(Path(task["log_path"])), "command": command,
+            "run_dir": task["run_dir"]})
+        _deliver_terminal_once(config, path)
+    except Exception:
+        LOGGER.exception("恢复远程训练监控失败，活动状态已保留")
+    finally:
+        if release_lock:
+            release_training_lock(lock)
+
+
+def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_lock) -> None:
     run_id = task["run_id"]
     lease = task.get("claim_lease")
     manifest_payload = {**task, "output_root": task["parameters"]["remote_output_root"]}
@@ -812,6 +1247,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
 
     try:
         command = prepare_trace_command(config, task, build_training_command(config, task))
+        save_active_run(config, task, "launching", command=command)
         log_path = Path(task["log_path"])
         with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
             log_handle.write(f"\n[{datetime.now(timezone.utc).isoformat()}] REMOTE COMMAND {shlex.join(command)}\n")
@@ -819,7 +1255,11 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
             environment["MKL_THREADING_LAYER"] = "GNU"
             environment["PYTHONUNBUFFERED"] = "1"
             process = subprocess.Popen(command, cwd=config["training_cwd"], env=environment, stdout=log_handle,
-                                       stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                       stderr=subprocess.STDOUT, text=True, start_new_session=True,
+                                       pass_fds=(training_lock.fileno(),))
+            identity = process_identity(process.pid)
+            if identity:
+                save_active_run(config, task, "running", command=command, identity=identity)
             report_progress({"status": "running", "pid": process.pid, "run_dir": task["run_dir"],
                              "completed_epochs": task.get("completed_epochs", 0),
                              "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {})})
@@ -880,7 +1320,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
                          "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in last_metrics],
                          "log_tail": log_lines, "exit_code": exit_code, "command": command,
                          "error_message": error, "stop_reason": stop_reason, "run_dir": task["run_dir"]}
-        pending_path = save_pending_final(config, run_id, final_payload)
+        pending_path = _save_terminal_for_retry(config, task, final_payload)
         while True:
             try:
                 if deliver_pending_final(config, pending_path):
@@ -907,10 +1347,11 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event) -> None:
             except OSError:
                 pass
         try:
-            pending_path = save_pending_final(config, run_id, {"_claim_lease": lease, "status": "failed", "error_message": str(exc)[:4000], "exit_code": 1,
-                                                             "completed_epochs": task.get("completed_epochs", 0),
-                                                             "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
-                                                             "log_tail": recent_log_lines(Path(task["log_path"]))})
+            pending_path = _save_terminal_for_retry(config, task, {
+                "status": "failed", "error_message": str(exc)[:4000], "exit_code": 1,
+                "completed_epochs": task.get("completed_epochs", 0),
+                "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
+                "log_tail": recent_log_lines(Path(task["log_path"]))})
             deliver_pending_final(config, pending_path)
         except Exception:
             LOGGER.exception("远程训练错误状态上报失败")
@@ -924,11 +1365,26 @@ def run_remote_task(config: dict, task: dict, stop: threading.Event, training_lo
         LOGGER.warning("本机已有另一个 Agent 在训练，拒绝并发启动任务 %s", task.get("run_id"))
         return
     try:
-        lease = task.get("claim_lease")
-        if lease:
-            api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/runs/{task['run_id']}/confirm",
-                     "POST", {"lease": lease})
-        _run_remote_task(config, task, stop)
+        save_active_run(config, task, "claimed")
+        try:
+            stop_requested = confirm_remote_claim(config, task, stop)
+        except ClaimConfirmationPending as exc:
+            LOGGER.warning("%s；未启动训练，下次循环会使用同一租约继续确认", exc)
+            return
+        except ClaimRejected as exc:
+            clear_active_run(config, task["run_id"])
+            LOGGER.warning("%s；未启动训练进程", exc)
+            return
+        save_active_run(config, task, "confirmed")
+        if stop_requested:
+            path = _save_terminal_for_retry(config, task, {
+                "status": "stopped", "stop_reason": "platform_stop", "exit_code": None,
+                "completed_epochs": task.get("completed_epochs", 0), "progress": task.get("progress", 0),
+                "latest_metrics": task.get("latest_metrics", {}), "metrics": [],
+                "log_tail": recent_log_lines(Path(task["log_path"])), "run_dir": task.get("run_dir")})
+            _deliver_terminal_once(config, path)
+            return
+        _run_remote_task(config, task, stop, lock)
     finally:
         release_training_lock(lock)
 
@@ -946,15 +1402,43 @@ def send(config: dict, payload: dict) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="YOLO Forge 算力监控与可选远程训练 Agent")
     parser.add_argument("--config", required=True, type=Path, help="平台下载的 JSON 配置")
-    parser.add_argument("--once", action="store_true", help="采集并上报一次后退出，用于验证连接")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="采集并上报一次后退出，用于验证连接")
+    mode.add_argument("--check-config", action="store_true", help="仅在本机检查配置和训练环境，不连接中心")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         config = load_config(args.config)
-    except (OSError, ValueError, TypeError):
-        LOGGER.error("配置无效或无法读取。请使用平台生成的 JSON 文件并设置权限 chmod 600。")
+    except (OSError, ValueError, TypeError) as exc:
+        if args.check_config:
+            LOGGER.error("配置检查失败：%s", exc)
+        else:
+            LOGGER.error("配置无效或无法读取。请使用平台生成的 JSON 文件并设置权限 chmod 600。")
         return 2
+    if args.check_config:
+        capability = training_capability(config)
+        if config["enable_training"] and not capability["ready"]:
+            LOGGER.error("配置格式有效，但训练环境未就绪：%s", capability["reason"])
+            return 1
+        if config["enable_training"]:
+            LOGGER.info("配置检查通过；远程训练已就绪；YOLO %s；共享训练锁%s占用",
+                        capability["yolo_version"] or "版本未知", "已" if capability["lock_occupied"] else "未")
+        else:
+            LOGGER.info("配置检查通过；当前仅启用算力监控")
+        return 0
+    try:
+        instance_lock = acquire_agent_instance_lock(config)
+    except OSError as exc:
+        LOGGER.error("Agent 单实例锁创建失败：%s", exc)
+        return 2
+    if instance_lock is None:
+        LOGGER.error("同一配置已有 Agent 进程在运行，本进程已退出")
+        return 3
+
+    def finish(code: int) -> int:
+        release_training_lock(instance_lock)
+        return code
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
@@ -989,19 +1473,47 @@ def main() -> int:
                     if not retry_pending_finals(config):
                         stop.wait(delay)
                         continue
-                    training_lock = acquire_training_lock(config)
-                    if training_lock is None:
-                        stop.wait(min(delay, 5))
-                        continue
-                    response = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/poll", "POST", {})
-                    task = response.get("task")
-                    if task:
+                    active_state = load_active_run(config)
+                    process_lock = False
+                    if active_state and active_state["phase"] in {"launching", "running"}:
+                        identity = _recovery_identity(active_state)
+                        process_lock = bool(identity and process_holds_training_lock(config, identity["pid"]))
+                    if process_lock:
                         training_stop = threading.Event()
-                        active_training = threading.Thread(target=run_remote_task, args=(config, task, training_stop, training_lock),
+                        active_training = threading.Thread(target=recover_remote_task,
+                                                          args=(config, active_state, training_stop, None, True),
                                                           name="remote-training", daemon=True)
                         active_training.start()
-                        training_lock = None  # ownership transferred to the training thread
-                        LOGGER.info("已领取远程任务 %s / Attempt %s", task.get("task_id"), task.get("attempt_number"))
+                        LOGGER.info("已识别并接管持有共享锁的训练进程 %s", active_state["run_id"])
+                    else:
+                        training_lock = acquire_training_lock(config)
+                        if training_lock is None:
+                            stop.wait(min(delay, 5))
+                            continue
+                        if active_state:
+                            training_stop = threading.Event()
+                            target = (run_remote_task if active_state["phase"] in {"claimed", "confirmed"}
+                                      else recover_remote_task)
+                            argument = active_state["task"] if target is run_remote_task else active_state
+                            active_training = threading.Thread(target=target,
+                                                              args=(config, argument, training_stop, training_lock),
+                                                              name="remote-training", daemon=True)
+                            active_training.start()
+                            training_lock = None  # ownership transferred to the training thread
+                            LOGGER.info("已加载未完成的远程任务 %s", active_state["run_id"])
+                        else:
+                            response = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/poll", "POST", {})
+                            task = response.get("task")
+                            if task:
+                                save_active_run(config, task, "claimed")
+                                training_stop = threading.Event()
+                                active_training = threading.Thread(target=run_remote_task,
+                                                                  args=(config, task, training_stop, training_lock),
+                                                                  name="remote-training", daemon=True)
+                                active_training.start()
+                                training_lock = None  # ownership transferred to the training thread
+                                LOGGER.info("已领取远程任务 %s / Attempt %s", task.get("task_id"),
+                                            task.get("attempt_number"))
                 except (HTTPError, URLError, OSError, ValueError, TypeError):
                     LOGGER.warning("远程任务轮询失败，将在下次心跳重试")
                 finally:
@@ -1010,17 +1522,17 @@ def main() -> int:
             # Do not log response bodies, headers or configuration containing secrets.
             LOGGER.warning("上报返回 HTTP %s。401 请检查 Token；403 请检查节点是否禁用；422 请检查采样与时钟。", exc.code)
             if args.once:
-                return 1
+                return finish(1)
             failures += 1
             delay = min(60, 5 * 2 ** min(failures, 4))
         except (URLError, OSError, ValueError, TypeError):
             LOGGER.warning("采样或连接失败，请检查中心地址、网络、证书和 nvidia-smi。将自动重试。")
             if args.once:
-                return 1
+                return finish(1)
             failures += 1
             delay = min(60, 5 * 2 ** min(failures, 4))
         if args.once:
-            return 0
+            return finish(0)
         stop.wait(delay + (random.random() if failures else 0))
     if active_training and active_training.is_alive():
         training_stop.set()
@@ -1028,7 +1540,7 @@ def main() -> int:
     if active_operation and active_operation.is_alive():
         active_operation.join(timeout=20)
     LOGGER.info("Agent 已停止")
-    return 0
+    return finish(0)
 
 
 if __name__ == "__main__":

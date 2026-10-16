@@ -85,6 +85,13 @@ class TaskResourceUpdate(BaseModel):
     data_path: str | None = None
 
 
+class RemoteInterruptConfirmation(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    confirm_process_stopped: Literal[True]
+
+
 class TaskRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

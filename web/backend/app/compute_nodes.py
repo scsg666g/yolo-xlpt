@@ -409,6 +409,29 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         return {"task": None, "poll_interval_seconds": 5, "required_agent_version": "1.2.0",
                 "message": "请升级 Agent 至 1.2.0 或以上版本后领取训练任务"}
     now = utcnow()
+    # If a stop arrived after delivery but before confirmation, the Agent is
+    # contractually forbidden to start the process. Retire an abandoned claim
+    # after its lease expires so it cannot occupy the node forever.
+    expired_stopping_id = db.scalar(select(TrainingRun.id).where(
+        TrainingRun.execution_node_id == node_id, TrainingRun.status == "stopping",
+        TrainingRun.stop_requested.is_(True), TrainingRun.claim_lease.is_not(None),
+        TrainingRun.claim_confirmed.is_(False), TrainingRun.claim_expires_at < now,
+    ).order_by(TrainingRun.queued_at).limit(1))
+    if expired_stopping_id:
+        retired = db.execute(update(TrainingRun).where(
+            TrainingRun.id == expired_stopping_id, TrainingRun.status == "stopping",
+            TrainingRun.stop_requested.is_(True), TrainingRun.claim_confirmed.is_(False),
+            TrainingRun.claim_expires_at < now,
+        ).values(status="stopped", pid=None, finished_at=now,
+                 error_message="平台已取消远程训练启动，训练进程尚未启动"))
+        if retired.rowcount == 1:
+            db.expire_all()
+            retired_run = db.get(TrainingRun, expired_stopping_id)
+            retired_task = db.get(TrainingTask, retired_run.task_id) if retired_run else None
+            if retired_run and retired_task and retired_task.current_run_id == retired_run.id:
+                mirror_run_to_task(retired_task, retired_run)
+                add_event(db, retired_task.id, "stopped", retired_run.error_message, run_id=retired_run.id)
+            db.commit()
     expired = db.scalar(select(TrainingRun).where(
         TrainingRun.execution_node_id == node_id, TrainingRun.status == "starting",
         TrainingRun.claim_lease.is_not(None), TrainingRun.claim_confirmed.is_(False),
@@ -479,17 +502,32 @@ class ClaimConfirmation(BaseModel):
 def confirm_remote_claim(node_id: str, run_id: str, payload: ClaimConfirmation,
                          request: Request, db: Session = Depends(get_db)):
     authenticated_agent(node_id, request, db)
-    run = db.get(TrainingRun, run_id)
     now = utcnow()
-    if not run or run.execution_node_id != node_id or run.claim_lease != payload.lease:
-        raise HTTPException(409, "训练领取已失效，请等待下一次任务轮询")
-    if run.claim_confirmed:
+    confirmed = db.execute(update(TrainingRun).where(
+        TrainingRun.id == run_id, TrainingRun.execution_node_id == node_id,
+        TrainingRun.claim_lease == payload.lease, TrainingRun.claim_confirmed.is_(False),
+        TrainingRun.status.in_(["starting", "stopping"]),
+        TrainingRun.claim_expires_at.is_not(None), TrainingRun.claim_expires_at >= now,
+    ).values(claim_confirmed=True))
+    if confirmed.rowcount == 1:
+        db.commit()
+        run = db.get(TrainingRun, run_id)
+        return {"confirmed": True, "stop": bool(run and run.stop_requested)}
+
+    # A client may retry after the server committed but its response was lost.
+    # The same node and lease receive the original successful outcome even if
+    # the lease timestamp has since elapsed or the run has reached a new state.
+    db.rollback()
+    run = db.get(TrainingRun, run_id)
+    if (run and run.execution_node_id == node_id and run.claim_lease == payload.lease
+            and run.claim_confirmed):
+        if run.status in {"completed", "failed", "stopped", "interrupted"}:
+            return {"confirmed": True, "stop": True, "status": run.status}
         return {"confirmed": True, "stop": bool(run.stop_requested)}
-    if run.status != "starting" or not run.claim_expires_at or as_utc(run.claim_expires_at) < now:
+    if (run and run.execution_node_id == node_id and run.claim_lease == payload.lease
+            and run.claim_expires_at and as_utc(run.claim_expires_at) < now):
         raise HTTPException(409, "训练领取已过期，请等待下一次任务轮询")
-    run.claim_confirmed = True
-    db.commit()
-    return {"confirmed": True, "stop": bool(run.stop_requested)}
+    raise HTTPException(409, "训练领取已失效，请等待下一次任务轮询")
 
 
 @router.post("/nodes/{node_id}/agent/runs/{run_id}/update")
@@ -506,9 +544,9 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
     if not task:
         raise HTTPException(404, "训练任务不存在")
     prior_status = run.status
-    terminal = {"stopped", "completed", "failed"}
+    terminal = {"stopped", "completed", "failed", "interrupted"}
     if prior_status in terminal:
-        return {"status": prior_status, "stop_requested": False}
+        return {"status": prior_status, "stop_requested": bool(run.stop_requested)}
     if payload.status not in {"starting", "running", "stopping", *terminal}:
         raise HTTPException(422, "非法状态")
     effective_status = "stopping" if run.stop_requested and payload.status in {"starting", "running"} else payload.status

@@ -16,6 +16,7 @@ import app.compute_nodes as monitoring
 from app.database import Base, get_db
 from app.main import app
 from app.models import ComputeNode, TaskEvent, TrainingRun, TrainingTask, utcnow
+from app.parameter_catalog import training_parameter_keys
 from sqlalchemy import select
 from app.services import create_training_run
 
@@ -277,11 +278,277 @@ def test_remote_claim_lease_requires_confirmation(monitoring_client):
     assert client.post(update_url, headers=headers(credential), json={"status": "running"}).status_code == 409
     assert client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm", headers=headers(credential),
                        json={"lease": "0" * 32}).status_code == 409
-    assert client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm", headers=headers(credential),
-                       json={"lease": lease}).status_code == 200
+    confirm_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm"
+    first_confirmation = client.post(confirm_url, headers=headers(credential), json={"lease": lease})
+    assert first_confirmation.status_code == 200
+    # Treat the first HTTP response as lost. A delayed retry of the same
+    # committed confirmation must remain successful after the lease timestamp.
+    with factory() as db:
+        db.get(TrainingRun, run_id).claim_expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+    repeated_confirmation = client.post(confirm_url, headers=headers(credential), json={"lease": lease})
+    assert repeated_confirmation.status_code == 200
+    assert repeated_confirmation.json() == {"confirmed": True, "stop": False}
     update = client.post(update_url, headers={**headers(credential), "X-Training-Lease": lease},
                          json={"status": "running", "pid": 1234})
     assert update.status_code == 200
+    assert client.post(confirm_url, headers=headers(credential), json={"lease": lease}).json() == {
+        "confirmed": True, "stop": False,
+    }
+
+
+@pytest.mark.parametrize("terminal_status, stop_requested", [
+    ("completed", False), ("failed", False), ("stopped", True), ("interrupted", True),
+])
+def test_terminal_remote_claim_confirmation_retry_forces_stop(
+        monitoring_client, terminal_status, stop_requested):
+    client, factory = monitoring_client
+    credential = create(client, f"Terminal {terminal_status} Agent")
+    node_id = credential["node"]["id"]
+    task = TrainingTask(id=f"terminal-{terminal_status}", name="terminal", task_type="detect",
+                        execution_node_id=node_id, model_path="/remote/model.pt",
+                        data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"})
+    with factory() as db:
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run_id = run.id
+        db.commit()
+
+    report = sample()
+    report["agent_version"] = "1.7.0"
+    report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(credential), json=report).status_code == 200
+    claimed = client.post(f"/api/compute/nodes/{node_id}/agent/poll",
+                          headers=headers(credential)).json()["task"]
+    lease = claimed["claim_lease"]
+    confirm_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm"
+    assert client.post(confirm_url, headers=headers(credential), json={"lease": lease}).status_code == 200
+
+    # Simulate a stale Agent state file retrying a claim whose run has already
+    # reached a terminal state. Completion and failure normally do not set a
+    # stop request, but every terminal state must still prevent a new launch.
+    with factory() as db:
+        run = db.get(TrainingRun, run_id)
+        run.status = terminal_status
+        run.stop_requested = stop_requested
+        run.claim_expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+
+    retry = client.post(confirm_url, headers=headers(credential), json={"lease": lease})
+    assert retry.status_code == 200
+    assert retry.json() == {"confirmed": True, "stop": True, "status": terminal_status}
+
+    update_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update"
+    late_update = client.post(update_url,
+                              headers={**headers(credential), "X-Training-Lease": lease},
+                              json={"status": "running", "pid": 4321})
+    assert late_update.status_code == 200
+    assert late_update.json() == {"status": terminal_status, "stop_requested": stop_requested}
+    with factory() as db:
+        run = db.get(TrainingRun, run_id)
+        assert run.status == terminal_status
+        assert run.pid is None
+
+
+def test_remote_task_rejects_parameters_missing_from_agent_capability(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Parameter Agent")
+    node_id = credential["node"]["id"]
+    all_parameters = training_parameter_keys()
+
+    def report(supported):
+        payload = sample()
+        payload["agent_version"] = "1.7.0"
+        payload["training"] = {
+            "enabled": True, "ready": True,
+            "supported_parameters": sorted(supported),
+        }
+        response = client.post(f"/api/compute/nodes/{node_id}/report",
+                               headers=headers(credential), json=payload)
+        assert response.status_code == 200
+
+    task_payload = {
+        "name": "Remote time limit", "execution_node_id": node_id,
+        "model_path": "/remote/model.pt", "data_path": "/remote/data.yaml",
+        "remote_output_root": "/remote/runs", "advanced": {"time": 1.5},
+    }
+    report(all_parameters - {"time"})
+    unsupported = client.post("/api/tasks", json=task_payload)
+    assert unsupported.status_code == 422 and "time" in unsupported.json()["detail"]
+
+    report(all_parameters)
+    created = client.post("/api/tasks", json=task_payload)
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    # A task created before an Agent downgrade must also be blocked at launch.
+    report(all_parameters - {"time"})
+    start = client.post(f"/api/tasks/{task_id}/start")
+    assert start.status_code == 409 and "time" in start.json()["detail"]
+    with factory() as db:
+        task = db.get(TrainingTask, task_id)
+        assert task.status == "draft" and not task.runs
+
+
+def test_stop_between_remote_claim_and_confirmation_is_idempotent(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Stop Race Agent")
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        task = TrainingTask(id="stop-claim-race", name="stop race", task_type="detect",
+                            execution_node_id=node_id, model_path="/remote/model.pt",
+                            data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run_id = run.id
+        db.commit()
+
+    report = sample()
+    report["agent_version"] = "1.6.0"
+    report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(credential), json=report).status_code == 200
+    claimed = client.post(f"/api/compute/nodes/{node_id}/agent/poll",
+                          headers=headers(credential)).json()["task"]
+    lease = claimed["claim_lease"]
+
+    first_stop = client.post("/api/tasks/stop-claim-race/stop")
+    repeated_stop = client.post("/api/tasks/stop-claim-race/stop")
+    assert first_stop.status_code == 200 and first_stop.json()["status"] == "stopping"
+    assert repeated_stop.status_code == 200 and repeated_stop.json()["status"] == "stopping"
+
+    confirm = client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm",
+                          headers=headers(credential), json={"lease": lease})
+    assert confirm.status_code == 200
+    assert confirm.json() == {"confirmed": True, "stop": True}
+    assert client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm",
+                       headers=headers(credential), json={"lease": lease}).json() == confirm.json()
+
+    update = client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update",
+                         headers={**headers(credential), "X-Training-Lease": lease},
+                         json={"status": "stopped", "stop_reason": "platform_stop", "exit_code": -15})
+    assert update.status_code == 200 and update.json()["status"] == "stopped"
+    with factory() as db:
+        run = db.get(TrainingRun, run_id)
+        stop_events = db.scalars(select(TaskEvent).where(
+            TaskEvent.run_id == run_id, TaskEvent.event_type == "stop_requested")).all()
+        assert run.status == "stopped" and run.claim_confirmed is True
+        assert len(stop_events) == 1
+
+
+def test_expired_unconfirmed_stop_releases_remote_node(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Expired Stop Agent")
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        first_task = TrainingTask(id="expired-stop", name="expired stop", task_type="detect",
+                                  execution_node_id=node_id, model_path="/remote/model.pt",
+                                  data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"})
+        second_task = TrainingTask(id="after-expired-stop", name="next", task_type="detect",
+                                   execution_node_id=node_id, model_path="/remote/model.pt",
+                                   data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"})
+        db.add_all([first_task, second_task])
+        db.flush()
+        first_run = create_training_run(db, first_task, "fresh")
+        second_run = create_training_run(db, second_task, "fresh")
+        first_run.queued_at = utcnow() - timedelta(seconds=2)
+        second_run.queued_at = utcnow() - timedelta(seconds=1)
+        first_run_id, second_run_id = first_run.id, second_run.id
+        db.commit()
+
+    report = sample()
+    report["agent_version"] = "1.6.0"
+    report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(credential), json=report).status_code == 200
+    first_claim = client.post(f"/api/compute/nodes/{node_id}/agent/poll",
+                              headers=headers(credential)).json()["task"]
+    assert first_claim["run_id"] == first_run_id
+    assert client.post("/api/tasks/expired-stop/stop").status_code == 200
+    with factory() as db:
+        stopped = db.get(TrainingRun, first_run_id)
+        stopped.claim_expires_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+
+    next_claim = client.post(f"/api/compute/nodes/{node_id}/agent/poll",
+                             headers=headers(credential)).json()["task"]
+    assert next_claim["run_id"] == second_run_id
+    with factory() as db:
+        stopped = db.get(TrainingRun, first_run_id)
+        task = db.get(TrainingTask, "expired-stop")
+        assert stopped.status == "stopped" and stopped.claim_confirmed is False
+        assert task.status == "stopped"
+        assert stopped.error_message == "平台已取消远程训练启动，训练进程尚未启动"
+
+
+def test_confirmed_remote_run_can_be_manually_interrupted_after_stop_stalls(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Recovery Agent")
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        task = TrainingTask(id="stalled-remote", name="stalled", task_type="detect",
+                            execution_node_id=node_id, model_path="/remote/model.pt",
+                            data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run_id = run.id
+        db.commit()
+
+    report = sample()
+    report["agent_version"] = "1.7.0"
+    report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(credential), json=report).status_code == 200
+    claimed = client.post(f"/api/compute/nodes/{node_id}/agent/poll",
+                          headers=headers(credential)).json()["task"]
+    lease = claimed["claim_lease"]
+    assert client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm",
+                       headers=headers(credential), json={"lease": lease}).status_code == 200
+    assert client.post("/api/tasks/stalled-remote/stop").json()["status"] == "stopping"
+
+    confirmation = {"run_id": run_id, "confirm_process_stopped": True}
+    too_soon = client.post("/api/tasks/stalled-remote/force-interrupt", json=confirmation)
+    assert too_soon.status_code == 409
+    assert client.post("/api/tasks/stalled-remote/force-interrupt", json={
+        "run_id": run_id, "confirm_process_stopped": False,
+    }).status_code == 422
+
+    with factory() as db:
+        run = db.get(TrainingRun, run_id)
+        stop_event = db.scalar(select(TaskEvent).where(
+            TaskEvent.run_id == run_id, TaskEvent.event_type == "stop_requested"))
+        stop_event.created_at = utcnow() - timedelta(seconds=31)
+        # A continuing Agent heartbeat must not restart the recovery delay.
+        run.progress = 1
+        db.commit()
+        assert run.updated_at > stop_event.created_at
+    stale_run = client.post("/api/tasks/stalled-remote/force-interrupt", json={
+        "run_id": "0" * 32, "confirm_process_stopped": True,
+    })
+    assert stale_run.status_code == 409
+    released = client.post("/api/tasks/stalled-remote/force-interrupt", json=confirmation)
+    assert released.status_code == 200 and released.json()["status"] == "interrupted"
+    repeated_release = client.post("/api/tasks/stalled-remote/force-interrupt", json=confirmation)
+    assert repeated_release.status_code == 409
+
+    late_update = client.post(
+        f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update",
+        headers={**headers(credential), "X-Training-Lease": lease},
+        json={"status": "running", "pid": 9999},
+    )
+    assert late_update.status_code == 200
+    assert late_update.json() == {"status": "interrupted", "stop_requested": True}
+    with factory() as db:
+        run = db.get(TrainingRun, run_id)
+        events = db.scalars(select(TaskEvent).where(
+            TaskEvent.run_id == run_id, TaskEvent.event_type == "force_interrupted")).all()
+        assert run.status == "interrupted" and run.pid is None and len(events) == 1
+
+
 def test_remote_training_trace_upload_is_authenticated_and_stored(monitoring_client, tmp_path, monkeypatch):
     client, factory = monitoring_client
     monkeypatch.setattr(monitoring, "DATA_ROOT", tmp_path)
