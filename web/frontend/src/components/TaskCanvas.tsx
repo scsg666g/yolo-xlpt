@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArtifactDownload } from './ArtifactDownload'
 import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, type Connection, type Edge, type Node } from '@xyflow/react'
-import { Activity, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, ScanEye, SlidersHorizontal, Square, Terminal, Trophy, Workflow, Zap } from 'lucide-react'
+import { Activity, AlertCircle, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, ScanEye, SlidersHorizontal, Square, Terminal, Trophy, Workflow, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue, statusLabel } from '../api'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
@@ -67,9 +67,11 @@ function TaskCanvasInner() {
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [logs, setLogs] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
+  const [initialLoadError, setInitialLoadError] = useState('')
   const [working, setWorking] = useState(false)
   const [notice, setNotice] = useState('')
   const [syncError, setSyncError] = useState('')
+  const [layoutFeedback, setLayoutFeedback] = useState<{ kind: 'saving' | 'success' | 'error'; message: string } | null>(null)
   const [editingParameters, setEditingParameters] = useState(false)
   const [editingResource, setEditingResource] = useState<'dataset' | 'model' | null>(null)
   const [viewingLogs, setViewingLogs] = useState(false)
@@ -90,27 +92,44 @@ function TaskCanvasInner() {
   const [lastOutputAt, setLastOutputAt] = useState(Date.now())
   const previousUpdate = useRef<{ runId: string; epoch: number; logs: string; status: string; artifacts: Map<number, string> } | null>(null)
   const requestVersion = useRef(0)
-  const pendingRequest = useRef<number | null>(null)
+  const pendingRequest = useRef<{ version: number; controller: AbortController } | null>(null)
+  const mutationPending = useRef(false)
+  const hasLoadedTask = useRef(false)
+  const layoutSavePending = useRef(false)
+  const layoutSaveController = useRef<AbortController | null>(null)
+  const layoutFeedbackTimer = useRef<number | null>(null)
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges)
   const { fitView, getViewport } = useReactFlow()
 
-  const refresh = useCallback(async () => {
-    if (pendingRequest.current !== null) return
+  const cancelPendingRefresh = useCallback(() => {
+    requestVersion.current += 1
+    pendingRequest.current?.controller.abort()
+    pendingRequest.current = null
+  }, [])
+
+  const refresh = useCallback(async (options: { allowDuringMutation?: boolean; preferredRunId?: string } = {}) => {
+    if ((mutationPending.current && !options.allowDuringMutation) || pendingRequest.current !== null) return
     const version = ++requestVersion.current
-    pendingRequest.current = version
+    const controller = new AbortController()
+    pendingRequest.current = { version, controller }
+    let resolvedSelectedId: string | undefined
     try {
       // Validate the task first so a stale canvas URL does not fire several
       // dependent 404 requests on every polling cycle.
-      const [taskData, runData] = await Promise.all([api.task(taskId), api.runs(taskId)])
+      const [taskData, runData] = await Promise.all([api.task(taskId, controller.signal), api.runs(taskId, controller.signal)])
       if (version !== requestVersion.current) return
-      const selectedId = runData.some((run) => run.id === selectedRunId)
-        ? selectedRunId
+      hasLoadedTask.current = true
+      setInitialLoadError('')
+      const requestedRunId = options.preferredRunId ?? selectedRunId
+      const selectedId = runData.some((run) => run.id === requestedRunId)
+        ? requestedRunId
         : (taskData.current_run_id || runData[0]?.id || '')
+      resolvedSelectedId = selectedId
       const selectedRun = runData.find((run) => run.id === selectedId)
       setTask(taskData); setRuns(runData)
-      if (selectedId !== selectedRunId) setSelectedRunId(selectedId)
       if (!selectedRun) {
+        if (selectedId !== selectedRunId) setSelectedRunId(selectedId)
         setMetrics([]); setArtifacts([]); setEvents([]); setLogs([])
         setEffectiveBestWeight(null)
         setSyncError('')
@@ -118,9 +137,9 @@ function TaskCanvasInner() {
         return
       }
       const [metricData, artifactData, effectiveBestWeightData, eventData, logData] = await Promise.all([
-        api.runMetrics(taskId, selectedRun.id), api.runArtifacts(taskId, selectedRun.id),
-        api.runEffectiveBestWeight(taskId, selectedRun.id), api.runEvents(taskId, selectedRun.id),
-        api.runLogs(taskId, selectedRun.id),
+        api.runMetrics(taskId, selectedRun.id, controller.signal), api.runArtifacts(taskId, selectedRun.id, controller.signal),
+        api.runEffectiveBestWeight(taskId, selectedRun.id, controller.signal), api.runEvents(taskId, selectedRun.id, controller.signal),
+        api.runLogs(taskId, selectedRun.id, controller.signal),
       ])
       if (version !== requestVersion.current) return
       const previous = previousUpdate.current
@@ -148,20 +167,24 @@ function TaskCanvasInner() {
         status: selectedRun.status,
         artifacts: artifactSignatures,
       }
+      if (selectedId !== selectedRunId) setSelectedRunId(selectedId)
       setMetrics(metricData); setArtifacts(artifactData); setEvents(eventData); setLogs(logData.lines)
       setEffectiveBestWeight(effectiveBestWeightData)
       setSyncError('')
       setLastSyncedAt(Date.now())
     } catch (reason) {
-      if (version !== requestVersion.current) return
+      if (controller.signal.aborted || version !== requestVersion.current) return
+      if (resolvedSelectedId !== undefined && resolvedSelectedId !== selectedRunId) setSelectedRunId(resolvedSelectedId)
       const status = reason instanceof Error ? (reason as Error & { status?: number }).status : undefined
       if (status === 404) {
         navigate('/', { replace: true })
         return
       }
-      setSyncError(reason instanceof Error ? reason.message : '加载失败')
+      const message = reason instanceof Error ? reason.message : '加载失败'
+      if (hasLoadedTask.current) setSyncError(message)
+      else setInitialLoadError(message)
     } finally {
-      if (pendingRequest.current === version) pendingRequest.current = null
+      if (pendingRequest.current?.version === version) pendingRequest.current = null
       if (version === requestVersion.current) setLoading(false)
     }
   }, [navigate, selectedRunId, taskId])
@@ -185,10 +208,9 @@ function TaskCanvasInner() {
     const timer = window.setInterval(refresh, 3000)
     return () => {
       window.clearInterval(timer)
-      requestVersion.current += 1
-      pendingRequest.current = null
+      cancelPendingRefresh()
     }
-  }, [pageVisible, refresh])
+  }, [cancelPendingRefresh, pageVisible, refresh])
 
   useEffect(() => {
     previousUpdate.current = null
@@ -202,6 +224,11 @@ function TaskCanvasInner() {
     const timer = window.setTimeout(() => setNewArtifactIds([]), 4000)
     return () => window.clearTimeout(timer)
   }, [newArtifactIds])
+
+  useEffect(() => () => {
+    if (layoutFeedbackTimer.current !== null) window.clearTimeout(layoutFeedbackTimer.current)
+    layoutSaveController.current?.abort()
+  }, [])
 
   useEffect(() => {
     try { localStorage.setItem('yolo-canvas-effects', effectsEnabled ? 'on' : 'off') } catch { /* Storage may be disabled. */ }
@@ -306,22 +333,58 @@ function TaskCanvasInner() {
   }, items)), [setEdges, motionAllowed, currentIsActive, isCurrentRun, viewTask?.status])
 
   async function action(kind: 'start' | 'stop' | 'resume' | 'retry') {
+    if (mutationPending.current) return
+    mutationPending.current = true
+    cancelPendingRefresh()
     setWorking(true); setNotice('')
+    let preferredRunId = selectedRunId
     try {
       const updated = await api[kind](taskId)
+      cancelPendingRefresh()
       setTask(updated)
-      if (updated.current_run_id && updated.current_run_id !== selectedRunId) setSelectedRunId(updated.current_run_id)
-      else await refresh()
-    } catch (reason) { setNotice(reason instanceof Error ? reason.message : '操作失败') } finally { setWorking(false) }
+      preferredRunId = updated.current_run_id || selectedRunId
+    } catch (reason) {
+      setNotice(reason instanceof Error ? reason.message : '操作失败')
+    } finally {
+      try {
+        await refresh({ allowDuringMutation: true, preferredRunId })
+      } finally {
+        mutationPending.current = false
+        setWorking(false)
+      }
+    }
   }
 
   async function saveLayout() {
-    if (!task) return
-    await api.saveLayout(task.id, { nodes: nodes.map(({ id, position }) => ({ id, position })), viewport: getViewport() })
-    setNotice('画布布局已保存'); window.setTimeout(() => setNotice(''), 1800)
+    if (!task || layoutSavePending.current) return
+    layoutSavePending.current = true
+    const controller = new AbortController()
+    layoutSaveController.current = controller
+    if (layoutFeedbackTimer.current !== null) window.clearTimeout(layoutFeedbackTimer.current)
+    setLayoutFeedback({ kind: 'saving', message: '正在保存布局…' })
+    try {
+      await api.saveLayout(task.id, { nodes: nodes.map(({ id, position }) => ({ id, position })), viewport: getViewport() }, controller.signal)
+      setLayoutFeedback({ kind: 'success', message: '画布布局已保存' })
+      layoutFeedbackTimer.current = window.setTimeout(() => {
+        setLayoutFeedback(null)
+        layoutFeedbackTimer.current = null
+      }, 1800)
+    } catch (reason) {
+      if (!controller.signal.aborted) setLayoutFeedback({ kind: 'error', message: reason instanceof Error ? reason.message : '布局保存失败，请重试' })
+    } finally {
+      if (layoutSaveController.current === controller) layoutSaveController.current = null
+      layoutSavePending.current = false
+    }
   }
 
-  if (loading || !task || !viewTask) return <div className="canvas-loading"><LoaderCircle className="spin" />正在装载训练画布…</div>
+  if (loading && !task) return <div className="canvas-loading"><LoaderCircle className="spin" />正在装载训练画布…</div>
+  if (!task || !viewTask) return <div className="canvas-loading canvas-load-failure" role="alert">
+    <AlertCircle size={28} />
+    <strong>训练画布加载失败</strong>
+    <p>{initialLoadError || '暂时无法获取任务数据，请重试。'}</p>
+    <div className="canvas-load-failure-actions"><button className="button ghost" onClick={() => navigate('/')}><ArrowLeft size={15} />返回任务中心</button><button className="button primary" onClick={() => { cancelPendingRefresh(); setInitialLoadError(''); setLoading(true); void refresh() }}><RefreshCw size={15} />重新加载</button></div>
+  </div>
+  const savingLayout = layoutFeedback?.kind === 'saving'
   const canStart = task.status === 'draft'
   const canResume = ['stopped', 'interrupted'].includes(task.status)
   const canStop = ['queued', 'starting', 'running'].includes(task.status)
@@ -343,10 +406,11 @@ function TaskCanvasInner() {
       <div className={`canvas-heartbeat ${currentIsActive ? 'active' : ''} ${syncDelayed || outputWaiting ? 'delayed' : ''}`} title={syncError || `接口响应：${syncAge} 秒前；本次查看中最近观察到输出变化：${outputAge} 秒前。无新输出不代表训练失败。`}><Radio size={13} /><i /><span>{heartbeatLabel}</span><strong>{syncAge}秒前</strong></div>
       <div className="canvas-actions">
         {notice && <span className="toast"><Check size={14} />{notice}</span>}
-        {syncError && <span className="canvas-sync-error" role="status">{syncError}</span>}
+        {layoutFeedback && <span className={`toast ${layoutFeedback.kind}`} role={layoutFeedback.kind === 'error' ? 'alert' : 'status'} title={layoutFeedback.message}>{layoutFeedback.kind === 'saving' ? <LoaderCircle className="spin" size={14} /> : layoutFeedback.kind === 'error' ? <AlertCircle size={14} /> : <Check size={14} />}{layoutFeedback.message}</span>}
+        {syncError && <span className="canvas-sync-error" role="alert" title={syncError}>同步失败：{syncError}</span>}
         <button className="button ghost compact effects-toggle" aria-pressed={effectsEnabled} title={reduceMotion ? '系统已启用减少动态效果，动画保持关闭' : '仅控制画布动画，不影响训练'} onClick={() => setEffectsEnabled((enabled) => !enabled)}><Activity size={15} />动效{effectsEnabled ? '开' : '关'}</button>
         <button className="button ghost compact" onClick={() => fitView({ padding: 0.16, duration: reduceMotion ? 0 : 500 })}><Maximize size={15} />适应画布</button>
-        <button className="button ghost compact" onClick={saveLayout}><Save size={15} />保存布局</button>
+        <button className="button ghost compact" disabled={savingLayout} aria-busy={savingLayout} onClick={() => void saveLayout()}>{savingLayout ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{savingLayout ? '保存中' : '保存布局'}</button>
         {isCurrentRun && canStart && <button className="button primary compact" disabled={working} onClick={() => action('start')}><Play size={15} />启动训练</button>}
         {isCurrentRun && canResume && <button className="button primary compact" disabled={working} onClick={() => action('resume')}><RefreshCw size={15} />继续训练</button>}
         {isCurrentRun && canRetry && <button className="button ghost compact" disabled={working} onClick={() => action('retry')}><RotateCcw size={15} />重新训练</button>}

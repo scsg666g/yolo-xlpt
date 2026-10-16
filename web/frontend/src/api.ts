@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, MetricPoint, ModelTest, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelTest, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -41,6 +41,7 @@ async function requestWithTimeout<T>(path: string, init?: RequestInit, timeoutMs
 const deletionTimeout = '删除请求超时，后台可能已经受理。请关闭弹窗，查看任务列表或回收站确认状态后再操作。'
 
 export const api = {
+  health: (signal?: AbortSignal) => requestWithTimeout<PlatformHealth>('/api/health', { signal }, 8_000, '健康检查超时'),
   createModelTest: (artifact_id: number, confidence: number, files: File[], signal: AbortSignal) =>
     requestWithTimeout<ModelTest>('/api/model-tests', { method: 'POST', body: JSON.stringify({ artifact_id, confidence, files: files.map(({ name, size }) => ({ name, size })) }), signal }),
   uploadModelTestImage: (id: string, index: number, file: File, signal: AbortSignal) =>
@@ -55,24 +56,28 @@ export const api = {
   completeDatasetUpload: (id: string, names: string[], signal: AbortSignal) =>
     request<DatasetUploadResult>(`/api/datasets/uploads/${id}/complete`, { method: 'POST', body: JSON.stringify({ names }), signal }),
   cancelDatasetUpload: (id: string) => request<void>(`/api/datasets/uploads/${id}`, { method: 'DELETE' }),
+  managedDatasets: (signal?: AbortSignal) => requestWithTimeout<ManagedDataset[]>('/api/datasets/managed', { signal }),
+  deleteManagedDataset: (name: string) => requestWithTimeout<void>(`/api/datasets/managed/${encodeURIComponent(name)}`, { method: 'DELETE' }, 30_000,
+    '删除请求超时，请刷新数据集列表确认状态'),
   tasks: (signal?: AbortSignal) => request<TrainingTask[]>('/api/tasks', { signal }),
   reorderTasks: (task_ids: string[]) => request<void>('/api/tasks/order', { method: 'PATCH', body: JSON.stringify({ task_ids }) }),
   deletedTasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks?deleted_only=true', { signal }).then((tasks) => tasks.filter((task) => task.deleted_at)),
-  task: (id: string) => request<TrainingTask>(`/api/tasks/${id}`),
+  task: (id: string, signal?: AbortSignal) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}`, { signal }),
   create: (payload: TaskCreatePayload) => request<TrainingTask>('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }),
-  start: (id: string) => request<TrainingTask>(`/api/tasks/${id}/start`, { method: 'POST' }),
-  resume: (id: string) => request<TrainingTask>(`/api/tasks/${id}/resume`, { method: 'POST' }),
-  retry: (id: string) => request<TrainingTask>(`/api/tasks/${id}/retry`, { method: 'POST' }),
-  stop: (id: string) => request<TrainingTask>(`/api/tasks/${id}/stop`, { method: 'POST' }),
-  clone: (id: string) => request<TrainingTask>(`/api/tasks/${id}/clone`, { method: 'POST' }),
+  start: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/start`, { method: 'POST' }),
+  resume: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/resume`, { method: 'POST' }),
+  retry: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/retry`, { method: 'POST' }),
+  stop: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/stop`, { method: 'POST' }),
+  clone: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/clone`, { method: 'POST' }),
   rename: (id: string, name: string) => request<TrainingTask>(`/api/tasks/${id}/name`, { method: 'PATCH', body: JSON.stringify({ name }) }),
   remove: (id: string) => requestWithTimeout<void>(`/api/tasks/${id}/trash`, { method: 'POST' }, 30_000, deletionTimeout),
   restore: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/restore`, { method: 'POST' }, 30_000,
     '恢复请求超时，后台可能已经受理。请刷新任务列表和回收站确认状态。'),
   permanentRemove: (id: string) => requestWithTimeout<{ status: string; message: string } | undefined>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }, 30_000, deletionTimeout),
   prepareArtifact: (id: number, retry = false, signal?: AbortSignal) => requestWithTimeout<{ status: string; message?: string }>(`/api/artifacts/${id}/prepare?retry=${retry}`, { method: 'POST', signal }),
-  saveLayout: (id: string, layout: TrainingTask['canvas_layout']) =>
-    request<TrainingTask>(`/api/tasks/${id}/layout`, { method: 'PATCH', body: JSON.stringify({ layout }) }),
+  saveLayout: (id: string, layout: TrainingTask['canvas_layout'], signal?: AbortSignal) =>
+    requestWithTimeout<TrainingTask>(`/api/tasks/${id}/layout`, { method: 'PATCH', body: JSON.stringify({ layout }), signal }, 15_000,
+      '保存布局超时，请检查网络后重试'),
   updateConfig: (id: string, payload: {
     epochs: number; batch: number; imgsz: number; device: string; workers: number; optimizer: string; config: Record<string, unknown>; custom_config: Record<string, unknown>
   }) => request<TrainingTask>(`/api/tasks/${id}/config`, { method: 'PATCH', body: JSON.stringify(payload) }),
@@ -82,12 +87,12 @@ export const api = {
   artifacts: (id: string) => request<Artifact[]>(`/api/tasks/${id}/artifacts`),
   events: (id: string) => request<TaskEvent[]>(`/api/tasks/${id}/events`),
   logs: (id: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/logs?tail=240`),
-  runs: (id: string) => request<TrainingRun[]>(`/api/tasks/${id}/runs`),
-  runMetrics: (id: string, runId: string) => request<MetricPoint[]>(`/api/tasks/${id}/runs/${runId}/metrics`),
-  runArtifacts: (id: string, runId: string) => request<Artifact[]>(`/api/tasks/${id}/runs/${runId}/artifacts`),
-  runEffectiveBestWeight: (id: string, runId: string) => request<EffectiveBestWeight>(`/api/tasks/${id}/runs/${runId}/effective-best-weight`),
-  runEvents: (id: string, runId: string) => request<TaskEvent[]>(`/api/tasks/${id}/runs/${runId}/events`),
-  runLogs: (id: string, runId: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`),
+  runs: (id: string, signal?: AbortSignal) => requestWithTimeout<TrainingRun[]>(`/api/tasks/${id}/runs`, { signal }),
+  runMetrics: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<MetricPoint[]>(`/api/tasks/${id}/runs/${runId}/metrics`, { signal }),
+  runArtifacts: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<Artifact[]>(`/api/tasks/${id}/runs/${runId}/artifacts`, { signal }),
+  runEffectiveBestWeight: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<EffectiveBestWeight>(`/api/tasks/${id}/runs/${runId}/effective-best-weight`, { signal }),
+  runEvents: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<TaskEvent[]>(`/api/tasks/${id}/runs/${runId}/events`, { signal }),
+  runLogs: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`, { signal }),
   trainingTrace: (id: string, runId: string) => request<TrainingTrace>(`/api/tasks/${id}/runs/${runId}/trace`),
   resources: () => request<Resources>('/api/resources'),
   compute: () => request<ComputeResources>('/api/compute'),
@@ -98,7 +103,7 @@ export const api = {
   rotateComputeToken: (id: string) => request<ComputeNodeCredential>(`/api/compute/nodes/${id}/token`, { method: 'POST' }),
   deleteComputeNode: (id: string) => request<void>(`/api/compute/nodes/${id}`, { method: 'DELETE' }),
   trainingParameters: () => request<{ source: string; parameters: TrainingParameterDefinition[] }>('/api/training-parameters'),
-  importRuns: () => request<{ imported: number }>('/api/import', { method: 'POST' }),
+  importRuns: () => requestWithTimeout<{ imported: number }>('/api/import', { method: 'POST' }, 30_000, '同步历史任务超时，请稍后刷新查看'),
 }
 
 export function uploadDatasetFile(id: string, index: number, file: File, signal: AbortSignal, onProgress: (bytes: number) => void): Promise<void> {

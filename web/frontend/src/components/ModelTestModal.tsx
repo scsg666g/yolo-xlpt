@@ -10,6 +10,12 @@ interface Props {
   onClose: () => void
 }
 
+interface SelectedImage {
+  id: number
+  file: File
+  previewUrl: string
+}
+
 const statuses: Record<ModelTest['status'], string> = {
   uploading: '准备图片', preparing: '准备模型', queued: '等待测试', running: '正在检测', completed: '检测完成', failed: '检测失败',
 }
@@ -19,7 +25,7 @@ function detectionLabel(count: number | null) {
 }
 
 export function ModelTestModal({ artifact, taskName, onClose }: Props) {
-  const [files, setFiles] = useState<File[]>([])
+  const [images, setImages] = useState<SelectedImage[]>([])
   const [confidence, setConfidence] = useState(0.25)
   const [test, setTest] = useState<ModelTest | null>(null)
   const [selected, setSelected] = useState(0)
@@ -27,22 +33,24 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
   const [dragging, setDragging] = useState(false)
   const [stage, setStage] = useState('')
   const [error, setError] = useState('')
-  const [previews, setPreviews] = useState<string[]>([])
   const [enlarged, setEnlarged] = useState<{ url: string; title: string } | null>(null)
   const input = useRef<HTMLInputElement>(null)
   const controller = useRef<AbortController | null>(null)
   const testId = useRef<string | null>(null)
   const dialog = useRef<HTMLDivElement>(null)
+  const lightbox = useRef<HTMLDivElement>(null)
+  const lightboxOpener = useRef<HTMLElement | null>(null)
   const dragDepth = useRef(0)
-
-  useEffect(() => {
-    const urls = files.map((file) => URL.createObjectURL(file))
-    setPreviews(urls)
-    return () => urls.forEach((url) => URL.revokeObjectURL(url))
-  }, [files])
+  const nextImageId = useRef(0)
+  const previewUrls = useRef(new Set<string>())
+  const files = images.map(({ file }) => file)
 
   useEffect(() => () => {
     controller.current?.abort()
+    const urls = [...previewUrls.current]
+    previewUrls.current.clear()
+    // Let React detach image elements before invalidating their browser URLs.
+    window.setTimeout(() => urls.forEach((url) => URL.revokeObjectURL(url)), 0)
     const id = testId.current
     if (id) {
       const cleanup = async () => {
@@ -63,21 +71,43 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        event.preventDefault()
         event.stopImmediatePropagation()
         if (enlarged) setEnlarged(null)
         else onClose()
       }
       if (event.key === 'Tab') {
-        const controls = dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), [tabindex="0"]')
-        if (!controls?.length) return
+        const focusScope = enlarged ? lightbox.current : dialog.current
+        const controls = focusScope?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), [tabindex="0"]')
+        if (!controls?.length) {
+          event.preventDefault()
+          focusScope?.focus()
+          return
+        }
         const first = controls[0]; const last = controls[controls.length - 1]
-        if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog.current)) { event.preventDefault(); last.focus() }
+        if (!focusScope?.contains(document.activeElement)) { event.preventDefault(); (event.shiftKey ? last : first).focus() }
+        else if (event.shiftKey && (document.activeElement === first || document.activeElement === focusScope)) { event.preventDefault(); last.focus() }
         else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
       }
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [busy, enlarged, onClose])
+
+  useEffect(() => {
+    if (!enlarged) return
+    const opener = lightboxOpener.current
+    lightbox.current?.querySelector<HTMLElement>('button:not(:disabled)')?.focus()
+    return () => {
+      lightboxOpener.current = null
+      if (opener?.isConnected) opener.focus()
+    }
+  }, [enlarged])
+
+  function openLightbox(url: string, title: string, opener: HTMLElement) {
+    lightboxOpener.current = opener
+    setEnlarged({ url, title })
+  }
 
   function chooseImages(list: FileList | null) {
     const added = Array.from(list || [])
@@ -90,13 +120,24 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
     if (chosen.some((file) => !/\.(jpe?g|png|webp|bmp)$/i.test(file.name) || !file.size || file.size > 20 * 1024 ** 2)) {
       setError('请选择 JPG、PNG、WEBP 或 BMP 图片，单张不超过 20 MB'); return
     }
-    setFiles(chosen); setError(''); setTest(null); setStage(''); setEnlarged(null)
+    const additions = added.map((file) => {
+      const previewUrl = URL.createObjectURL(file)
+      previewUrls.current.add(previewUrl)
+      return { id: nextImageId.current++, file, previewUrl }
+    })
+    setImages((current) => [...current, ...additions]); setError(''); setTest(null); setStage(''); setEnlarged(null)
   }
 
   function removeImage(index: number) {
     if (busy) return
-    const remaining = files.filter((_, current) => current !== index)
-    setFiles(remaining)
+    const removed = images[index]
+    const remaining = images.filter((_, current) => current !== index)
+    setImages(remaining)
+    if (removed) {
+      previewUrls.current.delete(removed.previewUrl)
+      // The state update removes the image source before the next task revokes it.
+      window.setTimeout(() => URL.revokeObjectURL(removed.previewUrl), 0)
+    }
     setSelected(Math.max(0, Math.min(selected > index ? selected - 1 : selected, remaining.length - 1)))
     setError(''); setTest(null); setStage(''); setEnlarged(null)
   }
@@ -201,7 +242,7 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
   const detections = completed ? test.files[selected].detections : null
   const detectedImages = completed ? test.files.filter((file) => file.detections !== null && file.detections > 0).length : 0
   const emptyImages = completed ? test.files.filter((file) => file.detections === 0).length : 0
-  const original = completed ? `/api/model-tests/${test.id}/images/${selected}/original` : previews[selected]
+  const original = completed ? `/api/model-tests/${test.id}/images/${selected}/original` : images[selected]?.previewUrl
   const result = completed ? `/api/model-tests/${test.id}/images/${selected}/result` : ''
   const selectedFile = files[selected]
 
@@ -222,12 +263,12 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
         {(stage || busy) && <div className={`model-test-status${failed ? ' failed' : ''}`} role="status">{busy ? <LoaderCircle className="spin" size={14} /> : failed ? <AlertCircle size={14} /> : null}{stage}{completed && ` · 本次阈值 ${test.confidence.toFixed(2)}`}</div>}
         {completed && <div className="model-test-summary" role="status">共 {test.files.length} 张：<strong>{detectedImages} 张检测到目标</strong>，{emptyImages} 张未检测到。</div>}
         {!files.length ? <button className="model-test-empty" disabled={busy} onClick={() => input.current?.click()}><Images size={46} /><strong>点击或拖入图片</strong><span>支持 JPG、PNG、WEBP、BMP，可一次上传多张</span></button> : <div className="model-test-workspace">
-          <nav className="model-test-thumbnails" aria-label="测试图片">{files.map((file, index) => <div className="model-test-thumbnail" key={index}><button className={`model-test-thumbnail-select${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} aria-pressed={selected === index}><img src={previews[index]} alt="" draggable={false} /><span title={file.name}>{file.name}</span><small className={completed && (test.files[index].detections || 0) > 0 ? 'has-detections' : undefined}>{completed ? detectionLabel(test.files[index].detections) : formatBytes(file.size)}</small></button><button className="model-test-remove" disabled={busy} title={`移除 ${file.name}`} aria-label={`移除 ${file.name}`} onClick={() => removeImage(index)}><X size={14} /></button></div>)}</nav>
-          <div className="model-test-comparison">{[{ url: original, title: '原图' }, { url: result, title: '检测结果' }].map(({ url, title }) => <section className="model-test-panel" key={title}><div><strong>{title}</strong>{url && <button className="icon-button" title={`放大${title}`} aria-label={`放大${title}`} onClick={() => setEnlarged({ url, title })}><Maximize2 size={15} /></button>}</div>{title === '检测结果' && completed && detections !== null && <div className={`model-test-outcome ${detections > 0 ? 'detected' : 'not-detected'}`} role="status">{detections > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}<div><strong>{detections > 0 ? detectionLabel(detections) : `当前置信度阈值 ${test.confidence.toFixed(2)} 下未检测到目标`}</strong>{detections === 0 && <p>可适当降低阈值后重新检测。这不代表图片中一定没有目标。</p>}</div></div>}{url ? <button className="model-test-image" onDoubleClick={() => setEnlarged({ url, title })} onKeyDown={(event) => { if (event.key === 'Enter') setEnlarged({ url, title }) }} aria-label={`${title}，双击放大`}><img src={url} alt={`${selectedFile?.name} ${title}`} /></button> : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '检测结果生成中…' : failed ? '检测失败，请查看上方错误原因' : '运行检测后，查看目标框与置信度'}</span></div>}</section>)}</div>
+          <nav className="model-test-thumbnails" aria-label="测试图片">{images.map(({ id, file, previewUrl }, index) => <div className="model-test-thumbnail" key={id}><button className={`model-test-thumbnail-select${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} aria-pressed={selected === index}><img src={previewUrl} alt="" draggable={false} /><span title={file.name}>{file.name}</span><small className={completed && (test.files[index].detections || 0) > 0 ? 'has-detections' : undefined}>{completed ? detectionLabel(test.files[index].detections) : formatBytes(file.size)}</small></button><button className="model-test-remove" disabled={busy} title={`移除 ${file.name}`} aria-label={`移除 ${file.name}`} onClick={() => removeImage(index)}><X size={14} /></button></div>)}</nav>
+          <div className="model-test-comparison">{[{ url: original, title: '原图' }, { url: result, title: '检测结果' }].map(({ url, title }) => <section className="model-test-panel" key={title}><div><strong>{title}</strong>{url && <button className="icon-button" title={`放大${title}`} aria-label={`放大${title}`} onClick={(event) => openLightbox(url, title, event.currentTarget)}><Maximize2 size={15} /></button>}</div>{title === '检测结果' && completed && detections !== null && <div className={`model-test-outcome ${detections > 0 ? 'detected' : 'not-detected'}`} role="status">{detections > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}<div><strong>{detections > 0 ? detectionLabel(detections) : `当前置信度阈值 ${test.confidence.toFixed(2)} 下未检测到目标`}</strong>{detections === 0 && <p>可适当降低阈值后重新检测。这不代表图片中一定没有目标。</p>}</div></div>}{url ? <button className="model-test-image" onDoubleClick={(event) => openLightbox(url, title, event.currentTarget)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLightbox(url, title, event.currentTarget) } }} aria-label={`${title}，双击放大`}><img src={url} alt={`${selectedFile?.name} ${title}`} /></button> : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '检测结果生成中…' : failed ? '检测失败，请查看上方错误原因' : '运行检测后，查看目标框与置信度'}</span></div>}</section>)}</div>
         </div>}
       </div>
       <footer><span>{completed ? `${selectedFile?.name} · ${detectionLabel(test.files[selected].detections)} · 双击图片放大 · 关闭前请下载结果` : '阈值越高，显示的检测结果越严格'}</span>{result && <a className="button primary" href={`${result}?download=true`} download><Download size={15} />下载结果图</a>}<button className="button ghost" onClick={close}>{busy ? '取消并关闭' : '关闭'}</button></footer>
-      {enlarged && <div className="model-test-lightbox" role="dialog" aria-label={`放大查看${enlarged.title}`} onClick={() => setEnlarged(null)}><button className="icon-button" autoFocus aria-label="关闭图片放大" onClick={() => setEnlarged(null)}><X size={24} /></button><img src={enlarged.url} alt={enlarged.title} onClick={(event) => event.stopPropagation()} /><span>{enlarged.title} · Esc 关闭</span></div>}
+      {enlarged && <div ref={lightbox} className="model-test-lightbox" role="dialog" aria-modal="true" aria-label={`放大查看${enlarged.title}`} tabIndex={-1} onClick={() => setEnlarged(null)}><button className="icon-button" aria-label="关闭图片放大" onClick={() => setEnlarged(null)}><X size={24} /></button><img src={enlarged.url} alt={enlarged.title} onClick={(event) => event.stopPropagation()} /><span>{enlarged.title} · Esc 关闭</span></div>}
     </div>
   </div>
 }

@@ -341,6 +341,46 @@ def test_path_is_within(tmp_path: Path):
     assert not path_is_within(tmp_path / "outside.pt", [allowed])
 
 
+def test_discover_files_prunes_hidden_directories_before_traversal(tmp_path: Path, monkeypatch):
+    visible = tmp_path / "visible"
+    visible.mkdir()
+    (visible / "data.yaml").write_text("visible", encoding="utf-8")
+    for name in (".platform-upload-abc", ".platform-deletions"):
+        hidden = tmp_path / name
+        hidden.mkdir()
+        (hidden / "data.yaml").write_text("hidden", encoding="utf-8")
+
+    real_scandir = services_module.os.scandir
+
+    def reject_hidden_traversal(path):
+        assert not Path(path).name.startswith("."), f"hidden directory was traversed: {path}"
+        return real_scandir(path)
+
+    monkeypatch.setattr(services_module.os, "scandir", reject_hidden_traversal)
+    assert services_module.discover_files([tmp_path], {".yaml"}) == [{
+        "name": "data.yaml",
+        "path": str(visible / "data.yaml"),
+        "size": len("visible"),
+        "root": str(tmp_path),
+    }]
+
+
+def test_discover_files_skips_file_removed_between_check_and_stat(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dataset" / "data.yaml"
+    target.parent.mkdir()
+    target.write_text("train: images/train\n", encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def remove_after_check(path):
+        result = real_is_file(path)
+        if path == target and result:
+            path.unlink()
+        return result
+
+    monkeypatch.setattr(Path, "is_file", remove_after_check)
+    assert services_module.discover_files([tmp_path], {".yaml"}) == []
+
+
 def test_prepare_dataset_config_makes_dataset_root_absolute(tmp_path: Path, monkeypatch):
     dataset = tmp_path / "dataset"
     (dataset / "images" / "train").mkdir(parents=True)

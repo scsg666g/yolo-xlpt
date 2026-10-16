@@ -133,6 +133,10 @@ class InferenceWorker:
         if self._thread:
             self._thread.join(timeout=5)
 
+    @property
+    def is_alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def _loop(self) -> None:
         while not self._stop.wait(1):
             with self.lock:

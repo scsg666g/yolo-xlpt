@@ -6,6 +6,7 @@ import '@xyflow/react/dist/style.css'
 import './styles.css'
 import './compare.css'
 import './compute.css'
+import './datasets.css'
 import './editor.css'
 
 const savedTheme = localStorage.getItem('yolo-forge-theme')

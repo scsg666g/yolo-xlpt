@@ -1,4 +1,6 @@
 import pytest
+import app.dataset_uploads as dataset_uploads
+import app.main as main_module
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -9,7 +11,8 @@ from app.models import TaskEvent, TrainingTask, utcnow
 
 
 @pytest.fixture
-def clone_client(tmp_path):
+def clone_client(tmp_path, monkeypatch):
+    monkeypatch.setattr(dataset_uploads, "UPLOAD_ROOT", tmp_path / "staging")
     engine = create_engine(f"sqlite:///{tmp_path / 'clone.db'}")
     Base.metadata.create_all(engine)
     with sessionmaker(bind=engine, expire_on_commit=False)() as db:
@@ -70,6 +73,18 @@ def test_cloning_original_and_copy_share_numbering(clone_client):
     assert event.payload["source_id"] == source.id
     assert source.name == "火"
     assert source.config["_resume_checkpoint"] == "last.pt"
+
+
+def test_remote_clone_does_not_take_local_dataset_lock(clone_client, monkeypatch):
+    client, db = clone_client
+    source = add_task(db, "remote-source", "远程任务", execution_node_id="remote-node")
+
+    def forbidden_lock():
+        raise AssertionError("远程任务不应获取本机数据集锁")
+
+    monkeypatch.setattr(main_module, "managed_dataset_mutation", forbidden_lock)
+    result = clone(client, source.id)
+    assert result["execution_node_id"] == "remote-node"
 
 
 @pytest.mark.parametrize("source_name", ["火", "火 - 副本", "火 - 副本 - 副本", "火 - 副本 2"])

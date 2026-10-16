@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import math
 import os
 import re
@@ -11,19 +12,29 @@ import time
 import uuid
 import warnings as python_warnings
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 import yaml
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
 from .config import DATA_ROOT, DATASET_ROOTS
+from .database import get_db
+from .models import TrainingTask
 
 router = APIRouter(prefix="/api/datasets/uploads", tags=["dataset uploads"])
+management_router = APIRouter(prefix="/api/datasets/managed", tags=["managed datasets"])
+logger = logging.getLogger(__name__)
 UPLOAD_ROOT = DATA_ROOT / "dataset_uploads"
+MANAGED_MARKER = ".yolo-platform-dataset.json"
+MANAGED_DELETION_DIR = ".platform-deletions"
+MANAGED_PUBLICATION_PREFIX = ".platform-upload-"
 MAX_FILES = 200_000
 MAX_TOTAL_BYTES = 50 * 1024**3
 MAX_FILE_BYTES = 256 * 1024**2
@@ -31,6 +42,7 @@ MAX_TEXT_BYTES = 4 * 1024**2
 SESSION_TTL = 24 * 60 * 60
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 METADATA_FILES = {"data.yaml", "data.yml", "classes.txt"}
+MANAGED_STAT_KEYS = {"train_images", "val_images", "labels", "classes", "background_images"}
 
 
 class UploadFileSpec(BaseModel):
@@ -45,6 +57,142 @@ class UploadCreate(BaseModel):
 
 class UploadComplete(BaseModel):
     names: list[str] = Field(default_factory=list, max_length=1000)
+
+
+def managed_marker(directory: Path) -> dict | None:
+    marker = directory / MANAGED_MARKER
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != 1 or payload.get("name") != directory.name:
+        return None
+    stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+    return {
+        "version": 1,
+        "name": directory.name,
+        "upload_id": payload.get("upload_id") if isinstance(payload.get("upload_id"), str) else None,
+        "created_at": payload.get("created_at") if isinstance(payload.get("created_at"), str) else None,
+        "total_bytes": payload.get("total_bytes") if type(payload.get("total_bytes")) is int and payload["total_bytes"] >= 0 else 0,
+        "stats": {key: value for key, value in stats.items()
+                  if key in MANAGED_STAT_KEYS and type(value) is int and value >= 0},
+        "classes": [value for value in payload.get("classes", [])
+                    if isinstance(value, str)][:1000] if isinstance(payload.get("classes"), list) else [],
+        "warnings": [value for value in payload.get("warnings", [])
+                     if isinstance(value, str)][:100] if isinstance(payload.get("warnings"), list) else [],
+    }
+
+
+@contextmanager
+def managed_dataset_mutation():
+    """Serialize local task references with managed-dataset deletion across workers."""
+    lock_directory = UPLOAD_ROOT.parent
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_directory / ".managed-datasets.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def local_tasks_by_reference_priority(db: Session) -> list[TrainingTask]:
+    return list(db.scalars(select(TrainingTask).where(
+        TrainingTask.execution_node_id.is_(None),
+    ).order_by(
+        TrainingTask.deleted_at.is_not(None), TrainingTask.created_at.desc(), TrainingTask.id,
+    )).all())
+
+
+def canonical_path(raw: str | Path) -> Path:
+    try:
+        return Path(raw).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(os.path.abspath(os.path.expanduser(str(raw))))
+
+
+def dataset_references(db: Session, config_path: str,
+                       local_tasks: list[TrainingTask] | None = None) -> list[TrainingTask]:
+    target = canonical_path(config_path)
+    return [task for task in (local_tasks if local_tasks is not None else local_tasks_by_reference_priority(db))
+            if canonical_path(task.data_path) == target]
+
+
+@management_router.get("")
+def list_managed_datasets(db: Session = Depends(get_db)):
+    root = DATASET_ROOTS[0]
+    if not root.is_dir():
+        return []
+    datasets = []
+    local_tasks = local_tasks_by_reference_priority(db)
+    for directory in root.iterdir():
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        metadata = managed_marker(directory)
+        config_path = (directory / "data.yaml").resolve()
+        if not metadata or not config_path.is_file():
+            continue
+        references = dataset_references(db, str(config_path), local_tasks)
+        datasets.append({
+            "name": directory.name,
+            "directory": str(directory.resolve()),
+            "config_path": str(config_path),
+            "created_at": metadata.get("created_at"),
+            "total_bytes": int(metadata.get("total_bytes") or 0),
+            "stats": metadata.get("stats") or {},
+            "classes": metadata.get("classes") or [],
+            "warnings": metadata.get("warnings") or [],
+            "references": [{"id": task.id, "name": task.name, "status": task.status,
+                            "deleted": task.deleted_at is not None} for task in references],
+        })
+    return sorted(datasets, key=lambda item: (item["created_at"] or "", item["name"]), reverse=True)
+
+
+@management_router.delete("/{name}", status_code=204)
+def delete_managed_dataset(name: str, db: Session = Depends(get_db)):
+    validate_name(name)
+    root = DATASET_ROOTS[0].resolve()
+    detached: Path | None = None
+    upload_id: str | None = None
+    with managed_dataset_mutation():
+        directory = root / name
+        metadata = managed_marker(directory) if directory.is_dir() and not directory.is_symlink() else None
+        if metadata is None:
+            raise HTTPException(404, "平台上传的数据集不存在")
+        config_path = str((directory / "data.yaml").resolve())
+        references = dataset_references(db, config_path)
+        if references:
+            task_names = "、".join(task.name for task in references[:3])
+            suffix = f"等 {len(references)} 个任务" if len(references) > 3 else ""
+            if suffix:
+                task_names += "、"
+            raise HTTPException(409, f"数据集仍被任务引用：{task_names}{suffix}；请先更换数据集或永久删除任务")
+        quarantine = root / MANAGED_DELETION_DIR
+        detached = quarantine / f"{uuid.uuid4().hex}-{name}"
+        try:
+            quarantine.mkdir(parents=True, exist_ok=True)
+            directory.replace(detached)
+        except OSError as exc:
+            raise HTTPException(507, "数据集无法移入清理区，请检查目录权限和磁盘状态") from exc
+        marker_upload_id = metadata.get("upload_id")
+        if isinstance(marker_upload_id, str) and re.fullmatch(r"[0-9a-f]{32}", marker_upload_id):
+            upload_id = marker_upload_id
+
+    try:
+        shutil.rmtree(detached)
+    except FileNotFoundError:
+        # A concurrent housekeeping pass may have already finished the detached deletion.
+        pass
+    except OSError as exc:
+        raise HTTPException(507, "数据集已从平台移除，但部分文件清理失败；请检查磁盘和目录权限") from exc
+    finally:
+        if upload_id:
+            shutil.rmtree(UPLOAD_ROOT / upload_id, ignore_errors=True)
+        try:
+            detached.parent.rmdir()
+        except OSError:
+            pass
 
 
 def validate_name(name: str) -> None:
@@ -123,6 +271,66 @@ def cleanup_expired_uploads() -> None:
             continue
 
 
+def remove_publication_workdir(path: Path) -> None:
+    """Remove one upload-owned hidden publication path without following symlinks."""
+    try:
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_managed_dataset_workdirs() -> None:
+    """Retry detached deletions and remove stale, never-published upload directories."""
+    root = DATASET_ROOTS[0]
+    if not root.is_dir():
+        return
+    quarantine = root / MANAGED_DELETION_DIR
+    if quarantine.is_dir() and not quarantine.is_symlink():
+        for candidate in quarantine.iterdir():
+            if candidate.is_dir() and not candidate.is_symlink():
+                shutil.rmtree(candidate, ignore_errors=True)
+        try:
+            quarantine.rmdir()
+        except OSError:
+            pass
+    now = time.time()
+    for candidate in root.glob(f"{MANAGED_PUBLICATION_PREFIX}*"):
+        upload_id = candidate.name.removeprefix(MANAGED_PUBLICATION_PREFIX)
+        if (not re.fullmatch(r"[0-9a-f]{32}", upload_id) or not candidate.is_dir()
+                or candidate.is_symlink()):
+            continue
+        try:
+            if now - candidate.stat().st_mtime < SESSION_TTL:
+                continue
+            lock_path = UPLOAD_ROOT / upload_id / ".lock"
+            try:
+                lock = lock_path.open("r+")
+            except FileNotFoundError:
+                remove_publication_workdir(candidate)
+                continue
+            with lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                try:
+                    try:
+                        session_is_active = now - lock_path.stat().st_mtime < SESSION_TTL
+                    except FileNotFoundError:
+                        session_is_active = False
+                    if not session_is_active:
+                        remove_publication_workdir(candidate)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            continue
+
+
 def completed_indices(directory: Path, manifest: dict) -> list[int]:
     return [index for index, spec in enumerate(manifest["files"])
             if (path := directory / "files" / spec["path"]).is_file() and path.stat().st_size == spec["size"]]
@@ -163,6 +371,10 @@ def create_upload(payload: UploadCreate):
         raise HTTPException(413, "数据集总大小不能超过 50 GB")
     UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
     cleanup_expired_uploads()
+    try:
+        cleanup_managed_dataset_workdirs()
+    except OSError as exc:
+        logger.warning("managed_dataset_workdir_cleanup_failed error=%s", type(exc).__name__)
     if shutil.disk_usage(UPLOAD_ROOT).free < total + 100 * 1024**2:
         raise HTTPException(507, "服务器磁盘空间不足，无法保存该数据集")
     upload_id = uuid.uuid4().hex
@@ -303,50 +515,131 @@ def validate_contents(files_root: Path, manifest: dict, names: list[str]) -> tup
     return stats, warnings
 
 
+def published_upload_result(destination: Path, upload_id: str) -> dict | None:
+    """Rebuild a lost receipt from the immutable, published dataset metadata."""
+    if not destination.is_dir() or destination.is_symlink():
+        return None
+    metadata = managed_marker(destination)
+    if not metadata or metadata.get("upload_id") != upload_id:
+        return None
+    config_path = destination / "data.yaml"
+    try:
+        if not config_path.is_file():
+            raise OSError("data.yaml is missing")
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(config, dict) or not isinstance(config.get("names"), (dict, list)) or not config["names"]:
+            raise ValueError("data.yaml names are missing")
+        names = class_names(destination, [])
+        config_size = config_path.stat().st_size
+    except (OSError, ValueError, TypeError, UnicodeError, yaml.YAMLError, HTTPException) as exc:
+        raise HTTPException(500, "已发布的数据集元数据损坏，无法恢复上传状态") from exc
+    stats = metadata["stats"]
+    if (metadata["classes"] != names or set(stats) != MANAGED_STAT_KEYS
+            or stats.get("classes") != len(names)):
+        raise HTTPException(500, "已发布的数据集元数据不一致，无法恢复上传状态")
+    return {
+        "name": destination.name,
+        "directory": str(destination.resolve()),
+        "names": names,
+        "stats": stats,
+        "warnings": metadata["warnings"],
+        "resource": {
+            "name": destination.name,
+            "path": str(config_path.resolve()),
+            "root": str(DATASET_ROOTS[0]),
+            "size": config_size,
+        },
+    }
+
+
 @router.post("/{upload_id}/complete")
 def complete_upload(upload_id: str, payload: UploadComplete):
     with upload_session(upload_id) as (directory, manifest):
         if "result" in manifest:
             return manifest["result"]
+        files_root = directory / "files"
+        destination = DATASET_ROOTS[0] / manifest["name"]
+        receipt = directory / ".manifest.tmp"
+
+        # A process may have published the directory and stopped before replacing
+        # the upload receipt. Recover from published facts before consulting this
+        # retry's class-name payload or the remaining staging files.
+        recovered_result = None
+        with managed_dataset_mutation():
+            recovered_result = published_upload_result(destination, upload_id)
+            if recovered_result is not None:
+                try:
+                    receipt.write_text(
+                        json.dumps({**manifest, "result": recovered_result}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    receipt.replace(directory / "manifest.json")
+                except OSError as exc:
+                    raise HTTPException(507, "数据集已发布，但上传状态保存失败，请重试") from exc
+            elif destination.exists() or destination.is_symlink():
+                raise HTTPException(409, f"服务器已存在同名目录“{manifest['name']}”，请重命名本地文件夹后上传")
+        if recovered_result is not None:
+            shutil.rmtree(files_root, ignore_errors=True)
+            return recovered_result
+
         if len(completed_indices(directory, manifest)) != len(manifest["files"]):
             raise HTTPException(409, "文件尚未全部上传，请继续上传或重试")
-        files_root = directory / "files"
         names = class_names(files_root, payload.names)
         stats, warnings = validate_contents(files_root, manifest, names)
-        destination = DATASET_ROOTS[0] / manifest["name"]
+        total_bytes = sum(spec["size"] for spec in manifest["files"])
+        config_path = destination / "data.yaml"
+        config_text = yaml.safe_dump({
+            "path": str(destination.resolve()), "train": "images/train", "val": "images/val",
+            "names": dict(enumerate(names)),
+        }, allow_unicode=True, sort_keys=False)
+        result = {"name": manifest["name"], "directory": str(destination.resolve()), "names": names,
+                  "stats": stats, "warnings": warnings,
+                  "resource": {"name": manifest["name"], "path": str(config_path.resolve()),
+                               "root": str(DATASET_ROOTS[0]), "size": len(config_text.encode("utf-8"))}}
+
+        publication = destination.parent / f"{MANAGED_PUBLICATION_PREFIX}{upload_id}"
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if shutil.disk_usage(destination.parent).free < sum(spec["size"] for spec in manifest["files"]) + 100 * 1024**2:
+            # A stopped process may have left a large partial copy. Reclaim it
+            # before checking whether there is room to rebuild the full dataset.
+            remove_publication_workdir(publication)
+            if shutil.disk_usage(destination.parent).free < total_bytes + 100 * 1024**2:
                 raise HTTPException(507, "数据集目标目录所在磁盘空间不足")
-            destination.mkdir()
-        except FileExistsError as exc:
-            raise HTTPException(409, f"服务器已存在同名目录“{manifest['name']}”，请重命名本地文件夹后上传") from exc
+            publication.mkdir()
         except OSError as exc:
             raise HTTPException(507, "无法创建数据集目录，请检查服务器权限和磁盘空间") from exc
         try:
-            # Keep staged files until publication succeeds, allowing a safe retry on IO failure.
+            # Build under a hidden sibling, then expose the complete dataset with
+            # one same-filesystem directory rename.
             for folder in ("images", "labels"):
                 source = files_root / folder
                 if source.exists():
-                    shutil.copytree(source, destination / folder)
+                    shutil.copytree(source, publication / folder)
                 for split in ("train", "val"):
-                    (destination / folder / split).mkdir(parents=True, exist_ok=True)
-            config_path = destination / "data.yaml"
-            config = {"path": str(destination.resolve()), "train": "images/train", "val": "images/val",
-                      "names": dict(enumerate(names))}
-            config_temporary = destination / ".data.yaml.tmp"
-            config_temporary.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
-            result = {"name": manifest["name"], "directory": str(destination.resolve()), "names": names,
-                      "stats": stats, "warnings": warnings,
-                      "resource": {"name": manifest["name"], "path": str(config_path.resolve()),
-                                   "root": str(DATASET_ROOTS[0]), "size": config_temporary.stat().st_size}}
-            config_temporary.replace(config_path)
+                    (publication / folder / split).mkdir(parents=True, exist_ok=True)
+            (publication / "data.yaml").write_text(config_text, encoding="utf-8")
+            (publication / MANAGED_MARKER).write_text(json.dumps({
+                "version": 1,
+                "upload_id": upload_id,
+                "name": manifest["name"],
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "total_bytes": total_bytes,
+                "stats": stats,
+                "classes": names,
+                "warnings": warnings,
+            }, ensure_ascii=False), encoding="utf-8")
             # Retain a success receipt so a lost response can be safely retried.
-            receipt = directory / ".manifest.tmp"
             receipt.write_text(json.dumps({**manifest, "result": result}, ensure_ascii=False), encoding="utf-8")
-            receipt.replace(directory / "manifest.json")
+            with managed_dataset_mutation():
+                if destination.exists() or destination.is_symlink():
+                    raise HTTPException(409, f"服务器已存在同名目录“{manifest['name']}”，请重命名本地文件夹后上传")
+                publication.replace(destination)
+                receipt.replace(directory / "manifest.json")
+        except HTTPException:
+            shutil.rmtree(publication, ignore_errors=True)
+            raise
         except OSError as exc:
-            shutil.rmtree(destination, ignore_errors=True)
+            shutil.rmtree(publication, ignore_errors=True)
             raise HTTPException(507, "数据集保存失败，请检查磁盘空间后重试") from exc
         shutil.rmtree(files_root, ignore_errors=True)
         return result
@@ -354,5 +647,10 @@ def complete_upload(upload_id: str, payload: UploadComplete):
 
 @router.delete("/{upload_id}", status_code=204)
 def cancel_upload(upload_id: str):
-    with upload_session(upload_id) as (directory, _):
-        shutil.rmtree(directory)
+    with upload_session(upload_id) as (directory, manifest):
+        publication = DATASET_ROOTS[0] / f"{MANAGED_PUBLICATION_PREFIX}{upload_id}"
+        try:
+            remove_publication_workdir(publication)
+            shutil.rmtree(directory)
+        except OSError as exc:
+            raise HTTPException(507, "上传临时文件清理失败，请检查目录权限后重试") from exc

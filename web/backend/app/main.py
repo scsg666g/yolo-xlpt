@@ -7,7 +7,7 @@ import mimetypes
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -20,7 +20,12 @@ from sqlalchemy.orm import Session
 from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, RUNS_ROOT, WEB_ROOT
 from .compute_nodes import ensure_local_node, local_snapshot, remote_trace_root, router as compute_nodes_router
 from .database import Base, SessionLocal, engine, get_db, migrate_database
-from .dataset_uploads import router as dataset_upload_router
+from .dataset_uploads import (
+    cleanup_managed_dataset_workdirs,
+    managed_dataset_mutation,
+    management_router as dataset_management_router,
+    router as dataset_upload_router,
+)
 from .inference import router as inference_router, worker as inference_worker
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete
@@ -79,7 +84,12 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
         ensure_local_node(db)
-    import_existing_runs()
+    try:
+        cleanup_managed_dataset_workdirs()
+    except OSError as exc:
+        logger.warning("managed_dataset_workdir_cleanup_failed error=%s", type(exc).__name__)
+    with managed_dataset_mutation():
+        import_existing_runs()
     backfill_training_runs()
     migrate_training_logs()
     scheduler.start()
@@ -102,6 +112,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="YOLO 模型训练平台", version="1.0.0", lifespan=lifespan)
 app.include_router(dataset_upload_router)
+app.include_router(dataset_management_router)
 app.include_router(inference_router)
 app.include_router(compute_nodes_router)
 app.include_router(remote_operations_router)
@@ -124,6 +135,11 @@ async def log_slow_requests(request: Request, call_next):
         if elapsed >= 1.0 and request.url.path.startswith("/api/"):
             logger.warning("slow_request method=%s path=%s duration_ms=%.1f", request.method,
                            request.url.path, elapsed * 1000)
+
+
+def serialize_managed_dataset_references():
+    with managed_dataset_mutation():
+        yield
 
 
 def get_task_or_404(db: Session, task_id: str, *, include_deleted: bool = False) -> TrainingTask:
@@ -149,9 +165,16 @@ def health():
     except Exception as exc:
         logger.warning("health_database_error error=%s", type(exc).__name__)
         raise HTTPException(503, "数据库暂不可用") from exc
-    return {"status": "ok", "instance": PLATFORM_INSTANCE_NAME,
-            "scheduler": "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped",
-            "local_deletion_worker": "running" if local_deletion_worker.is_alive else "stopped",
+    scheduler_status = "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped"
+    deletion_status = "running" if local_deletion_worker.is_alive else "stopped"
+    inference_status = "running" if inference_worker.is_alive else "stopped"
+    return {"status": "ok" if all(status == "running" for status in (
+                scheduler_status, deletion_status, inference_status,
+            )) else "degraded",
+            "instance": PLATFORM_INSTANCE_NAME,
+            "scheduler": scheduler_status,
+            "local_deletion_worker": deletion_status,
+            "inference_worker": inference_status,
             "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "runs_root": str(RUNS_ROOT)}
 
@@ -217,46 +240,49 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
         capability = (node.snapshot or {}).get("training")
         if capability and not capability.get("ready"):
             raise HTTPException(422, f"远程 Agent 当前不可训练：{capability.get('reason') or '训练能力未就绪'}")
-        model_path, data_path = payload.model_path.strip(), payload.data_path.strip()
-        output_root = (payload.remote_output_root or "").strip()
-        if not Path(model_path).is_absolute() or not Path(data_path).is_absolute() or not Path(output_root).is_absolute():
-            raise HTTPException(422, "远程模型、数据 YAML 和输出目录都必须是远程服务器上的绝对路径")
-        if any("\x00" in value for value in (model_path, data_path, output_root)):
-            raise HTTPException(422, "路径不能包含空字符")
-    else:
-        try:
-            model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
-            data_path = str(validate_dataset_config(payload.data_path))
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-    task_id = uuid.uuid4().hex[:16]
-    config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "execution_node_id", "remote_output_root", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
-    if node:
-        config["remote_output_root"] = payload.remote_output_root.strip()
-    supported_keys = editable_training_keys()
-    config.update({key: value for key, value in payload.advanced.items() if key in supported_keys})
-    task = TrainingTask(
-        id=task_id,
-        name=payload.name.strip(),
-        task_type=payload.task_type,
-        execution_node_id=node.id if node else None,
-        model_path=model_path,
-        data_path=data_path,
-        epochs=payload.epochs,
-        batch=payload.batch,
-        imgsz=payload.imgsz,
-        device=payload.device,
-        workers=payload.workers,
-        optimizer=payload.optimizer,
-        config=config,
-        display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
-    )
-    db.add(task)
-    db.flush()
-    add_event(db, task.id, "created", "训练任务已创建")
-    db.commit()
-    db.refresh(task)
-    return task
+    guard = nullcontext() if node else managed_dataset_mutation()
+    with guard:
+        if node:
+            model_path, data_path = payload.model_path.strip(), payload.data_path.strip()
+            output_root = (payload.remote_output_root or "").strip()
+            if not Path(model_path).is_absolute() or not Path(data_path).is_absolute() or not Path(output_root).is_absolute():
+                raise HTTPException(422, "远程模型、数据 YAML 和输出目录都必须是远程服务器上的绝对路径")
+            if any("\x00" in value for value in (model_path, data_path, output_root)):
+                raise HTTPException(422, "路径不能包含空字符")
+        else:
+            try:
+                model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+                data_path = str(validate_dataset_config(payload.data_path))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        task_id = uuid.uuid4().hex[:16]
+        config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "execution_node_id", "remote_output_root", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
+        if node:
+            config["remote_output_root"] = payload.remote_output_root.strip()
+        supported_keys = editable_training_keys()
+        config.update({key: value for key, value in payload.advanced.items() if key in supported_keys})
+        task = TrainingTask(
+            id=task_id,
+            name=payload.name.strip(),
+            task_type=payload.task_type,
+            execution_node_id=node.id if node else None,
+            model_path=model_path,
+            data_path=data_path,
+            epochs=payload.epochs,
+            batch=payload.batch,
+            imgsz=payload.imgsz,
+            device=payload.device,
+            workers=payload.workers,
+            optimizer=payload.optimizer,
+            config=config,
+            display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
+        )
+        db.add(task)
+        db.flush()
+        add_event(db, task.id, "created", "训练任务已创建")
+        db.commit()
+        db.refresh(task)
+        return task
 
 
 @app.get("/api/tasks/{task_id}", response_model=TaskRead)
@@ -410,20 +436,24 @@ def next_clone_name(db: Session, source_name: str) -> str:
 @app.post("/api/tasks/{task_id}/clone", response_model=TaskRead, status_code=201)
 def clone_task(task_id: str, db: Session = Depends(get_db)):
     source = get_task_or_404(db, task_id)
-    clone = TrainingTask(
-        id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
-        execution_node_id=source.execution_node_id,
-        model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
-        imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
-        config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
-        display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
-    )
-    db.add(clone)
-    db.flush()
-    add_event(db, clone.id, "cloned", f"从任务 {source.name} 克隆", payload={"source_id": source.id})
-    db.commit()
-    db.refresh(clone)
-    return clone
+    guard = nullcontext() if source.execution_node_id else managed_dataset_mutation()
+    with guard:
+        if not source.execution_node_id:
+            db.refresh(source)
+        clone = TrainingTask(
+            id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
+            execution_node_id=source.execution_node_id,
+            model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
+            imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
+            config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
+            display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
+        )
+        db.add(clone)
+        db.flush()
+        add_event(db, clone.id, "cloned", f"从任务 {source.name} 克隆", payload={"source_id": source.id})
+        db.commit()
+        db.refresh(clone)
+        return clone
 
 
 @app.patch("/api/tasks/{task_id}/name", response_model=TaskRead)
@@ -539,42 +569,46 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
 @app.patch("/api/tasks/{task_id}/resources", response_model=TaskRead)
 def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    if task.status in {"queued", "starting", "running", "stopping"}:
-        raise HTTPException(409, "任务正在运行或排队，不能更换模型或数据集")
-    if payload.model_path is None and payload.data_path is None:
-        raise HTTPException(422, "至少需要提供一个模型或数据集路径")
-    try:
+    guard = nullcontext() if task.execution_node_id else managed_dataset_mutation()
+    with guard:
+        if not task.execution_node_id:
+            db.refresh(task)
+        if task.status in {"queued", "starting", "running", "stopping"}:
+            raise HTTPException(409, "任务正在运行或排队，不能更换模型或数据集")
+        if payload.model_path is None and payload.data_path is None:
+            raise HTTPException(422, "至少需要提供一个模型或数据集路径")
+        try:
+            if payload.model_path is not None:
+                if task.execution_node_id:
+                    if not Path(payload.model_path).is_absolute() or "\x00" in payload.model_path:
+                        raise ValueError("远程模型必须是绝对路径")
+                    task.model_path = payload.model_path.strip()
+                else:
+                    task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+            if payload.data_path is not None:
+                if task.execution_node_id:
+                    if not Path(payload.data_path).is_absolute() or "\x00" in payload.data_path:
+                        raise ValueError("远程数据集 YAML 必须是绝对路径")
+                    task.data_path = payload.data_path.strip()
+                else:
+                    task.data_path = str(validate_dataset_config(payload.data_path))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        current_config = dict(task.config or {})
+        issues = dict(current_config.get("path_issues") or {})
         if payload.model_path is not None:
-            if task.execution_node_id:
-                if not Path(payload.model_path).is_absolute() or "\x00" in payload.model_path:
-                    raise ValueError("远程模型必须是绝对路径")
-                task.model_path = payload.model_path.strip()
-            else:
-                task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+            issues["model_missing"] = False
+            current_config["model"] = task.model_path
         if payload.data_path is not None:
-            if task.execution_node_id:
-                if not Path(payload.data_path).is_absolute() or "\x00" in payload.data_path:
-                    raise ValueError("远程数据集 YAML 必须是绝对路径")
-                task.data_path = payload.data_path.strip()
-            else:
-                task.data_path = str(validate_dataset_config(payload.data_path))
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    current_config = dict(task.config or {})
-    issues = dict(current_config.get("path_issues") or {})
-    if payload.model_path is not None:
-        issues["model_missing"] = False
-        current_config["model"] = task.model_path
-    if payload.data_path is not None:
-        issues["data_missing"] = False
-        current_config["data"] = task.data_path
-    current_config["path_issues"] = issues
-    task.config = current_config
-    changed = "模型" if payload.model_path is not None else "数据集"
-    add_event(db, task.id, "resource_updated", f"{changed}路径已更新", payload=payload.model_dump(exclude_none=True))
-    db.commit()
-    db.refresh(task)
-    return task
+            issues["data_missing"] = False
+            current_config["data"] = task.data_path
+        current_config["path_issues"] = issues
+        task.config = current_config
+        changed = "模型" if payload.model_path is not None else "数据集"
+        add_event(db, task.id, "resource_updated", f"{changed}路径已更新", payload=payload.model_dump(exclude_none=True))
+        db.commit()
+        db.refresh(task)
+        return task
 
 
 @app.get("/api/tasks/{task_id}/metrics", response_model=list[MetricRead])
@@ -733,7 +767,7 @@ def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
     return FileResponse(path, filename=path.name, media_type=mimetypes.guess_type(path.name)[0])
 
 
-@app.post("/api/import", status_code=202)
+@app.post("/api/import", status_code=202, dependencies=[Depends(serialize_managed_dataset_references)])
 def import_runs():
     return {"imported": import_existing_runs()}
 

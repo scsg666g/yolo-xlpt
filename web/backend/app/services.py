@@ -343,6 +343,14 @@ def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
         raise ValueError(f"{label}不存在：{path}")
     if not path_is_within(path, roots):
         raise ValueError(f"{label}必须位于允许的目录中")
+    for root in roots:
+        try:
+            relative = path.relative_to(root.expanduser().resolve())
+        except ValueError:
+            continue
+        if any(part.startswith(".") for part in relative.parts):
+            raise ValueError(f"{label}不能位于平台隐藏目录中")
+        break
     return path
 
 
@@ -396,9 +404,21 @@ def discover_files(roots: list[Path], suffixes: set[str]) -> list[dict[str, Any]
     for root in roots:
         if not root.exists():
             continue
-        for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in suffixes:
-                stat = path.stat()
+        for directory, child_directories, filenames in os.walk(root, topdown=True, followlinks=False):
+            child_directories[:] = [name for name in child_directories if not name.startswith(".")]
+            parent = Path(directory)
+            for filename in filenames:
+                if filename.startswith("."):
+                    continue
+                path = parent / filename
+                try:
+                    if not path.is_file() or path.suffix.lower() not in suffixes:
+                        continue
+                    stat = path.stat()
+                except OSError:
+                    # A managed dataset can be atomically detached while this
+                    # directory snapshot is being traversed.
+                    continue
                 name = path.parent.name if path.name in {"data.yaml", "data.yml"} and root in DATASET_ROOTS else path.name
                 files.append({"name": name, "path": str(path), "size": stat.st_size, "root": str(root)})
     return sorted(files, key=lambda item: item["name"].lower())

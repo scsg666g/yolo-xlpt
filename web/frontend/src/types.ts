@@ -9,6 +9,17 @@ export type TaskStatus =
   | 'failed'
   | 'interrupted'
 
+export interface PlatformHealth {
+  status: 'ok' | 'degraded'
+  instance: string
+  scheduler: 'running' | 'stopped'
+  local_deletion_worker: 'running' | 'stopped'
+  inference_worker: 'running' | 'stopped'
+  database: 'ok'
+  database_latency_ms: number
+  runs_root: string
+}
+
 export interface TrainingTask {
   id: string
   name: string
@@ -230,6 +241,31 @@ export interface DatasetUploadResult {
   resource: ResourceFile
   stats: { train_images: number; val_images: number; labels: number; classes: number; background_images: number }
   warnings: string[]
+}
+
+export interface ManagedDatasetReference {
+  id: string
+  name: string
+  status: string
+  deleted: boolean
+}
+
+export interface ManagedDataset {
+  name: string
+  directory: string
+  config_path: string
+  created_at: string | null
+  total_bytes: number
+  stats: {
+    train_images?: number
+    val_images?: number
+    labels?: number
+    classes?: number
+    background_images?: number
+  }
+  classes: string[]
+  warnings: string[]
+  references: ManagedDatasetReference[]
 }
 
 export interface TaskCreatePayload {

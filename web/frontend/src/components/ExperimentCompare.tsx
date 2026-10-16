@@ -146,6 +146,7 @@ export function ExperimentCompare() {
   const [metrics, setMetrics] = useState<Record<string, MetricPoint[]>>({})
   const [metricErrors, setMetricErrors] = useState<Record<string, string>>({})
   const requestVersion = useRef(0)
+  const activeRequest = useRef<AbortController | null>(null)
   const [metricKey, setMetricKey] = useState('metrics/mAP50(B)')
   const [baselineId, setBaselineId] = useState('')
   const [evaluationMode, setEvaluationMode] = useState<'latest' | 'best'>('latest')
@@ -172,11 +173,20 @@ export function ExperimentCompare() {
     if (next.toString() !== params.toString()) setParams(next, { replace: true })
   }, [selectedIds, params, setParams])
 
+  const invalidateActiveRequest = useCallback(() => {
+    requestVersion.current++
+    activeRequest.current?.abort()
+    activeRequest.current = null
+  }, [])
+
   const load = useCallback(async () => {
     const version = ++requestVersion.current
+    activeRequest.current?.abort()
+    const controller = new AbortController()
+    activeRequest.current = controller
     try {
-      const taskList = await api.tasks()
-      const runLists = await Promise.all(taskList.map(async (task) => [task, await api.runs(task.id)] as const))
+      const taskList = await api.tasks(controller.signal)
+      const runLists = await Promise.all(taskList.map(async (task) => [task, await api.runs(task.id, controller.signal)] as const))
       const items = runLists.flatMap(([task, runs]) => {
         const run = runs.find((item) => item.id === task.current_run_id) || runs[0]
         return run ? [{ id: run.id, task, run, view: runView(task, run) }] : []
@@ -186,7 +196,7 @@ export function ExperimentCompare() {
       const normalizedIds = selectedIds.map((id) => items.find((item) => item.id === id)?.id || items.find((item) => item.task.id === id && item.id === item.task.current_run_id)?.id).filter(Boolean) as string[]
       if (normalizedIds.join(',') !== selectedIds.join(',')) setSelectedIds(normalizedIds.slice(0, 4))
       const selectedItems = normalizedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
-      const results = await Promise.allSettled(selectedItems.map((item) => api.runMetrics(item.task.id, item.run.id)))
+      const results = await Promise.allSettled(selectedItems.map((item) => api.runMetrics(item.task.id, item.run.id, controller.signal)))
       if (version !== requestVersion.current) return
       const points: Record<string, MetricPoint[]> = {}
       const failures: Record<string, string> = {}
@@ -197,22 +207,32 @@ export function ExperimentCompare() {
       })
       setMetrics(points); setMetricErrors(failures); setError('')
     } catch (reason) {
-      if (version === requestVersion.current) setError(reason instanceof Error ? reason.message : '加载对比数据失败')
-    } finally { if (version === requestVersion.current) setLoading(false) }
+      if (!controller.signal.aborted && version === requestVersion.current) setError(reason instanceof Error ? reason.message : '加载对比数据失败')
+    } finally {
+      if (activeRequest.current === controller) activeRequest.current = null
+      if (!controller.signal.aborted && version === requestVersion.current) setLoading(false)
+    }
   }, [selectedIds])
 
   useEffect(() => {
-    load()
-    const mountedRequestVersion = requestVersion.current
-    const timer = window.setInterval(load, 5000)
-    return () => {
-      window.clearInterval(timer)
-      requestVersion.current = mountedRequestVersion + 1
+    let cancelled = false
+    let timer: number | undefined
+
+    async function poll() {
+      await load()
+      if (!cancelled) timer = window.setTimeout(poll, 5000)
     }
-  }, [load])
+
+    void poll()
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      invalidateActiveRequest()
+    }
+  }, [invalidateActiveRequest, load])
 
   function setSelection(ids: string[]) {
-    requestVersion.current++
+    invalidateActiveRequest()
     const next = [...new Set(ids)].slice(0, 4)
     setSelectedIds(next)
     setBaselineId((current) => next.includes(current) ? current : next[0] || '')
@@ -248,8 +268,14 @@ export function ExperimentCompare() {
   }), [selected, metrics, metricKey])
 
   const filteredExperiments = experiments.filter((item) => item.task.name.toLowerCase().includes(search.toLowerCase()) || item.view.model_path.toLowerCase().includes(search.toLowerCase()) || `attempt ${item.run.attempt_number}`.includes(search.toLowerCase()))
+  const experimentCount = Math.max(selected.length, 1)
+  const experimentLayout = {
+    '--experiment-count': experimentCount,
+    '--experiment-column-width': `calc(${100 / experimentCount}% - ${170 / experimentCount}px)`,
+    '--parameter-table-min-width': `${170 + experimentCount * 180}px`,
+  } as React.CSSProperties
 
-  return <div className="page compare-page">
+  return <div className="page compare-page" style={experimentLayout}>
     <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较不同任务当前运行的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择任务 <span className="selection-count">{selected.length}/4</span><ChevronDown size={15} /></button></header>
     {pickerOpen && <div className="compare-picker">
       <header><div><strong>选择参与对比的训练任务</strong><span>已选择 {selectedIds.length} 个，最多同时选择 4 个；每个任务使用当前运行</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
