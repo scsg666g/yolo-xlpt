@@ -301,7 +301,27 @@ export interface ModelTest {
   id: string
   status: 'uploading' | 'preparing' | 'queued' | 'running' | 'completed' | 'failed'
   confidence: number
+  iou: number
   error: string | null
   expires_at: number
-  files: Array<{ name: string; size: number; uploaded: boolean; detections: number | null }>
+  model: {
+    weight_name: string
+    weight_size: number
+    modified_at: string | null
+    attempt_number: number
+    best_epoch: number | null
+    metric_name: string
+    metric_value: number | null
+    device: string
+    imgsz: number
+  }
+  timings: { model_load: number; preprocess: number; inference: number; postprocess: number; total: number } | null
+  files: Array<{
+    name: string
+    size: number
+    uploaded: boolean
+    detections: number | null
+    objects: Array<{ class_id: number; class_name: string; confidence: number; bbox_xyxy: number[] }>
+    timings: { preprocess?: number; inference?: number; postprocess?: number }
+  }>
 }

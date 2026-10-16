@@ -1,5 +1,7 @@
 from io import BytesIO
+import json
 from pathlib import Path
+import zipfile
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,6 +59,9 @@ def test_batch_upload_isolated_from_training_and_result_download(image_test_clie
     client, _, artifact = image_test_client
     response = create(client, artifact, ["重复.png", "重复.png"])
     assert response.status_code == 201
+    assert response.json()["iou"] == 0.7
+    assert response.json()["model"]["weight_name"] == "best.pt"
+    assert response.json()["model"]["attempt_number"] == 1
     test_id = response.json()["id"]
     base = f"/api/model-tests/{test_id}"
     assert client.post(base + "/start").status_code == 409
@@ -75,10 +80,14 @@ def test_batch_upload_isolated_from_training_and_result_download(image_test_clie
     Image.new("RGB", (40, 30), "red").save(job.directory / "results/0.jpg")
     job.status = "completed"
     job.files[0]["detections"] = 0
+    (job.directory / "detection-results.zip").write_bytes(b"zip")
     result = client.get(base + "/images/0/result?download=true")
     assert result.status_code == 200
     assert 'attachment; filename="detection-1.jpg"' == result.headers["content-disposition"]
     assert client.get(base).json()["files"][0]["detections"] == 0
+    download = client.get(base + "/download")
+    assert download.status_code == 200
+    assert download.headers["content-type"] == "application/zip"
     assert client.delete(base).status_code == 204
     assert client.get(base).status_code == 404
     assert not job.directory.exists()
@@ -97,10 +106,63 @@ def test_can_cancel_queued_test_without_touching_checkpoint(image_test_client):
     assert Path(artifact.path).read_bytes() == b"test-checkpoint"
 
 
+def test_worker_records_structured_detections_timings_and_batch_export(image_test_client, monkeypatch):
+    client, _, artifact = image_test_client
+    test_id = create(client, artifact, ["street.png"]).json()["id"]
+    base = f"/api/model-tests/{test_id}"
+    assert client.put(base + "/images/0", content=image_bytes()).status_code == 204
+    assert client.post(base + "/start").status_code == 202
+    job = inference.worker.jobs[test_id]
+
+    class FakeProcess:
+        def __init__(self, command, **_kwargs):
+            output = Path(command[command.index("--output") + 1])
+            summary = Path(command[command.index("--summary") + 1])
+            output.mkdir()
+            Image.new("RGB", (40, 30), "red").save(output / "0.jpg")
+            summary.write_text(json.dumps({
+                "device": "CPU", "imgsz": 640,
+                "timings": {"model_load": 120, "preprocess": 3, "inference": 25, "postprocess": 2, "total": 160},
+                "images": [{"index": 0, "objects": [{"class_id": 0, "class_name": "person",
+                            "confidence": 0.91, "bbox_xyxy": [1, 2, 20, 25]}],
+                            "timings": {"preprocess": 3, "inference": 25, "postprocess": 2}}],
+            }), encoding="utf-8")
+
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+    monkeypatch.setattr(inference.subprocess, "Popen", FakeProcess)
+    inference.worker.execute(job)
+
+    payload = client.get(base).json()
+    assert payload["status"] == "completed"
+    assert payload["files"][0]["detections"] == 1
+    assert payload["files"][0]["objects"][0]["class_name"] == "person"
+    assert payload["timings"]["inference"] == 25
+    archive_path = job.directory / "detection-results.zip"
+    with zipfile.ZipFile(archive_path) as archive:
+        assert set(archive.namelist()) == {"detections.json", "results/1-street.png.jpg"}
+        exported = json.loads(archive.read("detections.json"))
+        assert exported["iou"] == 0.7
+        assert exported["files"][0]["objects"][0]["confidence"] == 0.91
+
+
 @pytest.mark.parametrize("confidence", [-0.1, 0, 1.01, "nan"])
 def test_rejects_invalid_confidence(image_test_client, confidence):
     client, _, artifact = image_test_client
     assert create(client, artifact, confidence=confidence).status_code == 422
+
+
+@pytest.mark.parametrize("iou", [-0.1, 0, 1.01, "nan"])
+def test_rejects_invalid_iou(image_test_client, iou):
+    client, _, artifact = image_test_client
+    assert create(client, artifact, iou=iou).status_code == 422
 
 
 def test_upload_validation_and_no_path_injection(image_test_client):

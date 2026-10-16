@@ -42,8 +42,8 @@ const deletionTimeout = '删除请求超时，后台可能已经受理。请关�
 
 export const api = {
   health: (signal?: AbortSignal) => requestWithTimeout<PlatformHealth>('/api/health', { signal }, 8_000, '健康检查超时'),
-  createModelTest: (artifact_id: number, confidence: number, files: File[], signal: AbortSignal) =>
-    requestWithTimeout<ModelTest>('/api/model-tests', { method: 'POST', body: JSON.stringify({ artifact_id, confidence, files: files.map(({ name, size }) => ({ name, size })) }), signal }),
+  createModelTest: (artifact_id: number, confidence: number, iou: number, files: File[], signal: AbortSignal) =>
+    requestWithTimeout<ModelTest>('/api/model-tests', { method: 'POST', body: JSON.stringify({ artifact_id, confidence, iou, files: files.map(({ name, size }) => ({ name, size })) }), signal }),
   uploadModelTestImage: (id: string, index: number, file: File, signal: AbortSignal) =>
     requestWithTimeout<void>(`/api/model-tests/${id}/images/${index}`, { method: 'PUT', body: file, headers: { 'Content-Type': 'application/octet-stream' }, signal }, 120_000),
   startModelTest: (id: string, signal: AbortSignal) => requestWithTimeout<ModelTest>(`/api/model-tests/${id}/start`, { method: 'POST', signal }, 120_000),

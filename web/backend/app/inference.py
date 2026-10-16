@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,12 +19,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
 from .config import DATA_ROOT, ULTRALYTICS_ROOT, YOLO_BIN
 from .database import get_db
-from .models import Artifact, TrainingRun, TrainingTask
+from .models import Artifact, MetricPoint, TrainingRun, TrainingTask
 from .remote_operations import matching_fetch, operation_file
 from .services import failure_detail, path_is_within, training_environment
 
@@ -41,6 +45,7 @@ class ImageSpec(BaseModel):
 class TestCreate(BaseModel):
     artifact_id: int
     confidence: float = Field(default=0.25, ge=0.01, le=1)
+    iou: float = Field(default=0.7, ge=0.01, le=1)
     files: list[ImageSpec] = Field(min_length=1, max_length=10)
 
 
@@ -49,8 +54,11 @@ class ImageTest:
     id: str
     artifact_id: int
     confidence: float
+    iou: float
     files: list[dict]
     directory: Path
+    model: dict = field(default_factory=dict)
+    timings: dict | None = None
     created_at: float = field(default_factory=time.time)
     status: str = "uploading"
     error: str | None = None
@@ -58,8 +66,31 @@ class ImageTest:
 
     def public(self) -> dict:
         return {"id": self.id, "status": self.status, "error": self.error,
-                "confidence": self.confidence, "files": [dict(item) for item in self.files],
+                "confidence": self.confidence, "iou": self.iou, "model": dict(self.model),
+                "timings": dict(self.timings) if self.timings else None,
+                "files": [dict(item) for item in self.files],
                 "expires_at": self.created_at + TTL}
+
+
+def model_summary(db: Session, artifact: Artifact, run: TrainingRun) -> dict:
+    best_epoch = None
+    best_metric = None
+    points = db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()
+    for point in points:
+        value = point.values.get("metrics/mAP50-95(B)")
+        if isinstance(value, (int, float)) and math.isfinite(value) and (best_metric is None or value > best_metric):
+            best_epoch, best_metric = point.epoch, float(value)
+    return {
+        "weight_name": Path(artifact.name).name,
+        "weight_size": artifact.size,
+        "modified_at": artifact.modified_at.isoformat() if artifact.modified_at else None,
+        "attempt_number": run.attempt_number,
+        "best_epoch": best_epoch,
+        "metric_name": "mAP50-95",
+        "metric_value": best_metric,
+        "device": "CPU",
+        "imgsz": 640,
+    }
 
 
 def weight_path(db: Session, artifact_id: int) -> Path:
@@ -153,10 +184,13 @@ class InferenceWorker:
     def execute(self, job: ImageTest) -> None:
         output = job.directory / "results"
         log = job.directory / "inference.log"
-        command = [str(YOLO_BIN), "detect", "predict", f"model={job.directory / 'model.pt'}",
-                   f"source={job.directory / 'images'}", f"project={job.directory}", "name=results",
-                   "device=cpu", "batch=1", "imgsz=640", f"conf={job.confidence}",
-                   "save=True", "save_txt=True", "save_conf=True", "exist_ok=True", "verbose=False"]
+        summary_path = job.directory / "summary.json"
+        python_bin = YOLO_BIN.with_name("python")
+        command = [str(python_bin), str(Path(__file__).with_name("inference_runner.py")),
+                   "--model", str(job.directory / "model.pt"), "--source", str(job.directory / "images"),
+                   "--output", str(output), "--summary", str(summary_path),
+                   "--ultralytics-root", str(ULTRALYTICS_ROOT), "--confidence", str(job.confidence),
+                   "--iou", str(job.iou), "--imgsz", "640"]
         try:
             environment = {**training_environment(), "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "2",
                            "MKL_NUM_THREADS": "2"}
@@ -176,16 +210,32 @@ class InferenceWorker:
                     raise RuntimeError("推理超过 5 分钟，请减少图片数量或尺寸后重试") from None
             if code:
                 raise RuntimeError(failure_detail(str(log)) or "模型推理失败，请检查权重是否兼容当前训练环境")
-            counts = []
-            for index in range(len(job.files)):
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            image_results = summary.get("images", [])
+            if len(image_results) != len(job.files):
+                raise RuntimeError("推理没有生成完整结果")
+            for index, item in enumerate(image_results):
                 if not (output / f"{index}.jpg").is_file():
                     raise RuntimeError("推理没有生成完整结果，请确认模型为目标检测模型")
-                label = output / "labels" / f"{index}.txt"
-                counts.append(len(label.read_text().splitlines()) if label.is_file() else 0)
+                objects = item.get("objects", [])
+                job.files[index]["detections"] = len(objects)
+                job.files[index]["objects"] = objects
+                job.files[index]["timings"] = item.get("timings", {})
+            job.timings = summary.get("timings", {})
+            export = {
+                "model": job.model, "confidence": job.confidence, "iou": job.iou,
+                "device": summary.get("device", "CPU"), "imgsz": summary.get("imgsz", 640),
+                "timings": job.timings, "files": job.files,
+            }
+            (job.directory / "detections.json").write_text(json.dumps(export, ensure_ascii=False, indent=2), encoding="utf-8")
+            with zipfile.ZipFile(job.directory / "detection-results.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+                archive.write(job.directory / "detections.json", "detections.json")
+                for index, item in enumerate(job.files):
+                    original_name = re.split(r"[/\\]", item["name"])[-1]
+                    safe_name = re.sub(r"[^\w.-]+", "_", original_name).strip("._") or "image"
+                    archive.write(output / f"{index}.jpg", f"results/{index + 1}-{safe_name}.jpg")
             with self.lock:
                 if job.status != "cancelled":
-                    for item, count in zip(job.files, counts):
-                        item["detections"] = count
                     job.status = "completed"
         except Exception as exc:
             with self.lock:
@@ -215,8 +265,13 @@ def create_test(payload: TestCreate, db: Session = Depends(get_db)):
         test_id = uuid.uuid4().hex
         directory = TEST_ROOT / test_id
         (directory / "images").mkdir(parents=True)
-        job = ImageTest(test_id, payload.artifact_id, payload.confidence,
-                        [{**item.model_dump(), "uploaded": False, "detections": None} for item in payload.files], directory)
+        artifact = db.get(Artifact, payload.artifact_id)
+        run = db.get(TrainingRun, artifact.run_id) if artifact and artifact.run_id else None
+        if not artifact or not run:
+            raise HTTPException(404, "模型权重所属的训练运行不存在")
+        job = ImageTest(test_id, payload.artifact_id, payload.confidence, payload.iou,
+                        [{**item.model_dump(), "uploaded": False, "detections": None, "objects": [], "timings": {}}
+                         for item in payload.files], directory, model=model_summary(db, artifact, run))
         worker.jobs[test_id] = job
         return job.public()
 
@@ -307,6 +362,18 @@ def test_image(test_id: str, index: int, kind: str, download: bool = False):
             raise HTTPException(404, "图片尚未上传")
         filename = f"detection-{index + 1}.jpg" if download else None
         return FileResponse(path, media_type="image/jpeg", filename=filename)
+
+
+@router.get("/{test_id}/download")
+def download_test(test_id: str):
+    with worker.lock:
+        job = worker.get(test_id)
+        if job.status != "completed":
+            raise HTTPException(409, "检测结果尚未生成")
+        path = job.directory / "detection-results.zip"
+        if not path.is_file():
+            raise HTTPException(404, "检测结果压缩包不存在")
+        return FileResponse(path, media_type="application/zip", filename="detection-results.zip")
 
 
 @router.delete("/{test_id}", status_code=204)

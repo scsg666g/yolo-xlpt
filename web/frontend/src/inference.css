@@ -7,14 +7,22 @@
 .model-test-modal > header, .model-test-modal > footer { flex-shrink: 0; background: var(--panel); border-color: var(--line); }
 .model-test-modal > header h2 { color: var(--text); }
 .model-test-body { padding: 20px 24px; overflow: auto; }
+.model-test-model-strip { display: grid; grid-template-columns: 1fr 1fr 1.4fr 1fr; gap: 1px; margin: -20px -24px 18px; border-bottom: 1px solid var(--line); background: var(--line); }
+.model-test-model-strip > div { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 12px 16px; background: var(--panel-2); color: var(--muted); }
+.model-test-model-strip svg { flex: 0 0 auto; color: #8fb5d8; }
+.model-test-model-strip span { min-width: 0; display: flex; flex-direction: column; gap: 4px; font-size: 10px; }
+.model-test-model-strip strong { overflow: hidden; color: var(--text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .model-test-settings { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.model-test-settings label { display: flex; gap: 10px; font-size: 12px; margin-left: auto; }
+.model-test-settings label { display: flex; justify-content: space-between; gap: 10px; font-size: 11px; }
 .model-test-settings label strong { color: var(--green); font-variant-numeric: tabular-nums; }
-.model-test-settings input[type=range] { width: 180px; accent-color: var(--green); }
+.model-test-slider { width: 165px; display: grid; gap: 3px; }
+.model-test-slider:first-of-type { margin-left: auto; }
+.model-test-settings input[type=range] { width: 100%; accent-color: var(--green); }
 .model-test-help { color: var(--muted); font-size: 11px; line-height: 1.6; }
 .model-test-error { border: 1px solid #a75559; border-radius: 8px; padding: 12px; color: #dc717a; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .model-test-status { display: flex; align-items: center; gap: 8px; color: var(--green); font-size: 12px; margin: 12px 0; }
 .model-test-status.failed { color: #dc717a; }
+.model-test-parameter-notice { display: flex; align-items: center; gap: 8px; margin: 10px 0; padding: 9px 12px; border-left: 3px solid #e0b968; background: color-mix(in srgb, #e0b968 8%, var(--panel)); color: #e0c98f; font-size: 11px; line-height: 1.5; }
 .model-test-summary { padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); color: var(--text); font-size: 12px; line-height: 1.6; }
 .model-test-outcome { display: flex; align-items: flex-start; gap: 9px; margin: 12px 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--panel); font-size: 12px; line-height: 1.6; }
 .model-test-outcome > svg { flex-shrink: 0; margin-top: 1px; }
@@ -25,6 +33,7 @@
 .model-test-empty span { font-size: 12px; }
 .model-test-empty:hover { border-color: var(--green); }
 .model-test-workspace { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 16px; margin-top: 16px; }
+.model-test-main { min-width: 0; }
 .model-test-thumbnails { max-height: 490px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
 .model-test-thumbnail { position: relative; flex-shrink: 0; }
 .model-test-thumbnail-select { width: 100%; padding: 7px; display: flex; flex-direction: column; gap: 5px; text-align: left; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--panel-2); cursor: pointer; }
@@ -42,6 +51,31 @@
 .model-test-image { display: flex; align-items: center; justify-content: center; flex: 1; min-height: 340px; width: 100%; border: 0; padding: 8px; background: transparent; cursor: zoom-in; }
 .model-test-image img { max-width: 100%; max-height: 430px; object-fit: contain; }
 .model-test-placeholder { min-height: 340px; display: flex; flex: 1; align-items: center; justify-content: center; flex-direction: column; gap: 14px; color: var(--muted); font-size: 11px; }
+.model-test-insights { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 14px; }
+.model-test-stat-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.model-test-stat-grid > div { min-width: 0; display: flex; align-items: center; gap: 9px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2); }
+.model-test-stat-grid svg { flex: 0 0 auto; color: #75c6b0; }
+.model-test-stat-grid span { min-width: 0; display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 9px; }
+.model-test-stat-grid strong { color: var(--text); font-size: 14px; font-variant-numeric: tabular-nums; }
+.model-test-detail-grid { display: grid; grid-template-columns: 1fr 1.2fr .9fr; gap: 20px; margin-top: 16px; }
+.model-test-detail-grid > div { min-width: 0; }
+.model-test-detail-grid h3 { display: flex; justify-content: space-between; margin: 0 0 10px; color: var(--text); font-size: 11px; }
+.model-test-detail-grid h3 span, .model-test-detail-grid p { color: var(--muted); font-size: 10px; font-weight: 400; }
+.model-test-object-list { max-height: 150px; overflow-y: auto; }
+.model-test-object-list > div { display: grid; grid-template-columns: 28px minmax(0, 1fr) 50px; gap: 7px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 10px; }
+.model-test-object-list span { color: var(--muted); }
+.model-test-object-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-test-object-list em { color: var(--green); text-align: right; font-style: normal; font-variant-numeric: tabular-nums; }
+.model-test-class-list { display: grid; gap: 8px; }
+.model-test-class-list > div { display: grid; grid-template-columns: 72px minmax(40px, 1fr) 94px; align-items: center; gap: 8px; font-size: 10px; }
+.model-test-class-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-test-class-list span { height: 5px; overflow: hidden; background: var(--line); }
+.model-test-class-list i { display: block; height: 100%; background: #6dc4ad; }
+.model-test-class-list em { color: var(--muted); text-align: right; font-style: normal; font-variant-numeric: tabular-nums; }
+.model-test-detail-grid dl { display: grid; gap: 7px; margin: 0; }
+.model-test-detail-grid dl > div { display: flex; justify-content: space-between; gap: 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); font-size: 10px; }
+.model-test-detail-grid dt { color: var(--muted); }
+.model-test-detail-grid dd { margin: 0; color: var(--text); font-variant-numeric: tabular-nums; }
 .model-test-modal > footer { display: flex; align-items: center; gap: 10px; }
 .model-test-modal > footer > span { margin-right: auto; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .model-test-lightbox { position: fixed; inset: 0; z-index: 160; background: rgba(4, 8, 14, .96); display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px; }
@@ -54,8 +88,20 @@
 .model-test-node-button { width: 100%; justify-content: center; margin-top: 12px; }
 .model-test-modal button:focus-visible, .model-test-modal a:focus-visible, .weight-test-button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
 @media (max-width: 900px) {
+  .model-test-model-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-test-workspace { grid-template-columns: 110px minmax(0, 1fr); }
   .model-test-comparison { grid-template-columns: 1fr; }
-  .model-test-settings label { margin-left: 0; }
+  .model-test-slider:first-of-type { margin-left: 0; }
+  .model-test-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .model-test-detail-grid { grid-template-columns: 1fr; }
   .model-test-image, .model-test-placeholder { min-height: 220px; }
+}
+@media (max-width: 620px) {
+  .model-test-body { padding: 16px; }
+  .model-test-model-strip { grid-template-columns: 1fr; margin: -16px -16px 16px; }
+  .model-test-workspace { grid-template-columns: 1fr; }
+  .model-test-thumbnails { max-height: none; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .model-test-slider { width: 100%; }
+  .model-test-modal > footer { flex-wrap: wrap; }
+  .model-test-modal > footer > span { width: 100%; }
 }

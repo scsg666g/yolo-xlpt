@@ -279,6 +279,16 @@ function TaskCanvasInner() {
   const inheritedBestWeight = !directBestWeight && !!effectiveBestWeight?.inherited
   const bestWeightOrigin = inheritedBestWeight && effectiveBestWeight?.source_attempt_number
     ? `继承自 Attempt ${String(effectiveBestWeight.source_attempt_number).padStart(3, '0')}` : ''
+  const modelTestAttempt = inheritedBestWeight ? effectiveBestWeight?.source_attempt_number : selectedRun?.attempt_number
+  const modelTestBestMetric = useMemo(() => {
+    if (inheritedBestWeight) return null
+    let best: { epoch: number; value: number } | null = null
+    for (const point of metrics) {
+      const value = point.values['metrics/mAP50-95(B)']
+      if (typeof value === 'number' && Number.isFinite(value) && (!best || value > best.value)) best = { epoch: point.epoch, value }
+    }
+    return best
+  }, [inheritedBestWeight, metrics])
   const lastWeight = weightArtifacts.find((artifact) => artifact.name.split('/').pop() === 'last.pt')
   const testDisabledReason = viewTask?.task_type !== 'detect' ? '目前支持目标检测模型'
     : ['queued', 'starting', 'running', 'stopping'].includes(viewTask?.status || '') ? '训练结束或停止后可测试' : null
@@ -430,7 +440,7 @@ function TaskCanvasInner() {
     <LogViewerModal task={viewTask} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
     <CanvasDetailModal kind={detailKind} task={viewTask} run={selectedRun} metrics={metrics} artifacts={artifacts} effectiveBestWeight={effectiveBestWeight} events={events} onClose={() => setDetailKind(null)} onTest={(artifact) => { setDetailKind(null); setTestingArtifact(artifact) }} testDisabledReason={testDisabledReason} />
     <TrainingTraceModal task={viewTask} run={selectedRun} open={viewingTrace} onClose={() => setViewingTrace(false)} />
-    {testingArtifact && <ModelTestModal key={testingArtifact.id} artifact={testingArtifact} taskName={task.name} onClose={() => setTestingArtifact(null)} />}
+    {testingArtifact && <ModelTestModal key={testingArtifact.id} artifact={testingArtifact} taskName={task.name} attemptNumber={modelTestAttempt} bestMetric={modelTestBestMetric} onClose={() => setTestingArtifact(null)} />}
   </div>
 }
 

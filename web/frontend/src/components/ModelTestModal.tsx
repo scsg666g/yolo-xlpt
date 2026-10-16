@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { AlertCircle, CheckCircle2, Download, Images, Info, LoaderCircle, Maximize2, Play, ScanEye, Upload, X } from 'lucide-react'
+import { AlertCircle, Box, CheckCircle2, Clock3, Cpu, Download, FileArchive, Gauge, Images, Info, LoaderCircle, Maximize2, Play, ScanEye, Target, Upload, X } from 'lucide-react'
 import { api, formatBytes } from '../api'
 import type { Artifact, ModelTest } from '../types'
 import '../inference.css'
@@ -7,6 +7,8 @@ import '../inference.css'
 interface Props {
   artifact: Artifact
   taskName: string
+  attemptNumber?: number | null
+  bestMetric?: { epoch: number; value: number } | null
   onClose: () => void
 }
 
@@ -24,9 +26,10 @@ function detectionLabel(count: number | null) {
   return count === null ? '结果未就绪' : count > 0 ? `检测到 ${count} 个目标` : '未检测到目标'
 }
 
-export function ModelTestModal({ artifact, taskName, onClose }: Props) {
+export function ModelTestModal({ artifact, taskName, attemptNumber, bestMetric, onClose }: Props) {
   const [images, setImages] = useState<SelectedImage[]>([])
   const [confidence, setConfidence] = useState(0.25)
+  const [iou, setIou] = useState(0.7)
   const [test, setTest] = useState<ModelTest | null>(null)
   const [selected, setSelected] = useState(0)
   const [busy, setBusy] = useState(false)
@@ -206,7 +209,7 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
         if (Date.now() > deadline) throw new Error('模型尚未准备完成，请确认远程服务器在线后重试')
         await pause()
       }
-      const created = await api.createModelTest(artifact.id, confidence, files, signal)
+      const created = await api.createModelTest(artifact.id, confidence, iou, files, signal)
       testId.current = created.id
       for (let index = 0; index < files.length; index++) {
         setStage(`正在上传 ${index + 1}/${files.length}：${files[index].name}`)
@@ -245,29 +248,65 @@ export function ModelTestModal({ artifact, taskName, onClose }: Props) {
   const original = completed ? `/api/model-tests/${test.id}/images/${selected}/original` : images[selected]?.previewUrl
   const result = completed ? `/api/model-tests/${test.id}/images/${selected}/result` : ''
   const selectedFile = files[selected]
+  const selectedResult = completed ? test.files[selected] : null
+  const objects = selectedResult?.objects || []
+  const allObjects = completed ? test.files.flatMap((file) => file.objects) : []
+  const classCounts = allObjects.reduce<Record<string, { count: number; confidence: number }>>((counts, item) => {
+    const current = counts[item.class_name] || { count: 0, confidence: 0 }
+    counts[item.class_name] = { count: current.count + 1, confidence: current.confidence + item.confidence }
+    return counts
+  }, {})
+  const classRows = Object.entries(classCounts).sort((left, right) => right[1].count - left[1].count)
+  const averageConfidence = allObjects.length ? allObjects.reduce((sum, item) => sum + item.confidence, 0) / allObjects.length : null
+  const parametersChanged = completed && (confidence !== test.confidence || iou !== test.iou)
+
+  function milliseconds(value: number | undefined) {
+    if (value === undefined || !Number.isFinite(value)) return '—'
+    return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${value.toFixed(1)} ms`
+  }
+  const modelAttempt = test?.model.attempt_number ?? attemptNumber
+  const modelBest = test?.model.best_epoch && test.model.metric_value !== null
+    ? { epoch: test.model.best_epoch, value: test.model.metric_value } : bestMetric
 
   return <div className="modal-backdrop model-test-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close() }} onDragOver={(event) => { if (event.dataTransfer.types.includes('Files')) { event.preventDefault(); event.dataTransfer.dropEffect = 'none' } }} onDrop={(event) => { event.preventDefault(); resetDrag() }}>
     <div ref={dialog} tabIndex={-1} className={`modal model-test-modal${dragging ? ' is-dragging' : ''}`} role="dialog" aria-modal="true" aria-labelledby="model-test-title" onDragEnter={dragEnter} onDragOver={dragOver} onDragLeave={dragLeave} onDrop={dropImages}>
       {dragging && <div className="model-test-drop-indicator" role="status"><Upload size={40} /><strong>松开添加图片</strong><span>{files.length ? '追加到当前图片列表' : '支持一次拖入多张图片'}</span></div>}
       <header><div className="modal-heading"><div className="heading-icon"><ScanEye size={22} /></div><div><span className="eyebrow">MODEL TEST</span><h2 id="model-test-title">测试模型</h2><p>{taskName} · {artifact.name.split('/').pop()}</p></div></div><button className="icon-button" onClick={close} aria-label="关闭模型测试" title={busy ? '取消测试并关闭' : '关闭'}><X size={20} /></button></header>
       <div className="model-test-body">
+        <section className="model-test-model-strip" aria-label="当前测试模型">
+          <div><Box size={17} /><span>测试权重<strong>{test?.model.weight_name || artifact.name.split('/').pop()} · {formatBytes(artifact.size)}</strong></span></div>
+          <div><FileArchive size={17} /><span>来源<strong>{modelAttempt ? `Attempt ${String(modelAttempt).padStart(3, '0')}` : '当前选中运行'}</strong></span></div>
+          <div><Gauge size={17} /><span>最高 mAP50-95<strong>{modelBest ? `Epoch ${modelBest.epoch} · ${modelBest.value.toFixed(4)}` : '暂无指标记录'}</strong></span></div>
+          <div><Cpu size={17} /><span>执行环境<strong>CPU · 640 px</strong></span></div>
+        </section>
         <div className="model-test-settings">
           <button className="button ghost" disabled={busy} onClick={() => input.current?.click()}><Upload size={16} />{files.length ? `添加图片（${files.length}/10）` : '上传图片'}</button>
           <input ref={input} hidden disabled={busy} type="file" accept=".jpg,.jpeg,.png,.webp,.bmp" multiple onChange={(event) => chooseImages(event.target.files)} />
-          <label htmlFor="test-confidence">置信度阈值 <strong>{confidence.toFixed(2)}</strong></label>
-          <input id="test-confidence" type="range" min="0.01" max="1" step="0.01" value={confidence} disabled={busy} onChange={(event) => setConfidence(Number(event.target.value))} />
+          <div className="model-test-slider"><label htmlFor="test-confidence">置信度 Conf <strong>{confidence.toFixed(2)}</strong></label><input id="test-confidence" type="range" min="0.01" max="1" step="0.01" value={confidence} disabled={busy} onChange={(event) => setConfidence(Number(event.target.value))} /></div>
+          <div className="model-test-slider"><label htmlFor="test-iou">NMS IoU <strong>{iou.toFixed(2)}</strong></label><input id="test-iou" type="range" min="0.01" max="1" step="0.01" value={iou} disabled={busy} onChange={(event) => setIou(Number(event.target.value))} /></div>
           <button className="button primary" disabled={busy || !files.length} onClick={() => void run()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{completed ? '重新检测' : '运行检测'}</button>
         </div>
         <p className="model-test-help">{busy ? '检测期间不能添加或移除图片' : '可继续拖入图片追加，点击缩略图右上角移除'} · 最多 10 张 · 单张 20 MB / 2000 万像素 · 总大小 100 MB · CPU 检测</p>
         {error && <div className="model-test-error" role="alert">{error}</div>}
-        {(stage || busy) && <div className={`model-test-status${failed ? ' failed' : ''}`} role="status">{busy ? <LoaderCircle className="spin" size={14} /> : failed ? <AlertCircle size={14} /> : null}{stage}{completed && ` · 本次阈值 ${test.confidence.toFixed(2)}`}</div>}
+        {(stage || busy) && <div className={`model-test-status${failed ? ' failed' : ''}`} role="status">{busy ? <LoaderCircle className="spin" size={14} /> : failed ? <AlertCircle size={14} /> : null}{stage}{completed && ` · Conf ${test.confidence.toFixed(2)} · IoU ${test.iou.toFixed(2)}`}</div>}
+        {parametersChanged && <div className="model-test-parameter-notice" role="status"><Info size={15} />参数已修改，当前画面仍是 Conf {test.confidence.toFixed(2)} / IoU {test.iou.toFixed(2)} 的结果，请重新检测。</div>}
         {completed && <div className="model-test-summary" role="status">共 {test.files.length} 张：<strong>{detectedImages} 张检测到目标</strong>，{emptyImages} 张未检测到。</div>}
         {!files.length ? <button className="model-test-empty" disabled={busy} onClick={() => input.current?.click()}><Images size={46} /><strong>点击或拖入图片</strong><span>支持 JPG、PNG、WEBP、BMP，可一次上传多张</span></button> : <div className="model-test-workspace">
           <nav className="model-test-thumbnails" aria-label="测试图片">{images.map(({ id, file, previewUrl }, index) => <div className="model-test-thumbnail" key={id}><button className={`model-test-thumbnail-select${selected === index ? ' selected' : ''}`} onClick={() => setSelected(index)} aria-pressed={selected === index}><img src={previewUrl} alt="" draggable={false} /><span title={file.name}>{file.name}</span><small className={completed && (test.files[index].detections || 0) > 0 ? 'has-detections' : undefined}>{completed ? detectionLabel(test.files[index].detections) : formatBytes(file.size)}</small></button><button className="model-test-remove" disabled={busy} title={`移除 ${file.name}`} aria-label={`移除 ${file.name}`} onClick={() => removeImage(index)}><X size={14} /></button></div>)}</nav>
-          <div className="model-test-comparison">{[{ url: original, title: '原图' }, { url: result, title: '检测结果' }].map(({ url, title }) => <section className="model-test-panel" key={title}><div><strong>{title}</strong>{url && <button className="icon-button" title={`放大${title}`} aria-label={`放大${title}`} onClick={(event) => openLightbox(url, title, event.currentTarget)}><Maximize2 size={15} /></button>}</div>{title === '检测结果' && completed && detections !== null && <div className={`model-test-outcome ${detections > 0 ? 'detected' : 'not-detected'}`} role="status">{detections > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}<div><strong>{detections > 0 ? detectionLabel(detections) : `当前置信度阈值 ${test.confidence.toFixed(2)} 下未检测到目标`}</strong>{detections === 0 && <p>可适当降低阈值后重新检测。这不代表图片中一定没有目标。</p>}</div></div>}{url ? <button className="model-test-image" onDoubleClick={(event) => openLightbox(url, title, event.currentTarget)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLightbox(url, title, event.currentTarget) } }} aria-label={`${title}，双击放大`}><img src={url} alt={`${selectedFile?.name} ${title}`} /></button> : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '检测结果生成中…' : failed ? '检测失败，请查看上方错误原因' : '运行检测后，查看目标框与置信度'}</span></div>}</section>)}</div>
+          <div className="model-test-main">
+            <div className="model-test-comparison">{[{ url: original, title: '原图' }, { url: result, title: '检测结果' }].map(({ url, title }) => <section className="model-test-panel" key={title}><div><strong>{title}</strong>{url && <button className="icon-button" title={`放大${title}`} aria-label={`放大${title}`} onClick={(event) => openLightbox(url, title, event.currentTarget)}><Maximize2 size={15} /></button>}</div>{title === '检测结果' && completed && detections !== null && <div className={`model-test-outcome ${detections > 0 ? 'detected' : 'not-detected'}`} role="status">{detections > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}<div><strong>{detections > 0 ? detectionLabel(detections) : `当前置信度阈值 ${test.confidence.toFixed(2)} 下未检测到目标`}</strong>{detections === 0 && <p>可适当降低阈值后重新检测。这不代表图片中一定没有目标。</p>}</div></div>}{url ? <button className="model-test-image" onDoubleClick={(event) => openLightbox(url, title, event.currentTarget)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLightbox(url, title, event.currentTarget) } }} aria-label={`${title}，双击放大`}><img src={url} alt={`${selectedFile?.name} ${title}`} /></button> : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '检测结果生成中…' : failed ? '检测失败，请查看上方错误原因' : '运行检测后，查看目标框与置信度'}</span></div>}</section>)}</div>
+            {completed && <section className="model-test-insights" aria-label="检测统计">
+              <div className="model-test-stat-grid"><div><Target size={17} /><span>全部目标<strong>{allObjects.length}</strong></span></div><div><Images size={17} /><span>命中图片<strong>{detectedImages}/{test.files.length}</strong></span></div><div><Gauge size={17} /><span>平均置信度<strong>{averageConfidence === null ? '—' : averageConfidence.toFixed(3)}</strong></span></div><div><Clock3 size={17} /><span>平均推理<strong>{milliseconds(test.timings ? test.timings.inference / test.files.length : undefined)}</strong></span></div></div>
+              <div className="model-test-detail-grid">
+                <div><h3>当前图片目标 <span>{objects.length}</span></h3>{objects.length ? <div className="model-test-object-list">{objects.map((item, index) => <div key={`${item.class_id}-${index}`}><span>#{index + 1}</span><strong>{item.class_name}</strong><em>{item.confidence.toFixed(3)}</em></div>)}</div> : <p>当前图片没有达到阈值的目标。</p>}</div>
+                <div><h3>整批类别统计 <span>{classRows.length}</span></h3>{classRows.length ? <div className="model-test-class-list">{classRows.map(([name, value]) => <div key={name}><strong>{name}</strong><span><i style={{ width: `${Math.max(8, value.count / allObjects.length * 100)}%` }} /></span><em>{value.count} · 平均 {(value.confidence / value.count).toFixed(3)}</em></div>)}</div> : <p>本次没有检测到目标。</p>}</div>
+                <div><h3>性能数据</h3><dl><div><dt>模型加载</dt><dd>{milliseconds(test.timings?.model_load)}</dd></div><div><dt>预处理</dt><dd>{milliseconds(selectedResult?.timings.preprocess)}</dd></div><div><dt>当前图推理</dt><dd>{milliseconds(selectedResult?.timings.inference)}</dd></div><div><dt>后处理</dt><dd>{milliseconds(selectedResult?.timings.postprocess)}</dd></div><div><dt>整批总耗时</dt><dd>{milliseconds(test.timings?.total)}</dd></div></dl></div>
+              </div>
+            </section>}
+          </div>
         </div>}
       </div>
-      <footer><span>{completed ? `${selectedFile?.name} · ${detectionLabel(test.files[selected].detections)} · 双击图片放大 · 关闭前请下载结果` : '阈值越高，显示的检测结果越严格'}</span>{result && <a className="button primary" href={`${result}?download=true`} download><Download size={15} />下载结果图</a>}<button className="button ghost" onClick={close}>{busy ? '取消并关闭' : '关闭'}</button></footer>
+      <footer><span>{completed ? `${selectedFile?.name} · ${detectionLabel(test.files[selected].detections)} · 双击图片放大 · 关闭后临时结果将清理` : '阈值越高，显示的检测结果越严格'}</span>{completed && <a className="button ghost" href={`/api/model-tests/${test.id}/download`} download><FileArchive size={15} />下载全部</a>}{result && <a className="button primary" href={`${result}?download=true`} download><Download size={15} />当前结果图</a>}<button className="button ghost" onClick={close}>{busy ? '取消并关闭' : '关闭'}</button></footer>
       {enlarged && <div ref={lightbox} className="model-test-lightbox" role="dialog" aria-modal="true" aria-label={`放大查看${enlarged.title}`} tabIndex={-1} onClick={() => setEnlarged(null)}><button className="icon-button" aria-label="关闭图片放大" onClick={() => setEnlarged(null)}><X size={24} /></button><img src={enlarged.url} alt={enlarged.title} onClick={(event) => event.stopPropagation()} /><span>{enlarged.title} · Esc 关闭</span></div>}
     </div>
   </div>
