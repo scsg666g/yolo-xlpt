@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -59,6 +60,29 @@ TYPE_OVERRIDES = {
     "nms": "boolean", "channels_last": "boolean", "dnn": "boolean",
 }
 
+# These constraints mirror the basic scalar checks used by the bundled
+# Ultralytics configuration. They are attached to the generated catalog so the
+# API validates the exact parameter surface it advertises to clients.
+INTEGER_KEYS = {
+    "patience", "workers", "seed", "close_mosaic", "mask_ratio", "max_det", "nbs", "save_period",
+}
+INTEGER_MINIMUMS = {"patience": 0, "workers": 0, "seed": 0, "close_mosaic": 0, "mask_ratio": 1, "max_det": 1, "nbs": 1}
+UNIT_INTERVAL_KEYS = {
+    "dropout", "lr0", "lrf", "cls_pw", "momentum", "weight_decay", "warmup_momentum",
+    "warmup_bias_lr", "hsv_h", "hsv_s", "hsv_v", "translate", "perspective", "flipud",
+    "fliplr", "bgr", "mosaic", "mixup", "cutmix", "copy_paste", "erasing", "conf", "iou",
+    "multi_scale", "dlam", "scale",
+}
+
+
+def is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
 # Some options live outside the train/val blocks in default.yaml but are also
 # consumed by model.train(). Keep these explicit exceptions small and sourced
 # from the same YAML file.
@@ -73,6 +97,20 @@ def _value_type(value: Any, key: str) -> str:
     if isinstance(value, (int, float)):
         return "number"
     return "text"
+
+
+def _value_constraints(key: str, value: Any, value_type: str) -> dict[str, Any]:
+    constraints: dict[str, Any] = {"nullable": value is None}
+    if value_type != "number":
+        return constraints
+    constraints["integer"] = key in INTEGER_KEYS or isinstance(value, int) and not isinstance(value, bool)
+    if key in INTEGER_MINIMUMS:
+        constraints["minimum"] = INTEGER_MINIMUMS[key]
+    if key in UNIT_INTERVAL_KEYS:
+        constraints.update({"minimum": 0.0, "maximum": 1.0})
+    if key == "fraction":
+        constraints.update({"minimum_exclusive": 0.0, "fraction_or_count": True})
+    return constraints
 
 
 def _section_keys(text: str) -> list[tuple[str, str]]:
@@ -105,25 +143,82 @@ def load_parameter_catalog() -> dict[str, dict[str, Any]]:
         if key in catalog:
             continue
         value = values.get(key)
+        value_type = _value_type(value, key)
         catalog[key] = {
             "key": key,
             "label": LABELS.get(key, key),
-            "type": _value_type(value, key),
+            "type": value_type,
             "default": value,
             "section": section,
+            **_value_constraints(key, value, value_type),
         }
     for key in CROSS_SECTION_TRAINING_KEYS:
         if key in values and key not in catalog:
             value = values[key]
+            value_type = _value_type(value, key)
             catalog[key] = {
                 "key": key,
                 "label": LABELS.get(key, key),
-                "type": _value_type(value, key),
+                "type": value_type,
                 "default": value,
                 "section": "Training-compatible",
+                **_value_constraints(key, value, value_type),
             }
     return catalog
 
 
 def training_parameter_keys() -> set[str]:
     return set(load_parameter_catalog())
+
+
+def validate_parameter_values(
+    parameters: dict[str, Any], catalog: dict[str, dict[str, Any]] | None = None,
+) -> None:
+    """Validate advertised training parameters before storing or launching them."""
+    definitions = load_parameter_catalog() if catalog is None else catalog
+    if definitions:
+        unknown = set(parameters) - set(definitions)
+        if unknown:
+            raise ValueError(f"包含不支持的参数：{', '.join(sorted(unknown))}")
+
+    for key, value in parameters.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and not is_finite_number(value):
+            raise ValueError(f"参数 {key} 必须是有限数字")
+        definition = definitions.get(key) if definitions else None
+        if not definition:
+            continue
+        if value is None:
+            if definition.get("nullable"):
+                continue
+            raise ValueError(f"参数 {key} 不能为空")
+
+        value_type = definition.get("type")
+        if value_type == "boolean":
+            if not isinstance(value, bool):
+                raise ValueError(f"参数 {key} 必须是布尔值")
+            continue
+        if value_type == "text":
+            if not isinstance(value, str):
+                raise ValueError(f"参数 {key} 必须是文本")
+            if not value.strip():
+                raise ValueError(f"参数 {key} 不能为空文本")
+            if len(value) > 500:
+                raise ValueError(f"参数 {key} 文本过长")
+            continue
+        if value_type != "number" or isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"参数 {key} 必须是数字")
+        if not is_finite_number(value):
+            raise ValueError(f"参数 {key} 必须是有限数字")
+        if definition.get("integer") and not isinstance(value, int):
+            raise ValueError(f"参数 {key} 必须是整数")
+        minimum = definition.get("minimum")
+        maximum = definition.get("maximum")
+        minimum_exclusive = definition.get("minimum_exclusive")
+        if minimum is not None and value < minimum:
+            raise ValueError(f"参数 {key} 不能小于 {minimum}")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"参数 {key} 不能大于 {maximum}")
+        if minimum_exclusive is not None and value <= minimum_exclusive:
+            raise ValueError(f"参数 {key} 必须大于 {minimum_exclusive}")
+        if definition.get("fraction_or_count") and value > 1 and not isinstance(value, int):
+            raise ValueError(f"参数 {key} 大于 1 时必须使用整数样本数")

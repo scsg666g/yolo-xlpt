@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Plus, Search, SlidersHorizontal, Trash2, X } from 'lucide-react'
 import { api } from '../api'
 import type { TrainingParameterDefinition, TrainingTask } from '../types'
+import { useModalFocus } from '../useModalFocus'
 
 interface Props {
   task: TrainingTask | null
@@ -307,6 +308,16 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
   const [catalogDefinitions, setCatalogDefinitions] = useState<Record<string, ParameterDefinition> | null>(null)
   const latestTask = useRef(task)
   latestTask.current = task
+  const dialogRef = useModalFocus<HTMLFormElement>(open && Boolean(task), onClose, {
+    canClose: !saving,
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
+  const importDialogRef = useModalFocus<HTMLDivElement>(open && Boolean(task) && importOpen, () => setImportOpen(false), {
+    initialFocusSelector: 'textarea',
+  })
+  const jsonDialogRef = useModalFocus<HTMLDivElement>(open && Boolean(task) && jsonOpen, () => setJsonOpen(false), {
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
 
   useEffect(() => {
     const currentTask = latestTask.current
@@ -459,9 +470,9 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
     } finally { setSaving(false) }
   }
 
-  return <div className="modal-backdrop parameter-backdrop" onMouseDown={onClose}>
-    <form className="modal parameter-modal" onSubmit={save} onMouseDown={(event) => event.stopPropagation()}>
-      <header><div className="modal-heading"><div className="heading-icon"><SlidersHorizontal size={18} /></div><div><span className="eyebrow">TRAINING CONFIGURATION</span><h2>编辑训练参数</h2><p>{task.name}</p></div></div><button type="button" className="icon-button" onClick={onClose}><X size={20} /></button></header>
+  return <div className="modal-backdrop parameter-backdrop" onMouseDown={() => { if (!saving) onClose() }}>
+    <form ref={dialogRef} className="modal parameter-modal" role="dialog" aria-modal="true" aria-labelledby="edit-parameters-title" tabIndex={-1} onSubmit={save} onMouseDown={(event) => event.stopPropagation()}>
+      <header><div className="modal-heading"><div className="heading-icon"><SlidersHorizontal size={18} /></div><div><span className="eyebrow">TRAINING CONFIGURATION</span><h2 id="edit-parameters-title">编辑训练参数</h2><p>{task.name}</p></div></div><button type="button" className="icon-button" data-modal-initial-focus aria-label="关闭参数编辑窗口" disabled={saving} onClick={onClose}><X size={20} /></button></header>
       <div className="modal-body">
         {locked && <div className="alert warning">任务正在运行或排队，请停止任务后再修改参数。</div>}
         {error && <div className="alert error">{error}</div>}
@@ -499,19 +510,19 @@ export function EditParametersModal({ task, open, onClose, onSaved }: Props) {
           </div>
         </div>}
       </div>
-      {importOpen && <div className="parameter-import-backdrop" onMouseDown={() => setImportOpen(false)}><div className="parameter-import-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3>批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。全部字段都会列出诊断结果，不会执行粘贴的代码。</p></div><button type="button" className="icon-button" onClick={() => setImportOpen(false)}><X size={18} /></button></header>
+      {importOpen && <div className="parameter-import-backdrop" onMouseDown={() => setImportOpen(false)}><div ref={importDialogRef} className="parameter-import-modal" role="dialog" aria-modal="true" aria-labelledby="edit-parameters-import-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+        <header><div><span className="eyebrow">PASTE CONFIGURATION</span><h3 id="edit-parameters-import-title">批量识别训练参数</h3><p>可粘贴 Python、YOLO CLI、YAML 或 JSON 样式的参数。全部字段都会列出诊断结果，不会执行粘贴的代码。</p></div><button type="button" className="icon-button" aria-label="关闭批量导入窗口" onClick={() => setImportOpen(false)}><X size={18} /></button></header>
         <div className="parameter-import-body"><textarea value={importText} onChange={(event) => changeImportText(event.target.value)} placeholder={'例如：\nmodel.train(epochs=100, batch=16, imgsz=640, lr0=0.01, freeze=10)\n\n或：\nepochs: 100\namp: true\nmosaic: 0.8'} />
           <ParameterImportResults diagnostics={importDiagnostics} parameters={detectedParameters} selectedKeys={selectedImportKeys} onSelectionChange={setSelectedImportKeys} />
         </div>
         <footer><span>将导入 {selectedImportKeys.length} 项{importDiagnostics.length > detectedParameters.length ? `，${importDiagnostics.length - detectedParameters.length} 项不会导入` : ''}</span><button type="button" className="button ghost" onClick={() => setImportOpen(false)}>取消</button><button type="button" className="button primary" disabled={!selectedImportKeys.length} onClick={applyImportedParameters}>导入 {selectedImportKeys.length} 个参数</button></footer>
       </div></div>}
-      {jsonOpen && <div className="parameter-import-backdrop" onMouseDown={() => setJsonOpen(false)}><div className="parameter-json-modal" onMouseDown={(event) => event.stopPropagation()}>
-        <header><div><span className="eyebrow">EFFECTIVE CONFIGURATION</span><h3>完整 JSON 参数</h3><p>{Object.keys(jsonParameters).length} 个当前参数</p></div><button type="button" className="icon-button" onClick={() => setJsonOpen(false)}><X size={18} /></button></header>
+      {jsonOpen && <div className="parameter-import-backdrop" onMouseDown={() => setJsonOpen(false)}><div ref={jsonDialogRef} className="parameter-json-modal" role="dialog" aria-modal="true" aria-labelledby="edit-parameters-json-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+        <header><div><span className="eyebrow">EFFECTIVE CONFIGURATION</span><h3 id="edit-parameters-json-title">完整 JSON 参数</h3><p>{Object.keys(jsonParameters).length} 个当前参数</p></div><button type="button" className="icon-button" data-modal-initial-focus aria-label="关闭 JSON 参数窗口" onClick={() => setJsonOpen(false)}><X size={18} /></button></header>
         <div className="parameter-json-body"><pre>{jsonText}</pre></div>
         <footer><span>当前表单配置</span><button type="button" className="button primary" onClick={copyJson}>{jsonCopied ? <Check size={15} /> : <Clipboard size={15} />}{jsonCopied ? '已复制' : '复制 JSON'}</button></footer>
       </div></div>}
-      <footer><span className="parameter-note">双击配置节点可随时重新打开</span><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked}>{saving && <LoaderCircle size={16} className="spin" />}保存参数</button></footer>
+      <footer><span className="parameter-note">双击配置节点可随时重新打开</span><button type="button" className="button ghost" disabled={saving} onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked}>{saving && <LoaderCircle size={16} className="spin" />}保存参数</button></footer>
     </form>
   </div>
 }

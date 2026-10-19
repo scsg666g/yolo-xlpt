@@ -4,10 +4,13 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
+import app.config as config_module
 import app.database as database_module
 import app.local_deletions as local_deletions_module
 import app.model_test_storage as model_test_storage
@@ -18,12 +21,13 @@ from app.main import app
 import app.main as main_module
 from app.local_deletions import LocalDeletionWorker
 from app.models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
-from app.schemas import TaskRead
+from app.schemas import TaskConfigUpdate, TaskCreate, TaskRead
 from app.services import (
     TrainingScheduler,
     backfill_training_runs,
     create_training_run,
     failure_detail,
+    import_existing_runs,
     migrate_training_logs,
     mirror_run_to_task,
     path_is_within,
@@ -75,6 +79,189 @@ def test_local_scheduler_gpu_occupancy_is_scoped_to_local_tasks(
         session.commit()
 
         assert TrainingScheduler()._available(session, queued) is available
+
+
+def test_scheduler_claim_is_atomic_across_scheduler_instances(tmp_path: Path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'atomic-claim.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with session_factory() as db:
+        task = make_task("task-atomic-claim", status="queued")
+        run = TrainingRun(
+            id="run-atomic-claim", task=task, attempt_number=1, launch_mode="fresh", status="queued",
+            model_path=task.model_path, data_path=task.data_path, parameter_snapshot={"epochs": 10},
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    first = TrainingScheduler(session_factory=session_factory)
+    second = TrainingScheduler(session_factory=session_factory)
+    with session_factory() as db:
+        assert first._claim_queued_run(db, "run-atomic-claim")
+    with session_factory() as db:
+        assert not second._claim_queued_run(db, "run-atomic-claim")
+        assert db.get(TrainingRun, "run-atomic-claim").status == "starting"
+        assert db.get(TrainingTask, "task-atomic-claim").status == "starting"
+
+
+def test_popen_happens_after_durable_claim_and_final_db_failure_is_recoverable(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'launch-recovery.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    run_dir = tmp_path / "runs" / "attempt-001"
+    log_path = tmp_path / "logs" / "attempt-001.log"
+    with session_factory() as db:
+        task = make_task("task-launch-recovery", status="starting")
+        run = TrainingRun(
+            id="run-launch-recovery", task=task, attempt_number=1, launch_mode="fresh", status="starting",
+            model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), log_path=str(log_path),
+            parameter_snapshot={"epochs": 10, "config": {}},
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    command = ["fake-yolo", "detect", "train"]
+    monkeypatch.setattr(scheduler, "_command", lambda *_args: command)
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", tmp_path / "runtime")
+    monkeypatch.setattr(services_module, "prepare_dataset_config", lambda _raw, destination: destination)
+
+    class FakeProcess:
+        pid = 4312
+
+        def __init__(self, *_args, **_kwargs):
+            with session_factory() as observer:
+                persisted = observer.get(TrainingRun, "run-launch-recovery")
+                assert persisted.status == "starting"
+                assert persisted.command == command
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(services_module.subprocess, "Popen", FakeProcess)
+    with session_factory() as db:
+        run = db.get(TrainingRun, "run-launch-recovery")
+        task = db.get(TrainingTask, "task-launch-recovery")
+        real_commit = db.commit
+        commits = 0
+
+        def fail_final_commit():
+            nonlocal commits
+            commits += 1
+            if commits == 2:
+                raise RuntimeError("simulated final commit failure")
+            real_commit()
+
+        monkeypatch.setattr(db, "commit", fail_final_commit)
+        with pytest.raises(RuntimeError, match="simulated final commit failure"):
+            scheduler._launch(db, task, run)
+        db.rollback()
+
+    with session_factory() as db:
+        persisted = db.get(TrainingRun, "run-launch-recovery")
+        assert persisted.status == "starting"
+        assert persisted.command == command
+        assert not TrainingScheduler(session_factory=session_factory)._claim_queued_run(db, persisted.id)
+
+    with session_factory() as db:
+        scheduler._poll_processes(db)
+        db.commit()
+        assert db.get(TrainingRun, "run-launch-recovery").status == "running"
+        assert db.get(TrainingRun, "run-launch-recovery").pid == FakeProcess.pid
+
+
+def test_stop_winning_between_prepared_commit_and_popen_return_terminates_process(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'stop-launch-race.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    run_dir = tmp_path / "runs" / "attempt-001"
+    with session_factory() as db:
+        task = make_task("task-stop-launch-race", status="queued")
+        run = TrainingRun(
+            id="run-stop-launch-race", task=task, attempt_number=1, launch_mode="fresh", status="queued",
+            model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir),
+            log_path=str(tmp_path / "logs" / "attempt-001.log"), parameter_snapshot={"epochs": 10, "config": {}},
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    with session_factory() as db:
+        assert scheduler._claim_queued_run(db, "run-stop-launch-race")
+    monkeypatch.setattr(scheduler, "_command", lambda *_args: ["fake-yolo", "train"])
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", tmp_path / "runtime")
+    monkeypatch.setattr(services_module, "prepare_dataset_config", lambda _raw, destination: destination)
+    signals = []
+    monkeypatch.setattr(services_module.os, "killpg", lambda pid, sent_signal: signals.append((pid, sent_signal)))
+
+    class FakeProcess:
+        pid = 5432
+
+        def __init__(self, *_args, **_kwargs):
+            assert scheduler.stop_task("task-stop-launch-race")
+
+        def poll(self):
+            return -15
+
+    monkeypatch.setattr(services_module.subprocess, "Popen", FakeProcess)
+    with session_factory() as db:
+        scheduler._launch(
+            db, db.get(TrainingTask, "task-stop-launch-race"), db.get(TrainingRun, "run-stop-launch-race"),
+        )
+
+    assert scheduler.stop_task("task-stop-launch-race")  # repeated requests are idempotent
+    assert signals == [(FakeProcess.pid, services_module.signal.SIGTERM),
+                       (FakeProcess.pid, services_module.signal.SIGTERM)]
+    with session_factory() as db:
+        assert db.get(TrainingRun, "run-stop-launch-race").status == "stopping"
+        scheduler._poll_processes(db)
+        db.commit()
+        assert db.get(TrainingRun, "run-stop-launch-race").status == "stopped"
+        assert db.get(TrainingTask, "task-stop-launch-race").status == "stopped"
+
+
+def test_stop_rereads_process_registered_during_status_transition(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'stop-process-registration-race.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with session_factory() as db:
+        task = make_task("task-stop-registration-race", status="running", pid=6543)
+        run = TrainingRun(
+            id="run-stop-registration-race", task=task, attempt_number=1, launch_mode="fresh", status="running",
+            model_path=task.model_path, data_path=task.data_path, pid=6543,
+            parameter_snapshot={"epochs": 10, "config": {}},
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    managed = services_module.ManagedTrainingProcess(
+        run_id="run-stop-registration-race", pid=6543, command=["fake-yolo"], started_at=utcnow(),
+    )
+    db = session_factory()
+    original_execute = db.execute
+    execute_calls = 0
+
+    def register_between_status_update_and_signal(*args, **kwargs):
+        nonlocal execute_calls
+        result = original_execute(*args, **kwargs)
+        execute_calls += 1
+        if execute_calls == 2:
+            with scheduler._process_lock:
+                scheduler.processes["task-stop-registration-race"] = managed
+        return result
+
+    monkeypatch.setattr(db, "execute", register_between_status_update_and_signal)
+    scheduler.session_factory = lambda: db
+    signals = []
+    monkeypatch.setattr(services_module.os, "killpg", lambda pid, sent_signal: signals.append((pid, sent_signal)))
+
+    assert scheduler.stop_task("task-stop-registration-race")
+    assert signals == [(managed.pid, services_module.signal.SIGTERM)]
 
 
 def test_process_match_requires_command_and_start_time(monkeypatch):
@@ -336,6 +523,87 @@ def test_rename_rejects_invalid_names_and_missing_tasks(tmp_path: Path):
         session.close()
 
 
+@pytest.mark.parametrize("field,value", [
+    ("name", "  \t "),
+    ("optimizer", "   "),
+    ("device", "0,00"),
+])
+def test_task_create_rejects_blank_text_and_duplicate_gpus(field, value):
+    payload = {"name": "training", "model_path": "model.pt", "data_path": "data.yaml", field: value}
+    with pytest.raises(ValidationError):
+        TaskCreate(**payload)
+
+
+@pytest.mark.parametrize("field,value", [("optimizer", " \t"), ("device", "1,1")])
+def test_task_config_rejects_blank_optimizer_and_duplicate_gpus(field, value):
+    payload = {"epochs": 10, "batch": 2, "imgsz": 640, "device": "0", "workers": 1, "optimizer": "auto"}
+    payload[field] = value
+    with pytest.raises(ValidationError):
+        TaskConfigUpdate(**payload)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_task_create_rejects_nonfinite_lr0(value):
+    with pytest.raises(ValidationError):
+        TaskCreate(name="training", model_path="model.pt", data_path="data.yaml", lr0=value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 10**400])
+def test_task_config_rejects_nonfinite_custom_numbers(tmp_path: Path, value):
+    session = make_session(tmp_path)
+    task = make_task("task-custom-nonfinite", status="draft")
+    session.add(task)
+    session.commit()
+    payload = TaskConfigUpdate(
+        epochs=10, batch=2, imgsz=640, device="0", workers=1, optimizer="auto",
+        config={}, custom_config={"custom_value": value},
+    )
+
+    with pytest.raises(HTTPException) as error:
+        main_module.update_task_config(task.id, payload, session)
+
+    assert error.value.status_code == 422
+    session.close()
+
+
+@pytest.mark.parametrize("changed_field", ["epochs", "data_path"])
+def test_local_resume_rejects_checkpoint_snapshot_mismatch(tmp_path: Path, changed_field: str):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "attempt-001"
+    checkpoint = run_dir / "weights" / "last.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    task = make_task(
+        "task-resume-mismatch", status="stopped", epochs=20, completed_epochs=5,
+        data_path=str(tmp_path / "original-data.yaml"), run_dir=str(run_dir),
+    )
+    run = TrainingRun(
+        id="run-resume-mismatch", task=task, attempt_number=1, launch_mode="fresh", status="stopped",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir),
+        parameter_snapshot={"epochs": 20, "config": {}}, completed_epochs=5,
+    )
+    task.current_run_id = run.id
+    if changed_field == "epochs":
+        task.epochs = 21
+    else:
+        task.data_path = str(tmp_path / "replacement-data.yaml")
+    session.add_all([task, run])
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        response = TestClient(app).post(f"/api/tasks/{task.id}/resume")
+        assert response.status_code == 409
+        assert "上一 Attempt" in response.json()["detail"]
+        assert len(session.scalars(select(TrainingRun).where(TrainingRun.task_id == task.id)).all()) == 1
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
 def test_path_is_within(tmp_path: Path):
     allowed = tmp_path / "allowed"
     allowed.mkdir()
@@ -403,6 +671,26 @@ def test_training_environment_uses_gnu_mkl_threading_layer():
     assert training_environment()["MKL_THREADING_LAYER"] == "GNU"
 
 
+def test_yolo_bin_resolution_prefers_config_then_python_environment_then_path(tmp_path, monkeypatch):
+    explicit = tmp_path / "configured" / "yolo"
+    assert config_module.resolve_yolo_bin(str(explicit)) == explicit.resolve()
+
+    environment_python = tmp_path / "environment" / "bin" / "python"
+    environment_python.parent.mkdir(parents=True)
+    environment_cli = environment_python.with_name("yolo")
+    environment_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(config_module.sys, "executable", str(environment_python))
+    monkeypatch.setattr(config_module.shutil, "which", lambda _name: (_ for _ in ()).throw(
+        AssertionError("PATH lookup must not run when the environment CLI exists")
+    ))
+    assert config_module.resolve_yolo_bin("") == environment_cli.resolve()
+
+    environment_cli.unlink()
+    path_cli = tmp_path / "path-bin" / "yolo"
+    monkeypatch.setattr(config_module.shutil, "which", lambda name: str(path_cli) if name == "yolo" else None)
+    assert config_module.resolve_yolo_bin("") == path_cli.resolve()
+
+
 def test_failure_detail_prefers_root_error(tmp_path: Path):
     log = tmp_path / "platform.log"
     log.write_text(
@@ -450,6 +738,56 @@ def test_sync_artifacts_is_idempotent(tmp_path: Path):
     assert artifact.path == str(results_file.resolve())
     assert artifact.size == results_file.stat().st_size
     session.close()
+
+
+def test_sync_artifacts_removes_records_for_disappeared_local_files(tmp_path: Path):
+    run_dir = tmp_path / "run-stale"
+    run_dir.mkdir()
+    result = run_dir / "results.csv"
+    result.write_text("epoch,metric\n", encoding="utf-8")
+    session = make_session(tmp_path)
+    task = make_task("task-stale-artifact", run_dir=str(run_dir))
+    run = TrainingRun(
+        id="run-stale-artifact", task=task, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+    sync_artifacts(session, task, run)
+    session.commit()
+    assert session.scalar(select(Artifact).where(Artifact.run_id == run.id)) is not None
+
+    result.unlink()
+    sync_artifacts(session, task, run)
+    session.commit()
+
+    assert session.scalar(select(Artifact).where(Artifact.run_id == run.id)) is None
+    session.close()
+
+
+def test_import_existing_runs_isolates_corrupt_args_yaml(tmp_path: Path, monkeypatch):
+    ultralytics_root = tmp_path / "ultralytics"
+    bad = ultralytics_root / "runs" / "00-bad" / "args.yaml"
+    good = ultralytics_root / "runs" / "01-good" / "args.yaml"
+    bad.parent.mkdir(parents=True)
+    good.parent.mkdir(parents=True)
+    bad.write_text("mode: train\nepochs: definitely-not-a-number\n", encoding="utf-8")
+    good.write_text(
+        "mode: train\nname: valid-run\ntask: detect\nepochs: 3\nbatch: 2\nimgsz: 320\nworkers: 1\n",
+        encoding="utf-8",
+    )
+    engine = create_engine(f"sqlite:///{tmp_path / 'imports.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    monkeypatch.setattr(services_module, "ULTRALYTICS_ROOT", ultralytics_root)
+    monkeypatch.setattr(services_module, "SessionLocal", session_factory)
+
+    assert import_existing_runs() == 1
+    with session_factory() as db:
+        tasks = db.scalars(select(TrainingTask)).all()
+        assert len(tasks) == 1
+        assert tasks[0].name == "valid-run"
 
 
 def test_resume_checkpoint_and_command(tmp_path: Path):
@@ -728,6 +1066,32 @@ def test_permanent_delete_rejects_outside_run_directory(tmp_path: Path, monkeypa
         assert "允许的删除范围" in str(error)
     else:
         raise AssertionError("outside run directory should be rejected")
+
+
+def test_permanent_delete_unlinks_top_level_symlink_without_following_target(tmp_path: Path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    runtime_root = tmp_path / "runtime"
+    outside = tmp_path / "outside-training-data"
+    outside.mkdir()
+    protected = outside / "keep.pt"
+    protected.write_bytes(b"must remain")
+    run_link = runs_root / "detect" / "task-symlink" / "attempt-001"
+    run_link.parent.mkdir(parents=True)
+    run_link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(services_module, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", runtime_root)
+    task = make_task("task-symlink", run_dir=str(run_link))
+    task.runs = [TrainingRun(
+        id="run-symlink", task_id=task.id, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_link), parameter_snapshot={},
+    )]
+
+    deleted = permanently_delete_task_files(task)
+
+    assert str(run_link) in deleted
+    assert not run_link.exists()
+    assert not run_link.is_symlink()
+    assert protected.read_bytes() == b"must remain"
 
 
 def test_soft_delete_filters_task_list_and_restore(tmp_path: Path, monkeypatch):

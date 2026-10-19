@@ -194,13 +194,17 @@ export function ExperimentCompare() {
     try {
       const taskList = await api.tasks(controller.signal)
       const runLists = await Promise.all(taskList.map(async (task) => [task, await api.runs(task.id, controller.signal)] as const))
-      const items = runLists.flatMap(([task, runs]) => {
-        const run = runs.find((item) => item.id === task.current_run_id) || runs[0]
-        return run ? [{ id: run.id, task, run, view: runView(task, run) }] : []
-      })
+      const items = runLists.flatMap(([task, runs]) => [...runs]
+        .sort((left, right) => right.attempt_number - left.attempt_number)
+        .map((run) => ({ id: run.id, task, run, view: runView(task, run) })))
       if (version !== requestVersion.current) return
       setExperiments(items)
-      const normalizedIds = selectedIds.map((id) => items.find((item) => item.id === id)?.id || items.find((item) => item.task.id === id && item.id === item.task.current_run_id)?.id).filter(Boolean) as string[]
+      const normalizedIds = selectedIds.map((id) => {
+        const exactRun = items.find((item) => item.id === id)
+        if (exactRun) return exactRun.id
+        const taskRuns = items.filter((item) => item.task.id === id)
+        return taskRuns.find((item) => item.id === item.task.current_run_id)?.id || taskRuns[0]?.id
+      }).filter(Boolean) as string[]
       const limitedIds = normalizedIds.slice(0, compareLimit)
       if (limitedIds.join(',') !== selectedIds.join(',')) setSelectedIds(limitedIds)
       const selectedItems = limitedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
@@ -275,7 +279,13 @@ export function ExperimentCompare() {
     })),
   }), [selected, metrics, metricKey])
 
-  const filteredExperiments = experiments.filter((item) => item.task.name.toLowerCase().includes(search.toLowerCase()) || item.view.model_path.toLowerCase().includes(search.toLowerCase()) || `attempt ${item.run.attempt_number}`.includes(search.toLowerCase()))
+  const filteredExperiments = experiments.filter((item) => {
+    const keyword = search.trim().toLowerCase()
+    return item.task.name.toLowerCase().includes(keyword)
+      || item.view.model_path.toLowerCase().includes(keyword)
+      || `attempt ${item.run.attempt_number}`.includes(keyword)
+      || `a${String(item.run.attempt_number).padStart(3, '0')}`.includes(keyword)
+  })
   const experimentCount = Math.max(selected.length, 1)
   const experimentLayout = {
     '--experiment-count': experimentCount,
@@ -284,19 +294,19 @@ export function ExperimentCompare() {
   } as React.CSSProperties
 
   return <div className="page compare-page" style={experimentLayout}>
-    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较不同任务当前运行的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择任务 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
+    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较任意历史 Attempt 的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择运行 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
     {pickerOpen && <div className="compare-picker">
-      <header><div><strong>选择参与对比的训练任务</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；每个任务使用当前运行</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
-      <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务或模型" /></div>
-      <div className="compare-picker-list">{filteredExperiments.map((item) => { const checked = selectedIds.includes(item.id); return <button key={item.id} onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个任务` : undefined}><i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i><span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span><em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em></button> })}</div>
+      <header><div><strong>选择参与对比的训练运行</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；可选择每个任务的任意历史 Attempt</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
+      <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务、模型或 Attempt" /></div>
+      <div className="compare-picker-list">{filteredExperiments.map((item) => { const checked = selectedIds.includes(item.id); return <button key={item.id} onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个运行` : undefined}><i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i><span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span><em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em></button> })}</div>
     </div>}
     {error && <div className="alert error">{error}</div>}
-    {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练任务</strong><span>{compareLimit === 2 ? '请选择 2 个任务' : `可同时选择 2～${compareLimit} 个任务`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练任务</button></div> : <>
-      {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个不同任务才能对比</strong><span>当前只有一个任务，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}
+    {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练运行</strong><span>{compareLimit === 2 ? '请选择 2 个运行' : `可同时选择 2～${compareLimit} 个运行`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练运行</button></div> : <>
+      {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个训练运行才能对比</strong><span>当前只有一个运行，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}
       <section className={`selected-experiments${selected.length > 4 ? ' many' : ''}`}>{selected.map((item, index) => <article key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><button onClick={() => setSelection(selectedIds.filter((id) => id !== item.id))}><X size={14} /></button><span>ATTEMPT {String(item.run.attempt_number).padStart(3, '0')} · {item.run.launch_mode.toUpperCase()}</span><h3>{item.task.name}</h3><p>{item.view.model_path.split('/').pop()} · {item.view.task_type}</p><div><i style={{ width: `${item.view.progress}%` }} /></div><footer><strong>{metricValue(item.view, ['metrics/mAP50(B)'])}</strong><small>mAP50</small><strong>{Math.round(item.view.progress)}%</strong><small>进度</small></footer></article>)}</section>
       {selected.length >= 2 && <>
       <section className="compare-panel metric-summary-panel">
-        <header><div><Activity size={17} /><div><h2>实验指标对比</h2><span>每列对应一个任务的当前运行，颜色与下方曲线一致</span></div></div><div className="metric-summary-controls"><label>指标口径<select aria-label="指标口径" value={evaluationMode} onChange={(event) => setEvaluationMode(event.target.value as 'latest' | 'best')}><option value="latest">最新指标</option><option value="best">最佳轮次指标</option></select></label><span className="metric-run-count">{selected.length} 个任务</span></div></header>
+        <header><div><Activity size={17} /><div><h2>实验指标对比</h2><span>每列对应一个已选 Attempt，颜色与下方曲线一致</span></div></div><div className="metric-summary-controls"><label>指标口径<select aria-label="指标口径" value={evaluationMode} onChange={(event) => setEvaluationMode(event.target.value as 'latest' | 'best')}><option value="latest">最新指标</option><option value="best">最佳轮次指标</option></select></label><span className="metric-run-count">{selected.length} 个运行</span></div></header>
         <div className="metric-summary-notes">
           <p>{evaluationMode === 'latest' ? '最新指标截至各实验已记录的训练轮次。' : '最佳轮次按各实验历史最高 mAP50-95 选取，以下六项指标均来自该轮；缺少 mAP50-95 时显示暂无数据。'} mAP50-95 为主要效果参考；训练 Loss 和累计耗时不参与效果排名。</p>
           {comparisonEnabled && <><p>差值相对于基准实验；同数据集配置仍需确认验证集版本、类别与评估条件一致。颜色表示数值差异，小幅变化不代表显著改善。</p><div className="metric-comparison-legend"><span className="improved"><ArrowUp size={12} />改善</span><span className="regressed"><ArrowDown size={12} />下降</span><span><Minus size={12} />持平 / 仅展示差值</span><span><Trophy size={12} />本行有效数据最优</span></div></>}

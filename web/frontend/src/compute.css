@@ -126,3 +126,23 @@ body:has(.compute-page) { min-width: 0; }
 :root[data-theme='dark'] .process-table th { color: #9dacb7; background: #1c2a36; }
 :root[data-theme='dark'] .process-table td, :root[data-theme='dark'] .host-panel dd { color: #c2ced6; }
 :root[data-theme='dark'] .host-name { color: #8cebc5; border-color: #3b4e5a; background: #16212b; }
+
+.node-identity em,
+.node-meta,
+.auto-refresh,
+.compute-overview span,
+.compute-overview small,
+.compute-empty span,
+.compute-empty small,
+.gpu-card header span,
+.gpu-card header em,
+.gpu-bars small,
+.compute-panel header span strong,
+.compute-panel header span small,
+.compute-panel header em,
+.host-name small,
+.host-name strong,
+.host-panel dt,
+.host-panel dd {
+  font-size: 11px;
+}

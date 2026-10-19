@@ -118,3 +118,26 @@ body:has(.compare-page) { min-width: 0; }
 @media (max-width: 600px) {
   .compare-picker { position: relative; top: auto; right: auto; width: 100%; margin: -10px 0 20px; }
 }
+
+.selection-count,
+.compare-picker > header span,
+.picker-done,
+.compare-picker-search input,
+.compare-picker-list strong,
+.compare-picker-list small,
+.compare-empty span,
+.compare-notice strong,
+.compare-notice span,
+.selected-experiments article > span,
+.selected-experiments p,
+.selected-experiments footer strong,
+.selected-experiments footer small,
+.compare-panel header span,
+.compare-panel header select,
+.comparison-table th,
+.comparison-table td,
+.comparison-table td em,
+.metric-best-badge,
+.metric-comparison-table .metric-direction {
+  font-size: 11px;
+}

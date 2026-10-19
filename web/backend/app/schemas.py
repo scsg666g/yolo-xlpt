@@ -18,14 +18,19 @@ class TaskCreate(BaseModel):
     imgsz: int = Field(default=640, ge=32, le=4096)
     device: str = "0"
     workers: int = Field(default=8, ge=0, le=64)
-    optimizer: str = Field(default="auto", max_length=40)
+    optimizer: str = Field(default="auto", min_length=1, max_length=40)
     patience: int = Field(default=50, ge=0, le=10000)
-    lr0: float | None = Field(default=None, gt=0, le=1)
+    lr0: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
     pretrained: bool = True
     cache: bool | str = False
     amp: bool = True
     close_mosaic: int = Field(default=10, ge=0, le=1000)
     advanced: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("name", "optimizer", mode="before")
+    @classmethod
+    def strip_required_text(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("device")
     @classmethod
@@ -36,7 +41,10 @@ class TaskCreate(BaseModel):
         parts = value.split(",")
         if not parts or any(not part.strip().isdigit() for part in parts):
             raise ValueError("device 必须是 cpu、mps 或逗号分隔的 GPU 编号")
-        return ",".join(part.strip() for part in parts)
+        normalized = [str(int(part.strip())) for part in parts]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("device 不能包含重复的 GPU 编号")
+        return ",".join(normalized)
 
 
 class LayoutUpdate(BaseModel):
@@ -68,6 +76,11 @@ class TaskConfigUpdate(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     custom_config: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("optimizer", mode="before")
+    @classmethod
+    def strip_optimizer(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
     @field_validator("device")
     @classmethod
     def validate_device(cls, value: str) -> str:
@@ -77,7 +90,10 @@ class TaskConfigUpdate(BaseModel):
         parts = value.split(",")
         if not parts or any(not part.strip().isdigit() for part in parts):
             raise ValueError("device 必须是 cpu、mps 或逗号分隔的 GPU 编号")
-        return ",".join(part.strip() for part in parts)
+        normalized = [str(int(part.strip())) for part in parts]
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("device 不能包含重复的 GPU 编号")
+        return ",".join(normalized)
 
 
 class TaskResourceUpdate(BaseModel):

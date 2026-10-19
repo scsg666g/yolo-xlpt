@@ -18,8 +18,15 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
-from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, RUNS_ROOT, WEB_ROOT
-from .compute_nodes import as_utc, ensure_local_node, local_snapshot, remote_trace_root, router as compute_nodes_router
+from .config import DATASET_ROOTS, MODEL_ROOTS, PLATFORM_INSTANCE_NAME, PLATFORM_VERSION, RUNS_ROOT, WEB_ROOT
+from .compute_nodes import (
+    as_utc,
+    ensure_local_node,
+    local_snapshot,
+    remote_trace_root,
+    remote_training_unavailable_reason,
+    router as compute_nodes_router,
+)
 from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .dataset_uploads import (
     cleanup_managed_dataset_workdirs,
@@ -36,7 +43,7 @@ from .inference import (
 )
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete
-from .parameter_catalog import load_parameter_catalog
+from .parameter_catalog import is_finite_number, load_parameter_catalog, validate_parameter_values
 from .remote_operations import (
     active_remote_delete,
     matching_fetch,
@@ -124,7 +131,7 @@ async def lifespan(_: FastAPI):
         scheduler.stop()
 
 
-app = FastAPI(title="YOLO 模型训练平台", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="YOLO 模型训练平台", version=PLATFORM_VERSION, lifespan=lifespan)
 app.include_router(dataset_upload_router)
 app.include_router(dataset_management_router)
 app.include_router(inference_router)
@@ -197,6 +204,12 @@ def reject_unsupported_remote_parameters(node: ComputeNode | None, config: dict,
         )
 
 
+def reject_unavailable_remote_training(node: ComputeNode | None, status_code: int) -> None:
+    reason = remote_training_unavailable_reason(node)
+    if reason:
+        raise HTTPException(status_code, f"远程 Agent 当前不可训练：{reason}")
+
+
 @app.get("/api/health")
 def health():
     started = time.perf_counter()
@@ -206,14 +219,27 @@ def health():
     except Exception as exc:
         logger.warning("health_database_error error=%s", type(exc).__name__)
         raise HTTPException(503, "数据库暂不可用") from exc
-    scheduler_status = "running" if scheduler._thread and scheduler._thread.is_alive() else "stopped"
+    scheduler_running = bool(
+        getattr(scheduler, "is_alive", False)
+        or (getattr(scheduler, "_thread", None) and scheduler._thread.is_alive())
+    )
+    scheduler_error = getattr(scheduler, "active_error", None)
+    scheduler_status = "error" if scheduler_running and scheduler_error else "running" if scheduler_running else "stopped"
+    scheduler_last_error = getattr(scheduler, "last_error", None)
+    scheduler_last_error_at = getattr(scheduler, "last_error_at", None)
+    if hasattr(scheduler_last_error_at, "isoformat"):
+        scheduler_last_error_at = scheduler_last_error_at.isoformat()
     deletion_status = "running" if local_deletion_worker.is_alive else "stopped"
     inference_status = "running" if inference_worker.is_alive else "stopped"
     return {"status": "ok" if all(status == "running" for status in (
                 scheduler_status, deletion_status, inference_status,
             )) else "degraded",
             "instance": PLATFORM_INSTANCE_NAME,
+            "version": PLATFORM_VERSION,
             "scheduler": scheduler_status,
+            "scheduler_error": scheduler_error,
+            "scheduler_last_error": scheduler_last_error,
+            "scheduler_last_error_at": scheduler_last_error_at,
             "local_deletion_worker": deletion_status,
             "inference_worker": inference_status,
             "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
@@ -276,11 +302,7 @@ def update_task_order(payload: TaskOrderUpdate, db: Session = Depends(get_db)):
 def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
     node = db.get(ComputeNode, payload.execution_node_id) if payload.execution_node_id else None
     if payload.execution_node_id:
-        if not node or node.kind != "agent" or not node.enabled:
-            raise HTTPException(422, "请选择已启用的远程 Agent 服务器")
-        capability = (node.snapshot or {}).get("training")
-        if capability and not capability.get("ready"):
-            raise HTTPException(422, f"远程 Agent 当前不可训练：{capability.get('reason') or '训练能力未就绪'}")
+        reject_unavailable_remote_training(node, 422)
     guard = nullcontext() if node else managed_dataset_mutation()
     with guard:
         if node:
@@ -302,7 +324,14 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
         if node:
             config["remote_output_root"] = payload.remote_output_root.strip()
         supported_keys = editable_training_keys()
-        config.update({key: value for key, value in payload.advanced.items() if key in supported_keys})
+        unknown = set(payload.advanced) - supported_keys
+        if unknown:
+            raise HTTPException(422, f"包含不支持的参数：{', '.join(sorted(unknown))}")
+        try:
+            validate_parameter_values(payload.advanced)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        config.update(payload.advanced)
         if node:
             reject_unsupported_remote_parameters(node, config)
         task = TrainingTask(
@@ -343,7 +372,9 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
     if task.status != "draft":
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
     if task.execution_node_id:
-        reject_unsupported_remote_parameters(db.get(ComputeNode, task.execution_node_id), task.config, 409)
+        node = db.get(ComputeNode, task.execution_node_id)
+        reject_unavailable_remote_training(node, 409)
+        reject_unsupported_remote_parameters(node, task.config, 409)
     else:
         if not Path(task.model_path).exists() or not Path(task.data_path).exists():
             raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
@@ -363,11 +394,17 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     if task.status not in {"stopped", "interrupted"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
+    previous = current_run(db, task)
+    previous_epochs = (previous.parameter_snapshot or {}).get("epochs") if previous else None
+    if previous and (
+        (previous_epochs is not None and task.epochs != previous_epochs)
+        or task.data_path != previous.data_path
+    ):
+        raise HTTPException(409, "断点续训沿用上一 Attempt 的总轮数和数据集，请恢复原配置或选择重新训练")
     if task.execution_node_id:
-        reject_unsupported_remote_parameters(db.get(ComputeNode, task.execution_node_id), task.config, 409)
-        previous = current_run(db, task)
-        if previous and (task.epochs != previous.parameter_snapshot.get("epochs") or task.data_path != previous.data_path):
-            raise HTTPException(409, "断点续训沿用检查点的总轮数和数据集，请恢复原配置或选择重新训练")
+        node = db.get(ComputeNode, task.execution_node_id)
+        reject_unavailable_remote_training(node, 409)
+        reject_unsupported_remote_parameters(node, task.config, 409)
         checkpoint_artifact = db.scalar(select(Artifact).where(
             Artifact.run_id == previous.id, Artifact.name == "weights/last.pt", Artifact.size > 0,
         )) if previous else None
@@ -389,7 +426,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     if task.epochs <= task.completed_epochs:
         if task.execution_node_id:
             raise HTTPException(409, f"断点已经完成全部 {task.completed_epochs} 个 Epoch，请选择重新训练")
-        raise HTTPException(409, f"断点已经完成 {task.completed_epochs} 个 Epoch，请增加训练轮数或选择重新训练")
+        raise HTTPException(409, f"断点已经完成全部 {task.completed_epochs} 个 Epoch，请选择重新训练")
     run = create_training_run(db, task, "resume", checkpoint)
     add_event(
         db,
@@ -410,7 +447,9 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
     if task.status not in {"failed", "stopped", "interrupted", "completed"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能重新训练")
     if task.execution_node_id:
-        reject_unsupported_remote_parameters(db.get(ComputeNode, task.execution_node_id), task.config, 409)
+        node = db.get(ComputeNode, task.execution_node_id)
+        reject_unavailable_remote_training(node, 409)
+        reject_unsupported_remote_parameters(node, task.config, 409)
     else:
         try:
             validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
@@ -680,6 +719,10 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
     unknown = set(payload.config) - supported_keys
     if unknown:
         raise HTTPException(422, f"包含不支持的参数：{', '.join(sorted(unknown))}")
+    try:
+        validate_parameter_values(payload.config)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     if len(payload.custom_config) > 30:
         raise HTTPException(422, "自定义参数最多添加 30 项")
     for key, value in payload.custom_config.items():
@@ -687,7 +730,11 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
             raise HTTPException(422, f"自定义参数名不合法：{key}")
         if key in RESERVED_CUSTOM_KEYS or key in supported_keys:
             raise HTTPException(422, f"参数 {key} 由平台或预设参数管理，不能自定义覆盖")
-        if not isinstance(value, (str, int, float, bool)) or isinstance(value, str) and len(value) > 500:
+        if (
+            not isinstance(value, (str, int, float, bool))
+            or isinstance(value, str) and len(value) > 500
+            or isinstance(value, (int, float)) and not isinstance(value, bool) and not is_finite_number(value)
+        ):
             raise HTTPException(422, f"自定义参数 {key} 的值必须是布尔、数字或短文本")
     task.epochs = payload.epochs
     task.batch = payload.batch

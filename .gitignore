@@ -172,6 +172,8 @@ weights/
 !web/frontend/src/api.ts
 !web/frontend/src/preferences.ts
 !web/frontend/src/types.ts
+!web/frontend/src/env.d.ts
+!web/frontend/src/useModalFocus.ts
 !web/frontend/vite.config.ts
 *.pb
 *.onnx

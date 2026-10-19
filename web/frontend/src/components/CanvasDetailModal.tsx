@@ -1,8 +1,9 @@
-import { useEffect, useMemo } from 'react'
+import { useMemo } from 'react'
 import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
 import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, ScanEye, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
+import { useModalFocus } from '../useModalFocus'
 import { LineChartView } from './LineChart'
 
 export type CanvasDetailKind = 'runtime' | 'status' | 'metrics' | 'artifacts' | 'weights'
@@ -215,19 +216,16 @@ function WeightsDetails({ artifacts, effectiveBestWeight, task, run, onTest, tes
 }
 
 export function CanvasDetailModal({ kind, task, run, metrics, artifacts, effectiveBestWeight, events, onClose, onTest, testDisabledReason }: Props) {
-  useEffect(() => {
-    if (!kind) return
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [kind, onClose])
+  const dialogRef = useModalFocus<HTMLDivElement>(Boolean(kind), onClose, {
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
 
   if (!kind) return null
   const meta = detailMeta[kind]
   const Icon = meta.icon
   return <div className="modal-backdrop canvas-detail-backdrop" onMouseDown={onClose}>
-    <div className={`modal canvas-detail-modal detail-${kind}`} role="dialog" aria-modal="true" aria-labelledby="canvas-detail-title" style={{ '--detail-accent': meta.accent } as React.CSSProperties} onMouseDown={(event) => event.stopPropagation()}>
-      <header><div className="modal-heading"><div className="heading-icon canvas-detail-icon"><Icon size={19} /></div><div><span className="eyebrow">{meta.eyebrow}</span><h2 id="canvas-detail-title">{meta.title}</h2><p>{task.name}{run ? ` · Attempt ${String(run.attempt_number).padStart(3, '0')}` : ''}</p></div></div><button className="icon-button" title="关闭" aria-label="关闭详情弹窗" onClick={onClose}><X size={20} /></button></header>
+    <div ref={dialogRef} className={`modal canvas-detail-modal detail-${kind}`} role="dialog" aria-modal="true" aria-labelledby="canvas-detail-title" tabIndex={-1} style={{ '--detail-accent': meta.accent } as React.CSSProperties} onMouseDown={(event) => event.stopPropagation()}>
+      <header><div className="modal-heading"><div className="heading-icon canvas-detail-icon"><Icon size={19} /></div><div><span className="eyebrow">{meta.eyebrow}</span><h2 id="canvas-detail-title">{meta.title}</h2><p>{task.name}{run ? ` · Attempt ${String(run.attempt_number).padStart(3, '0')}` : ''}</p></div></div><button className="icon-button" data-modal-initial-focus title="关闭" aria-label="关闭详情弹窗" onClick={onClose}><X size={20} /></button></header>
       <div className="canvas-detail-body">
         {kind === 'runtime' && <RuntimeDetails task={task} run={run} />}
         {kind === 'status' && <StatusDetails task={task} run={run} events={events} />}

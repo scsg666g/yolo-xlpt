@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -39,6 +40,7 @@ def test_health_reports_each_core_worker(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ok"
+    assert payload["version"] == main_module.PLATFORM_VERSION
     assert payload["database"] == "ok"
     assert payload["scheduler"] == "running"
     assert payload["local_deletion_worker"] == "running"
@@ -65,6 +67,33 @@ def test_health_reports_degraded_when_a_worker_stops(monkeypatch):
     assert response.status_code == 200
     assert response.json()["status"] == "degraded"
     assert response.json()["inference_worker"] == "stopped"
+
+
+def test_health_reports_active_scheduler_error(monkeypatch):
+    failed_at = datetime(2026, 10, 19, 8, 30, tzinfo=UTC)
+    monkeypatch.setattr(main_module, "engine", _Engine())
+    monkeypatch.setattr(main_module, "scheduler", SimpleNamespace(
+        is_alive=True,
+        active_error="RuntimeError: scheduler failed",
+        last_error="RuntimeError: scheduler failed",
+        last_error_at=failed_at,
+    ))
+    monkeypatch.setattr(main_module, "local_deletion_worker", SimpleNamespace(is_alive=True))
+    monkeypatch.setattr(main_module, "inference_worker", SimpleNamespace(is_alive=True))
+
+    client = TestClient(main_module.app)
+    try:
+        response = client.get("/api/health")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "degraded"
+    assert payload["scheduler"] == "error"
+    assert payload["scheduler_error"] == "RuntimeError: scheduler failed"
+    assert payload["scheduler_last_error"] == "RuntimeError: scheduler failed"
+    assert payload["scheduler_last_error_at"] == failed_at.isoformat()
 
 
 def test_health_returns_service_unavailable_when_database_check_fails(monkeypatch):

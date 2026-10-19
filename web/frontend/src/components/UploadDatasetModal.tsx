@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, LoaderCircle, Upload, X } from 'lucide-react'
 import { api, formatBytes, uploadDatasetFile } from '../api'
 import type { DatasetUploadResult } from '../types'
+import { useModalFocus } from '../useModalFocus'
 import '../upload.css'
 
 interface Props {
@@ -31,6 +32,10 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
   const controller = useRef<AbortController | null>(null)
   const selectionVersion = useRef(0)
   const active = useRef(true)
+  const dialogRef = useModalFocus<HTMLFormElement>(true, onClose, {
+    canClose: !busy,
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
 
   useEffect(() => {
     active.current = true
@@ -140,7 +145,7 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
   }
 
   return <div className="modal-backdrop dataset-upload-backdrop" onMouseDown={() => { if (!busy) onClose() }}>
-    <form className="modal dataset-upload-modal" role="dialog" aria-modal="true" aria-labelledby="dataset-upload-title" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+    <form ref={dialogRef} className="modal dataset-upload-modal" role="dialog" aria-modal="true" aria-labelledby="dataset-upload-title" tabIndex={-1} onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
       <header><div><span className="eyebrow">UPLOAD DATASET</span><h2 id="dataset-upload-title">上传数据集文件夹</h2></div><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭上传窗口"><X size={20} /></button></header>
       <div className="modal-body">
         <p className="upload-intro">保留你选择的文件夹原名，上传后自动生成 data.yaml 并选中该数据集。</p>
@@ -152,7 +157,7 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
           <details><summary>标签示例与文件限制</summary><pre>0 0.5 0.5 0.2 0.3</pre><p>支持 JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF；单张图片最大 256 MB，标签或配置最大 4 MB，总计最大 50 GB / 20 万个文件。第一版仅支持目标检测。</p></details>
         </div>
         <input ref={inputRef} type="file" multiple {...directoryAttributes} hidden disabled={busy} onChange={(event) => { void selectFolder(event.target.files); event.target.value = '' }} aria-label="选择数据集文件夹" />
-        <button type="button" className="upload-folder-picker" disabled={busy} onClick={() => inputRef.current?.click()}><FolderOpen size={26} /><span><strong>{folderName || '选择数据集文件夹'}</strong><small>{files.length ? `${files.length} 个文件 · ${formatBytes(totalBytes)} · 训练 ${trainCount} 张 / 验证 ${valCount} 张` : '点击选择本地文件夹，支持中文目录名'}</small></span><span className="button compact">{folderName ? '重新选择' : '选择文件夹'}</span></button>
+        <button type="button" className="upload-folder-picker" data-modal-initial-focus disabled={busy} onClick={() => inputRef.current?.click()}><FolderOpen size={26} /><span><strong>{folderName || '选择数据集文件夹'}</strong><small>{files.length ? `${files.length} 个文件 · ${formatBytes(totalBytes)} · 训练 ${trainCount} 张 / 验证 ${valCount} 张` : '点击选择本地文件夹，支持中文目录名'}</small></span><span className="button compact">{folderName ? '重新选择' : '选择文件夹'}</span></button>
         {ignoredCount > 0 && <p className="upload-help">已忽略 {ignoredCount} 个隐藏文件、系统文件或缓存文件。</p>}
         {folderName && <p className="upload-help">服务器目录名：<strong>{folderName}</strong>。存在同名目录时会提示，不覆盖已有数据。</p>}
         {destination && <p className="upload-destination">data.yaml 中的 path：<code>{destination}</code></p>}

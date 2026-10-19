@@ -48,3 +48,40 @@
 :root[data-theme='light'] .parameter-picker-menu { border-color: #cbd9e1; background: #fff; box-shadow: 0 14px 35px rgba(42,67,81,.14); }:root[data-theme='light'] .parameter-picker-menu > label { color: #6c8290; border-color: #dce6eb; background: #f5f8fa; }:root[data-theme='light'] .parameter-picker-menu > label input { color: #294554; }:root[data-theme='light'] .parameter-picker-menu > div > button:hover { color: #087e61; background: #eaf6f2; }:root[data-theme='light'] .parameter-picker-menu > div > button strong { color: #355263; }:root[data-theme='light'] .parameter-picker-menu > div > button code { color: #718793; }
 :root[data-theme='light'] .import-summary > span { color: #627987; border-color: #d7e2e8; background: #f5f8fa; }:root[data-theme='light'] .import-summary strong { color: #294758; }:root[data-theme='light'] .import-summary .supported { color: #087e61; border-color: #b9dacc; background: #edf8f4; }:root[data-theme='light'] .import-summary .supported strong { color: #087e61; }:root[data-theme='light'] .import-summary .excluded { color: #946400; border-color: #ead2aa; background: #fff8e9; }:root[data-theme='light'] .import-summary .excluded strong { color: #946400; }
 :root[data-theme='light'] .import-diagnostic + .import-diagnostic { border-color: #e2e9ed; }:root[data-theme='light'] .import-diagnostic.selected { background: #edf8f4; }:root[data-theme='light'] .import-diagnostic > span strong { color: #294758; }:root[data-theme='light'] .import-diagnostic > span code, :root[data-theme='light'] .import-diagnostic > span small { color: #6c8290; }:root[data-theme='light'] .import-diagnostic > div em { color: #355263; }:root[data-theme='light'] .import-diagnostic > div b { color: #607684; background: #edf3f6; }:root[data-theme='light'] .import-diagnostic.supported > div b { color: #087e61; background: #daf0e8; }:root[data-theme='light'] .import-diagnostic.context > div b { color: #3473bd; background: #e7f0fb; }:root[data-theme='light'] .import-diagnostic.deprecated > div b, :root[data-theme='light'] .import-diagnostic.unknown > div b { color: #946400; background: #fff0cd; }:root[data-theme='light'] .import-diagnostic.invalid > div b { color: #b94046; background: #fdecee; }
+
+/* Parameter editing is information-dense, but helper text must remain legible. */
+.custom-title strong,
+.custom-title span,
+.custom-add-row input,
+.custom-add-row select,
+.custom-add-row .button,
+.custom-help,
+.batch-import-button,
+.json-preview-button,
+.parameter-import-modal header p,
+.parameter-import-body textarea,
+.detected-toolbar strong,
+.detected-toolbar button,
+.detected-list strong,
+.detected-list code,
+.detected-list em,
+.detected-empty,
+.import-summary > span,
+.import-diagnostic > span strong,
+.import-diagnostic > span code,
+.import-diagnostic > span small,
+.import-diagnostic > div em,
+.import-diagnostic > div b,
+.parameter-import-modal > footer span,
+.parameter-json-modal header p,
+.parameter-json-body pre,
+.parameter-json-modal > footer span,
+.parameter-picker > button,
+.parameter-picker > button strong,
+.parameter-picker > button code,
+.parameter-picker-menu > label input,
+.parameter-picker-menu > div > button strong,
+.parameter-picker-menu > div > button code,
+.parameter-picker-menu > div > p {
+  font-size: 11px;
+}

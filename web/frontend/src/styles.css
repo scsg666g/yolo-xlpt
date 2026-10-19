@@ -4,6 +4,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 1180px; min-height: 100vh; background: radial-gradient(circle at 80% -10%, #132b2a 0, transparent 31%), var(--bg); }
 body:has(.dashboard-page) { min-width: 0; }
+body:has(.canvas-page) { min-width: 0; }
 button, input, select { font: inherit; }
 button { color: inherit; }
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 224px minmax(0, 1fr); }
@@ -114,6 +115,16 @@ button { color: inherit; }
   .log-modal *, .log-modal *::after { animation: none !important; scroll-behavior: auto; }
 }
 @media (max-width: 1600px) { .canvas-toolbar { gap: 8px; flex-wrap: wrap; padding: 7px 12px; }.canvas-page { grid-template-rows: auto 1fr; }.canvas-state { font-size: 8px; }.canvas-heartbeat { margin-left: auto; }.canvas-actions { margin-left: auto; }.attempt-picker { min-width: 180px; } }
+
+@media (min-width: 761px) and (max-width: 1179px) {
+  .canvas-toolbar { min-width: 0; align-content: center; }
+  .canvas-title { min-width: 0; flex: 1 1 190px; }
+  .canvas-title > div { min-width: 0; }
+  .attempt-picker { min-width: 0; flex: 1 1 210px; }
+  .canvas-state { flex: 1 1 240px; padding-left: 0; border-left: 0; }
+  .canvas-heartbeat { flex: 0 0 auto; margin-left: 0; }
+  .canvas-actions { width: 100%; margin-left: 0; flex-wrap: wrap; justify-content: flex-end; }
+}
 
 @media (max-width: 1280px) { .page { padding-left: 30px; padding-right: 30px; }.stat-row { grid-template-columns: repeat(2, 1fr); } }
 
@@ -677,3 +688,72 @@ button { color: inherit; }
   .theme-picker button:hover, .sidebar nav a:hover, .icon-text:hover, .button:hover,
   .icon-button:hover, .task-card footer button:hover { transform: none; }
 }
+
+/* Keep operational labels readable without enlarging primary controls. */
+.brand-title .brand-version,
+.theme-picker > span,
+.theme-picker button,
+.status,
+.task-path,
+.progress-heading,
+.metric-strip span,
+.metric-strip strong,
+.task-warning,
+.task-card footer,
+.empty span,
+.form-grid label,
+.canvas-title span,
+.attempt-picker select,
+.canvas-state,
+.canvas-heartbeat,
+.canvas-heartbeat strong,
+.canvas-node header span,
+.node-row,
+.node-row strong,
+.path-value,
+.node-error,
+.node-empty,
+.artifact-list > div,
+.canvas-legend,
+.toast,
+.modal-heading p,
+.parameter-section p,
+.toggle-cluster span,
+.parameter-toggle em,
+.parameter-note,
+.resource-path-label,
+.resource-path-label input,
+.resource-toolbar input,
+.resource-toolbar > span,
+.resource-list strong,
+.resource-list small,
+.resource-list em,
+.resource-empty,
+.trash-modal header p,
+.trash-list article strong,
+.trash-list article span,
+.trash-list article small,
+.trash-modal footer span,
+.log-modal-title span,
+.log-modal-title p,
+.log-live,
+.log-search input,
+.log-search span,
+.auto-scroll,
+.log-tool-row > button,
+.terminal-chrome code,
+.terminal-chrome em,
+.terminal-placeholder small,
+.log-modal > footer span,
+.log-action-message,
+.trace-explain,
+.trace-footer,
+.trace-steps button small,
+.trace-layer-list span,
+.trace-layer-list code,
+.trace-update-head,
+.trace-update-row {
+  font-size: 11px;
+}
+
+.terminal-output { font-size: 11px; }

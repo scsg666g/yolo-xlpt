@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
+import sys
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 
 from sqlalchemy.engine import make_url
@@ -9,6 +12,24 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 WEB_ROOT = BACKEND_ROOT.parent
 SOURCE_PROJECT_ROOT = WEB_ROOT.parent
 PLATFORM_INSTANCE_NAME = os.getenv("PLATFORM_INSTANCE_NAME", SOURCE_PROJECT_ROOT.name).strip()[:80] or SOURCE_PROJECT_ROOT.name
+
+
+def read_platform_version() -> str:
+    """Read the checkout version without depending on the process working directory."""
+    configured = os.getenv("PLATFORM_VERSION", "").strip()
+    if configured:
+        return configured[:40]
+    try:
+        value = (SOURCE_PROJECT_ROOT / "VERSION").read_text(encoding="ascii").strip()
+    except OSError:
+        try:
+            return package_version("yolo-training-platform")
+        except PackageNotFoundError:
+            return "0.0.0"
+    return value[:40] or "0.0.0"
+
+
+PLATFORM_VERSION = read_platform_version()
 
 
 def nonnegative_int_env(name: str, default: int) -> int:
@@ -31,9 +52,25 @@ def project_path(value: str | Path, *, base: Path = SOURCE_PROJECT_ROOT) -> Path
     return (path if path.is_absolute() else base / path).resolve()
 
 
+def resolve_yolo_bin(configured: str | None = None) -> Path:
+    """Locate the YOLO CLI without assuming a server-specific environment path."""
+    value = configured if configured is not None else os.getenv("YOLO_BIN", "")
+    if value.strip():
+        candidate = Path(value.strip()).expanduser()
+        if candidate.is_absolute() or candidate.parent != Path("."):
+            return (candidate if candidate.is_absolute() else PROJECT_ROOT / candidate).resolve()
+        located = shutil.which(value.strip())
+        return Path(located).resolve() if located else (PROJECT_ROOT / candidate).resolve()
+    environment_cli = Path(sys.executable).resolve().with_name("yolo")
+    if environment_cli.is_file():
+        return environment_cli
+    located = shutil.which("yolo")
+    return Path(located).resolve() if located else environment_cli
+
+
 PROJECT_ROOT = project_path(os.getenv("YOLO_PROJECT_ROOT", "."))
 ULTRALYTICS_ROOT = project_path(os.getenv("ULTRALYTICS_ROOT", "ultralytics"), base=PROJECT_ROOT)
-YOLO_BIN = Path(os.getenv("YOLO_BIN", "/data/conda/envs/yolo/bin/yolo")).resolve()
+YOLO_BIN = resolve_yolo_bin()
 NVIDIA_SMI_BIN = os.getenv("NVIDIA_SMI_BIN", "nvidia-smi")
 TRAINING_MKL_THREADING_LAYER = os.getenv("PLATFORM_MKL_THREADING_LAYER", "GNU")
 DATA_ROOT = project_path(os.getenv("PLATFORM_DATA_ROOT", "web/data"), base=PROJECT_ROOT)

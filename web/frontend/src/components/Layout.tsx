@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Activity, Boxes, Check, Cpu, Database, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
-import packageMetadata from '../../package.json'
 import { api } from '../api'
 import {
   COMPARE_LIMIT_DEFAULT,
@@ -29,15 +28,22 @@ function healthIssues(details: PlatformHealth): string[] {
   const issues: string[] = []
   if (details.status !== 'ok') issues.push('服务状态异常')
   if (details.database !== 'ok') issues.push('数据库异常')
-  if (details.scheduler !== 'running') issues.push('训练调度器未运行')
+  if (details.scheduler === 'error') issues.push(details.scheduler_error ? `训练调度器：${details.scheduler_error}` : '训练调度器运行异常')
+  else if (details.scheduler === 'stopped') issues.push('训练调度器未运行')
   if (details.local_deletion_worker !== 'running') issues.push('文件清理服务未运行')
   if (details.inference_worker !== 'running') issues.push('模型测试服务未运行')
   return issues
 }
 
-function workerLabel(status: 'running' | 'stopped' | undefined) {
+function workerLabel(status: 'running' | 'stopped' | 'error' | undefined) {
   if (!status) return '—'
-  return status === 'running' ? '运行中' : '已停止'
+  return status === 'running' ? '运行中' : status === 'error' ? '异常' : '已停止'
+}
+
+function dateTimeLabel(value: string | null | undefined) {
+  if (!value) return ''
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN', { hour12: false })
 }
 
 export function Layout() {
@@ -178,7 +184,7 @@ export function Layout() {
           <div className="brand-copy">
             <div className="brand-title">
               <strong>YOLO Forge</strong>
-              <span className="brand-version" title={`平台版本 ${packageMetadata.version}`}>v{packageMetadata.version}</span>
+              <span className="brand-version" title={`平台版本 ${import.meta.env.VITE_PLATFORM_VERSION}`}>v{import.meta.env.VITE_PLATFORM_VERSION}</span>
             </div>
             <span>训练控制台</span>
           </div>
@@ -225,15 +231,15 @@ export function Layout() {
 
             <div className="parameter-section" style={{ marginTop: 24 }}>
               <h3>实验对比</h3>
-              <p>设置当前浏览器最多同时展示的训练任务数量。</p>
+              <p>设置当前浏览器最多同时展示的训练运行（Attempt）数量。</p>
             </div>
             <div className="compare-limit-setting">
               <div>
-                <strong>最大同时对比任务数</strong>
+                <strong>最大同时对比运行数</strong>
                 <span>允许 {COMPARE_LIMIT_MIN}～{COMPARE_LIMIT_MAX} 个，默认 {COMPARE_LIMIT_DEFAULT} 个</span>
               </div>
               <div className="compare-limit-controls">
-                <div className="number-stepper" aria-label="最大同时对比任务数">
+                <div className="number-stepper" aria-label="最大同时对比运行数">
                   <button type="button" disabled={compareLimitDraft <= COMPARE_LIMIT_MIN} title="减少对比数量" aria-label="减少对比数量" onClick={() => setCompareLimitDraft((value) => Math.max(COMPARE_LIMIT_MIN, value - 1))}><Minus size={15} /></button>
                   <output aria-live="polite">{compareLimitDraft}</output>
                   <button type="button" disabled={compareLimitDraft >= COMPARE_LIMIT_MAX} title="增加对比数量" aria-label="增加对比数量" onClick={() => setCompareLimitDraft((value) => Math.min(COMPARE_LIMIT_MAX, value + 1))}><Plus size={15} /></button>
@@ -244,7 +250,7 @@ export function Layout() {
             </div>
             <div className={`compare-limit-message${storedCompareCount > compareLimitDraft ? ' warning' : ''}`} aria-live="polite">
               {storedCompareCount > compareLimitDraft
-                ? `当前已选择 ${storedCompareCount} 个任务；应用后保留前 ${compareLimitDraft} 个，并移除其余 ${storedCompareCount - compareLimitDraft} 个。`
+                ? `当前已选择 ${storedCompareCount} 个运行；应用后保留前 ${compareLimitDraft} 个，并移除其余 ${storedCompareCount - compareLimitDraft} 个。`
                 : compareLimitDraft === compareLimit ? `当前上限为 ${compareLimit} 个。` : `新上限 ${compareLimitDraft} 个尚未应用。`}
             </div>
 
@@ -260,8 +266,11 @@ export function Layout() {
             </div>
             <div className="form-grid" style={{ marginTop: 18 }}>
               <label>平台实例<input readOnly value={health.details?.instance || '—'} /></label>
+              <label>平台版本<input readOnly value={health.details?.version || import.meta.env.VITE_PLATFORM_VERSION || '—'} /></label>
               <label>数据库延迟<input readOnly value={health.details ? `${health.details.database_latency_ms.toFixed(2)} ms` : '—'} /></label>
               <label className="span-2">训练输出目录<input readOnly title={health.details?.runs_root || ''} value={health.details?.runs_root || '—'} /></label>
+              {health.details?.scheduler_error && <label className="span-2">当前调度错误<input readOnly title={health.details.scheduler_error} value={health.details.scheduler_error} /></label>}
+              {health.details?.scheduler_last_error && health.details.scheduler_last_error !== health.details.scheduler_error && <label className="span-2">最近调度错误<input readOnly title={health.details.scheduler_last_error} value={`${health.details.scheduler_last_error}${health.details.scheduler_last_error_at ? ` · ${dateTimeLabel(health.details.scheduler_last_error_at)}` : ''}`} /></label>}
             </div>
           </div>
           <footer>

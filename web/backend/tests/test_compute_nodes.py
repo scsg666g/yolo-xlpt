@@ -22,12 +22,12 @@ from app.services import create_training_run
 
 
 def sample(gpus=None):
-    return {"agent_version": "1.0.0", "compute": {
+    return {"agent_version": "1.8.0", "compute": {
         "available": bool(gpus), "sampled_at": utcnow().isoformat(), "provider": "NVIDIA" if gpus else None,
         "message": None, "host": {"hostname": "remote-host", "platform": "Linux", "cpu_count": 8,
                                  "memory_total": 16000, "memory_used": 4000, "load_average": [1, 2, 3]},
         "gpus": gpus or [],
-    }}
+    }, "training": {"enabled": True, "ready": True, "supported_parameters": []}}
 
 
 @pytest.fixture
@@ -162,6 +162,45 @@ def test_validation_stale_reports_and_cpu_only_nodes(monitoring_client):
     assert client.post(url, headers=headers(credential), content=b"x" * (monitoring.MAX_REPORT_BYTES + 1)).status_code == 413
 
 
+def test_remote_online_status_uses_center_receive_time_when_agent_clock_lags(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client)
+    with factory() as db:
+        node = db.get(ComputeNode, credential["node"]["id"])
+        node.agent_version = "1.8.0"
+        node.last_seen_at = utcnow()
+        node.snapshot = {
+            "sampled_at": (utcnow() - timedelta(days=2)).isoformat(),
+            "host": {"hostname": "clock-behind"}, "gpus": [],
+            "training": {"enabled": True, "ready": True, "supported_parameters": []},
+        }
+        db.commit()
+    detail = client.get(f"/api/compute/nodes/{credential['node']['id']}").json()
+    assert detail["status"] == "online"
+    assert detail["required_agent_version"] == "1.8.0"
+    assert detail["training_unavailable_reason"] is None
+
+
+def test_serialized_node_uses_platform_training_gate_over_agent_ready_flag(monitoring_client):
+    client, _ = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    report = sample()
+    report["agent_version"] = "1.7.0"
+    assert report["training"]["ready"] is True
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(credential), json=report).status_code == 200
+
+    detail = client.get(f"/api/compute/nodes/{node_id}").json()
+    assert detail["training"]["ready"] is True
+    assert detail["training_unavailable_reason"] == "请将远程 Agent 升级到 1.8.0 或以上版本"
+
+    current = sample()
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(credential), json=current).status_code == 200
+    assert client.get(f"/api/compute/nodes/{node_id}").json()["training_unavailable_reason"] is None
+
+
 def test_agent_download_and_cpu_report_schema(monitoring_client, tmp_path, monkeypatch):
     client, _ = monitoring_client
     response = client.get("/api/compute/agent/download")
@@ -178,7 +217,9 @@ def test_agent_download_and_cpu_report_schema(monitoring_client, tmp_path, monke
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({"center_url": "https://example.com", "node_id": credential["node"]["id"], "token": credential["token"]}))
     os.chmod(config_path, 0o600)
-    assert agent.load_config(config_path)["report_interval_seconds"] == 5
+    loaded = agent.load_config(config_path)
+    assert loaded["report_interval_seconds"] == 5
+    assert loaded["training_cwd"] == str(config_path.parent.resolve())
     os.chmod(config_path, 0o644)
     with pytest.raises(ValueError):
         agent.load_config(config_path)
@@ -219,11 +260,24 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
     assert client.post(poll_url, headers=headers(second)).status_code == 401
     assert client.post(f"/api/compute/nodes/{second['node']['id']}/agent/poll", headers=headers(second)).json()["task"] is None
     blocked = client.post(poll_url, headers=headers(first)).json()
-    assert blocked["task"] is None and blocked["required_agent_version"] == "1.2.0"
+    assert blocked["task"] is None and blocked["required_agent_version"] == "1.8.0"
+    with factory() as db:
+        assert db.get(TrainingRun, run_id).status == "queued"
+    old_report = sample()
+    old_report["agent_version"] = "1.7.0"
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(first), json=old_report).status_code == 200
+    assert client.post(poll_url, headers=headers(first)).json()["required_agent_version"] == "1.8.0"
+    unready_report = sample()
+    unready_report["training"].update(ready=False, reason="output root is read-only")
+    assert client.post(f"/api/compute/nodes/{node_id}/report",
+                       headers=headers(first), json=unready_report).status_code == 200
+    unready = client.post(poll_url, headers=headers(first)).json()
+    assert unready["task"] is None and unready["message"] == "output root is read-only"
     with factory() as db:
         assert db.get(TrainingRun, run_id).status == "queued"
     report = sample()
-    report["agent_version"] = "1.2.0"
+    report["agent_version"] = "1.8.0"
     assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(first), json=report).status_code == 200
     claimed = client.post(poll_url, headers=headers(first)).json()["task"]
     assert claimed["run_id"] == run_id
@@ -232,9 +286,13 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
     assert log_path.parent.parent.parent == Path("/remote/runs/.platform-logs")
     assert log_path.name == "attempt-001.log" and log_path.parent.name == "remote-test"
     assert client.post(poll_url, headers=headers(first)).json()["task"] is None
+    lease = claimed["claim_lease"]
+    confirm_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/confirm"
+    assert client.post(confirm_url, headers=headers(first), json={"lease": lease}).status_code == 200
     update_url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update"
     assert client.post(update_url, headers=headers(second), json={"status": "running"}).status_code == 401
-    update = client.post(update_url, headers=headers(first), json={"status": "running", "pid": 1234,
+    lease_headers = {**headers(first), "X-Training-Lease": lease}
+    update = client.post(update_url, headers=lease_headers, json={"status": "running", "pid": 1234,
         "completed_epochs": 1, "progress": 10, "latest_metrics": {"score": 0.5},
         "metrics": [{"epoch": 1, "values": {"score": 0.5}}], "log_tail": ["epoch 1"]})
     assert update.status_code == 200, update.text
@@ -243,9 +301,10 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
     assert client.post("/api/tasks/remote-test/stop").status_code == 200
     control = client.get(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/control", headers=headers(first))
     assert control.json()["stop"] is True
-    reply = client.post(update_url, headers=headers(first), json={"status": "running", "pid": 1234})
+    reply = client.post(update_url, headers=lease_headers, json={"status": "running", "pid": 1234})
     assert reply.json()["status"] == "stopping" and reply.json()["stop_requested"] is True
-    assert client.post(update_url, headers=headers(first), json={"status": "stopped", "exit_code": -15}).status_code == 200
+    assert client.post(update_url, headers=lease_headers,
+                       json={"status": "stopped", "exit_code": -15}).status_code == 200
     with factory() as db:
         assert db.get(TrainingRun, run_id).status == "stopped"
         assert db.get(TrainingRun, run_id).error_message == "收到平台停止指令，训练进程已停止"
@@ -269,7 +328,7 @@ def test_remote_claim_lease_requires_confirmation(monitoring_client):
         run_id = run.id
         db.commit()
     report = sample()
-    report["agent_version"] = "1.6.0"
+    report["agent_version"] = "1.8.0"
     report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
     assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=report).status_code == 200
     task_payload = client.post(f"/api/compute/nodes/{node_id}/agent/poll", headers=headers(credential)).json()["task"]
@@ -316,7 +375,7 @@ def test_terminal_remote_claim_confirmation_retry_forces_stop(
         db.commit()
 
     report = sample()
-    report["agent_version"] = "1.7.0"
+    report["agent_version"] = "1.8.0"
     report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
     assert client.post(f"/api/compute/nodes/{node_id}/report",
                        headers=headers(credential), json=report).status_code == 200
@@ -360,7 +419,7 @@ def test_remote_task_rejects_parameters_missing_from_agent_capability(monitoring
 
     def report(supported):
         payload = sample()
-        payload["agent_version"] = "1.7.0"
+        payload["agent_version"] = "1.8.0"
         payload["training"] = {
             "enabled": True, "ready": True,
             "supported_parameters": sorted(supported),
@@ -407,7 +466,7 @@ def test_stop_between_remote_claim_and_confirmation_is_idempotent(monitoring_cli
         db.commit()
 
     report = sample()
-    report["agent_version"] = "1.6.0"
+    report["agent_version"] = "1.8.0"
     report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
     assert client.post(f"/api/compute/nodes/{node_id}/report",
                        headers=headers(credential), json=report).status_code == 200
@@ -460,7 +519,7 @@ def test_expired_unconfirmed_stop_releases_remote_node(monitoring_client):
         db.commit()
 
     report = sample()
-    report["agent_version"] = "1.6.0"
+    report["agent_version"] = "1.8.0"
     report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
     assert client.post(f"/api/compute/nodes/{node_id}/report",
                        headers=headers(credential), json=report).status_code == 200
@@ -499,7 +558,7 @@ def test_confirmed_remote_run_can_be_manually_interrupted_after_stop_stalls(moni
         db.commit()
 
     report = sample()
-    report["agent_version"] = "1.7.0"
+    report["agent_version"] = "1.8.0"
     report["training"] = {"enabled": True, "ready": True, "supported_parameters": []}
     assert client.post(f"/api/compute/nodes/{node_id}/report",
                        headers=headers(credential), json=report).status_code == 200

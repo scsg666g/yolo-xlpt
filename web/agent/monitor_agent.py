@@ -30,13 +30,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
 LOGGER = logging.getLogger("yolo-monitor-agent")
 CONFIRM_RETRY_DELAYS = (1, 2, 4, 8)
 ACTIVE_STATE_VERSION = 1
+WORKSPACE_REGISTRY_VERSION = 2
 _YOLO_VERSION_CACHE: dict[tuple[str, int | None], str | None] = {}
 
 
@@ -245,7 +246,7 @@ def _configured_yolo_version(binary: str) -> str | None:
 
 
 def training_lock_occupied(config: dict) -> bool:
-    """Inspect the shared lock without changing its contents."""
+    """Inspect both the legacy configured lock and output-root intention locks."""
     lock_path = Path(config.get("training_lock_file") or Path(config["training_cwd"]) / ".yolo-forge-training.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
@@ -255,9 +256,13 @@ def training_lock_occupied(config: dict) -> bool:
         except BlockingIOError:
             return True
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return False
     finally:
         handle.close()
+    root_locks = acquire_output_root_locks(config)
+    if root_locks is None:
+        return True
+    release_training_lock(root_locks)
+    return False
 
 
 def training_capability(config: dict) -> dict:
@@ -389,7 +394,7 @@ def load_config(path: Path) -> dict:
     if type(trace_enabled) is not bool:
         raise ValueError("enable_training_trace 必须为布尔值")
     yolo_bin = config.get("yolo_bin", "yolo")
-    training_cwd = config.get("training_cwd", "/data/yolo/yolo")
+    training_cwd = config.get("training_cwd", str(path.resolve().parent))
     if not isinstance(yolo_bin, str) or not yolo_bin or not isinstance(training_cwd, str) or not Path(training_cwd).is_absolute():
         raise ValueError("yolo_bin/training_cwd 配置无效")
     cwd_path = Path(training_cwd).resolve(strict=True) if enabled else Path(training_cwd).resolve()
@@ -409,8 +414,36 @@ def load_config(path: Path) -> dict:
             "enable_training_trace": trace_enabled}
 
 
-def acquire_training_lock(config: dict):
-    """Try to reserve this physical training workspace across Agent processes."""
+class LockBundle:
+    """Keep a deterministic set of advisory locks alive as one ownership token."""
+
+    def __init__(self, handles: list, primary=0):
+        self.handles = handles
+        self.primary = primary
+
+    def fileno(self) -> int:
+        return self.handles[self.primary].fileno()
+
+    def filenos(self) -> tuple[int, ...]:
+        return tuple(handle.fileno() for handle in self.handles)
+
+    def close(self) -> None:
+        # Closing without LOCK_UN preserves locks inherited by a training child.
+        for handle in reversed(self.handles):
+            handle.close()
+        self.handles.clear()
+
+
+def _release_lock_handles(handles: list) -> None:
+    for handle in reversed(handles):
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def acquire_training_lock(config: dict, output_roots: list[Path] | None = None):
+    """Reserve the configured workspace and every overlapping output-root scope."""
     lock_path = Path(config.get("training_lock_file") or Path(config["training_cwd"]) / ".yolo-forge-training.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
@@ -420,21 +453,26 @@ def acquire_training_lock(config: dict):
     except BlockingIOError:
         handle.close()
         return None
+    workspace_locks = acquire_output_root_locks(config, output_roots)
+    if workspace_locks is None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+        return None
     handle.seek(0)
     handle.truncate()
     json.dump({"pid": os.getpid(), "node_id": config["node_id"],
                "acquired_at": datetime.now(timezone.utc).isoformat()}, handle)
     handle.flush()
-    return handle
+    return LockBundle([handle, *workspace_locks.handles])
 
 
 def release_training_lock(handle) -> None:
     if handle is None:
         return
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    finally:
-        handle.close()
+    handles = handle.handles if isinstance(handle, LockBundle) else [handle]
+    _release_lock_handles(handles)
+    if isinstance(handle, LockBundle):
+        handle.handles = []
 
 
 def process_holds_training_lock(config: dict, pid: int) -> bool:
@@ -476,6 +514,258 @@ def acquire_agent_instance_lock(config: dict):
                "acquired_at": datetime.now(timezone.utc).isoformat()}, handle)
     handle.flush()
     return handle
+
+
+def configured_training_lock(config: dict) -> Path:
+    return Path(config.get("training_lock_file") or Path(config["training_cwd"]) / ".yolo-forge-training.lock").resolve()
+
+
+def workspace_state_dir(config: dict) -> Path:
+    override = config.get("_workspace_state_dir")
+    if override is not None:
+        directory = Path(override)
+        if not directory.is_absolute():
+            raise ValueError("内部 workspace 状态目录必须是绝对路径")
+    else:
+        configured = os.environ.get("XDG_STATE_HOME")
+        base = Path(configured) if configured else Path.home() / ".local" / "state"
+        if not base.is_absolute():
+            raise ValueError("XDG_STATE_HOME 必须是绝对路径")
+        directory = base / "yolo-forge-agent"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    return directory
+
+
+def workspace_registry_dir(config: dict) -> Path:
+    return workspace_state_dir(config) / "workspaces"
+
+
+def legacy_workspace_registry_dir(config: dict) -> Path:
+    lock_path = configured_training_lock(config)
+    return lock_path.with_name(lock_path.name + ".agents")
+
+
+def workspace_owner_id(config: dict) -> str:
+    return hashlib.sha256(config["node_id"].encode("ascii")).hexdigest()
+
+
+def _normalized_output_roots(values) -> list[Path]:
+    roots = sorted({Path(value).resolve() for value in values}, key=lambda item: (len(item.parts), str(item)))
+    return [root for root in roots if not any(parent == root or parent in root.parents for parent in roots if parent != root)]
+
+
+def configured_output_roots(config: dict) -> list[Path]:
+    values = config.get("training_output_roots") or config.get("allowed_training_roots") or []
+    return _normalized_output_roots(values)
+
+
+def paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
+def _output_lock_requests(roots: list[Path]) -> dict[str, int]:
+    requests: dict[str, int] = {}
+    for root in _normalized_output_roots(roots):
+        current = Path(root.anchor)
+        prefixes = [current]
+        for part in root.parts[1:]:
+            current /= part
+            prefixes.append(current)
+        for prefix in prefixes[:-1]:
+            requests.setdefault(str(prefix), fcntl.LOCK_SH)
+        requests[str(root)] = fcntl.LOCK_EX
+    return requests
+
+
+def acquire_output_root_locks(config: dict, additional_roots: list[Path] | None = None) -> LockBundle | None:
+    """Use hierarchical intention locks so parent/child roots conflict but sibling roots do not."""
+    roots = configured_output_roots(config)
+    if additional_roots:
+        roots = _normalized_output_roots([*roots, *additional_roots])
+    requests = _output_lock_requests(roots)
+    directory = workspace_state_dir(config) / "locks"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    handles = []
+    try:
+        for path, mode in sorted(requests.items()):
+            digest = hashlib.sha256(path.encode("utf-8")).hexdigest()
+            handle = (directory / f"{digest}.lock").open("a+", encoding="utf-8")
+            os.chmod(handle.name, 0o600)
+            try:
+                fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                _release_lock_handles(handles)
+                return None
+            handles.append(handle)
+    except Exception:
+        _release_lock_handles(handles)
+        raise
+    return LockBundle(handles)
+
+
+def _workspace_registry_lock(config: dict):
+    directory = workspace_registry_dir(config)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = workspace_state_dir(config) / ".registry.lock"
+    handle = path.open("a+", encoding="utf-8")
+    os.chmod(path, 0o600)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def _live_agent_configs():
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        pid = int(entry.name)
+        argv = _process_argv(pid)
+        config_path = _agent_config_path(pid, argv)
+        if config_path is None:
+            continue
+        try:
+            if config_path.stat().st_size > 128 * 1024:
+                yield pid, None
+                continue
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            yield pid, payload if isinstance(payload, dict) else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            yield pid, None
+
+
+def _cleanup_legacy_workspace_markers(config: dict) -> None:
+    directory = legacy_workspace_registry_dir(config)
+    if not directory.is_dir():
+        return
+    for path in directory.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("node_id") == config["node_id"]:
+                path.unlink(missing_ok=True)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+
+
+def register_workspace(config: dict) -> Path:
+    """Atomically register this live node without persisting credentials."""
+    current_identity = process_identity(os.getpid())
+    if current_identity is None:
+        raise ValueError("无法确认当前 Agent 进程身份")
+    for _pid, other in _live_agent_configs():
+        if other is not None and other.get("node_id") == config["node_id"]:
+            raise ValueError("同一 node_id 已有另一个 Agent 进程在运行")
+    directory = workspace_registry_dir(config)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    owner = workspace_owner_id(config)
+    path = directory / f"{owner}.json"
+    payload = {
+        "version": WORKSPACE_REGISTRY_VERSION,
+        "owner_id": owner,
+        "node_id": config["node_id"],
+        "training_output_roots": [str(path) for path in configured_output_roots(config)],
+        "process": current_identity,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    guard = _workspace_registry_lock(config)
+    try:
+        for candidate in directory.glob("*.json"):
+            try:
+                existing = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                if candidate == path:
+                    candidate.unlink(missing_ok=True)
+                    continue
+                raise ValueError("共享 workspace 登记文件损坏，已拒绝继续") from None
+            if not isinstance(existing, dict) or existing.get("node_id") != config["node_id"]:
+                continue
+            identity = existing.get("process")
+            if process_identity_matches(identity) and identity.get("pid") != os.getpid():
+                raise ValueError("同一 node_id 已有另一个 Agent 进程在运行")
+            if candidate != path or not process_identity_matches(identity):
+                candidate.unlink(missing_ok=True)
+        _atomic_private_json(path, payload)
+        _cleanup_legacy_workspace_markers(config)
+    finally:
+        release_training_lock(guard)
+    return path
+
+
+def _agent_config_path(pid: int, argv: list[str]) -> Path | None:
+    if not any(Path(argument).name == "monitor_agent.py" for argument in argv):
+        return None
+    raw = None
+    for index, argument in enumerate(argv):
+        if argument == "--config" and index + 1 < len(argv):
+            raw = argv[index + 1]
+            break
+        if argument.startswith("--config="):
+            raw = argument.split("=", 1)[1]
+            break
+    if not raw:
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    try:
+        return (Path(f"/proc/{pid}/cwd").resolve(strict=True) / path).resolve()
+    except OSError:
+        return None
+
+
+def _other_live_agent_conflicts(config: dict, target_roots: list[Path]) -> bool:
+    """Detect older Agents that cannot publish a shared workspace record."""
+    for _pid, other in _live_agent_configs():
+        try:
+            if other is None:
+                return True
+            if not other.get("enable_training", False):
+                continue
+            values = other.get("training_output_roots") or other.get("allowed_training_roots") or []
+            other_roots = _normalized_output_roots(
+                value for value in values if isinstance(value, str) and Path(value).is_absolute()
+            )
+            if not other_roots or any(paths_overlap(target, root) for target in target_roots for root in other_roots):
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            # A visible Agent with an unreadable configuration is an unknown
+            # owner. Refusing deletion is safer than guessing its path scope.
+            return True
+    return False
+
+
+def workspace_delete_conflicts(config: dict, target_roots: list[Path]) -> bool:
+    """Reject deletion when another center owns an overlapping output root."""
+    register_workspace(config)
+    owner = workspace_owner_id(config)
+    directory = workspace_registry_dir(config)
+    guard = _workspace_registry_lock(config)
+    try:
+        for path in directory.glob("*.json"):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if (not isinstance(payload, dict) or payload.get("version") != WORKSPACE_REGISTRY_VERSION or
+                        not isinstance(payload.get("owner_id"), str)):
+                    return True
+                if payload["owner_id"] == owner:
+                    continue
+                if not process_identity_matches(payload.get("process")):
+                    path.unlink(missing_ok=True)
+                    continue
+                values = payload.get("training_output_roots")
+                if not isinstance(values, list) or any(
+                        not isinstance(value, str) or not Path(value).is_absolute() for value in values):
+                    return True
+                other_roots = _normalized_output_roots(values)
+                if any(paths_overlap(target, root) for target in target_roots for root in other_roots):
+                    return True
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return True
+    finally:
+        release_training_lock(guard)
+    return _other_live_agent_conflicts(config, target_roots)
 
 
 def _atomic_private_json(path: Path, payload: dict) -> None:
@@ -766,30 +1056,45 @@ def report_manifest(config: dict, payload: dict) -> None:
 
 
 def delete_remote_files(config: dict, payload: dict) -> None:
-    # Validate the complete plan before deleting the first file. rmtree never follows
-    # directory symlinks inside the owned Attempt; the Attempt itself cannot be one.
-    plans = [operation_paths(config, run, allow_missing_root=True) for run in payload["runs"]]
-    targets = list(plans)
-    protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
-    protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
-    for run_dir, log in targets:
-        if (run_dir.exists() and not run_dir.is_dir()) or (log and log.exists() and not log.is_file()):
-            raise ValueError("Attempt 或日志的文件类型不正确，已拒绝清理")
-        for path in protected:
-            if path == run_dir or run_dir in path.parents or (log and path == log):
-                raise ValueError("任务目录包含仍被引用的模型、数据或训练程序，已拒绝清理")
-    for run_dir, log in targets:
-        if run_dir.exists():
-            if not run_dir.is_dir():
-                raise ValueError("Attempt 路径不是目录")
-            shutil.rmtree(run_dir)
-        if log:
-            log.unlink(missing_ok=True)
-        for parent in {run_dir.parent, log.parent if log else run_dir.parent}:
-            try:
-                parent.rmdir()  # remove empty task directory only
-            except OSError:
-                pass
+    # Serialize deletion with every training process using this workspace. This
+    # also prevents a second Agent from claiming new work during validation.
+    requested_roots = [Path(run["output_root"]).resolve() for run in payload["runs"]]
+    training_lock = acquire_training_lock(config, requested_roots)
+    if training_lock is None:
+        raise ValueError("训练工作区正在使用，已拒绝远程删除；请等待训练结束后重试")
+    try:
+        # Validate the complete plan before deleting the first file. rmtree never
+        # follows directory symlinks inside an owned Attempt.
+        plans = [operation_paths(config, run, allow_missing_root=True) for run in payload["runs"]]
+        targets = list(plans)
+        target_roots = _normalized_output_roots(requested_roots)
+        if workspace_delete_conflicts(config, target_roots):
+            raise ValueError(
+                "检测到另一个 Agent 也登记或正在使用相同训练输出目录，"
+                "为防止跨平台误删已拒绝清理；请为每个平台配置独立的 training_output_roots"
+            )
+        protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
+        protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
+        for run_dir, log in targets:
+            if (run_dir.exists() and not run_dir.is_dir()) or (log and log.exists() and not log.is_file()):
+                raise ValueError("Attempt 或日志的文件类型不正确，已拒绝清理")
+            for path in protected:
+                if path == run_dir or run_dir in path.parents or (log and path == log):
+                    raise ValueError("任务目录包含仍被引用的模型、数据或训练程序，已拒绝清理")
+        for run_dir, log in targets:
+            if run_dir.exists():
+                if not run_dir.is_dir():
+                    raise ValueError("Attempt 路径不是目录")
+                shutil.rmtree(run_dir)
+            if log:
+                log.unlink(missing_ok=True)
+            for parent in {run_dir.parent, log.parent if log else run_dir.parent}:
+                try:
+                    parent.rmdir()  # remove empty task directory only
+                except OSError:
+                    pass
+    finally:
+        release_training_lock(training_lock)
 
 
 def execute_operation(config: dict, operation: dict, stop: threading.Event) -> None:
@@ -915,6 +1220,18 @@ def recent_log_lines(path: Path) -> list[str]:
         return []
 
 
+def recent_log_text(path: Path, maximum_bytes: int = 2 * 1024 * 1024) -> str:
+    """Read a bounded binary tail so durable completion markers survive verbose final validation."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - maximum_bytes))
+            return handle.read(maximum_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
 def save_pending_final(config: dict, run_id: str, payload: dict) -> Path:
     """Keep terminal results on disk until the center acknowledges them; no credentials."""
     if not re.fullmatch(r"[0-9a-f]{32}", run_id):
@@ -937,7 +1254,7 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
     if not re.fullmatch(r"[0-9a-f]{32}", run_id):
         raise ValueError("运行 ID 无效")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("status") not in {"completed", "stopped", "failed"}:
+    if payload.get("status") not in {"completed", "stopped", "failed", "interrupted"}:
         raise ValueError("本地最终状态无效")
     metrics = payload.get("metrics", [])
     batch = dict(payload, metrics=metrics[:256])
@@ -950,7 +1267,7 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
     batch.pop("_claim_lease", None)
     response = (api_json(config, endpoint, "POST", batch, {"X-Training-Lease": lease})
                 if lease else api_json(config, endpoint, "POST", batch))
-    if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed"}:
+    if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed", "interrupted"}:
         save_pending_final(config, run_id, dict(payload, metrics=metrics[256:]))
         return False
     clear_active_run(config, run_id)
@@ -1089,6 +1406,31 @@ def _recovery_identity(state: dict) -> dict | None:
     return matches[0] if matches else None
 
 
+def recovered_natural_exit(task: dict, completed: int, log_lines: list[str]) -> tuple[str, str | None, int | None]:
+    """Classify an orphaned process exit using durable completion evidence."""
+    try:
+        expected = max(1, int(task.get("parameters", {}).get("epochs") or 1))
+    except (TypeError, ValueError):
+        expected = 1
+    if completed >= expected:
+        return "completed", None, 0
+    weights = Path(task["run_dir"]) / "weights"
+    best = weights / "best.pt"
+    last = weights / "last.pt"
+    text = (recent_log_text(Path(task["log_path"])) or "\n".join(log_lines)).lower()
+    completion_markers = ("results saved to", "training complete", "epochs completed in", "earlystopping:")
+    try:
+        weights_complete = (best.is_file() and best.stat().st_size > 0 and
+                            last.is_file() and last.stat().st_size > 0)
+    except OSError:
+        weights_complete = False
+    if weights_complete and any(marker in text for marker in completion_markers):
+        return "completed", None, 0
+    return ("interrupted",
+            "Agent 重启后接管的训练进程已结束，但无法取得原进程退出码；已保留产物供核对",
+            None)
+
+
 def recover_remote_task(config: dict, state: dict, stop: threading.Event, training_lock=None,
                         process_holds_lock: bool = False) -> None:
     """Monitor an orphaned, identity-verified process without starting a duplicate."""
@@ -1123,12 +1465,23 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             clear_active_run(config, run_id)
             return
         if identity is None:
+            completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+            completed = max(completed, task.get("completed_epochs", 0))
+            latest = latest or task.get("latest_metrics", {})
+            log_lines = recent_log_lines(Path(task["log_path"]))
+            requested_stop = bool(control.get("stop"))
+            if requested_stop:
+                status, error, exit_code = "stopped", None, None
+            else:
+                status, error, exit_code = recovered_natural_exit(task, completed, log_lines)
             path = _save_terminal_for_retry(config, task, {
-                "status": "failed", "error_message": "Agent 重启时未找到身份匹配的训练进程，为避免重复训练已终止本次 Attempt",
-                "exit_code": 1, "completed_epochs": task.get("completed_epochs", 0),
-                "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
-                "metrics": [], "log_tail": recent_log_lines(Path(task["log_path"])),
-                "run_dir": task.get("run_dir")})
+                "status": status, "error_message": error, "exit_code": exit_code,
+                "stop_reason": "platform_stop" if requested_stop else None,
+                "completed_epochs": completed,
+                "progress": (100 if status == "completed" else
+                             min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100)),
+                "latest_metrics": latest, "metrics": metrics, "log_tail": log_lines,
+                "command": state.get("command") or [], "run_dir": task.get("run_dir")})
             _deliver_terminal_once(config, path)
             return
         command = state.get("command") or []
@@ -1179,17 +1532,17 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
         completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
         completed = max(completed, task.get("completed_epochs", 0))
         latest = latest or task.get("latest_metrics", {})
+        log_lines = recent_log_lines(Path(task["log_path"]))
         if requested_stop:
             status, error, exit_code = "stopped", None, None
         else:
-            status, exit_code = "failed", 1
-            error = "Agent 重启后已接管训练监控，但无法可靠获取原进程退出码；请检查远程产物后重新训练"
+            status, error, exit_code = recovered_natural_exit(task, completed, log_lines)
         path = _save_terminal_for_retry(config, task, {
             "status": status, "error_message": error, "exit_code": exit_code,
             "stop_reason": stop_reason, "completed_epochs": completed,
-            "progress": min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
+            "progress": 100 if status == "completed" else min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
             "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in sent_epochs],
-            "log_tail": recent_log_lines(Path(task["log_path"])), "command": command,
+            "log_tail": log_lines, "command": command,
             "run_dir": task["run_dir"]})
         _deliver_terminal_once(config, path)
     except Exception:
@@ -1254,9 +1607,11 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             environment = os.environ.copy()
             environment["MKL_THREADING_LAYER"] = "GNU"
             environment["PYTHONUNBUFFERED"] = "1"
+            inherited_locks = (training_lock.filenos() if isinstance(training_lock, LockBundle)
+                               else (training_lock.fileno(),))
             process = subprocess.Popen(command, cwd=config["training_cwd"], env=environment, stdout=log_handle,
                                        stderr=subprocess.STDOUT, text=True, start_new_session=True,
-                                       pass_fds=(training_lock.fileno(),))
+                                       pass_fds=inherited_locks)
             identity = process_identity(process.pid)
             if identity:
                 save_active_run(config, task, "running", command=command, identity=identity)
@@ -1439,6 +1794,11 @@ def main() -> int:
     def finish(code: int) -> int:
         release_training_lock(instance_lock)
         return code
+    try:
+        register_workspace(config)
+    except (OSError, ValueError, TypeError) as exc:
+        LOGGER.error("Agent 实例与共享训练工作区登记失败，已停止启动：%s", exc)
+        return finish(2)
     stop = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
@@ -1447,12 +1807,15 @@ def main() -> int:
     active_training: threading.Thread | None = None
     active_operation: threading.Thread | None = None
     training_stop = threading.Event()
+    last_unready_reason: str | None = None
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
                 "已启用" if config["enable_training"] else "未启用")
     while not stop.is_set():
         try:
             payload = collect(config["nvidia_smi_bin"], config)
             interval = send(config, payload)
+            capability = payload.get("training") or {}
+            training_ready = bool(capability.get("ready"))
             if failures or args.once:
                 LOGGER.info("采样上报成功：GPU %s，进程 %s", len(payload["compute"]["gpus"]),
                             sum(len(gpu["processes"]) for gpu in payload["compute"]["gpus"]))
@@ -1485,7 +1848,13 @@ def main() -> int:
                                                           name="remote-training", daemon=True)
                         active_training.start()
                         LOGGER.info("已识别并接管持有共享锁的训练进程 %s", active_state["run_id"])
+                    elif not active_state and not training_ready:
+                        reason = str(capability.get("reason") or "训练环境未就绪")
+                        if reason != last_unready_reason:
+                            LOGGER.warning("远程训练未就绪，暂停领取新任务：%s", reason)
+                            last_unready_reason = reason
                     else:
+                        last_unready_reason = None
                         training_lock = acquire_training_lock(config)
                         if training_lock is None:
                             stop.wait(min(delay, 5))

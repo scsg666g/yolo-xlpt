@@ -3,6 +3,7 @@ import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompar
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import type { TrainingTask } from '../types'
+import { useModalFocus } from '../useModalFocus'
 import { CreateTaskModal } from './CreateTaskModal'
 import { RenameTaskModal } from './RenameTaskModal'
 
@@ -44,6 +45,10 @@ export function Dashboard() {
   const syncRequest = useRef(false)
   const taskActionRequests = useRef(new Set<string>())
   const navigate = useNavigate()
+  const trashDialogRef = useModalFocus<HTMLDivElement>(trashOpen, () => setTrashOpen(false), {
+    canClose: !deleting,
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
 
   useEffect(() => {
     const controller = new AbortController()
@@ -382,8 +387,8 @@ export function Dashboard() {
         <footer><span>任务当前状态：{statusLabel(deleteTarget.status)}</span><button type="button" className="button ghost" disabled={deleting} onClick={() => setDeleteTarget(null)}>取消</button></footer>
       </div>
     </div>}
-    {trashOpen && <div className="modal-backdrop" onMouseDown={() => !deleting && setTrashOpen(false)}><div className="modal trash-modal" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span className="eyebrow">RECYCLE BIN</span><h2>训练任务回收站</h2><p>共 {trashTasks.length} 条已删除任务</p></div><button type="button" className="icon-button" title="关闭" aria-label="关闭回收站" disabled={deleting} onClick={() => setTrashOpen(false)}>×</button></header>
+    {trashOpen && <div className="modal-backdrop" onMouseDown={() => !deleting && setTrashOpen(false)}><div ref={trashDialogRef} className="modal trash-modal" role="dialog" aria-modal="true" aria-labelledby="trash-modal-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+      <header><div><span className="eyebrow">RECYCLE BIN</span><h2 id="trash-modal-title">训练任务回收站</h2><p>共 {trashTasks.length} 条已删除任务</p></div><button type="button" className="icon-button" data-modal-initial-focus title="关闭" aria-label="关闭回收站" disabled={deleting} onClick={() => setTrashOpen(false)}>×</button></header>
       <div className="trash-list">{operationNotice && <p role="status">{operationNotice}</p>}{trashError && <p className="alert error" role="alert">{trashError}</p>}{trashLoading && !trashTasks.length && <div className="empty">正在加载回收站…</div>}{trashTasks.map((task) => <article key={task.id}><div><strong>{task.name}</strong><span>{task.execution_node_id ? '远程服务器' : '本机服务器'} · {statusLabel(task.status)}</span><small>删除时间：{task.deleted_at ? new Date(task.deleted_at).toLocaleString('zh-CN') : '—'}</small>{task.deleted_reason === 'remote_delete_pending' && <small role="status">等待远程 Agent 清理；离线时保留记录，联网后执行</small>}{task.deleted_reason === 'local_delete_pending' && <small role="status">正在后台清理本机训练文件</small>}{['remote_delete_failed', 'local_delete_failed'].includes(task.deleted_reason || '') && <small role="alert">{task.error_message}</small>}</div><button type="button" className="button ghost compact" disabled={deleting || ['remote_delete_pending', 'remote_delete_failed', 'local_delete_pending', 'local_delete_failed'].includes(task.deleted_reason || '')} onClick={() => void restoreTask(task)}><RotateCcw size={14} />恢复</button><button type="button" className="button danger compact" disabled={deleting || ['remote_delete_pending', 'local_delete_pending'].includes(task.deleted_reason || '')} onClick={() => openDeletion(task, true)}><Trash2 size={14} />{['remote_delete_pending', 'local_delete_pending'].includes(task.deleted_reason || '') ? '清理中' : ['remote_delete_failed', 'local_delete_failed'].includes(task.deleted_reason || '') ? '重试清理' : '永久删除'}</button></article>)}{!trashLoading && !trashTasks.length && <div className="empty">回收站为空</div>}</div>
       <footer><span>移入回收站的任务不会被历史同步重新导入</span><button type="button" className="button ghost" disabled={deleting} onClick={() => setTrashOpen(false)}>关闭</button></footer>
     </div></div>}

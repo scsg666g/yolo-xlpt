@@ -24,7 +24,7 @@ function processRows(gpus: GpuInfo[]): Array<GpuProcess & { gpuIndex: number }> 
   return gpus.flatMap((gpu) => (gpu.processes || []).map((process) => ({ ...process, gpuIndex: gpu.index })))
 }
 
-function ComputeDetails({ data, tasks, remote }: { data: ComputeData; tasks: TrainingTask[]; remote: boolean }) {
+function ComputeDetails({ data, tasks, nodeId }: { data: ComputeData; tasks: TrainingTask[]; nodeId: string }) {
   const processes = useMemo(() => processRows(data?.gpus || []), [data])
   const summary = useMemo(() => {
     const gpus = data?.gpus || []
@@ -75,7 +75,10 @@ function ComputeDetails({ data, tasks, remote }: { data: ComputeData; tasks: Tra
       <section className="compute-lower-grid">
         <article className="compute-panel process-panel">
           <header><div><Activity size={17} /><span><strong>GPU 计算进程</strong><small>来自 nvidia-smi 的实时占用信息</small></span></div><em>{processes.length} 个进程</em></header>
-          {processes.length ? <div className="process-table"><table><thead><tr><th>GPU</th><th>PID</th><th>进程</th><th>关联训练任务</th><th>占用显存</th></tr></thead><tbody>{processes.map((process) => { const task = remote ? undefined : tasks.find((item) => item.pid === process.pid); return <tr key={`${process.gpuIndex}-${process.pid}`}><td>GPU {process.gpuIndex}</td><td className="mono">{process.pid}</td><td>{process.name}</td><td>{task ? <span className="linked-task">{task.name}</span> : <span className="muted-value">{remote ? '暂未关联任务' : '非平台任务'}</span>}</td><td>{memoryLabel(process.memory_used)}</td></tr> })}</tbody></table></div> : <div className="no-process"><Activity size={22} /><span>当前没有 GPU 计算进程</span></div>}
+          {processes.length ? <div className="process-table"><table><thead><tr><th>GPU</th><th>PID</th><th>进程</th><th>关联训练任务</th><th>占用显存</th></tr></thead><tbody>{processes.map((process) => {
+            const task = tasks.find((item) => item.pid === process.pid && (item.execution_node_id || 'local') === nodeId)
+            return <tr key={`${process.gpuIndex}-${process.pid}`}><td>GPU {process.gpuIndex}</td><td className="mono">{process.pid}</td><td>{process.name}</td><td>{task ? <span className="linked-task">{task.name}</span> : <span className="muted-value">{nodeId === 'local' ? '非平台任务' : '暂未关联任务'}</span>}</td><td>{memoryLabel(process.memory_used)}</td></tr>
+          })}</tbody></table></div> : <div className="no-process"><Activity size={22} /><span>当前没有 GPU 计算进程</span></div>}
         </article>
 
         <article className="compute-panel host-panel">
@@ -154,7 +157,7 @@ export function ComputeResources() {
         else errors[ids[index]] = result.reason instanceof Error ? result.reason.message : '服务器详情读取失败'
       })
       setDetails((previous) => ({ ...previous, ...successful })); setDetailErrors(errors)
-      if (ids.includes('local')) {
+      if (ids.length) {
         try { const latest = await api.tasks(current.signal); if (version === requestId.current) setTasks(latest) } catch { /* GPU data remains available. */ }
       }
     } catch (reason) {
@@ -251,6 +254,7 @@ export function ComputeResources() {
     <div className="node-list">{visible.map((node) => {
       const open = expanded.includes(node.id)
       const data = details[node.id]?.compute
+      const trainingUnavailableReason = node.training_unavailable_reason
       return <section className={`node-section ${open ? 'expanded' : ''}`} key={node.id}>
         <div className="node-heading">
           <button className="node-toggle" aria-expanded={open} aria-controls={`node-${node.id}`} onClick={() => toggle(node.id)}>
@@ -266,15 +270,15 @@ export function ComputeResources() {
         </div>
         {open && <div className="node-content" id={`node-${node.id}`}>
           <div className="node-meta"><span>最后接收：{dateLabel(node.last_seen_at)}</span>{node.kind === 'agent' && <span>上报间隔：{node.report_interval_seconds}s · 超过 {node.offline_after_seconds}s 无新数据显示离线</span>}{node.agent_version && <span>Agent v{node.agent_version}</span>}</div>
-          {node.kind === 'agent' && <div className={`node-training-state ${node.training?.ready ? 'ready' : 'not-ready'}`} role="status">
-            <strong>{node.training ? (node.training.ready ? '训练已就绪' : node.training.enabled ? '训练环境未就绪' : '训练未启用') : '训练能力未知'}</strong>
-            <span>{node.training?.reason || (node.training ? '可接受远程训练任务' : '请升级 Agent 至 1.6.0 以上以获取训练能力诊断')}</span>
+          {node.kind === 'agent' && <div className={`node-training-state ${trainingUnavailableReason ? 'not-ready' : 'ready'}`} role="status">
+            <strong>{trainingUnavailableReason ? '暂不可训练' : '训练已就绪'}</strong>
+            <span>{trainingUnavailableReason || '可接受远程训练任务'}</span>
           </div>}
           {node.status === 'offline' && <div className="node-warning">服务器已离线。下方为最后一次采样，当前 GPU 负载和进程状态待确认。</div>}
           {node.status === 'disabled' && <div className="node-warning">监控已禁用，Agent 上报将被拒绝。下方为此前保存的数据。</div>}
           {node.status === 'pending' && <div className="node-info">等待 Agent 接入。点击右侧“接入配置”，在对应服务器启动只读 Agent。</div>}
           {detailErrors[node.id] && <div className="alert error">{detailErrors[node.id]} · 此前采样尚未刷新</div>}
-          {data ? <ComputeDetails data={data} tasks={node.kind === 'local' ? tasks : []} remote={node.kind !== 'local'} />
+          {data ? <ComputeDetails data={data} tasks={tasks} nodeId={node.id} />
             : <div className="node-no-data"><Server size={26} /><span>{details[node.id] ? '这台服务器尚未上报算力数据' : '正在读取服务器详情…'}</span>{node.kind === 'agent' && <button className="button compact" onClick={() => setModal({ node, connect: true })}>查看接入步骤</button>}</div>}
         </div>}
       </section>

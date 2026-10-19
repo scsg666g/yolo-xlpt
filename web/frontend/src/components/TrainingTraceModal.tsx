@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Activity, AlertCircle, Boxes, BrainCircuit, ChevronRight, Image as ImageIcon, Layers3, RefreshCw, Sigma, Sparkles, X, Zap } from 'lucide-react'
 import type { TrainingRun, TrainingTask, TrainingTrace, TrainingTraceSample } from '../types'
 import { api } from '../api'
+import { useModalFocus } from '../useModalFocus'
 
 type Props = { task: TrainingTask; run: TrainingRun | null; open: boolean; onClose: () => void }
 type Step = 'input' | 'network' | 'loss' | 'update'
@@ -68,6 +69,9 @@ export function TrainingTraceModal({ task, run, open, onClose }: Props) {
   const [step, setStep] = useState<Step>('input')
   const [loading, setLoading] = useState(false)
   const runId = run?.id
+  const dialogRef = useModalFocus<HTMLElement>(open, onClose, {
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
 
   const load = useCallback(async () => {
     if (!runId) return
@@ -82,8 +86,8 @@ export function TrainingTraceModal({ task, run, open, onClose }: Props) {
   if (!open) return null
 
   return <div className="modal-backdrop trace-backdrop" onMouseDown={onClose}>
-    <section className="trace-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
-      <header className="trace-header"><div className="modal-heading"><div className="heading-icon trace-heading-icon"><Activity size={19} /></div><div><span className="eyebrow">TRAINING TRACE · REAL BATCH</span><h2>YOLO 训练过程解析</h2><p>{task.name} · {run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '未选择运行'} · 真实采样回放</p></div></div><div className="trace-header-actions"><button className="button ghost compact" onClick={load} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} />刷新采样</button><button className="icon-button" title="关闭" aria-label="关闭训练解析" onClick={onClose}><X size={20} /></button></div></header>
+    <section ref={dialogRef} className="trace-modal" role="dialog" aria-modal="true" aria-labelledby="training-trace-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+      <header className="trace-header"><div className="modal-heading"><div className="heading-icon trace-heading-icon"><Activity size={19} /></div><div><span className="eyebrow">TRAINING TRACE · REAL BATCH</span><h2 id="training-trace-title">YOLO 训练过程解析</h2><p>{task.name} · {run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '未选择运行'} · 真实采样回放</p></div></div><div className="trace-header-actions"><button className="button ghost compact" onClick={load} disabled={loading}><RefreshCw size={14} className={loading ? 'spin' : ''} />刷新采样</button><button className="icon-button" data-modal-initial-focus title="关闭" aria-label="关闭训练解析" onClick={onClose}><X size={20} /></button></div></header>
       {!trace?.available ? <div className="trace-unavailable"><AlertCircle size={25} /><strong>{loading ? '正在读取训练过程…' : '当前运行没有可用的过程采样'}</strong><p>{trace?.reason || '请启动新的本机目标检测训练，并在训练结束或运行中重新打开此卡片。'}</p></div> : <>
         <div className="trace-toolbar"><label><span>采样批次</span><select value={sampleIndex} onChange={(event) => setSampleIndex(Number(event.target.value))}>{samples.map((item, index) => <option key={`${item.epoch}-${item.batch}`} value={index}>Epoch {item.epoch} · Batch {item.batch}</option>)}</select></label><div className="trace-summary"><Stat label="已采样" value={`${trace.sample_count || samples.length} / ${trace.maximum || '—'}`} /><Stat label="间隔" value={`每 ${trace.interval || '—'} 批`} /><Stat label="当前步骤" value={currentStep.title} /></div></div>
         <div className="trace-main"><nav className="trace-steps">{steps.map(({ id, title, subtitle, icon: Icon }, index) => <button key={id} className={step === id ? 'active' : ''} onClick={() => setStep(id)}><span className="trace-step-index">{index + 1}</span><Icon size={16} /><span><strong>{title}</strong><small>{subtitle}</small></span><ChevronRight size={14} /></button>)}</nav><div className="trace-content">{sample && step === 'input' && <InputStep sample={sample} />}{sample && step === 'network' && <NetworkStep sample={sample} />}{sample && step === 'loss' && <LossStep sample={sample} />}{sample && step === 'update' && <UpdateStep sample={sample} />}</div></div>

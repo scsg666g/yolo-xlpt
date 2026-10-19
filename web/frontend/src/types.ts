@@ -12,7 +12,11 @@ export type TaskStatus =
 export interface PlatformHealth {
   status: 'ok' | 'degraded'
   instance: string
-  scheduler: 'running' | 'stopped'
+  version: string
+  scheduler: 'running' | 'stopped' | 'error'
+  scheduler_error?: string | null
+  scheduler_last_error?: string | null
+  scheduler_last_error_at?: string | null
   local_deletion_worker: 'running' | 'stopped'
   inference_worker: 'running' | 'stopped'
   database: 'ok'
@@ -202,6 +206,8 @@ export interface ComputeNode extends ComputeNodeSettings {
   last_seen_at: string | null
   sampled_at: string | null
   agent_version: string | null
+  required_agent_version: string
+  training_unavailable_reason: string | null
   training: {
     enabled: boolean
     ready: boolean

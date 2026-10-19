@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import math
+import re
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
@@ -35,6 +36,8 @@ MAX_TRACE_BYTES = 4 * 1024 * 1024
 MAX_TRACE_SAMPLES = 24
 MAX_TRACE_IMAGE_BYTES = 512 * 1024
 LOCAL_ID = "local"
+REQUIRED_AGENT_VERSION = "1.8.0"
+REQUIRED_AGENT_VERSION_PARTS = (1, 8, 0)
 Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Percentage = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
 
@@ -156,7 +159,7 @@ class RemoteRunUpdate(BaseModel):
     @field_validator("status")
     @classmethod
     def allowed_status(cls, value: str) -> str:
-        if value not in {"starting", "running", "stopping", "stopped", "completed", "failed"}:
+        if value not in {"starting", "running", "stopping", "stopped", "completed", "failed", "interrupted"}:
             raise ValueError("不支持的远程运行状态")
         return value
 
@@ -248,6 +251,45 @@ def as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def agent_version_at_least(value: str | None, minimum: tuple[int, int, int] = REQUIRED_AGENT_VERSION_PARTS) -> bool:
+    """Compare the numeric core of an Agent version without trusting arbitrary suffixes."""
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+._a-zA-Z0-9]*)?", value or "")
+    return bool(match and tuple(int(part) for part in match.groups()) >= minimum)
+
+
+def remote_training_unavailable_reason(node: ComputeNode | None, *, now: datetime | None = None) -> str | None:
+    """Return a user-facing reason when a remote node cannot safely accept work."""
+    if not node or node.kind != "agent":
+        return "远程服务器不存在"
+    if not node.enabled:
+        return "远程服务器已禁用"
+    if not agent_version_at_least(node.agent_version):
+        return f"请将远程 Agent 升级到 {REQUIRED_AGENT_VERSION} 或以上版本"
+    if node.last_seen_at is None:
+        return "远程 Agent 尚未连接"
+    current = now or utcnow()
+    snapshot = node.snapshot or {}
+    try:
+        sampled_at = datetime.fromisoformat(snapshot["sampled_at"])
+    except (KeyError, TypeError, ValueError):
+        return "远程 Agent 尚未上报有效状态"
+    timeout = max(30, node.report_interval_seconds * 3)
+    # Connectivity is established by the center's receive time. The remote
+    # sampled_at value is schema-validated but must not make a fresh request
+    # look offline when the server clock lags behind the center.
+    age = (current - as_utc(node.last_seen_at)).total_seconds()
+    if age > timeout:
+        return "远程 Agent 已离线"
+    capability = snapshot.get("training")
+    if not isinstance(capability, dict):
+        return "远程 Agent 未上报训练能力"
+    if not capability.get("enabled"):
+        return "远程 Agent 未启用训练"
+    if not capability.get("ready"):
+        return str(capability.get("reason") or "远程训练环境未就绪")[:400]
+    return None
+
+
 def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
     snapshot = local_snapshot() if node.kind == "local" else node.snapshot or {}
     last_seen = datetime.fromisoformat(snapshot["sampled_at"]) if node.kind == "local" else node.last_seen_at
@@ -259,8 +301,7 @@ def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
     elif last_seen is None:
         status = "pending"
     else:
-        sampled = datetime.fromisoformat(snapshot["sampled_at"])
-        age = max((utcnow() - as_utc(last_seen)).total_seconds(), (utcnow() - as_utc(sampled)).total_seconds())
+        age = (utcnow() - as_utc(last_seen)).total_seconds()
         status = "online" if age <= timeout else "offline"
     gpus = snapshot.get("gpus", [])
     utils = [gpu["utilization"] for gpu in gpus if gpu.get("utilization") is not None]
@@ -270,6 +311,10 @@ def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
         "report_interval_seconds": node.report_interval_seconds, "offline_after_seconds": timeout,
         "last_seen_at": as_utc(last_seen).isoformat() if last_seen else None,
         "sampled_at": snapshot.get("sampled_at"), "agent_version": node.agent_version,
+        "required_agent_version": REQUIRED_AGENT_VERSION,
+        "training_unavailable_reason": (
+            remote_training_unavailable_reason(node) if node.kind == "agent" else None
+        ),
         "hostname": snapshot.get("host", {}).get("hostname"),
         "training": snapshot.get("training") if node.kind == "agent" else None,
         "summary": {
@@ -400,14 +445,10 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
 @router.post("/nodes/{node_id}/agent/poll")
 def poll_training(node_id: str, request: Request, db: Session = Depends(get_db)):
     node = authenticated_agent(node_id, request, db)
-    # Older Agents require platform.log inside save_dir, which DDP deletes.
-    try:
-        version = tuple(int(part) for part in (node.agent_version or "0").split("."))
-    except ValueError:
-        version = (0,)
-    if version < (1, 2, 0):
-        return {"task": None, "poll_interval_seconds": 5, "required_agent_version": "1.2.0",
-                "message": "请升级 Agent 至 1.2.0 或以上版本后领取训练任务"}
+    unavailable = remote_training_unavailable_reason(node)
+    if unavailable:
+        return {"task": None, "poll_interval_seconds": 5,
+                "required_agent_version": REQUIRED_AGENT_VERSION, "message": unavailable}
     now = utcnow()
     # If a stop arrived after delivery but before confirmation, the Agent is
     # contractually forbidden to start the process. Retire an abandoned claim
@@ -447,9 +488,6 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     ).order_by(TrainingRun.queued_at, TrainingRun.id).limit(1))
     if not run:
         return {"task": None, "poll_interval_seconds": 5}
-    if run.launch_mode == "resume" and version < (1, 3, 0):
-        return {"task": None, "poll_interval_seconds": 5, "required_agent_version": "1.3.0",
-                "message": "断点续训需要 Agent 1.3.0 或以上版本"}
     task = db.get(TrainingTask, run.task_id)
     if not task or task.deleted_at or task.current_run_id != run.id:
         run.status = "failed"
@@ -460,7 +498,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     snapshot = run.parameter_snapshot or {}
     run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
     claimed_at = utcnow()
-    lease = secrets.token_hex(16) if version >= (1, 6, 0) else None
+    lease = secrets.token_hex(16)
     # Check node occupancy again in the atomic claim, since another poll may
     # start a different queued run between the earlier SELECTs.
     occupied = select(TrainingRun.id).where(

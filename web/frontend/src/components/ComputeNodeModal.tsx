@@ -82,8 +82,7 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
     if (!token || !savedNode) throw new Error('请先生成该服务器的 Agent Token')
     return JSON.stringify({ center_url: center.trim().replace(/\/+$/, ''), node_id: savedNode.id, token,
       report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi',
-      enable_training: false, allowed_training_roots: [], yolo_bin: '/data/conda/envs/yolo/bin/yolo',
-      training_cwd: '/data/yolo/yolo' }, null, 2)
+      enable_training: false, allowed_training_roots: [], yolo_bin: 'yolo' }, null, 2)
   }
 
   function downloadConfig() {
@@ -117,7 +116,7 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
             <li>把 <code>monitor_agent.py</code> 和 <code>agent-config.json</code> 放到远程服务器的同一目录。</li>
             <li>验证权限和连通性，然后上报一次：<pre>chmod 600 agent-config.json{'\n'}python3 monitor_agent.py --config agent-config.json --once</pre></li>
             <li>看到“采样上报成功”后，持续运行：<pre>python3 monitor_agent.py --config agent-config.json</pre></li>
-            <li>如需执行训练，先在 JSON 中设置 <code>enable_training</code> 为 <code>true</code>，并填写 <code>allowed_training_roots</code>（仅允许 Agent 访问这些绝对路径）；确认 <code>yolo_bin</code> 与 <code>training_cwd</code> 后重启 Agent。</li>
+            <li>如需执行训练，先在 JSON 中设置 <code>enable_training</code> 为 <code>true</code>，并按这台服务器的目录填写 <code>allowed_training_roots</code>（仅允许 Agent 访问这些绝对路径）。<code>yolo_bin</code> 默认使用 PATH 中的 <code>yolo</code>；若需特定工作目录，再显式填写该服务器上的绝对 <code>training_cwd</code>，否则使用 Agent 配置文件所在目录。修改后重启 Agent。</li>
           </ol>
           <p className="node-help">Agent 使用 Python 标准库；GPU 指标由本机 nvidia-smi 提供。训练会调用配置的 YOLO CLI，不执行任意 Shell。日志与产物留在远程服务器；当前平台接收进度、指标和最近日志，不会自动复制模型文件。</p>
           <button className="button compact" disabled={busy} onClick={() => void rotate()}><RefreshCw size={14} />重新生成 Token</button>

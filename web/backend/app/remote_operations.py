@@ -18,7 +18,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import DATA_ROOT
-from .compute_nodes import as_utc, authenticated_agent, remote_trace_root
+from .compute_nodes import (
+    REQUIRED_AGENT_VERSION,
+    agent_version_at_least,
+    as_utc,
+    authenticated_agent,
+    remote_trace_root,
+)
 from .database import get_db
 from .model_test_storage import delete_task_history
 from .models import Artifact, RemoteOperation, TrainingRun, TrainingTask, utcnow
@@ -219,12 +225,9 @@ def report_artifacts(node_id: str, run_id: str, payload: Manifest, request: Requ
 @router.post("/api/compute/nodes/{node_id}/agent/operations/poll")
 def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db)):
     node = authenticated_agent(node_id, request, db)
-    try:
-        compatible = tuple(int(p) for p in (node.agent_version or "0").split(".")) >= (1, 3, 0)
-    except ValueError:
-        compatible = False
-    if not compatible:
-        return {"operation": None, "required_agent_version": "1.3.0"}
+    if not agent_version_at_least(node.agent_version):
+        return {"operation": None, "required_agent_version": REQUIRED_AGENT_VERSION,
+                "message": f"请将远程 Agent 升级到 {REQUIRED_AGENT_VERSION} 或以上版本"}
     cutoff = utcnow() - timedelta(minutes=5)
     operation = db.scalar(select(RemoteOperation).where(
         RemoteOperation.node_id == node_id,

@@ -1,5 +1,6 @@
 """Remote execution regressions, using a small dummy process rather than GPU training."""
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -35,8 +36,10 @@ def training(tmp_path):
             "log_path": str(root / "runs/.platform-logs/20261012/task-id/attempt-001.log"),
             "parameters": {"epochs": 3, "batch": 2, "imgsz": 640, "device": "0,1",
                            "workers": 0, "optimizer": "auto", "remote_output_root": str(root / "runs")}}
-    config = {"node_id": "b" * 32, "allowed_training_roots": [str(root)], "yolo_bin": sys.executable,
-              "training_cwd": str(root), "training_state_dir": str(tmp_path / ".training-state")}
+    config = {"node_id": "b" * 32, "allowed_training_roots": [str(root)],
+              "training_output_roots": [str(root / "runs")], "yolo_bin": sys.executable,
+              "training_cwd": str(root), "training_state_dir": str(tmp_path / ".training-state"),
+              "_workspace_state_dir": str(tmp_path / ".workspace-state")}
     return config, task
 
 
@@ -121,7 +124,8 @@ def test_failed_updates_retry_metrics_and_explicit_stop(agent, training, monkeyp
             return self.stopped
 
     def popen(*args, **kwargs):
-        assert len(kwargs.get("pass_fds", ())) == 1
+        inherited = kwargs.get("pass_fds", ())
+        assert inherited and len(inherited) == len(set(inherited))
         run_dir = Path(task["run_dir"])
         shutil.rmtree(run_dir)
         run_dir.mkdir()
@@ -259,6 +263,133 @@ def test_training_process_inherits_workspace_lock(agent, training):
     second = agent.acquire_training_lock(config)
     assert second is not None
     agent.release_training_lock(second)
+
+
+def test_workspace_registration_allows_recovery_while_child_holds_output_locks(agent, training):
+    config, _ = training
+    lock = agent.acquire_training_lock(config)
+    assert lock is not None
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        pass_fds=lock.filenos(),
+    )
+    lock.close()
+    try:
+        assert agent.process_holds_training_lock(config, process.pid)
+        registered = agent.register_workspace(config)
+        payload = json.loads(registered.read_text())
+        assert payload["node_id"] == config["node_id"]
+        assert agent.acquire_output_root_locks(config) is None
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
+def test_output_root_locks_cover_different_configured_locks_and_nested_roots(agent, training):
+    config, _ = training
+    parent = Path(config["training_output_roots"][0])
+    child = parent / "nested"
+    sibling_a = parent.parent / "sibling-a"
+    sibling_b = parent.parent / "sibling-b"
+    for path in (child, sibling_a, sibling_b):
+        path.mkdir(parents=True)
+
+    parent_config = {**config, "training_lock_file": str(Path(config["training_cwd"]) / "parent.lock")}
+    child_config = {**config, "node_id": "c" * 32, "training_output_roots": [str(child)],
+                    "training_lock_file": str(Path(config["training_cwd"]) / "child.lock")}
+    parent_lock = agent.acquire_training_lock(parent_config)
+    assert parent_lock is not None
+    try:
+        assert agent.acquire_training_lock(child_config) is None
+    finally:
+        agent.release_training_lock(parent_lock)
+
+    first_config = {**config, "training_output_roots": [str(sibling_a)],
+                    "training_lock_file": str(Path(config["training_cwd"]) / "sibling-a.lock")}
+    second_config = {**config, "node_id": "d" * 32, "training_output_roots": [str(sibling_b)],
+                     "training_lock_file": str(Path(config["training_cwd"]) / "sibling-b.lock")}
+    first = agent.acquire_training_lock(first_config)
+    second = agent.acquire_training_lock(second_config)
+    assert first is not None and second is not None
+    agent.release_training_lock(second)
+    agent.release_training_lock(first)
+
+
+def test_workspace_registry_rejects_duplicate_node_and_reclaims_dead_process(agent, training):
+    config, _ = training
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        identity = agent.process_identity(process.pid)
+        registry = agent.workspace_registry_dir(config)
+        registry.mkdir(parents=True, exist_ok=True)
+        path = registry / f"{agent.workspace_owner_id(config)}.json"
+        agent._atomic_private_json(path, {
+            "version": agent.WORKSPACE_REGISTRY_VERSION,
+            "owner_id": agent.workspace_owner_id(config),
+            "node_id": config["node_id"],
+            "training_output_roots": config["training_output_roots"],
+            "process": identity,
+        })
+        with pytest.raises(ValueError, match="node_id"):
+            agent.register_workspace(config)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+    registered = agent.register_workspace(config)
+    payload = json.loads(registered.read_text())
+    assert payload["process"]["pid"] == os.getpid()
+
+
+def test_workspace_registry_is_stable_across_center_url_and_cleans_legacy_marker(agent, training):
+    config, _ = training
+    old = {**config, "center_url": "https://old-center.example"}
+    moved = {**config, "center_url": "https://new-center.example:8443"}
+    assert agent.workspace_owner_id(old) == agent.workspace_owner_id(moved)
+    legacy_owner = hashlib.sha256(f"{old['center_url']}\0{old['node_id']}".encode()).hexdigest()
+    legacy_dir = agent.legacy_workspace_registry_dir(old)
+    legacy_dir.mkdir(parents=True)
+    legacy = legacy_dir / f"{legacy_owner}.json"
+    legacy.write_text(json.dumps({"version": 1, "owner_id": legacy_owner, "node_id": old["node_id"]}))
+    agent.register_workspace(moved)
+    assert not legacy.exists()
+
+
+def test_workspace_registry_blocks_live_overlap_but_not_independent_or_stale_owner(agent, training):
+    config, _ = training
+    root = Path(config["training_output_roots"][0])
+    sibling = root.parent / "independent"
+    sibling.mkdir()
+    agent.register_workspace(config)
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    other_node = "e" * 32
+    other_owner = hashlib.sha256(other_node.encode("ascii")).hexdigest()
+    marker = agent.workspace_registry_dir(config) / f"{other_owner}.json"
+    try:
+        base = {"version": agent.WORKSPACE_REGISTRY_VERSION, "owner_id": other_owner,
+                "node_id": other_node, "process": agent.process_identity(process.pid)}
+        agent._atomic_private_json(marker, {**base, "training_output_roots": [str(root)]})
+        assert agent.workspace_delete_conflicts(config, [root]) is True
+        agent._atomic_private_json(marker, {**base, "training_output_roots": [str(sibling)]})
+        assert agent.workspace_delete_conflicts(config, [root]) is False
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+    agent._atomic_private_json(marker, {**base, "training_output_roots": [str(root)]})
+    assert agent.workspace_delete_conflicts(config, [root]) is False
+    assert not marker.exists()
+
+
+def test_delete_refuses_while_training_owns_output_root(agent, training):
+    config, task = training
+    agent.build_training_command(config, task)
+    payload = {**task, "output_root": task["parameters"]["remote_output_root"]}
+    lock = agent.acquire_training_lock(config)
+    try:
+        with pytest.raises(ValueError, match="正在使用"):
+            agent.delete_remote_files(config, {"runs": [payload]})
+    finally:
+        agent.release_training_lock(lock)
 
 
 def test_claim_confirmation_retries_lost_response_and_honors_stop(agent, training, monkeypatch):
@@ -434,6 +565,75 @@ def test_recovery_stops_only_identity_verified_process(agent, training, monkeypa
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+
+
+@pytest.mark.parametrize(("scenario", "expected"), [
+    ("all_epochs", "completed"),
+    ("early_stopping", "completed"),
+    ("uncertain", "interrupted"),
+])
+def test_recovery_classifies_process_that_exited_before_agent_restart(
+    agent, training, monkeypatch, scenario, expected,
+):
+    config, task = training
+    run_dir = Path(task["run_dir"])
+    weights = run_dir / "weights"
+    weights.mkdir(parents=True)
+    log = Path(task["log_path"])
+    log.parent.mkdir(parents=True)
+    if scenario == "all_epochs":
+        (run_dir / "results.csv").write_text("epoch,time,score\n1,1,0.1\n2,2,0.2\n3,3,0.3\n")
+        log.write_text("training output\n")
+    else:
+        (run_dir / "results.csv").write_text("epoch,time,score\n1,1,0.1\n")
+        (weights / "best.pt").write_bytes(b"best")
+        (weights / "last.pt").write_bytes(b"last")
+        marker = "EarlyStopping: Training stopped early\n" if scenario == "early_stopping" else "training vanished\n"
+        log.write_text(marker + "".join(f"final validation line {index}\n" for index in range(200)))
+    updates = []
+
+    def api(_config, path, method="GET", payload=None, extra_headers=None):
+        if path.endswith("/control"):
+            return {"status": "running", "stop": False}
+        updates.append(payload)
+        return {"status": payload["status"]}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    state = {"phase": "running", "task": task, "run_id": task["run_id"],
+             "process": {"pid": 99999999, "start_ticks": 1, "boot_id": "gone", "cmdline_sha256": "0" * 64},
+             "command": [sys.executable, "missing-training-process"]}
+    lock = agent.acquire_training_lock(config)
+    agent.recover_remote_task(config, state, threading.Event(), training_lock=lock)
+    assert updates[-1]["status"] == expected
+    assert updates[-1]["completed_epochs"] == (3 if scenario == "all_epochs" else 1)
+    assert updates[-1]["progress"] == (100 if expected == "completed" else pytest.approx(100 / 3))
+    if expected == "interrupted":
+        assert "无法取得原进程退出码" in updates[-1]["error_message"]
+
+
+def test_recovered_weight_stat_race_degrades_to_interrupted(agent, training, monkeypatch):
+    _config, task = training
+    weights = Path(task["run_dir"]) / "weights"
+    weights.mkdir(parents=True)
+    best, last = weights / "best.pt", weights / "last.pt"
+    best.write_bytes(b"best")
+    last.write_bytes(b"last")
+    log = Path(task["log_path"])
+    log.parent.mkdir(parents=True)
+    log.write_text("EarlyStopping: complete\n")
+    original = Path.stat
+    calls = 0
+
+    def racing_stat(path, *args, **kwargs):
+        nonlocal calls
+        if path == best:
+            calls += 1
+            if calls > 1:
+                raise FileNotFoundError(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    assert agent.recovered_natural_exit(task, 1, ["EarlyStopping: complete"])[0] == "interrupted"
 
 
 def test_check_config_is_offline_and_never_prints_token(agent, training, tmp_path):

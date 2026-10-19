@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Clipboard, Download, Search, Terminal, X } from 'lucide-react'
 import type { TrainingTask } from '../types'
+import { useModalFocus } from '../useModalFocus'
 
 interface Props {
   task: TrainingTask | null
@@ -23,6 +24,9 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
   const [copied, setCopied] = useState(false)
   const [actionMessage, setActionMessage] = useState('')
   const outputRef = useRef<HTMLDivElement>(null)
+  const dialogRef = useModalFocus<HTMLElement>(open && Boolean(task), onClose, {
+    initialFocusSelector: '[data-modal-initial-focus]',
+  })
   const visibleLines = useMemo(() => search ? lines.filter((line) => line.toLowerCase().includes(search.toLowerCase())) : lines, [lines, search])
 
   useEffect(() => {
@@ -75,10 +79,10 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
   }
 
   return <div className="modal-backdrop log-backdrop" onMouseDown={onClose}>
-    <section className="log-modal" onMouseDown={(event) => event.stopPropagation()}>
+    <section ref={dialogRef} className="log-modal" role="dialog" aria-modal="true" aria-labelledby="log-viewer-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
       <header>
-        <div className="log-modal-title"><div className="terminal-mark"><Terminal size={18} /></div><div><span>LIVE TRAINING OUTPUT</span><h2>实时训练日志</h2><p>{task.name} · {task.log_path || '等待创建日志文件'}</p></div></div>
-        <div className="log-header-actions"><span className={`log-live ${task.status === 'running' ? 'active' : ''}`}><i />{task.status === 'running' ? '实时更新' : '日志快照'}</span><button className="icon-button" onClick={onClose}><X size={20} /></button></div>
+        <div className="log-modal-title"><div className="terminal-mark"><Terminal size={18} /></div><div><span>LIVE TRAINING OUTPUT</span><h2 id="log-viewer-title">实时训练日志</h2><p>{task.name} · {task.log_path || '等待创建日志文件'}</p></div></div>
+        <div className="log-header-actions"><span className={`log-live ${task.status === 'running' ? 'active' : ''}`}><i />{task.status === 'running' ? '实时更新' : '日志快照'}</span><button className="icon-button" data-modal-initial-focus aria-label="关闭日志查看器" onClick={onClose}><X size={20} /></button></div>
       </header>
       <div className="log-tool-row">
         <div className="log-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索日志内容" />{search && <span>{visibleLines.length} 条匹配</span>}</div>

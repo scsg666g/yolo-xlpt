@@ -13,8 +13,9 @@ from sqlalchemy import event, select
 import app.model_test_storage as model_test_storage
 import app.remote_operations as operations
 from app.models import ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utcnow
+from app.parameter_catalog import training_parameter_keys
 from app.services import create_training_run
-from test_compute_nodes import create, headers, monitoring_client
+from test_compute_nodes import create, headers, monitoring_client, sample
 from test_remote_agent import agent, training
 
 
@@ -26,7 +27,11 @@ def remote_run(client, factory, tmp_path):
     model.write_bytes(b"base model")
     data.write_text("train: images/train\n")
     with factory() as db:
-        db.get(ComputeNode, credential["node"]["id"]).agent_version = "1.3.0"
+        node = db.get(ComputeNode, credential["node"]["id"])
+        node.agent_version = "1.8.0"
+        node.last_seen_at = utcnow()
+        node.snapshot = {"sampled_at": utcnow().isoformat(),
+                         "training": {"enabled": True, "ready": True, "supported_parameters": []}}
         task = TrainingTask(id="remote-lifecycle", name="Remote lifecycle", task_type="detect",
                             execution_node_id=credential["node"]["id"], model_path=str(model), data_path=str(data),
                             epochs=20, config={"remote_output_root": str(root)})
@@ -46,7 +51,8 @@ def remote_run(client, factory, tmp_path):
     log.parent.mkdir(parents=True)
     log.write_text("independent log")
     config = {"node_id": credential["node"]["id"], "allowed_training_roots": [str(tmp_path)],
-              "training_cwd": str(tmp_path), "yolo_bin": "/usr/bin/python3"}
+              "training_output_roots": [str(root)], "training_cwd": str(tmp_path),
+              "yolo_bin": "/usr/bin/python3", "_workspace_state_dir": str(tmp_path / ".workspace-state")}
     return credential, config, payload
 
 
@@ -70,6 +76,25 @@ def execute_through(client, credential, config, agent, operation_id):
         if work["id"] == operation_id:
             return work
     raise AssertionError(f"remote operation was not claimed: {operation_id}")
+
+
+def test_old_agent_cannot_claim_remote_file_operations(monitoring_client, tmp_path):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    client.get(f"/api/tasks/{payload['task_id']}/artifacts")
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "1.7.0"
+        db.commit()
+    blocked = client.post(
+        f"/api/compute/nodes/{credential['node']['id']}/agent/operations/poll",
+        json={}, headers=headers(credential),
+    ).json()
+    assert blocked["operation"] is None
+    assert blocked["required_agent_version"] == "1.8.0"
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "1.8.0"
+        db.commit()
+    assert claim(client, credential) is not None
 
 
 def test_remote_delete_confirm_retry_and_local_isolation(monitoring_client, agent, tmp_path, monkeypatch):
@@ -255,6 +280,12 @@ def test_remote_delete_serializes_same_node_references_until_completion(monitori
 
     # Deletion on one server must not pause normal work on another server.
     other = create(client, "Other deletion-independent node")
+    other_report = sample()
+    other_report["training"]["supported_parameters"] = sorted(training_parameter_keys())
+    assert client.post(
+        f"/api/compute/nodes/{other['node']['id']}/report",
+        headers=headers(other), json=other_report,
+    ).status_code == 200
     other_response = client.post("/api/tasks", json={
         "name": "Other node task",
         "execution_node_id": other["node"]["id"],
@@ -502,7 +533,13 @@ def test_concurrent_polls_keep_one_active_run_per_server(monitoring_client):
     credential = create(client)
     node_id = credential["node"]["id"]
     with factory() as db:
-        db.get(ComputeNode, node_id).agent_version = "1.3.0"
+        node = db.get(ComputeNode, node_id)
+        node.agent_version = "1.8.0"
+        node.last_seen_at = utcnow()
+        node.snapshot = {
+            "sampled_at": utcnow().isoformat(),
+            "training": {"enabled": True, "ready": True, "supported_parameters": []},
+        }
         for number in range(2):
             task = TrainingTask(id=f"queued-{number}", name=f"Queued {number}", task_type="detect",
                                 execution_node_id=node_id, model_path="/remote/model.pt",
