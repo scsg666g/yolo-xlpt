@@ -30,6 +30,7 @@ export interface TrainingTask {
   task_type: string
   status: TaskStatus
   source: string
+  group_id: string | null
   execution_node_id: string | null
   model_path: string
   data_path: string
@@ -58,6 +59,14 @@ export interface TrainingTask {
   current_run_id: string | null
   deleted_at: string | null
   deleted_reason: string | null
+}
+
+export interface TaskGroup {
+  id: string
+  name: string
+  display_order: number
+  created_at: string
+  updated_at: string
 }
 
 export interface TrainingRun {
@@ -277,6 +286,7 @@ export interface ManagedDataset {
 export interface TaskCreatePayload {
   name: string
   task_type: string
+  group_id?: string | null
   model_path: string
   data_path: string
   execution_node_id?: string | null

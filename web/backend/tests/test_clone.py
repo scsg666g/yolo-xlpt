@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base, get_db
 from app.main import app
-from app.models import TaskEvent, TrainingTask, utcnow
+from app.models import TaskEvent, TaskGroup, TrainingTask, utcnow
 
 
 @pytest.fixture
@@ -50,8 +50,11 @@ def clone(client, task_id):
 
 def test_cloning_original_and_copy_share_numbering(clone_client):
     client, db = clone_client
+    db.add(TaskGroup(id="fire-group", name="火灾检测", display_order=1000))
+    db.commit()
     source = add_task(
         db, "source", "火", status="completed", epochs=150, batch=4, imgsz=960,
+        group_id="fire-group",
         device="0,1", optimizer="MuSGD", completed_epochs=150,
         config={"lr0": 0.001, "_resume_checkpoint": "last.pt"},
         canvas_layout={"model": {"x": 10, "y": 20}},
@@ -63,6 +66,7 @@ def test_cloning_original_and_copy_share_numbering(clone_client):
         "火 - 副本 1", "火 - 副本 2", "火 - 副本 3",
     ]
     assert first["status"] == "draft"
+    assert first["group_id"] == "fire-group"
     assert first["completed_epochs"] == 0
     assert first["config"] == {"lr0": 0.001}
     for key in ("model_path", "data_path", "epochs", "batch", "imgsz", "device", "optimizer", "canvas_layout"):

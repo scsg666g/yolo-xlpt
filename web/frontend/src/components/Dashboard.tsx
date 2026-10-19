@@ -1,16 +1,52 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Copy, Cpu, GitCompareArrows, GripVertical, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
+import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Copy, Cpu, Folder, FolderInput, FolderPlus, GitCompareArrows, GripVertical, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
-import type { TrainingTask } from '../types'
+import type { TaskGroup, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { CreateTaskModal } from './CreateTaskModal'
 import { RenameTaskModal } from './RenameTaskModal'
+import { MoveTaskGroupModal, TaskGroupModal } from './TaskGroupModals'
 
 const statusIcon = (status: string) => status === 'completed' ? <CheckCircle2 size={15} /> : status === 'failed' || status === 'interrupted' ? <AlertTriangle size={15} /> : status === 'running' ? <Zap size={15} /> : <Clock3 size={15} />
+const activeStatuses = ['queued', 'starting', 'running', 'stopping']
+const collapsedGroupsKey = 'yolo-task-groups-collapsed-v1'
+const ungroupedKey = '__ungrouped__'
+
+function initialCollapsedGroups(): Set<string> {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(collapsedGroupsKey) || '[]')
+    return new Set(Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [])
+  } catch { return new Set() }
+}
+
+function taskMetric(task: TrainingTask, keys: string[]): number | null {
+  for (const key of keys) {
+    const raw = task.latest_metrics[key]
+    if (raw === null || raw === undefined || raw === '') continue
+    const value = Number(raw)
+    if (Number.isFinite(value)) return value
+  }
+  return null
+}
+
+interface TaskGroupView {
+  key: string
+  group: TaskGroup | null
+  name: string
+  allTasks: TrainingTask[]
+  tasks: TrainingTask[]
+}
+
+interface GroupEditorState {
+  group: TaskGroup | null
+  taskIds?: string[]
+  initialDelete?: boolean
+}
 
 export function Dashboard() {
   const [tasks, setTasks] = useState<TrainingTask[]>([])
+  const [groups, setGroups] = useState<TaskGroup[]>([])
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all')
   const [creating, setCreating] = useState(false)
@@ -22,6 +58,9 @@ export function Dashboard() {
   const [confirmPermanent, setConfirmPermanent] = useState(false)
   const [deleteError, setDeleteError] = useState('')
   const [renameTarget, setRenameTarget] = useState<TrainingTask | null>(null)
+  const [groupEditor, setGroupEditor] = useState<GroupEditorState | null>(null)
+  const [moveTarget, setMoveTarget] = useState<TrainingTask | null>(null)
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(initialCollapsedGroups)
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
@@ -74,7 +113,10 @@ export function Dashboard() {
     setLoadError('')
     if (dataVersion === 0) setLoading(true)
     try {
-      const incoming = await api.tasks(controller.signal)
+      const [incoming, incomingGroups] = await Promise.all([
+        api.tasks(controller.signal),
+        api.taskGroups(controller.signal),
+      ])
       if (taskRequest.current !== request) return
       // A newer poll response must not be replaced by an older HTTP response.
       if (taskDataVersion.current === dataVersion) {
@@ -92,6 +134,7 @@ export function Dashboard() {
           ]
           return orderedIds.map((id) => incomingById.get(id)!).filter(Boolean)
         })
+        setGroups(incomingGroups)
       }
       setLoadError('')
     } catch (reason) {
@@ -125,11 +168,36 @@ export function Dashboard() {
     }
   }, [refresh])
 
-  const filtered = useMemo(() => tasks.filter((task) => {
-    const matches = task.name.toLowerCase().includes(search.toLowerCase()) || task.model_path.toLowerCase().includes(search.toLowerCase())
-    const state = filter === 'all' || task.status === filter || (filter === 'active' && ['queued', 'starting', 'running', 'stopping'].includes(task.status))
+  const filtered = useMemo(() => {
+    const groupNames = new Map(groups.map((group) => [group.id, group.name.toLowerCase()]))
+    return tasks.filter((task) => {
+    const term = search.trim().toLowerCase()
+    const matches = !term || task.name.toLowerCase().includes(term) || task.model_path.toLowerCase().includes(term) || Boolean(task.group_id && groupNames.get(task.group_id)?.includes(term))
+    const state = filter === 'all' || task.status === filter || (filter === 'active' && activeStatuses.includes(task.status))
     return matches && state
-  }), [tasks, search, filter])
+  }) }, [tasks, groups, search, filter])
+
+  const groupedTasks = useMemo(() => {
+    const knownIds = new Set(groups.map((group) => group.id))
+    const visibleIds = new Set(filtered.map((task) => task.id))
+    const views: TaskGroupView[] = groups.map((group) => ({
+      key: group.id,
+      group,
+      name: group.name,
+      allTasks: tasks.filter((task) => task.group_id === group.id),
+      tasks: tasks.filter((task) => task.group_id === group.id && visibleIds.has(task.id)),
+    }))
+    const ungrouped = {
+      key: ungroupedKey,
+      group: null,
+      name: '未分组',
+      allTasks: tasks.filter((task) => !task.group_id || !knownIds.has(task.group_id)),
+      tasks: tasks.filter((task) => (!task.group_id || !knownIds.has(task.group_id)) && visibleIds.has(task.id)),
+    }
+    if (ungrouped.allTasks.length) views.push(ungrouped)
+    if (search.trim() || filter !== 'all') return views.filter((view) => view.tasks.length)
+    return views
+  }, [filtered, filter, groups, search, tasks])
 
   const refreshTrash = useCallback(async () => {
     trashRequest.current?.abort()
@@ -174,6 +242,48 @@ export function Dashboard() {
   const completed = tasks.filter((task) => task.status === 'completed').length
   const attention = tasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
 
+  function toggleGroup(key: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      window.localStorage.setItem(collapsedGroupsKey, JSON.stringify([...next]))
+      return next
+    })
+  }
+
+  function saveGroup(group: TaskGroup, assignedTaskIds: string[] = []) {
+    setGroups((current) => {
+      const existing = current.some((item) => item.id === group.id)
+      return existing ? current.map((item) => item.id === group.id ? group : item) : [...current, group]
+    })
+    if (assignedTaskIds.length) {
+      const assigned = new Set(assignedTaskIds)
+      setTasks((current) => current.map((task) => assigned.has(task.id) ? { ...task, group_id: group.id } : task))
+      setOperationNotice(`已创建分组“${group.name}”并移入 ${assignedTaskIds.length} 个任务`)
+    }
+    setGroupEditor(null)
+  }
+
+  function removeGroup(group: TaskGroup) {
+    setGroups((current) => current.filter((item) => item.id !== group.id))
+    setTasks((current) => current.map((task) => task.group_id === group.id ? { ...task, group_id: null } : task))
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      next.delete(group.id)
+      window.localStorage.setItem(collapsedGroupsKey, JSON.stringify([...next]))
+      return next
+    })
+    setOperationNotice(`分组“${group.name}”已删除，组内任务已移到未分组`)
+    setGroupEditor(null)
+  }
+
+  function saveTaskGroup(task: TrainingTask) {
+    setTasks((current) => current.map((item) => item.id === task.id ? task : item))
+    setOperationNotice('任务分组已更新')
+    setMoveTarget(null)
+  }
+
   function reorderedTasks(draggedId: string, targetId: string, after = false): TrainingTask[] {
     if (draggedId === targetId) return tasks
     const taskById = new Map(tasks.map((task) => [task.id, task]))
@@ -196,6 +306,13 @@ export function Dashboard() {
   async function dropTask(targetId: string) {
     if (!draggingId || draggingId === targetId || ordering) return
     const previous = tasks
+    const sourceTask = tasks.find((task) => task.id === draggingId)
+    const targetTask = tasks.find((task) => task.id === targetId)
+    if (!sourceTask || !targetTask || sourceTask.group_id !== targetTask.group_id) {
+      setDraggingId(null); setDragOverId(null)
+      setError('请使用文件夹按钮将任务移动到其他分组')
+      return
+    }
     const sourceIndex = filtered.findIndex((task) => task.id === draggingId)
     const targetIndex = filtered.findIndex((task) => task.id === targetId)
     if (sourceIndex < 0 || targetIndex < 0) {
@@ -336,10 +453,33 @@ export function Dashboard() {
     if (succeeded) { void refresh(); void refreshTrash() }
   }
 
+  function renderTaskCard(task: TrainingTask) {
+    return <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { const source = tasks.find((item) => item.id === draggingId); if (source?.group_id !== task.group_id) return; event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
+      <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整组内顺序" aria-label="按住拖动调整组内顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span></div>
+      <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" disabled={taskActionIds.has(task.id)} title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
+      <p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p>
+      <div className="progress-heading"><span>Epoch {task.completed_epochs} / {task.epochs}</span><strong>{Math.round(task.progress)}%</strong></div>
+      <div className="progress"><i style={{ width: `${task.progress}%` }} /></div>
+      <div className="metric-strip"><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>{task.device === 'cpu' ? 'CPU' : `GPU ${task.device}`}</strong></div></div>
+      {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
+      <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
+        {task.status === 'draft' && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="启动训练" aria-label={`启动训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.start(task.id))}><Zap size={15} /></button>}
+        {task.status === 'failed' && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="重新训练" aria-label={`重新训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.retry(task.id))}><RotateCcw size={15} /></button>}
+        {['stopped', 'interrupted'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="继续训练" aria-label={`继续训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.resume(task.id))}><RefreshCw size={15} /></button>}
+        {['queued', 'starting', 'running'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="停止训练" aria-label={`停止训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.stop(task.id))}><Square size={14} /></button>}
+        <button type="button" title="移动到分组" aria-label={`移动任务到分组：${task.name}`} onClick={(event) => { event.stopPropagation(); setMoveTarget(task) }}><FolderInput size={15} /></button>
+        <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="克隆任务" aria-label={`克隆任务：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.clone(task.id))}><Copy size={15} /></button>
+        <button type="button" title="加入实验对比" aria-label={`将${task.name}加入实验对比`} onClick={(e) => { e.stopPropagation(); navigate(`/compare?tasks=${task.id}`) }}><GitCompareArrows size={15} /></button>
+        {!activeStatuses.includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} title="删除任务" aria-label={`删除任务：${task.name}`} onClick={(e) => { e.stopPropagation(); openDeletion(task) }}><Trash2 size={15} /></button>}
+        <button type="button" title="打开画布" aria-label={`打开训练画布：${task.name}`} onClick={(e) => { e.stopPropagation(); navigate(`/tasks/${task.id}/canvas`) }}><ArrowUpRight size={15} /></button>
+      </div></footer>
+    </article>
+  }
+
   return <div className="page dashboard-page">
     <header className="page-header">
       <div><span className="eyebrow">TRAINING OPERATIONS</span><h1>训练任务中心</h1><p>创建、调度并观察每一次模型实验。</p></div>
-      <div className="header-actions"><button type="button" className="button ghost" onClick={openTrash}><Trash2 size={16} />回收站</button><button type="button" className="button ghost" disabled={syncing} onClick={() => void syncHistoricalRuns()}><RefreshCw size={16} className={syncing ? 'spin' : ''} />{syncing ? '同步中…' : '同步历史任务'}</button><button type="button" className="button primary" onClick={() => setCreating(true)}><Plus size={17} />新建训练任务</button></div>
+      <div className="header-actions"><button type="button" className="button ghost" onClick={openTrash}><Trash2 size={16} />回收站</button><button type="button" className="button ghost" disabled={syncing} onClick={() => void syncHistoricalRuns()}><RefreshCw size={16} className={syncing ? 'spin' : ''} />{syncing ? '同步中…' : '同步历史任务'}</button><button type="button" className="button ghost" onClick={() => setGroupEditor({ group: null })}><FolderPlus size={16} />新建分组</button><button type="button" className="button primary" onClick={() => setCreating(true)}><Plus size={17} />新建训练任务</button></div>
     </header>
 
     <section className="stat-row">
@@ -356,27 +496,34 @@ export function Dashboard() {
       </div>
       {error && <div className="alert error">{error}</div>}
       {syncNotice && <div className="alert" role="status">{syncNotice}</div>}
+      {operationNotice && <div className="alert" role="status">{operationNotice}</div>}
       {loadError && <div className="alert error" role="alert">{loadError}<button type="button" className="button ghost compact" onClick={() => void refresh()}>重新加载</button></div>}
-      {loading ? <div className="empty">正在加载任务…</div> : loadError && !tasks.length ? <div className="empty">暂时无法获取任务列表，请重新加载。</div> : filtered.length === 0 ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>创建任务后，每一次训练都会拥有独立画布。</span></div> :
-        <div className="task-grid">{filtered.map((task) => <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
-          <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整顺序" aria-label="按住拖动调整顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span></div>
-          <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" disabled={taskActionIds.has(task.id)} title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
-          <p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p>
-          <div className="progress-heading"><span>Epoch {task.completed_epochs} / {task.epochs}</span><strong>{Math.round(task.progress)}%</strong></div>
-          <div className="progress"><i style={{ width: `${task.progress}%` }} /></div>
-          <div className="metric-strip"><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>GPU {task.device}</strong></div></div>
-          {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
-          <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
-            {task.status === 'draft' && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="启动训练" aria-label={`启动训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.start(task.id))}><Zap size={15} /></button>}
-            {task.status === 'failed' && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="重新训练" aria-label={`重新训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.retry(task.id))}><RotateCcw size={15} /></button>}
-            {['stopped', 'interrupted'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="继续训练" aria-label={`继续训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.resume(task.id))}><RefreshCw size={15} /></button>}
-            {['queued', 'starting', 'running'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="停止训练" aria-label={`停止训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.stop(task.id))}><Square size={14} /></button>}
-            <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="克隆任务" aria-label={`克隆任务：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.clone(task.id))}><Copy size={15} /></button>
-            <button type="button" title="加入实验对比" aria-label={`将${task.name}加入实验对比`} onClick={(e) => { e.stopPropagation(); navigate(`/compare?tasks=${task.id}`) }}><GitCompareArrows size={15} /></button>
-            {!['queued', 'starting', 'running', 'stopping'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} title="删除任务" aria-label={`删除任务：${task.name}`} onClick={(e) => { e.stopPropagation(); openDeletion(task) }}><Trash2 size={15} /></button>}
-            <button type="button" title="打开画布" aria-label={`打开训练画布：${task.name}`} onClick={(e) => { e.stopPropagation(); navigate(`/tasks/${task.id}/canvas`) }}><ArrowUpRight size={15} /></button>
-          </div></footer>
-        </article>)}</div>}
+      {loading ? <div className="empty">正在加载任务…</div> : loadError && !tasks.length ? <div className="empty">暂时无法获取任务列表，请重新加载。</div> : filtered.length === 0 && (search.trim() || filter !== 'all') ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>请调整搜索关键词或状态筛选。</span></div> : tasks.length === 0 && groups.length === 0 ? <div className="empty"><Cpu size={28} /><strong>还没有训练任务</strong><span>可以先建立模型分组，再创建第一次训练。</span></div> :
+        <div className="task-group-list">{groupedTasks.map((view) => {
+          const isForcedOpen = Boolean(search.trim()) || filter !== 'all'
+          const isCollapsed = collapsedGroups.has(view.key) && !isForcedOpen
+          const activeCount = view.allTasks.filter((task) => activeStatuses.includes(task.status)).length
+          const completedCount = view.allTasks.filter((task) => task.status === 'completed').length
+          const attentionCount = view.allTasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
+          const signatures = new Set(view.allTasks.map((task) => `${task.task_type}\n${task.data_path}`))
+          const metrics = view.allTasks.map((task) => taskMetric(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])).filter((value): value is number => value !== null)
+          const bestMap = signatures.size <= 1 && metrics.length ? Math.max(...metrics) : null
+          return <section className={`task-group ${isCollapsed ? 'is-collapsed' : ''}`} key={view.key}>
+            <header className="task-group-header">
+              <div className="task-group-heading">
+                <button type="button" className="task-group-toggle" aria-expanded={!isCollapsed} aria-controls={`task-group-${view.key}`} onClick={() => toggleGroup(view.key)}>
+                  <ChevronDown size={18} /><span className="task-group-icon"><Folder size={17} /></span><span className="task-group-title"><strong>{view.name}</strong><small>{view.tasks.length === view.allTasks.length ? `${view.allTasks.length} 个任务` : `${view.tasks.length}/${view.allTasks.length} 个任务`}</small></span>
+                </button>
+                <div className="task-group-actions">
+                  <button type="button" className="icon-button rename" title={view.group ? '重命名分组' : '命名未分组任务'} aria-label={view.group ? `重命名分组：${view.name}` : '命名未分组任务'} onClick={() => setGroupEditor(view.group ? { group: view.group } : { group: null, taskIds: view.allTasks.map((task) => task.id) })}><Pencil size={14} /></button>
+                  {view.group && <button type="button" className="icon-button delete" title="删除分组" aria-label={`删除分组：${view.name}`} onClick={() => setGroupEditor({ group: view.group, initialDelete: true })}><Trash2 size={14} /></button>}
+                </div>
+              </div>
+              <div className="task-group-summary"><span className={activeCount ? 'active' : ''}>进行中 <strong>{activeCount}</strong></span><span>已完成 <strong>{completedCount}</strong></span>{attentionCount > 0 && <span className="attention">需关注 <strong>{attentionCount}</strong></span>}{bestMap !== null && <span>最佳 mAP50 <strong>{bestMap.toFixed(4)}</strong></span>}</div>
+            </header>
+            {!isCollapsed && <div id={`task-group-${view.key}`} className="task-group-body">{view.tasks.length ? <div className="task-grid">{view.tasks.map(renderTaskCard)}</div> : <div className="task-group-empty">分组中还没有任务，可在新建任务时选择该分组。</div>}</div>}
+          </section>
+        })}</div>}
     </section>
     {ordering && <div className="order-saving" role="status"><RefreshCw size={13} className="spin" />正在保存任务顺序…</div>}
     {renameTarget && <RenameTaskModal task={renameTarget} onClose={() => setRenameTarget(null)} onSaved={(updated) => { setTasks((current) => current.map((task) => task.id === updated.id ? { ...task, name: updated.name } : task)); setRenameTarget(null) }} />}
@@ -392,6 +539,8 @@ export function Dashboard() {
       <div className="trash-list">{operationNotice && <p role="status">{operationNotice}</p>}{trashError && <p className="alert error" role="alert">{trashError}</p>}{trashLoading && !trashTasks.length && <div className="empty">正在加载回收站…</div>}{trashTasks.map((task) => <article key={task.id}><div><strong>{task.name}</strong><span>{task.execution_node_id ? '远程服务器' : '本机服务器'} · {statusLabel(task.status)}</span><small>删除时间：{task.deleted_at ? new Date(task.deleted_at).toLocaleString('zh-CN') : '—'}</small>{task.deleted_reason === 'remote_delete_pending' && <small role="status">等待远程 Agent 清理；离线时保留记录，联网后执行</small>}{task.deleted_reason === 'local_delete_pending' && <small role="status">正在后台清理本机训练文件</small>}{['remote_delete_failed', 'local_delete_failed'].includes(task.deleted_reason || '') && <small role="alert">{task.error_message}</small>}</div><button type="button" className="button ghost compact" disabled={deleting || ['remote_delete_pending', 'remote_delete_failed', 'local_delete_pending', 'local_delete_failed'].includes(task.deleted_reason || '')} onClick={() => void restoreTask(task)}><RotateCcw size={14} />恢复</button><button type="button" className="button danger compact" disabled={deleting || ['remote_delete_pending', 'local_delete_pending'].includes(task.deleted_reason || '')} onClick={() => openDeletion(task, true)}><Trash2 size={14} />{['remote_delete_pending', 'local_delete_pending'].includes(task.deleted_reason || '') ? '清理中' : ['remote_delete_failed', 'local_delete_failed'].includes(task.deleted_reason || '') ? '重试清理' : '永久删除'}</button></article>)}{!trashLoading && !trashTasks.length && <div className="empty">回收站为空</div>}</div>
       <footer><span>移入回收站的任务不会被历史同步重新导入</span><button type="button" className="button ghost" disabled={deleting} onClick={() => setTrashOpen(false)}>关闭</button></footer>
     </div></div>}
-    <CreateTaskModal open={creating} onClose={() => setCreating(false)} onCreated={(task) => { setCreating(false); navigate(`/tasks/${task.id}/canvas`) }} />
+    {groupEditor && <TaskGroupModal group={groupEditor.group} taskIds={groupEditor.taskIds} initialDelete={groupEditor.initialDelete} onClose={() => setGroupEditor(null)} onSaved={saveGroup} onDeleted={removeGroup} />}
+    {moveTarget && <MoveTaskGroupModal task={moveTarget} groups={groups} onClose={() => setMoveTarget(null)} onSaved={saveTaskGroup} />}
+    <CreateTaskModal open={creating} groups={groups} onClose={() => setCreating(false)} onCreated={(task) => { setCreating(false); navigate(`/tasks/${task.id}/canvas`) }} />
   </div>
 }

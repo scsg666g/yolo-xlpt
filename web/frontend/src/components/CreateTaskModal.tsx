@@ -1,25 +1,27 @@
 import { useEffect, useState } from 'react'
 import { Braces, Check, ChevronDown, Clipboard, Code2, LoaderCircle, Upload, X } from 'lucide-react'
 import { api } from '../api'
-import type { ComputeNode, DatasetUploadResult, Resources, TaskCreatePayload, TrainingTask } from '../types'
+import type { ComputeNode, DatasetUploadResult, Resources, TaskCreatePayload, TaskGroup, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { UploadDatasetModal } from './UploadDatasetModal'
 import { analyzeImportedParameters, definitionsFromCatalog, importDefinitions, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
 
 interface Props {
   open: boolean
+  groups: TaskGroup[]
   onClose: () => void
   onCreated: (task: TrainingTask) => void
 }
 
 const initial: TaskCreatePayload = {
   name: '', task_type: 'detect', model_path: '', data_path: '', epochs: 100, batch: 16,
+  group_id: null,
   execution_node_id: null, remote_output_root: '',
   imgsz: 640, device: '0', workers: 8, optimizer: 'auto', patience: 50, lr0: null,
   pretrained: true, cache: false, amp: true, close_mosaic: 10, advanced: {},
 }
 
-export function CreateTaskModal({ open, onClose, onCreated }: Props) {
+export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
   const [resources, setResources] = useState<Resources | null>(null)
   const [nodes, setNodes] = useState<ComputeNode[]>([])
   const [form, setForm] = useState<TaskCreatePayload>(initial)
@@ -60,6 +62,12 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
     }).catch((reason) => setError(reason.message))
     api.computeNodes().then(setNodes).catch(() => setNodes([]))
   }, [open])
+
+  useEffect(() => {
+    if (form.group_id && !groups.some((group) => group.id === form.group_id)) {
+      setForm((current) => ({ ...current, group_id: null }))
+    }
+  }, [form.group_id, groups])
 
   useEffect(() => {
     if (!open) return
@@ -135,6 +143,7 @@ export function CreateTaskModal({ open, onClose, onCreated }: Props) {
           {error && <div className="alert error">{error}</div>}
           <div className="form-grid">
             <label className="span-2">任务名称<input data-modal-initial-focus required value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：反光背心 YOLO26x 试验 02" /></label>
+            <label className="span-2">训练分组<select value={form.group_id || ''} onChange={(e) => update('group_id', e.target.value || null)}><option value="">未分组</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select><small>将同一模型的多轮实验放在同一分组中，便于折叠和对比。</small></label>
             <label className="span-2">执行服务器<select value={form.execution_node_id || ''} onChange={(e) => { const id = e.target.value || null; setForm((current) => ({ ...current, execution_node_id: id, model_path: id ? '' : (resources?.models[0]?.path || ''), data_path: id ? '' : (resources?.datasets[0]?.path || ''), device: id ? '0' : String(resources?.gpus[0]?.index ?? 'cpu'), remote_output_root: '' })) }}><option value="">本机（中台服务器）</option>{nodes.filter((node) => node.kind === 'agent' && node.enabled).map((node) => <option key={node.id} value={node.id}>{node.name} · {node.address || node.hostname || node.status}</option>)}</select><small>{isRemote ? `远程 Agent：${remoteTrainingUnavailableReason || '训练已就绪'}` : '使用中台服务器本机资源与路径'}</small></label>
             <label>任务类型<select value={form.task_type} onChange={(e) => update('task_type', e.target.value)}><option value="detect">目标检测</option><option value="segment">实例分割</option><option value="classify">图像分类</option><option value="pose">姿态估计</option><option value="obb">旋转框</option></select></label>
             <label>GPU 设备{isRemote ? <input value={form.device} onChange={(e) => update('device', e.target.value)} placeholder="例如 0 或 0,1；也可填 cpu" /> : <select value={form.device} onChange={(e) => update('device', e.target.value)}>{resources?.gpus.map((gpu) => <option key={gpu.index} value={gpu.index}>{gpu.index} · {gpu.name}</option>)}{(resources?.gpus.length || 0) > 1 && <option value={resources!.gpus.map((gpu) => gpu.index).join(',')}>全部 GPU（DDP）</option>}<option value="cpu">CPU</option></select>}</label>

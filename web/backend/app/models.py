@@ -29,6 +29,18 @@ class ComputeNode(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class TaskGroup(Base):
+    __tablename__ = "task_groups"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), index=True)
+    display_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    tasks: Mapped[list["TrainingTask"]] = relationship(back_populates="group")
+
+
 class TrainingTask(Base):
     __tablename__ = "training_tasks"
 
@@ -37,6 +49,9 @@ class TrainingTask(Base):
     task_type: Mapped[str] = mapped_column(String(24), default="detect")
     status: Mapped[str] = mapped_column(String(24), default="draft", index=True)
     source: Mapped[str] = mapped_column(String(24), default="platform")
+    group_id: Mapped[str | None] = mapped_column(
+        ForeignKey("task_groups.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
     execution_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     model_path: Mapped[str] = mapped_column(Text)
     data_path: Mapped[str] = mapped_column(Text)
@@ -72,6 +87,7 @@ class TrainingTask(Base):
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     events: Mapped[list["TaskEvent"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     model_tests: Mapped[list["ModelTest"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    group: Mapped[TaskGroup | None] = relationship(back_populates="tasks")
 
 
 class TrainingRun(Base):

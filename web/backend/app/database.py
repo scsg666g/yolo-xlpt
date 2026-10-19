@@ -55,6 +55,7 @@ def migrate_database() -> Path | None:
         {index["name"] for index in inspector.get_indexes("model_tests")}
         if model_test_columns else set()
     )
+    group_table_exists = inspector.has_table("task_groups")
     display_order_needs_repair = False
     if "display_order" in task_columns:
         with engine.connect() as connection:
@@ -71,6 +72,8 @@ def migrate_database() -> Path | None:
         or "run_id" not in artifact_columns
         or "run_id" not in event_columns
         or "execution_node_id" not in task_columns
+        or "group_id" not in task_columns
+        or not group_table_exists
         or (bool(run_columns) and "execution_node_id" not in run_columns)
         or (bool(run_columns) and "stop_requested" not in run_columns)
         or (bool(run_columns) and "remote_log_tail" not in run_columns)
@@ -91,6 +94,21 @@ def migrate_database() -> Path | None:
         shutil.copy2(database, backup)
 
     with engine.begin() as connection:
+        if not group_table_exists:
+            connection.execute(text("""
+                CREATE TABLE task_groups (
+                    id VARCHAR(64) NOT NULL PRIMARY KEY,
+                    name VARCHAR(160) NOT NULL,
+                    display_order INTEGER NOT NULL DEFAULT 0,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL
+                )
+            """))
+            connection.execute(text("CREATE INDEX ix_task_groups_name ON task_groups (name)"))
+            connection.execute(text("CREATE INDEX ix_task_groups_display_order ON task_groups (display_order)"))
+        if "group_id" not in task_columns:
+            connection.execute(text("ALTER TABLE training_tasks ADD COLUMN group_id VARCHAR(64)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_group_id ON training_tasks (group_id)"))
         if "display_order" not in task_columns:
             connection.execute(text("ALTER TABLE training_tasks ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_display_order ON training_tasks (display_order)"))

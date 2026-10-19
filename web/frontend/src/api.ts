@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelTest, ModelTestPage, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelTest, ModelTestPage, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -88,6 +88,12 @@ export const api = {
   deleteManagedDataset: (name: string) => requestWithTimeout<void>(`/api/datasets/managed/${encodeURIComponent(name)}`, { method: 'DELETE' }, 30_000,
     '删除请求超时，请刷新数据集列表确认状态'),
   tasks: (signal?: AbortSignal) => request<TrainingTask[]>('/api/tasks', { signal }),
+  taskGroups: (signal?: AbortSignal) => request<TaskGroup[]>('/api/task-groups', { signal }),
+  createTaskGroup: (name: string) => request<TaskGroup>('/api/task-groups', { method: 'POST', body: JSON.stringify({ name }) }),
+  createTaskGroupFromTasks: (name: string, task_ids: string[]) => request<TaskGroup>('/api/task-groups/from-tasks', { method: 'POST', body: JSON.stringify({ name, task_ids }) }),
+  renameTaskGroup: (id: string, name: string) => request<TaskGroup>(`/api/task-groups/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+  deleteTaskGroup: (id: string) => request<void>(`/api/task-groups/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  assignTaskGroup: (id: string, group_id: string | null) => request<TrainingTask>(`/api/tasks/${id}/group`, { method: 'PATCH', body: JSON.stringify({ group_id }) }),
   reorderTasks: (task_ids: string[]) => request<void>('/api/tasks/order', { method: 'PATCH', body: JSON.stringify({ task_ids }) }),
   deletedTasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks?deleted_only=true', { signal }).then((tasks) => tasks.filter((task) => task.deleted_at)),
   task: (id: string, signal?: AbortSignal) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}`, { signal }),

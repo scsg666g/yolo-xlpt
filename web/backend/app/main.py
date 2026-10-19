@@ -41,7 +41,7 @@ from .inference import (
     stage_task_test_cancellation,
     worker as inference_worker,
 )
-from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TaskGroup, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete
 from .parameter_catalog import is_finite_number, load_parameter_catalog, validate_parameter_values
 from .remote_operations import (
@@ -52,7 +52,7 @@ from .remote_operations import (
     queue_scan,
     router as remote_operations_router,
 )
-from .schemas import ArtifactRead, EffectiveBestWeightRead, EventRead, LayoutUpdate, MetricRead, RemoteInterruptConfirmation, RunRead, TaskConfigUpdate, TaskCreate, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
+from .schemas import ArtifactRead, EffectiveBestWeightRead, EventRead, LayoutUpdate, MetricRead, RemoteInterruptConfirmation, RunRead, TaskConfigUpdate, TaskCreate, TaskGroupAssignment, TaskGroupCreate, TaskGroupCreateFromTasks, TaskGroupRead, TaskGroupRename, TaskOrderUpdate, TaskRead, TaskRename, TaskResourceUpdate
 from .services import (
     add_event,
     backfill_training_runs,
@@ -170,6 +170,21 @@ def get_task_or_404(db: Session, task_id: str, *, include_deleted: bool = False)
     return task
 
 
+def get_task_group_or_404(db: Session, group_id: str) -> TaskGroup:
+    group = db.get(TaskGroup, group_id)
+    if not group:
+        raise HTTPException(404, "训练分组不存在")
+    return group
+
+
+def reject_duplicate_group_name(db: Session, name: str, *, exclude_id: str | None = None) -> None:
+    query = select(TaskGroup).where(func.lower(TaskGroup.name) == name.casefold())
+    if exclude_id:
+        query = query.where(TaskGroup.id != exclude_id)
+    if db.scalar(query):
+        raise HTTPException(409, "训练分组名称已存在")
+
+
 def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
     run = db.scalar(select(TrainingRun).where(TrainingRun.id == run_id, TrainingRun.task_id == task_id))
     if not run:
@@ -269,6 +284,85 @@ def training_parameters():
     }
 
 
+@app.get("/api/task-groups", response_model=list[TaskGroupRead])
+def list_task_groups(db: Session = Depends(get_db)):
+    return db.scalars(select(TaskGroup).order_by(TaskGroup.display_order, TaskGroup.created_at, TaskGroup.id)).all()
+
+
+@app.post("/api/task-groups", response_model=TaskGroupRead, status_code=201)
+def create_task_group(payload: TaskGroupCreate, db: Session = Depends(get_db)):
+    reject_duplicate_group_name(db, payload.name)
+    group = TaskGroup(
+        id=uuid.uuid4().hex[:16],
+        name=payload.name,
+        display_order=(db.scalar(select(func.coalesce(func.max(TaskGroup.display_order), 0))) or 0) + 1000,
+    )
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    return group
+
+
+@app.post("/api/task-groups/from-tasks", response_model=TaskGroupRead, status_code=201)
+def create_task_group_from_tasks(payload: TaskGroupCreateFromTasks, db: Session = Depends(get_db)):
+    reject_duplicate_group_name(db, payload.name)
+    tasks = list(db.scalars(
+        select(TrainingTask).where(TrainingTask.id.in_(payload.task_ids))
+    ).all())
+    tasks_by_id = {task.id: task for task in tasks}
+    if len(tasks_by_id) != len(payload.task_ids):
+        raise HTTPException(404, "部分训练任务已不存在，请刷新后重试")
+    if any(task.deleted_at for task in tasks):
+        raise HTTPException(409, "已删除的训练任务不能加入分组")
+    if any(task.group_id for task in tasks):
+        raise HTTPException(409, "部分训练任务已加入其他分组，请刷新后重试")
+
+    group = TaskGroup(
+        id=uuid.uuid4().hex[:16],
+        name=payload.name,
+        display_order=(db.scalar(select(func.coalesce(func.max(TaskGroup.display_order), 0))) or 0) + 1000,
+    )
+    db.add(group)
+    db.flush()
+    for task_id in payload.task_ids:
+        task = tasks_by_id[task_id]
+        task.group_id = group.id
+        add_event(
+            db,
+            task.id,
+            "group_changed",
+            f"训练分组已调整为 {group.name}",
+            payload={
+                "old_group_id": None,
+                "old_group_name": None,
+                "group_id": group.id,
+                "group_name": group.name,
+            },
+        )
+    db.commit()
+    db.refresh(group)
+    return group
+
+
+@app.patch("/api/task-groups/{group_id}", response_model=TaskGroupRead)
+def rename_task_group(group_id: str, payload: TaskGroupRename, db: Session = Depends(get_db)):
+    group = get_task_group_or_404(db, group_id)
+    if group.name != payload.name:
+        reject_duplicate_group_name(db, payload.name, exclude_id=group.id)
+        group.name = payload.name
+        db.commit()
+        db.refresh(group)
+    return group
+
+
+@app.delete("/api/task-groups/{group_id}", status_code=204)
+def delete_task_group(group_id: str, db: Session = Depends(get_db)):
+    group = get_task_group_or_404(db, group_id)
+    db.execute(update(TrainingTask).where(TrainingTask.group_id == group.id).values(group_id=None))
+    db.delete(group)
+    db.commit()
+
+
 @app.get("/api/tasks", response_model=list[TaskRead])
 def list_tasks(status: str | None = Query(default=None), include_deleted: bool = Query(default=False),
                deleted_only: bool = Query(default=False), db: Session = Depends(get_db)):
@@ -298,8 +392,33 @@ def update_task_order(payload: TaskOrderUpdate, db: Session = Depends(get_db)):
     db.commit()
 
 
+@app.patch("/api/tasks/{task_id}/group", response_model=TaskRead)
+def assign_task_group(task_id: str, payload: TaskGroupAssignment, db: Session = Depends(get_db)):
+    task = get_task_or_404(db, task_id)
+    group = get_task_group_or_404(db, payload.group_id) if payload.group_id else None
+    if task.group_id != payload.group_id:
+        old_group = db.get(TaskGroup, task.group_id) if task.group_id else None
+        task.group_id = payload.group_id
+        add_event(
+            db,
+            task.id,
+            "group_changed",
+            f"训练分组已调整为 {group.name if group else '未分组'}",
+            payload={
+                "old_group_id": old_group.id if old_group else None,
+                "old_group_name": old_group.name if old_group else None,
+                "group_id": group.id if group else None,
+                "group_name": group.name if group else None,
+            },
+        )
+        db.commit()
+        db.refresh(task)
+    return task
+
+
 @app.post("/api/tasks", response_model=TaskRead, status_code=201)
 def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
+    group = get_task_group_or_404(db, payload.group_id) if payload.group_id else None
     node = db.get(ComputeNode, payload.execution_node_id) if payload.execution_node_id else None
     if payload.execution_node_id:
         reject_unavailable_remote_training(node, 422)
@@ -320,7 +439,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
         task_id = uuid.uuid4().hex[:16]
-        config = payload.model_dump(exclude={"name", "task_type", "model_path", "data_path", "execution_node_id", "remote_output_root", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
+        config = payload.model_dump(exclude={"name", "task_type", "group_id", "model_path", "data_path", "execution_node_id", "remote_output_root", "epochs", "batch", "imgsz", "device", "workers", "optimizer", "advanced"})
         if node:
             config["remote_output_root"] = payload.remote_output_root.strip()
         supported_keys = editable_training_keys()
@@ -338,6 +457,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             id=task_id,
             name=payload.name.strip(),
             task_type=payload.task_type,
+            group_id=group.id if group else None,
             execution_node_id=node.id if node else None,
             model_path=model_path,
             data_path=data_path,
@@ -607,6 +727,7 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
             reject_active_remote_delete(db, source.execution_node_id)
         clone = TrainingTask(
             id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
+            group_id=source.group_id,
             execution_node_id=source.execution_node_id,
             model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
             imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,

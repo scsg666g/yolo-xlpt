@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 class TaskCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     task_type: Literal["detect", "segment", "classify", "pose", "obb"] = "detect"
+    group_id: str | None = Field(default=None, min_length=1, max_length=64)
     model_path: str
     data_path: str
     execution_node_id: str | None = None
@@ -53,6 +54,48 @@ class LayoutUpdate(BaseModel):
 
 class TaskOrderUpdate(BaseModel):
     task_ids: list[str] = Field(min_length=1)
+
+
+class TaskGroupCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=160, strict=True)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def strip_name(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+
+class TaskGroupRename(TaskGroupCreate):
+    pass
+
+
+class TaskGroupCreateFromTasks(TaskGroupCreate):
+    model_config = ConfigDict(extra="forbid")
+
+    task_ids: list[str] = Field(min_length=1, max_length=500)
+
+    @field_validator("task_ids")
+    @classmethod
+    def reject_duplicate_task_ids(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("任务列表不能包含重复项")
+        return value
+
+
+class TaskGroupAssignment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    group_id: str | None = Field(default=None, min_length=1, max_length=64)
+
+
+class TaskGroupRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    name: str
+    display_order: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class TaskRename(BaseModel):
@@ -116,6 +159,7 @@ class TaskRead(BaseModel):
     task_type: str
     status: str
     source: str
+    group_id: str | None = None
     execution_node_id: str | None = None
     model_path: str
     data_path: str

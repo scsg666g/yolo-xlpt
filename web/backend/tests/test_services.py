@@ -932,6 +932,8 @@ def test_legacy_schema_migration_creates_backup_and_run_columns(tmp_path: Path, 
     inspector = inspect(legacy_engine)
 
     assert backup and backup.exists()
+    assert inspector.has_table("task_groups")
+    assert "group_id" in {column["name"] for column in inspector.get_columns("training_tasks")}
     assert "current_run_id" in {column["name"] for column in inspector.get_columns("training_tasks")}
     assert "run_id" in {column["name"] for column in inspector.get_columns("metric_points")}
     assert "run_id" in {column["name"] for column in inspector.get_columns("artifacts")}
