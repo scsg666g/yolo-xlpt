@@ -225,6 +225,7 @@ export interface ComputeNode extends ComputeNodeSettings {
     yolo_version: string | null
     python_version: string | null
     output_writable: boolean
+    output_roots?: string[]
     lock_occupied: boolean
   } | null
   hostname: string | null

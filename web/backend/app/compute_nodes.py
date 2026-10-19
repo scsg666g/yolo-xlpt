@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import platform
+import posixpath
 import secrets
 import socket
 import threading
@@ -15,7 +16,7 @@ import time
 import uuid
 import math
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -133,6 +134,14 @@ class TrainingCapability(BaseModel):
     python_version: str | None = Field(default=None, max_length=100)
     output_writable: bool = False
     lock_occupied: bool = False
+    output_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
+
+    @field_validator("output_roots")
+    @classmethod
+    def absolute_output_roots(cls, value: list[str]) -> list[str]:
+        if any(not PurePosixPath(root).is_absolute() or "\x00" in root for root in value):
+            raise ValueError("训练输出目录必须是远程服务器上的有效绝对路径")
+        return list(dict.fromkeys(posixpath.normpath(root) for root in value))
 
 
 class AgentReport(BaseModel):
@@ -288,6 +297,28 @@ def remote_training_unavailable_reason(node: ComputeNode | None, *, now: datetim
     if not capability.get("ready"):
         return str(capability.get("reason") or "远程训练环境未就绪")[:400]
     return None
+
+
+def remote_output_root_unavailable_reason(node: ComputeNode | None, output_root: Any) -> str | None:
+    """Check reported remote POSIX roots without consulting the center's filesystem.
+
+    Older Agents omit output_roots; their authoritative path checks remain on
+    the Agent. Symlinks and real filesystem permissions also remain remote.
+    """
+    if not isinstance(output_root, str) or "\x00" in output_root or not PurePosixPath(output_root).is_absolute():
+        return "训练输出目录必须是远程服务器上的有效绝对路径"
+    capability = (node.snapshot or {}).get("training") if node else None
+    roots = capability.get("output_roots") if isinstance(capability, dict) else None
+    if not roots:
+        return None
+    candidate = PurePosixPath(posixpath.normpath(output_root))
+    if any(candidate.is_relative_to(PurePosixPath(posixpath.normpath(root))) for root in roots):
+        return None
+    return (
+        f"训练输出目录 {output_root} 不在远程 Agent 允许的训练输出目录内：{'、'.join(roots)}。"
+        "请选择其中一个目录或其子目录；如需调整范围，请修改该 Agent 的 training_output_roots，"
+        "同时确保它在 allowed_training_roots 内，并重启该 Agent 后等待重新上报"
+    )
 
 
 def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
@@ -496,6 +527,25 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         db.commit()
         return {"task": None, "poll_interval_seconds": 5}
     snapshot = run.parameter_snapshot or {}
+    output_error = remote_output_root_unavailable_reason(node, snapshot.get("remote_output_root"))
+    if output_error:
+        # The Agent configuration can change after a task was queued. Retire
+        # only an unclaimed run (or an expired, unconfirmed lease) so a stale
+        # poll cannot overwrite a concurrent successful claim or stop.
+        rejected = db.execute(update(TrainingRun).where(
+            TrainingRun.id == run.id,
+            ((TrainingRun.status == "queued") | ((TrainingRun.status == "starting") &
+              TrainingRun.claim_confirmed.is_(False) & (TrainingRun.claim_expires_at < now))),
+        ).values(status="failed", pid=None, finished_at=now, error_message=output_error)
+          .execution_options(synchronize_session=False))
+        if rejected.rowcount == 1:
+            db.refresh(run)
+            mirror_run_to_task(task, run)
+            add_event(db, task.id, "failed", output_error, run_id=run.id)
+            db.commit()
+        else:
+            db.rollback()
+        return {"task": None, "poll_interval_seconds": 5, "message": output_error}
     run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
     claimed_at = utcnow()
     lease = secrets.token_hex(16)

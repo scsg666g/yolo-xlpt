@@ -17,12 +17,17 @@ python3 monitor_agent.py --config agent-config.json --once
 python3 monitor_agent.py --config agent-config.json
 ```
 
-`--check-config` 只在本机检查配置、YOLO 程序、输出写入、状态目录和共享锁，不连接中心、不打印 Token。`--once` 执行一次算力采样与上报，不领取训练任务；成功返回 0，失败返回非零退出码。持续运行时连接失败会退避重试；网络恢复后上报新采样。Agent 不会补传过期算力数据。终端关闭会结束前台 Agent，长期使用建议配置 systemd。
+`--check-config` 只在本机检查配置、YOLO 程序、输出写入、状态目录和共享锁，并显示解析后的工作目录、访问目录和输出目录，不连接中心、不打印 Token。`--once` 执行一次算力采样与上报，不领取训练任务；成功返回 0，失败返回非零退出码。持续运行时连接失败会退避重试；网络恢复后上报新采样。Agent 不会补传过期算力数据。终端关闭会结束前台 Agent，长期使用建议配置 systemd。
 
 配置示例（真实 Token 只在创建或重置时提供一次）：
 
 ```json
 {
+  "_comments": {
+    "center_url": "填写远程服务器可访问的中心地址；使用代理时填写代理入口",
+    "training_cwd": "相对于本配置文件所在目录；省略时使用配置文件目录",
+    "training_output_roots": "允许写入训练结果的目录；相对路径基于 training_cwd"
+  },
   "center_url": "http://<中心服务器地址>:18088",
   "node_id": "平台生成的节点ID",
   "token": "平台生成的独立Token",
@@ -37,7 +42,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-使用 **Agent 1.8.0 和配套的平台 1.1.0**，并确保 `center_url` 能从远程机器访问。当前中心将 1.8.0 作为新远程训练的最低版本；以下表格保留协议能力的版本演进，不表示旧 Agent 仍可向当前中心领取训练：
+当前脚本为 **Agent 1.8.1**，配套开发平台为 **1.1.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；以下表格保留协议能力的版本演进，不表示更旧 Agent 仍可向当前中心领取训练：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -48,22 +53,36 @@ python3 monitor_agent.py --config agent-config.json
 | 训练领取租约与启动确认 | 1.6.0 | 未确认领取在 90 秒后可重新分发，降低响应丢失导致的长期“启动中” |
 | 确认重试、活动运行恢复与单实例 | 1.7.0 | 配合新版中心处理确认响应丢失、确认前停止和 Agent 异常退出 |
 | 训练就绪门禁、层级输出根锁、共享根删除保护和恢复结果判定 | 1.8.0 | 中心按版本、`last_seen_at` 和 `training.ready` 控制训练入口；同机多 Agent 必须使用同一专用系统账户才能共享完整 workspace 保护 |
+| 相对路径配置、中文字段说明和输出目录能力上报 | 1.8.1 | 开发平台使用上报目录帮助选择并校验远程输出路径；旧中心可继续接入 Agent，但不会自动获得新版页面和校验逻辑 |
 
-当前中心在创建、启动、续训、重新训练和领取阶段都会拒绝低于 1.8.0 的 Agent。只需监控的旧 Agent 仍可上报算力，但不应用于新的远程训练。配置示例中的 `/srv/...` 是占位路径，必须按远程服务器实际目录替换：
+当前中心在创建、启动、续训、重新训练和领取阶段都会拒绝低于 1.8.0 的 Agent。只需监控的旧 Agent 仍可上报算力，但不应用于新的远程训练。下例假设 Agent 配置目录与项目目录 `yolo` 是兄弟目录，按服务器实际布局调整：
 
 ```json
 {
   "enable_training": true,
-  "allowed_training_roots": ["/srv/yolo/models", "/srv/yolo/datasets", "/srv/yolo/runs"],
-  "training_output_roots": ["/srv/yolo/runs"],
+  "training_cwd": "../yolo",
+  "allowed_training_roots": ["models", "datasets", "runs"],
+  "training_output_roots": ["runs"],
   "yolo_bin": "yolo",
   "enable_training_trace": true
 }
 ```
 
-这些字段须加到现有 JSON 对象中，保留原来的 `center_url`、`node_id`、`token` 等字段。`yolo_bin` 默认为 `yolo`，由 Agent 运行环境的 `PATH` 解析；需要锁定特定环境时再填写该服务器上的可执行文件绝对路径。`training_cwd` 可省略，默认为 `agent-config.json` 所在目录；需要在特定项目目录启动 YOLO 时再显式配置。`allowed_training_roots` 应仅列模型文件、数据 YAML、输出根目录所在的最小目录；输出根目录须事先存在，运行 Agent 的用户须有相应写权限。训练产物位于 `<输出根目录>/<任务类型>/<任务 ID>/attempt-001`。启动前 Agent 检查模型文件和数据 YAML 是否存在、路径是否落在允许目录内；它不会逐一检查 YAML 引用的全部图片路径是否也在允许目录内。命令通过参数数组执行，不执行任意 Shell。建议用具有训练目录写入权的专用非 root 用户运行 Agent。
+这些字段须加到现有 JSON 对象中，保留原来的 `center_url`、`node_id`、`token` 等字段。配置和示例文件用 `_comments` 对象提供中文说明，它是普通 JSON 元数据，不参与训练；不要改写成带 `//` 或 `/* */` 的 JSONC。
+
+Agent 1.8.1 按下表解析路径，不依赖启动终端所在目录；原有绝对路径配置仍兼容：
+
+| 字段 | 相对路径的基准 |
+| --- | --- |
+| `training_cwd` | `agent-config.json` 所在目录；省略时就是该目录 |
+| `allowed_training_roots`、`training_output_roots`、`training_lock_file` | 解析后的 `training_cwd` |
+| `yolo_bin` | 单独写 `yolo` 时通过运行环境的 `PATH` 查找；带 `/` 的相对路径基于 `training_cwd` |
+
+`allowed_training_roots` 应仅列模型文件、数据 YAML、输出根目录所在的最小目录；输出根目录须事先存在，运行 Agent 的用户须有相应写权限。训练产物位于 `<输出根目录>/<任务类型>/<任务 ID>/attempt-001`。启动前 Agent 检查模型文件和数据 YAML 是否存在、路径是否落在允许目录内；它不会逐一检查 YAML 引用的全部图片路径是否也在允许目录内。命令通过参数数组执行，不执行任意 Shell。建议用具有训练目录写入权的专用非 root 用户运行 Agent。
 
 `training_output_roots` 明确哪些允许目录可作为训练输出，每一项必须位于 `allowed_training_roots` 内。旧配置未填写时 Agent 会兼容运行，但只能判断允许目录中是否至少有一个可写；每次启动仍会对任务实际输出根目录再做写入检查。
+
+例如 `runs` 与 `ultralytics/runs` 是项目下的两个独立目录，将后者加入访问目录并不会自动把它加入输出目录。Agent 1.8.1 在 `training.output_roots` 中回传解析后的输出范围，新版开发平台据此提示可用目录并在接受训练前校验路径；最终文件存在性、权限、符号链接和目录边界仍由远程 Agent 检查。1.8.0 未上报该字段时保持兼容。原有任务与 Attempt 的路径快照不会随 Agent 配置自动迁移，应逐一核对；为历史产物保留访问目录，也不代表允许新训练写入该目录或允许绕过共享 owner 删除保护。
 
 `training_lock_file` 仍可选，默认位于 `training_cwd/.yolo-forge-training.lock`，用于保持单个 workspace 的兼容互斥；锁文件由 YOLO 子进程继承，Agent 意外结束时不会在训练存活期间提前释放。Agent 1.8.0 另外在 `${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/` 中对 `training_output_roots` 建立层级意向锁：相同根目录或父子根目录必然互斥，不相交的兄弟根目录可以并行。因此同一系统用户下的两个 1.8.0 Agent 不需要为了输出目录保护而手工填成同一个 `training_lock_file`。若为兼容旧部署而显式共用该文件，它仍是全局互斥锁，会让不相交的兄弟输出根也串行。
 
@@ -73,7 +92,7 @@ workspace 登记以 `node_id` 的稳定哈希作为 owner，不依赖配置文�
 
 Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Batch 的输入张量、网络层统计、损失和采样图片，并增量上传到中台的过程解析接口。平台不会上传完整特征图、模型权重或数据集；采样图片单张最多 512 KiB。采集失败不会中断训练，网络暂时不可用时会在下一次轮询重试。若远程服务器资源紧张，可在配置中设置 `"enable_training_trace": false`，关闭过程采集但保留普通训练、指标和日志回传。替换 Agent 后需重新领取或重新启动训练，已经运行的旧 Attempt 不会补采历史 Batch。
 
-中心从源码配置动态生成参数目录，Agent 1.8.0 与平台 1.1.0 的发布目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
+中心从源码配置动态生成参数目录，Agent 1.8.1 与平台 1.1.0 的发布目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
 
 ### 远程任务与文件操作（Agent 1.3.0）
 
@@ -122,17 +141,20 @@ Agent 将活动任务、启动命令、PID、Linux 进程启动时刻、命令�
 
 ### 更新 Agent
 
-先确认没有训练运行，然后停止原 Agent，备份并只替换 `monitor_agent.py`；保留 `agent-config.json` 与 `.training-state/`。从平台「算力资源」接入窗口下载最新脚本，或从远程可访问的中心地址下载到临时文件：
+先确认没有训练运行，然后停止原 Agent，备份脚本和配置，保留 `.training-state/`。本次修复涉及配置中的输出目录：除替换脚本外，还要合并对应部署包的路径与中文说明字段，保留该节点的 `center_url`、`node_id`、`token`；只替换脚本不会修复旧配置中的目录不匹配。不要将开发版节点配置覆盖到使用版节点。
+
+从平台「算力资源」接入窗口下载最新脚本，或从远程可访问的中心地址下载到临时文件：
 
 ```bash
 cd /path/to/agent  # 替换为实际 Agent 目录
 cp -p monitor_agent.py monitor_agent.py.backup
+cp -p agent-config.json agent-config.json.backup
 curl --fail --show-error --connect-timeout 5 --max-time 30 \
   http://YOUR_CENTER/api/compute/agent/download -o monitor_agent.new.py
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `1.8.0` 后，再替换并验证连接：
+确认输出为 `1.8.1`，完成配置合并并准备好可写的输出目录后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -203,9 +225,10 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 确认中心与 Agent 均为配套的 1.8.0，在算力页查看 `training.ready` 及原因，再检查 Agent 日志与 `.training-state/active/` |
+| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 1.8.1），在算力页查看 `training.ready` 及原因，再检查 Agent 日志与 `.training-state/active/` |
+| 训练输出目录被拒绝 | 比较 `--check-config` 的解析结果与任务输出路径，分别核对访问目录和 `training_output_roots`；两者均通过才能训练，修改本机待复制配置不会自动更新远端进程 |
 | 任务不领取、锁一直被占用 | 检查活动训练进程、`training_lock_file`、`${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/locks/` 和各 Agent 的 `training_output_roots`；锁文件存在本身不表示锁仍被持有 |
-| 永久删除提示共享 workspace 正在使用 | 查看同一系统用户下其他 1.8.0 Agent 的节点和输出根配置；停止或调整重叠的存活 Agent 后重试，不要手工删除登记来绕过保护 |
+| 永久删除提示共享 workspace 正在使用 | 查看同一系统用户下其他 1.8.0+ Agent 的节点和输出根配置；停止或调整重叠的存活 Agent 后重试，不要手工删除登记来绕过保护 |
 | 远程任务长时间“正在停止” | 先到远程服务器确认当前 Attempt 的 YOLO 进程已结束；停止超过 30 秒后才可在训练画布使用“解除占用”，该操作不会终止远程进程 |
 | 页面参数与远程命令不同 | 对照固定 `TRAINING_KEYS`、标量限制和远程 YOLO 版本，再检查实际命令与 `args.yaml` |
 | 产物扫描失败 | 检查允许目录、链接路径、文件数是否超过 1024、单文件元数据是否超过 8 GiB |

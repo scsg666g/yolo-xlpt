@@ -23,6 +23,7 @@ from .compute_nodes import (
     as_utc,
     ensure_local_node,
     local_snapshot,
+    remote_output_root_unavailable_reason,
     remote_trace_root,
     remote_training_unavailable_reason,
     router as compute_nodes_router,
@@ -223,6 +224,12 @@ def reject_unavailable_remote_training(node: ComputeNode | None, status_code: in
     reason = remote_training_unavailable_reason(node)
     if reason:
         raise HTTPException(status_code, f"远程 Agent 当前不可训练：{reason}")
+
+
+def reject_invalid_remote_output_root(node: ComputeNode | None, config: dict, status_code: int = 422) -> None:
+    reason = remote_output_root_unavailable_reason(node, (config or {}).get("remote_output_root"))
+    if reason:
+        raise HTTPException(status_code, reason)
 
 
 @app.get("/api/health")
@@ -452,6 +459,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             raise HTTPException(422, str(exc)) from exc
         config.update(payload.advanced)
         if node:
+            reject_invalid_remote_output_root(node, config)
             reject_unsupported_remote_parameters(node, config)
         task = TrainingTask(
             id=task_id,
@@ -494,6 +502,7 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
     if task.execution_node_id:
         node = db.get(ComputeNode, task.execution_node_id)
         reject_unavailable_remote_training(node, 409)
+        reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
     else:
         if not Path(task.model_path).exists() or not Path(task.data_path).exists():
@@ -524,6 +533,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     if task.execution_node_id:
         node = db.get(ComputeNode, task.execution_node_id)
         reject_unavailable_remote_training(node, 409)
+        reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
         checkpoint_artifact = db.scalar(select(Artifact).where(
             Artifact.run_id == previous.id, Artifact.name == "weights/last.pt", Artifact.size > 0,
@@ -569,6 +579,7 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
     if task.execution_node_id:
         node = db.get(ComputeNode, task.execution_node_id)
         reject_unavailable_remote_training(node, 409)
+        reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
     else:
         try:

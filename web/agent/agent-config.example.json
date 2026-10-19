@@ -1,0 +1,30 @@
+{
+  "_comments": {
+    "format": "标准 JSON；中文注释放在 _comments 中，不要使用 // 或 #。相对路径需要 Agent 1.8.1 或以上版本。",
+    "center_url": "远程服务器能够访问的中心平台或代理地址；迁移服务器时修改这里。",
+    "node_id": "从对应平台下载的节点 ID，必须与 token 配套；两套平台不可共用。",
+    "token": "替换为平台签发的真实凭证；配置文件权限设为 600，不提交 Git。",
+    "report_interval_seconds": "上报间隔，单位秒，范围 5～300；平台也可更新该间隔。",
+    "nvidia_smi_bin": "GPU 查询程序，默认在运行环境 PATH 中查找 nvidia-smi。",
+    "enable_training": "默认只监控；训练目录和 YOLO 环境配置好后才设为 true。",
+    "training_cwd": "相对路径基于本配置文件目录；. 表示此目录。所有训练目录相对它解析，不随启动终端目录变化。",
+    "allowed_training_roots": "模型、数据集 YAML、输出等允许访问的最小目录。相对路径基于 training_cwd，目录须已存在。保留历史目录不代表允许新训练写入。",
+    "training_output_roots": "允许写入训练结果的目录，必须位于 allowed_training_roots 中。相对路径基于 training_cwd，目录须存在且可写。两个平台的输出目录不能相同或互为父子；不要只修改 allowed_training_roots。空列表兼容旧配置，会使用全部访问允许目录，建议明确配置。",
+    "yolo_bin": "仅写 yolo 时从运行环境 PATH 查找。带 / 的相对路径以 training_cwd 为基准；需要指定 Conda 环境时填写对应程序路径。",
+    "training_lock_file": "相对路径基于 training_cwd。相同工作目录默认共享训练锁，避免并行抢占；不要删除运行中的锁文件或改锁名绕过保护。",
+    "enable_training_trace": "是否启用真实 Batch 过程采样；对支持的新训练生效，会增加采样开销。",
+    "deployment": "填写身份和目录后执行 --check-config，核对解析后的路径；变更配置需在训练空闲时重启 Agent。示例目录仅供参考，按服务器实际布局调整。"
+  },
+  "center_url": "http://YOUR_CENTER:18088",
+  "node_id": "00000000000000000000000000000000",
+  "token": "ylp_REPLACE_WITH_PLATFORM_TOKEN",
+  "report_interval_seconds": 5,
+  "nvidia_smi_bin": "nvidia-smi",
+  "enable_training": false,
+  "training_cwd": ".",
+  "allowed_training_roots": ["models", "datasets", "runs"],
+  "training_output_roots": ["runs"],
+  "yolo_bin": "yolo",
+  "training_lock_file": ".yolo-forge-training.lock",
+  "enable_training_trace": true
+}

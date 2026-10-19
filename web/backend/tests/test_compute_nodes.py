@@ -451,6 +451,140 @@ def test_remote_task_rejects_parameters_missing_from_agent_capability(monitoring
         assert task.status == "draft" and not task.runs
 
 
+def report_output_roots(client, credential, roots):
+    payload = sample()
+    payload["agent_version"] = "1.8.1"
+    payload["training"].update(output_roots=roots, supported_parameters=sorted(training_parameter_keys()))
+    response = client.post(f"/api/compute/nodes/{credential['node']['id']}/report",
+                           headers=headers(credential), json=payload)
+    assert response.status_code == 200, response.text
+
+
+def test_output_roots_are_persisted_and_exposed_in_node_list(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    report_output_roots(client, credential, ["/server/work/runs/", "/server/work/runs", "/outputs/team"])
+    expected = ["/server/work/runs", "/outputs/team"]
+    assert client.get(f"/api/compute/nodes/{node_id}").json()["training"]["output_roots"] == expected
+    listing = client.get("/api/compute/nodes").json()
+    assert next(node for node in listing if node["id"] == node_id)["training"]["output_roots"] == expected
+    with factory() as db:
+        assert db.get(ComputeNode, node_id).snapshot["training"]["output_roots"] == expected
+    for roots in (["relative/runs"], ["/invalid\x00path"]):
+        payload = sample()
+        payload["training"]["output_roots"] = roots
+        response = client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=payload)
+        assert response.status_code == 422
+
+
+@pytest.mark.parametrize(("output_root", "accepted"), [
+    ("/remote/runs", True),
+    ("/remote/runs/project", True),
+    ("/remote/runs/sub/../project", True),
+    ("/remote/runs-other", False),
+    ("/remote/runs/../outside", False),
+    ("/remote/runs/sub/../../outside", False),
+    ("/remote", False),
+])
+def test_remote_task_create_validates_reported_output_roots(monitoring_client, output_root, accepted):
+    client, factory = monitoring_client
+    credential = create(client)
+    report_output_roots(client, credential, ["/remote/runs"])
+    response = client.post("/api/tasks", json={
+        "name": "Remote output check", "execution_node_id": credential["node"]["id"],
+        "model_path": "/remote/model.pt", "data_path": "/remote/data.yaml",
+        "remote_output_root": output_root,
+    })
+    assert response.status_code == (201 if accepted else 422), response.text
+    if not accepted:
+        detail = response.json()["detail"]
+        assert output_root in detail and "/remote/runs" in detail and "training_output_roots" in detail
+        with factory() as db:
+            assert db.scalar(select(TrainingTask)) is None
+
+
+def test_remote_task_create_remains_compatible_with_old_agent_without_output_roots(monitoring_client):
+    client, _ = monitoring_client
+    credential = create(client)
+    payload = sample()
+    payload["training"]["supported_parameters"] = sorted(training_parameter_keys())
+    assert "output_roots" not in payload["training"]
+    assert client.post(f"/api/compute/nodes/{credential['node']['id']}/report",
+                       headers=headers(credential), json=payload).status_code == 200
+    response = client.post("/api/tasks", json={
+        "name": "Legacy Agent", "execution_node_id": credential["node"]["id"],
+        "model_path": "/remote/model.pt", "data_path": "/remote/data.yaml",
+        "remote_output_root": "/remote/runs",
+    })
+    assert response.status_code == 201, response.text
+    assert client.post(f"/api/tasks/{response.json()['id']}/start").status_code == 200
+    assert client.post(f"/api/compute/nodes/{credential['node']['id']}/agent/poll",
+                       headers=headers(credential)).json()["task"] is not None
+
+
+@pytest.mark.parametrize(("action", "status"), [("start", "draft"), ("retry", "failed"), ("resume", "stopped")])
+def test_remote_launch_rechecks_output_roots_without_creating_attempt(monitoring_client, action, status):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    report_output_roots(client, credential, ["/remote/new-runs"])
+    with factory() as db:
+        task = TrainingTask(id="changed-output-root", name="Changed output root", task_type="detect",
+                            execution_node_id=node_id, model_path="/remote/model.pt",
+                            data_path="/remote/data.yaml", config={"remote_output_root": "/remote/old-runs"})
+        db.add(task)
+        db.flush()
+        if action != "start":
+            previous = create_training_run(db, task, "fresh")
+            previous.status = status
+        task.status = status
+        db.commit()
+    response = client.post(f"/api/tasks/changed-output-root/{action}")
+    assert response.status_code == 409
+    assert "/remote/old-runs" in response.json()["detail"]
+    assert "/remote/new-runs" in response.json()["detail"]
+    with factory() as db:
+        task = db.get(TrainingTask, "changed-output-root")
+        assert task.status == status
+        assert len(task.runs) == (0 if action == "start" else 1)
+        assert not task.events
+
+
+@pytest.mark.parametrize("expired_claim", [False, True])
+def test_remote_poll_rejects_changed_output_roots_and_advances_queue(monitoring_client, expired_claim):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    report_output_roots(client, credential, ["/remote/new-runs"])
+    with factory() as db:
+        for task_id, root in [("changed-output", "/remote/old-runs"), ("valid-output", "/remote/new-runs")]:
+            task = TrainingTask(id=task_id, name=task_id, task_type="detect", execution_node_id=node_id,
+                                model_path="/remote/model.pt", data_path="/remote/data.yaml",
+                                config={"remote_output_root": root})
+            db.add(task)
+            db.flush()
+            run = create_training_run(db, task, "fresh")
+            if task_id == "changed-output" and expired_claim:
+                task.status = run.status = "starting"
+                run.claim_lease = "a" * 32
+                run.claim_expires_at = utcnow() - timedelta(seconds=1)
+                run.claim_confirmed = False
+        db.commit()
+    poll_url = f"/api/compute/nodes/{node_id}/agent/poll"
+    response = client.post(poll_url, headers=headers(credential))
+    assert response.status_code == 200 and response.json()["task"] is None
+    assert "training_output_roots" in response.json()["message"]
+    with factory() as db:
+        task = db.get(TrainingTask, "changed-output")
+        assert task.status == task.runs[0].status == "failed"
+        assert task.runs[0].finished_at is not None and task.runs[0].pid is None
+        assert task.error_message == task.runs[0].error_message
+        assert len(task.events) == 1 and task.events[0].event_type == "failed"
+    next_claim = client.post(poll_url, headers=headers(credential))
+    assert next_claim.json()["task"]["task_id"] == "valid-output"
+
+
 def test_stop_between_remote_claim_and_confirmation_is_idempotent(monitoring_client):
     client, factory = monitoring_client
     credential = create(client, "Stop Race Agent")

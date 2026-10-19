@@ -657,3 +657,106 @@ def test_check_config_is_offline_and_never_prints_token(agent, training, tmp_pat
     output = result.stdout + result.stderr
     assert result.returncode == 0 and "配置检查通过" in output
     assert token not in output
+    assert str(root / "runs") in output and "training_output_roots" in output
+
+
+def write_relative_config(tmp_path, **overrides):
+    project = tmp_path / "project"
+    (project / "runs").mkdir(parents=True, exist_ok=True)
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir(exist_ok=True)
+    path = agent_dir / "agent-config.json"
+    payload = {
+        "_comments": {"training_cwd": "相对于配置文件；其余训练目录相对于工作目录"},
+        "center_url": "http://127.0.0.1:9", "node_id": "1" * 32,
+        "token": "ylp_" + "s" * 32, "enable_training": True,
+        "training_cwd": "../project", "allowed_training_roots": ["runs"],
+        "training_output_roots": ["runs"], "yolo_bin": "./bin/yolo",
+        "training_lock_file": "./workspace.lock", **overrides,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False))
+    path.chmod(0o600)
+    return path, project
+
+
+def test_commented_relative_config_is_independent_of_shell_directory(agent, tmp_path, monkeypatch):
+    path, project = write_relative_config(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    loaded = agent.load_config(path)
+    assert loaded["training_cwd"] == str(project)
+    assert loaded["allowed_training_roots"] == [str(project / "runs")]
+    assert loaded["training_output_roots"] == [str(project / "runs")]
+    assert loaded["training_lock_file"] == str(project / "workspace.lock")
+    assert loaded["yolo_bin"] == str(project / "bin/yolo")
+    assert loaded["training_state_dir"] == str(path.parent / ".training-state")
+    # A deployment moved as a unit resolves against the new config location.
+    moved = tmp_path / "moved"
+    shutil.copytree(path.parent, moved / "agent")
+    shutil.copytree(project, moved / "project")
+    relocated = agent.load_config(moved / "agent/agent-config.json")
+    assert relocated["training_output_roots"] == [str(moved / "project/runs")]
+
+
+def test_relative_outputs_preserve_containment_and_symlink_protection(agent, tmp_path):
+    path, project = write_relative_config(tmp_path, training_output_roots=["runs/../../outside"])
+    with pytest.raises(ValueError, match="training_output_roots 必须位于"):
+        agent.load_config(path)
+    (tmp_path / "outside").mkdir()
+    (project / "runs/link").symlink_to(tmp_path / "outside", target_is_directory=True)
+    write_relative_config(tmp_path, training_output_roots=["runs/link"])
+    with pytest.raises(ValueError, match="training_output_roots 必须位于"):
+        agent.load_config(path)
+
+
+def test_relative_live_agent_config_still_blocks_overlapping_deletion(agent, tmp_path, monkeypatch):
+    path, project = write_relative_config(tmp_path)
+    original = Path.iterdir
+    monkeypatch.setattr(Path, "iterdir", lambda self: iter([Path("/proc/987654321")])
+                        if self == Path("/proc") else original(self))
+    monkeypatch.setattr(agent, "_process_argv", lambda pid: [])
+    monkeypatch.setattr(agent, "_agent_config_path", lambda pid, argv: path)
+    assert agent._other_live_agent_conflicts({}, [project / "runs"]) is True
+    assert agent._other_live_agent_conflicts({}, [project / "runs-other"]) is False
+    # Unreadable/invalid configuration must not silently remove ownership protection.
+    path.write_text('{"training_output_roots": [null]}')
+    assert agent._other_live_agent_conflicts({}, [project / "runs-other"]) is True
+
+
+def test_output_mismatch_explains_both_paths_before_creating_run(agent, training):
+    config, task = training
+    allowed = Path(config["training_cwd"]) / "different-runs"
+    allowed.mkdir()
+    config["training_output_roots"] = [str(allowed)]
+    with pytest.raises(ValueError) as failure:
+        agent.build_training_command(config, task)
+    assert "training_output_roots" in str(failure.value)
+    assert str(allowed) in str(failure.value)
+    assert task["parameters"]["remote_output_root"] in str(failure.value)
+    assert not Path(task["run_dir"]).exists()
+
+
+def test_capability_reports_actual_outputs_with_legacy_fallback(agent, training, monkeypatch):
+    config, _ = training
+    config["enable_training"] = True
+    monkeypatch.setattr(agent, "_configured_yolo_version", lambda _: "test")
+    capability = agent.training_capability(config)
+    assert capability["ready"] is True
+    assert capability["output_roots"] == config["training_output_roots"]
+    config.pop("training_output_roots")
+    assert agent.training_capability(config)["output_roots"] == config["allowed_training_roots"]
+
+
+def test_broken_output_link_reports_unavailable_without_crashing_monitor(agent, tmp_path):
+    path, project = write_relative_config(tmp_path)
+    config = agent.load_config(path)
+    output = project / "runs"
+    output.rmdir()
+    output.symlink_to("runs", target_is_directory=True)
+    capability = agent.training_capability(config)
+    assert capability["ready"] is False
+    assert capability["output_roots"] == []
+    assert capability["reason"]
+    with pytest.raises(ValueError, match="路径无法解析"):
+        agent.load_config(path)

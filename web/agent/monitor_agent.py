@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
@@ -272,8 +272,10 @@ def training_capability(config: dict) -> dict:
         return {"enabled": False, "ready": False, "reason": "远程训练未启用",
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
                 "python_version": platform.python_version(), "output_writable": False,
-                "lock_occupied": False}
+                "lock_occupied": False, "output_roots": []}
+    reported_roots = []
     try:
+        reported_roots = [str(root) for root in configured_output_roots(config)]
         cwd = Path(config["training_cwd"])
         roots = [Path(item) for item in config["allowed_training_roots"]]
         if not cwd.is_dir():
@@ -307,12 +309,14 @@ def training_capability(config: dict) -> dict:
         return {"enabled": True, "ready": True, "reason": None,
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": _configured_yolo_version(yolo),
                 "python_version": platform.python_version(), "output_writable": True,
-                "lock_occupied": occupied}
-    except (OSError, ValueError, KeyError) as exc:
+                "lock_occupied": occupied,
+                "output_roots": reported_roots}
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
                 "python_version": platform.python_version(), "output_writable": False,
-                "lock_occupied": False}
+                "lock_occupied": False,
+                "output_roots": reported_roots}
 
 
 def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
@@ -351,6 +355,31 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def config_path(value, base: Path, label: str) -> Path:
+    """Resolve deployment paths against an explicit base, never the shell cwd."""
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise ValueError(f"{label} 必须是非空路径")
+    candidate = Path(value)
+    try:
+        return (candidate if candidate.is_absolute() else base / candidate).resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"{label} 路径无法解析：{value}") from exc
+
+
+def normalized_training_paths(config: dict, path: Path) -> dict:
+    """Share path semantics with live-Agent inspection so relative roots stay protected."""
+    cwd = config_path(config.get("training_cwd", "."), path.resolve().parent, "training_cwd")
+    result = {"training_cwd": str(cwd)}
+    for key in ("allowed_training_roots", "training_output_roots"):
+        values = config.get(key, [])
+        if not isinstance(values, list):
+            raise ValueError(f"{key} 必须是路径列表")
+        result[key] = [str(config_path(value, cwd, key)) for value in values]
+    result["training_lock_file"] = str(config_path(
+        config.get("training_lock_file", ".yolo-forge-training.lock"), cwd, "training_lock_file"))
+    return result
+
+
 def load_config(path: Path) -> dict:
     if os.name == "posix" and stat.S_IMODE(path.stat().st_mode) & 0o077:
         raise ValueError("配置包含 Token，请先执行 chmod 600 <配置文件>")
@@ -376,32 +405,28 @@ def load_config(path: Path) -> dict:
     enabled = config.get("enable_training", False)
     if type(enabled) is not bool:
         raise ValueError("enable_training 必须为布尔值")
-    roots = config.get("allowed_training_roots", [])
-    if not isinstance(roots, list) or any(not isinstance(root, str) or not Path(root).is_absolute() for root in roots):
-        raise ValueError("allowed_training_roots 必须是绝对路径列表")
+    paths = normalized_training_paths(config, path)
+    roots = paths["allowed_training_roots"]
     if enabled and not roots:
         raise ValueError("启用训练时必须配置 allowed_training_roots")
-    output_roots = config.get("training_output_roots", [])
-    if (not isinstance(output_roots, list) or
-            any(not isinstance(root, str) or not Path(root).is_absolute() for root in output_roots)):
-        raise ValueError("training_output_roots 必须是绝对路径列表")
+    output_roots = paths["training_output_roots"]
     resolved_roots = [Path(item).resolve() for item in roots]
     resolved_outputs = [Path(item).resolve() for item in output_roots]
     if any(not any(output == root or root in output.parents for root in resolved_roots)
            for output in resolved_outputs):
-        raise ValueError("training_output_roots 必须位于 allowed_training_roots 内")
+        raise ValueError("training_output_roots 必须位于 allowed_training_roots 内；"
+                         f"输出目录：{'、'.join(output_roots)}；允许目录：{'、'.join(roots)}")
     trace_enabled = config.get("enable_training_trace", True)
     if type(trace_enabled) is not bool:
         raise ValueError("enable_training_trace 必须为布尔值")
     yolo_bin = config.get("yolo_bin", "yolo")
-    training_cwd = config.get("training_cwd", str(path.resolve().parent))
-    if not isinstance(yolo_bin, str) or not yolo_bin or not isinstance(training_cwd, str) or not Path(training_cwd).is_absolute():
-        raise ValueError("yolo_bin/training_cwd 配置无效")
+    training_cwd = paths["training_cwd"]
+    if not isinstance(yolo_bin, str) or not yolo_bin.strip():
+        raise ValueError("yolo_bin 必须是命令名或可执行文件路径")
     cwd_path = Path(training_cwd).resolve(strict=True) if enabled else Path(training_cwd).resolve()
-    lock_value = config.get("training_lock_file", str(cwd_path / ".yolo-forge-training.lock"))
-    if not isinstance(lock_value, str) or not Path(lock_value).is_absolute():
-        raise ValueError("training_lock_file 必须是绝对路径")
-    lock_path = Path(lock_value).resolve()
+    if "/" in yolo_bin:
+        yolo_bin = str(config_path(yolo_bin, cwd_path, "yolo_bin"))
+    lock_path = Path(paths["training_lock_file"])
     if enabled and not lock_path.parent.is_dir():
         raise ValueError("training_lock_file 的父目录必须已存在")
     return {"center_url": center, "node_id": node_id, "token": token,
@@ -631,6 +656,8 @@ def _live_agent_configs():
                 yield pid, None
                 continue
             payload = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                payload = {**payload, **normalized_training_paths(payload, config_path)}
             yield pid, payload if isinstance(payload, dict) else None
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             yield pid, None
@@ -911,7 +938,8 @@ def within_allowed(path: str, roots: list[str], *, file_required: bool = True,
     if not file_required and not candidate.is_dir():
         raise ValueError(f"远程服务器上的{label}不是目录：{candidate}")
     if not any(candidate == Path(root) or Path(root) in candidate.parents for root in roots):
-        raise ValueError(f"远程服务器上的{label}不在 Agent 允许目录内：{candidate}")
+        raise ValueError(f"远程服务器上的{label}不在 Agent 允许目录内：{candidate}；"
+                         f"allowed_training_roots：{'、'.join(roots)}")
     return candidate
 
 
@@ -936,7 +964,9 @@ def build_training_command(config: dict, task: dict) -> list[str]:
     configured_outputs = [Path(item) for item in config.get("training_output_roots", [])]
     if configured_outputs and not any(output_root == root or root in output_root.parents
                                       for root in configured_outputs):
-        raise ValueError("训练输出根目录不在 training_output_roots 内")
+        raise ValueError(f"训练输出根目录不在 training_output_roots 内：{output_root}；"
+                         f"可用输出根目录：{'、'.join(str(root) for root in configured_outputs)}；"
+                         "请修改任务输出目录，或核对远端实际加载的 Agent 配置后重新启动 Agent")
     try:
         _probe_writable_directory(output_root)
     except OSError as exc:
@@ -1772,6 +1802,11 @@ def main() -> int:
             LOGGER.error("配置无效或无法读取。请使用平台生成的 JSON 文件并设置权限 chmod 600。")
         return 2
     if args.check_config:
+        if config["enable_training"]:
+            LOGGER.info("训练工作目录：%s", config["training_cwd"])
+            LOGGER.info("allowed_training_roots（允许访问）：%s", "、".join(config["allowed_training_roots"]))
+            LOGGER.info("training_output_roots（任务输出可选目录）：%s",
+                        "、".join(str(root) for root in configured_output_roots(config)))
         capability = training_capability(config)
         if config["enable_training"] and not capability["ready"]:
             LOGGER.error("配置格式有效，但训练环境未就绪：%s", capability["reason"])

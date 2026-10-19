@@ -274,6 +274,13 @@ export function ComputeResources() {
             <strong>{trainingUnavailableReason ? '暂不可训练' : '训练已就绪'}</strong>
             <span>{trainingUnavailableReason || '可接受远程训练任务'}</span>
           </div>}
+          {node.kind === 'agent' && <details className="node-info">
+            <summary>训练输出允许目录 · {node.training?.output_roots?.length || 0} 项</summary>
+            {node.training?.output_roots?.length ? <>
+              <p>以下为 Agent 最近上报的实际目录；新建训练任务可选择这些目录或其已存在的子目录。如需新目录，请先在远程服务器创建。</p>
+              {node.training.output_roots.map((root) => <div key={root}><code style={{ overflowWrap: 'anywhere' }}>{root}</code></div>)}
+            </> : <p>Agent 尚未上报允许目录。请核对远程配置；升级 Agent 后会显示实际解析的目录。</p>}
+          </details>}
           {node.status === 'offline' && <div className="node-warning">服务器已离线。下方为最后一次采样，当前 GPU 负载和进程状态待确认。</div>}
           {node.status === 'disabled' && <div className="node-warning">监控已禁用，Agent 上报将被拒绝。下方为此前保存的数据。</div>}
           {node.status === 'pending' && <div className="node-info">等待 Agent 接入。点击右侧“接入配置”，在对应服务器启动只读 Agent。</div>}

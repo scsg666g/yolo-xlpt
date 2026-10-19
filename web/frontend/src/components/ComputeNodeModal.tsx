@@ -80,9 +80,27 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
     const url = new URL(center)
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('请输入有效的中心平台 HTTP(S) 地址')
     if (!token || !savedNode) throw new Error('请先生成该服务器的 Agent Token')
-    return JSON.stringify({ center_url: center.trim().replace(/\/+$/, ''), node_id: savedNode.id, token,
+    return JSON.stringify({
+      _comments: {
+        format: '本文件是标准 JSON；中文说明保存在 _comments 中，不要添加 // 或 # 注释。相对路径配置需要 Agent 1.8.1 或更高版本；旧版 Agent 请先升级或使用绝对路径。修改配置后需重启 Agent。',
+        center_url: '远程服务器能够访问的中心平台地址。开发版和使用版应连接各自的平台。',
+        node_id: '中心平台生成的节点 ID，应与 token 配套使用。',
+        token: '节点凭证，请保密；不要提交到 Git 或向他人分享。',
+        report_interval_seconds: '算力采样和状态上报间隔，单位为秒。',
+        nvidia_smi_bin: 'GPU 信息采集程序；默认从运行 Agent 的 PATH 查找 nvidia-smi。',
+        enable_training: '默认 false，仅上报算力。配置好训练环境和允许目录后再改为 true。',
+        training_cwd: '训练工作目录；相对路径以此配置文件所在目录为基准。默认 . 表示配置文件所在目录。',
+        allowed_training_roots: '允许访问模型、数据集及输出的目录列表；相对路径以 training_cwd 为基准。启用训练前必须填写。',
+        training_output_roots: '训练结果允许写入的目录列表，必须包含在 allowed_training_roots 中；相对路径以 training_cwd 为基准。开发版与使用版应使用互不重叠的输出目录。空列表会兼容使用 allowed_training_roots，建议明确配置。',
+        yolo_bin: 'YOLO 命令。仅填 yolo 时从 PATH 查找；包含路径分隔符的相对路径以 training_cwd 为基准。',
+        training_lock_file: '训练互斥锁文件；相对路径以 training_cwd 为基准。同一训练工作区的多个 Agent 应共用锁文件，不能通过改锁名绕过占用保护。',
+        enable_training_trace: '是否采样真实 Batch 的训练过程；仅受支持的新训练任务生成 Trace，会增加少量采样开销。',
+      },
+      center_url: center.trim().replace(/\/+$/, ''), node_id: savedNode.id, token,
       report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi',
-      enable_training: false, allowed_training_roots: [], yolo_bin: 'yolo' }, null, 2)
+      enable_training: false, training_cwd: '.', allowed_training_roots: [], training_output_roots: [],
+      yolo_bin: 'yolo', training_lock_file: '.yolo-forge-training.lock', enable_training_trace: true,
+    }, null, 2)
   }
 
   function downloadConfig() {
@@ -116,7 +134,8 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
             <li>把 <code>monitor_agent.py</code> 和 <code>agent-config.json</code> 放到远程服务器的同一目录。</li>
             <li>验证权限和连通性，然后上报一次：<pre>chmod 600 agent-config.json{'\n'}python3 monitor_agent.py --config agent-config.json --once</pre></li>
             <li>看到“采样上报成功”后，持续运行：<pre>python3 monitor_agent.py --config agent-config.json</pre></li>
-            <li>如需执行训练，先在 JSON 中设置 <code>enable_training</code> 为 <code>true</code>，并按这台服务器的目录填写 <code>allowed_training_roots</code>（仅允许 Agent 访问这些绝对路径）。<code>yolo_bin</code> 默认使用 PATH 中的 <code>yolo</code>；若需特定工作目录，再显式填写该服务器上的绝对 <code>training_cwd</code>，否则使用 Agent 配置文件所在目录。修改后重启 Agent。</li>
+            <li>下载的 JSON 包含中文 <code>_comments</code> 说明。如需执行训练，填写 <code>training_cwd</code>、<code>allowed_training_roots</code> 和 <code>training_output_roots</code> 后，再将 <code>enable_training</code> 改为 <code>true</code>。输出允许目录必须位于访问允许目录内，开发版与使用版应使用互不重叠的输出目录。</li>
+            <li>相对路径配置需要 Agent 1.8.1 或更高版本。<code>training_cwd</code> 的相对路径以配置文件目录为基准；允许目录、锁文件及带路径的 <code>yolo_bin</code> 的相对路径以训练工作目录为基准。仅填 <code>yolo</code> 时使用 PATH 中的命令。修改后重启 Agent，在算力页核对上报的实际输出目录；创建任务时可直接选择该目录。</li>
           </ol>
           <p className="node-help">Agent 使用 Python 标准库；GPU 指标由本机 nvidia-smi 提供。训练会调用配置的 YOLO CLI，不执行任意 Shell。日志与产物留在远程服务器；当前平台接收进度、指标和最近日志，不会自动复制模型文件。</p>
           <button className="button compact" disabled={busy} onClick={() => void rotate()}><RefreshCw size={14} />重新生成 Token</button>
