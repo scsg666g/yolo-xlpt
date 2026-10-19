@@ -1,8 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Boxes, Cpu, Database, LayoutDashboard, Moon, RefreshCw, Settings2, Sun, X } from 'lucide-react'
+import { Activity, Boxes, Check, Cpu, Database, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import packageMetadata from '../../package.json'
 import { api } from '../api'
+import {
+  COMPARE_LIMIT_DEFAULT,
+  COMPARE_LIMIT_MAX,
+  COMPARE_LIMIT_MIN,
+  readStoredCompareRuns,
+  useCompareLimit,
+  writeCompareLimit,
+  writeStoredCompareRuns,
+} from '../preferences'
 import type { PlatformHealth } from '../types'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
@@ -36,6 +45,9 @@ export function Layout() {
     document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
   )
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const compareLimit = useCompareLimit()
+  const [compareLimitDraft, setCompareLimitDraft] = useState(compareLimit)
+  const [storedCompareCount, setStoredCompareCount] = useState(0)
   const [health, setHealth] = useState<HealthView>({ phase: 'checking', details: null, error: '', checkedAt: null })
   const healthController = useRef<AbortController | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement>(null)
@@ -107,11 +119,21 @@ export function Layout() {
   useEffect(() => {
     if (!settingsOpen) return
     const trigger = settingsTrigger.current
+    setCompareLimitDraft(compareLimit)
+    setStoredCompareCount(readStoredCompareRuns().length)
     settingsDialog.current?.querySelector<HTMLElement>('[data-settings-initial-focus]')?.focus()
     return () => {
       if (trigger?.isConnected) trigger.focus()
     }
-  }, [settingsOpen])
+  }, [compareLimit, settingsOpen])
+
+  function applyCompareLimit() {
+    const current = readStoredCompareRuns()
+    const retained = current.slice(0, compareLimitDraft)
+    if (retained.length !== current.length) writeStoredCompareRuns(retained)
+    writeCompareLimit(compareLimitDraft)
+    setStoredCompareCount(retained.length)
+  }
 
   function closeSettings() {
     setSettingsOpen(false)
@@ -199,6 +221,31 @@ export function Layout() {
             <div className="header-actions">
               <button type="button" className={`button ${theme === 'light' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'light'} onClick={() => changeTheme('light')}><Sun size={15} />明亮主题</button>
               <button type="button" className={`button ${theme === 'dark' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'dark'} onClick={() => changeTheme('dark')}><Moon size={15} />深色主题</button>
+            </div>
+
+            <div className="parameter-section" style={{ marginTop: 24 }}>
+              <h3>实验对比</h3>
+              <p>设置当前浏览器最多同时展示的训练任务数量。</p>
+            </div>
+            <div className="compare-limit-setting">
+              <div>
+                <strong>最大同时对比任务数</strong>
+                <span>允许 {COMPARE_LIMIT_MIN}～{COMPARE_LIMIT_MAX} 个，默认 {COMPARE_LIMIT_DEFAULT} 个</span>
+              </div>
+              <div className="compare-limit-controls">
+                <div className="number-stepper" aria-label="最大同时对比任务数">
+                  <button type="button" disabled={compareLimitDraft <= COMPARE_LIMIT_MIN} title="减少对比数量" aria-label="减少对比数量" onClick={() => setCompareLimitDraft((value) => Math.max(COMPARE_LIMIT_MIN, value - 1))}><Minus size={15} /></button>
+                  <output aria-live="polite">{compareLimitDraft}</output>
+                  <button type="button" disabled={compareLimitDraft >= COMPARE_LIMIT_MAX} title="增加对比数量" aria-label="增加对比数量" onClick={() => setCompareLimitDraft((value) => Math.min(COMPARE_LIMIT_MAX, value + 1))}><Plus size={15} /></button>
+                </div>
+                <button type="button" className="icon-button" disabled={compareLimitDraft === COMPARE_LIMIT_DEFAULT} title={`恢复默认 ${COMPARE_LIMIT_DEFAULT} 个`} aria-label={`恢复默认 ${COMPARE_LIMIT_DEFAULT} 个`} onClick={() => setCompareLimitDraft(COMPARE_LIMIT_DEFAULT)}><RotateCcw size={15} /></button>
+                <button type="button" className="button primary compact" disabled={compareLimitDraft === compareLimit} onClick={applyCompareLimit}><Check size={15} />应用</button>
+              </div>
+            </div>
+            <div className={`compare-limit-message${storedCompareCount > compareLimitDraft ? ' warning' : ''}`} aria-live="polite">
+              {storedCompareCount > compareLimitDraft
+                ? `当前已选择 ${storedCompareCount} 个任务；应用后保留前 ${compareLimitDraft} 个，并移除其余 ${storedCompareCount - compareLimitDraft} 个。`
+                : compareLimitDraft === compareLimit ? `当前上限为 ${compareLimit} 个。` : `新上限 ${compareLimitDraft} 个尚未应用。`}
             </div>
 
             <div className="parameter-section" style={{ marginTop: 24 }}>

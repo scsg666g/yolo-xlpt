@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Layers3, Minus, Search, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
+import { readStoredCompareRuns, useCompareLimit, writeStoredCompareRuns } from '../preferences'
 import type { MetricPoint, TrainingRun, TrainingTask } from '../types'
 import { LineChartView } from './LineChart'
 
@@ -12,7 +13,7 @@ interface ComparisonRun {
   view: TrainingTask
 }
 
-const palette = ['#159a78', '#347bd1', '#a45fc7', '#e28a32']
+const palette = ['#159a78', '#347bd1', '#a45fc7', '#e28a32', '#d95c72', '#178fa5', '#b59a28', '#7b75d6']
 const metricOptions = [
   { key: 'metrics/mAP50(B)', label: 'mAP50', group: 'accuracy' },
   { key: 'metrics/mAP50-95(B)', label: 'mAP50-95', group: 'accuracy' },
@@ -142,6 +143,7 @@ function runView(task: TrainingTask, run: TrainingRun): TrainingTask {
 }
 
 export function ExperimentCompare() {
+  const compareLimit = useCompareLimit()
   const [experiments, setExperiments] = useState<ComparisonRun[]>([])
   const [metrics, setMetrics] = useState<Record<string, MetricPoint[]>>({})
   const [metricErrors, setMetricErrors] = useState<Record<string, string>>({})
@@ -157,16 +159,13 @@ export function ExperimentCompare() {
   const [params, setParams] = useSearchParams()
   const [selectedIds, setSelectedIds] = useState<string[]>(() => {
     const incoming = (params.get('runs') || params.get('tasks') || '').split(',').filter(Boolean)
-    if (params.has('runs') || params.has('tasks')) return [...new Set(incoming)].slice(0, 4)
-    try {
-      const persisted: unknown = JSON.parse(localStorage.getItem('yolo-forge-compare-runs') || localStorage.getItem('yolo-forge-compare-tasks') || '[]')
-      return Array.isArray(persisted) ? [...new Set(persisted.filter((id): id is string => typeof id === 'string' && !!id))].slice(0, 4) : []
-    } catch { return [] }
+    if (params.has('runs') || params.has('tasks')) return [...new Set(incoming)].slice(0, compareLimit)
+    return readStoredCompareRuns().slice(0, compareLimit)
   })
   const selected = useMemo(() => selectedIds.map((id) => experiments.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[], [experiments, selectedIds])
 
   useEffect(() => {
-    localStorage.setItem('yolo-forge-compare-runs', JSON.stringify(selectedIds))
+    writeStoredCompareRuns(selectedIds)
     const next = new URLSearchParams(window.location.search)
     next.delete('tasks')
     if (selectedIds.length) next.set('runs', selectedIds.join(',')); else next.delete('runs')
@@ -178,6 +177,14 @@ export function ExperimentCompare() {
     activeRequest.current?.abort()
     activeRequest.current = null
   }, [])
+
+  useEffect(() => {
+    if (selectedIds.length <= compareLimit) return
+    invalidateActiveRequest()
+    const next = selectedIds.slice(0, compareLimit)
+    setSelectedIds(next)
+    setBaselineId((current) => next.includes(current) ? current : next[0] || '')
+  }, [compareLimit, invalidateActiveRequest, selectedIds])
 
   const load = useCallback(async () => {
     const version = ++requestVersion.current
@@ -194,8 +201,9 @@ export function ExperimentCompare() {
       if (version !== requestVersion.current) return
       setExperiments(items)
       const normalizedIds = selectedIds.map((id) => items.find((item) => item.id === id)?.id || items.find((item) => item.task.id === id && item.id === item.task.current_run_id)?.id).filter(Boolean) as string[]
-      if (normalizedIds.join(',') !== selectedIds.join(',')) setSelectedIds(normalizedIds.slice(0, 4))
-      const selectedItems = normalizedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
+      const limitedIds = normalizedIds.slice(0, compareLimit)
+      if (limitedIds.join(',') !== selectedIds.join(',')) setSelectedIds(limitedIds)
+      const selectedItems = limitedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
       const results = await Promise.allSettled(selectedItems.map((item) => api.runMetrics(item.task.id, item.run.id, controller.signal)))
       if (version !== requestVersion.current) return
       const points: Record<string, MetricPoint[]> = {}
@@ -212,7 +220,7 @@ export function ExperimentCompare() {
       if (activeRequest.current === controller) activeRequest.current = null
       if (!controller.signal.aborted && version === requestVersion.current) setLoading(false)
     }
-  }, [selectedIds])
+  }, [compareLimit, selectedIds])
 
   useEffect(() => {
     let cancelled = false
@@ -233,14 +241,14 @@ export function ExperimentCompare() {
 
   function setSelection(ids: string[]) {
     invalidateActiveRequest()
-    const next = [...new Set(ids)].slice(0, 4)
+    const next = [...new Set(ids)].slice(0, compareLimit)
     setSelectedIds(next)
     setBaselineId((current) => next.includes(current) ? current : next[0] || '')
   }
 
   function toggleTask(id: string) {
     if (selectedIds.includes(id)) setSelection(selectedIds.filter((value) => value !== id))
-    else if (selectedIds.length < 4) setSelection([...selectedIds, id])
+    else if (selectedIds.length < compareLimit) setSelection([...selectedIds, id])
   }
 
   const differentDatasets = new Set(selected.map((item) => item.view.data_path)).size > 1
@@ -255,7 +263,7 @@ export function ExperimentCompare() {
     animationDuration: 350,
     color: palette,
     tooltip: { trigger: 'axis', backgroundColor: '#14202a', borderColor: '#334754', textStyle: { color: '#e7eef2' } },
-    legend: { data: selected.map((item) => `${item.task.name} · A${String(item.run.attempt_number).padStart(3, '0')}`), top: 5, textStyle: { color: '#6c8290', fontSize: 10 } },
+    legend: { type: selected.length > 4 ? 'scroll' : 'plain', data: selected.map((item) => `${item.task.name} · A${String(item.run.attempt_number).padStart(3, '0')}`), top: 5, left: 44, right: 44, textStyle: { color: '#6c8290', fontSize: 10 } },
     grid: { left: 55, right: 22, top: 48, bottom: 40 },
     xAxis: { type: 'value', name: 'Epoch', nameTextStyle: { color: '#728692' }, axisLabel: { color: '#718692' }, axisLine: { lineStyle: { color: '#bccdd5' } }, splitLine: { show: false } },
     yAxis: { type: 'value', axisLabel: { color: '#718692' }, axisLine: { show: false }, splitLine: { lineStyle: { color: '#dbe6eb', type: 'dashed' } } },
@@ -271,21 +279,21 @@ export function ExperimentCompare() {
   const experimentCount = Math.max(selected.length, 1)
   const experimentLayout = {
     '--experiment-count': experimentCount,
-    '--experiment-column-width': `calc(${100 / experimentCount}% - ${170 / experimentCount}px)`,
-    '--parameter-table-min-width': `${170 + experimentCount * 180}px`,
+    '--experiment-column-width': `max(180px, calc(${100 / experimentCount}% - ${170 / experimentCount}px))`,
+    '--parameter-table-min-width': `${170 + experimentCount * 200}px`,
   } as React.CSSProperties
 
   return <div className="page compare-page" style={experimentLayout}>
-    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较不同任务当前运行的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择任务 <span className="selection-count">{selected.length}/4</span><ChevronDown size={15} /></button></header>
+    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较不同任务当前运行的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择任务 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
     {pickerOpen && <div className="compare-picker">
-      <header><div><strong>选择参与对比的训练任务</strong><span>已选择 {selectedIds.length} 个，最多同时选择 4 个；每个任务使用当前运行</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
+      <header><div><strong>选择参与对比的训练任务</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；每个任务使用当前运行</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
       <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务或模型" /></div>
-      <div className="compare-picker-list">{filteredExperiments.map((item) => { const checked = selectedIds.includes(item.id); return <button key={item.id} onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= 4}><i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i><span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span><em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em></button> })}</div>
+      <div className="compare-picker-list">{filteredExperiments.map((item) => { const checked = selectedIds.includes(item.id); return <button key={item.id} onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个任务` : undefined}><i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i><span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span><em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em></button> })}</div>
     </div>}
     {error && <div className="alert error">{error}</div>}
-    {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练任务</strong><span>可同时选择 2～4 个任务，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练任务</button></div> : <>
+    {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练任务</strong><span>{compareLimit === 2 ? '请选择 2 个任务' : `可同时选择 2～${compareLimit} 个任务`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练任务</button></div> : <>
       {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个不同任务才能对比</strong><span>当前只有一个任务，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}
-      <section className="selected-experiments">{selected.map((item, index) => <article key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><button onClick={() => setSelection(selectedIds.filter((id) => id !== item.id))}><X size={14} /></button><span>ATTEMPT {String(item.run.attempt_number).padStart(3, '0')} · {item.run.launch_mode.toUpperCase()}</span><h3>{item.task.name}</h3><p>{item.view.model_path.split('/').pop()} · {item.view.task_type}</p><div><i style={{ width: `${item.view.progress}%` }} /></div><footer><strong>{metricValue(item.view, ['metrics/mAP50(B)'])}</strong><small>mAP50</small><strong>{Math.round(item.view.progress)}%</strong><small>进度</small></footer></article>)}</section>
+      <section className={`selected-experiments${selected.length > 4 ? ' many' : ''}`}>{selected.map((item, index) => <article key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><button onClick={() => setSelection(selectedIds.filter((id) => id !== item.id))}><X size={14} /></button><span>ATTEMPT {String(item.run.attempt_number).padStart(3, '0')} · {item.run.launch_mode.toUpperCase()}</span><h3>{item.task.name}</h3><p>{item.view.model_path.split('/').pop()} · {item.view.task_type}</p><div><i style={{ width: `${item.view.progress}%` }} /></div><footer><strong>{metricValue(item.view, ['metrics/mAP50(B)'])}</strong><small>mAP50</small><strong>{Math.round(item.view.progress)}%</strong><small>进度</small></footer></article>)}</section>
       {selected.length >= 2 && <>
       <section className="compare-panel metric-summary-panel">
         <header><div><Activity size={17} /><div><h2>实验指标对比</h2><span>每列对应一个任务的当前运行，颜色与下方曲线一致</span></div></div><div className="metric-summary-controls"><label>指标口径<select aria-label="指标口径" value={evaluationMode} onChange={(event) => setEvaluationMode(event.target.value as 'latest' | 'best')}><option value="latest">最新指标</option><option value="best">最佳轮次指标</option></select></label><span className="metric-run-count">{selected.length} 个任务</span></div></header>
@@ -322,7 +330,7 @@ export function ExperimentCompare() {
         </table></div>
       </section>
       <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={metricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header><LineChartView option={chart} style={{ height: 390 }} /></section>
-      <section className="compare-panel parameter-panel"><header><div><Layers3 size={17} /><div><h2>训练参数差异</h2><span>来自每次运行的固化参数快照</span></div></div></header><div className="comparison-table"><table><thead><tr><th>参数</th>{selected.map((item, index) => <th key={item.id}><i style={{ background: palette[index] }} />{item.task.name} · A{String(item.run.attempt_number).padStart(3, '0')}</th>)}</tr></thead><tbody>{parameterRows.map((parameter) => { const values = selected.map((item) => parameter.value(item.view)); const different = new Set(values.map(String)).size > 1; return <tr className={different ? 'different' : ''} key={parameter.label}><td>{parameter.label}{different && <em>不同</em>}</td>{values.map((value, index) => <td key={`${parameter.label}-${selected[index].id}`}>{value}</td>)}</tr> })}</tbody></table></div></section>
+      <section className="compare-panel parameter-panel"><header><div><Layers3 size={17} /><div><h2>训练参数差异</h2><span>来自每次运行的固化参数快照</span></div></div></header><div className="comparison-table"><table style={{ minWidth: 170 + selected.length * 200 }}><thead><tr><th>参数</th>{selected.map((item, index) => <th key={item.id}><i style={{ background: palette[index] }} />{item.task.name} · A{String(item.run.attempt_number).padStart(3, '0')}</th>)}</tr></thead><tbody>{parameterRows.map((parameter) => { const values = selected.map((item) => parameter.value(item.view)); const different = new Set(values.map(String)).size > 1; return <tr className={different ? 'different' : ''} key={parameter.label}><td>{parameter.label}{different && <em>不同</em>}</td>{values.map((value, index) => <td key={`${parameter.label}-${selected[index].id}`}>{value}</td>)}</tr> })}</tbody></table></div></section>
       </>}
     </>}
   </div>

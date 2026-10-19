@@ -582,6 +582,21 @@ button { color: inherit; }
 .canvas-load-failure p { max-width: 520px; margin: 0; color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
 .canvas-load-failure-actions { display: flex; gap: 8px; margin-top: 6px; }
 .platform-settings-modal { width: min(700px, calc(100vw - 28px)); }
+.compare-limit-setting { min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+.compare-limit-setting > div:first-child { min-width: 0; }
+.compare-limit-setting strong, .compare-limit-setting span { display: block; }
+.compare-limit-setting strong { color: var(--text); font-size: 12px; }
+.compare-limit-setting span { margin-top: 4px; color: var(--muted); font-size: 10px; }
+.compare-limit-controls { display: flex; align-items: center; gap: 7px; flex-shrink: 0; }
+.number-stepper { height: 34px; display: grid; grid-template-columns: 34px 42px 34px; overflow: hidden; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.number-stepper button { display: grid; place-items: center; border: 0; color: var(--muted); background: transparent; cursor: pointer; }
+.number-stepper button:hover:not(:disabled) { color: var(--green); background: rgba(112,240,189,.08); }
+.number-stepper button:focus-visible { position: relative; outline: 2px solid var(--green); outline-offset: -2px; }
+.number-stepper button:disabled { opacity: .35; cursor: not-allowed; }
+.number-stepper output { display: grid; place-items: center; border-inline: 1px solid var(--line); color: var(--text); font: 600 12px "DM Mono", monospace; }
+.compare-limit-message { min-height: 28px; display: flex; align-items: center; margin-top: 7px; padding: 0 10px; color: var(--muted); font-size: 10px; }
+.compare-limit-message.warning { color: #a66c19; border: 1px solid #ead4b3; border-radius: 6px; background: #fff7eb; }
+:root[data-theme='dark'] .compare-limit-message.warning { color: #f2c274; border-color: #685334; background: #2a2318; }
 
 @media (max-width: 600px) {
   body { min-width: 0; }
@@ -652,6 +667,8 @@ button { color: inherit; }
   .platform-settings-modal .form-grid .span-2 { grid-column: auto; }
   .platform-settings-modal footer { flex-wrap: wrap; }
   .platform-settings-modal footer > span { width: 100%; margin: 0 0 4px; }
+  .compare-limit-setting { align-items: flex-start; flex-direction: column; }
+  .compare-limit-controls { width: 100%; flex-wrap: wrap; }
 }
 
 @media (prefers-reduced-motion: reduce) {
