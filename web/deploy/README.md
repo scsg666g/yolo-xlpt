@@ -32,8 +32,10 @@ chmod 600 web/.env
 | 配置项 | 默认或模板行为 | 迁移时要核对的内容 |
 | --- | --- | --- |
 | `YOLO_PROJECT_ROOT` | 相对代码 checkout 解析 | 两套项目各自的根目录 |
-| `PLATFORM_DATA_ROOT` | `web/data` | 上传暂存、远程缓存等中心状态目录 |
+| `PLATFORM_DATA_ROOT` | `web/data` | 上传暂存、远程缓存、持久模型测试历史 `model-test-history/` 和临时测试工作目录 `model-test-work/` 等中心状态目录 |
 | `PLATFORM_RUNS_ROOT`、`PLATFORM_RUNTIME_ROOT`、`PLATFORM_LOG_ROOT` | 未单独设置时跟随数据根目录 | `.env.example` 已独立设置前两项，迁移数据根目录时须一起改；日志项需按需补充 |
+| `PLATFORM_MODEL_TEST_HISTORY_QUOTA_BYTES`、`PLATFORM_MODEL_TEST_TASK_QUOTA_BYTES` | 默认 20 GiB / 5 GiB | 中心保存的模型测试历史总量和单任务量；单位为字节，设为 `0` 才关闭对应配额 |
+| `PLATFORM_MODEL_TEST_MIN_FREE_BYTES`、`PLATFORM_MODEL_TEST_IMAGE_RESERVE_BYTES` | 默认 2 GiB / 64 MiB | 创建测试时保留的最低可用空间和每张图片的保守预留；单位为字节 |
 | `DATABASE_URL` | `sqlite:///web/data/platform.db` | 独立于数据根目录，修改 `PLATFORM_DATA_ROOT` 不会自动修改数据库地址 |
 | `YOLO_BIN`、`ULTRALYTICS_ROOT` | 训练程序与源码配置目录 | 参数目录来自源码，不是对实际 CLI 能力的探测 |
 | `PLATFORM_INSTANCE_NAME` | 模板分别设置 `development`、`production`，但 `.env` 中同名项优先 | 将示例的 `local` 改为对应实例名称，用健康接口核对最终生效值 |
@@ -71,14 +73,14 @@ curl --fail http://127.0.0.1:18089/api/health
 
 ## 更新与备份顺序
 
-1. 确认没有训练运行、清理中任务或正在传输的产物，记录当前版本、环境配置和运行目录。
-2. 在对应项目根目录执行数据库在线备份。默认数据库未改动时：
+1. 确认没有训练运行、模型测试、图片上传、清理中任务或正在传输的产物，记录当前版本、环境配置和运行目录。停止目标服务，或以其他方式确保备份期间不会再发生模型测试上传、执行和删除写入。
+2. 在对应项目根目录执行数据库备份。默认数据库未改动时：
 
    ```bash
    /data/conda/envs/yolo/bin/python web/deploy/backup_database.py
    ```
 
-3. 单独备份需要保留的模型、数据集、运行产物、日志、运行时配置与 `.env`；远程文件和 Agent 的 `.training-state/` 在对应远程机器备份。
+3. 将对应 `PLATFORM_DATA_ROOT/model-test-history/` 与第 2 步数据库快照作为同一备份集复制；再单独备份需要保留的模型、数据集、运行产物、日志、运行时配置与 `.env`。远程文件和 Agent 的 `.training-state/` 在对应远程机器备份。
 4. 拉取或复制代码，按 [开发检查](../README.md#开发检查与排障) 构建前端并运行测试。后端测试应使用临时数据库和数据目录，不对正式数据库执行测试。
 5. 只重启需要更新的那个服务，不要同时覆盖两套 `.env` 或 `web/data/`。后端启动会执行数据库迁移，保留升级前的一致备份。
 6. 检查健康接口、服务日志、首页及任务状态；确认这一实例正常后再更新另一实例。
@@ -92,7 +94,9 @@ curl --fail http://127.0.0.1:18089/api/health
   --output-dir /srv/yolo-backups
 ```
 
-脚本不会自动删除旧备份，也不包含模型、数据集、产物或日志。运行中的数据库文件不能仅靠复制 `.db` 作为一致备份；当前自动迁移中的备份使用 `shutil.copy2`，在 WAL 模式下不能替代升级前执行的 SQLite 在线备份。
+脚本不会自动删除旧备份，也不包含模型、数据集、产物、日志或 `model-test-history/`。SQLite 快照中的 `model_tests`、`model_test_images` 只是模型测试索引和元数据；对应原图、结果和下载文件位于 `model-test-history/`。Backup API 不会冻结这些文件的并发变化，因此需要可完整恢复且相互匹配的模型测试历史时，必须在目标服务停止或静默期间依次生成数据库快照和复制历史目录。按上述步骤确认没有活动模型测试后，`model-test-work/` 不包含需要备份的持久结果；若在活动测试期间强行备份，有效的固定权重副本也必须与数据库状态保持同一时点，否则恢复后该测试会明确失败。
+
+运行中的数据库文件不能仅靠复制 `.db` 作为一致备份；当前自动迁移中的备份使用 `shutil.copy2`，在 WAL 模式下不能替代升级前执行的 SQLite Backup API 备份。
 
 回滚需要匹配的代码版本和数据库结构。新版本已迁移数据库时，直接切换旧代码不一定兼容。先停止目标实例，保留当前状态，再按兼容版本与一致备份恢复，并核对文件路径；不要在另一实例运行时覆盖其数据库，也不要把两套实例的数据库互换。
 
@@ -114,6 +118,7 @@ curl --fail http://127.0.0.1:18088/api/health
 | 远程长期“启动中” | 确认中心与 Agent 均为配套的 1.7.0，再检查 Agent 确认重试日志、`.training-state/active/`、共享锁和服务器时钟；未确认领取在 90 秒后可重新分发，1.6.0 不具备确认重试和活动进程恢复 |
 | 远程长期“正在停止” | 先在远程服务器确认当前 Attempt 的 YOLO 进程已结束；状态保持 `stopping` 至少 30 秒后，可在训练画布使用“解除占用”。该操作只改中心状态，不会终止远程进程 |
 | 清理记录迟迟未消失 | 永久删除为异步 202；检查回收站原因、Agent 接入和对应后台操作。输出根目录缺失、允许目录失效或挂载离线时会明确失败并保留记录，恢复路径后重试 |
+| 恢复后模型测试有记录但图片打不开 | 数据库与 `model-test-history/` 不属于同一备份时点，或历史目录未恢复；使用成套备份恢复，并核对 `PLATFORM_DATA_ROOT` 和目录权限 |
 | 日志复制失败或下载不完整 | HTTP 内网剪贴板限制与尾部导出是两个问题；HTTPS 不会把尾部变成完整日志，见 [日志说明](../README.md#日志查看与导出) |
 
 训练命令和输出在任务日志中；API 请求和服务启动信息在 journal 中。更完整的代码证据及改进优先级见 [项目分析](../../docs/project-analysis.md#当前问题与优化优先级)。

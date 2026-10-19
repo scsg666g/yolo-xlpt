@@ -6,6 +6,7 @@ import hashlib
 import os
 import secrets
 import shutil
+import stat
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -19,6 +20,7 @@ from sqlalchemy.orm import Session
 from .config import DATA_ROOT
 from .compute_nodes import as_utc, authenticated_agent, remote_trace_root
 from .database import get_db
+from .model_test_storage import delete_task_history
 from .models import Artifact, RemoteOperation, TrainingRun, TrainingTask, utcnow
 from .services import add_event, artifact_kind
 
@@ -29,6 +31,61 @@ ACTIVE = {"queued", "starting", "running", "stopping"}
 
 def operation_file(operation: RemoteOperation, complete: bool = True) -> Path:
     return CACHE_ROOT / (operation.id + (".bin" if complete else ".part"))
+
+
+def cached_fetch_digest(
+    operation: RemoteOperation,
+    *,
+    path: Path | None = None,
+) -> tuple[str | None, str | None]:
+    """Return a stable cache digest and any validation error without changing it."""
+    payload = operation.payload or {}
+    expected_size = payload.get("size")
+    expected_sha256 = payload.get("sha256")
+    if not isinstance(expected_size, int) or isinstance(expected_size, bool) or expected_size < 0:
+        return None, "远程产物缓存缺少有效大小"
+    if expected_sha256 is not None and (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        return None, "远程产物缓存摘要无效"
+    path = path or operation_file(operation)
+    if path.is_symlink():
+        return None, "远程产物缓存路径无效"
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                return None, "远程产物缓存不是普通文件"
+            if before.st_size != expected_size:
+                return None, "远程产物缓存大小校验失败"
+            digest = hashlib.sha256()
+            for block in iter(lambda: handle.read(512 * 1024), b""):
+                digest.update(block)
+            after = os.fstat(handle.fileno())
+        current = path.lstat()
+    except OSError:
+        return None, "远程产物缓存文件不可用"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    current_identity = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or before_identity != after_identity
+        or after_identity != current_identity
+    ):
+        return None, "远程产物缓存在校验期间发生变化"
+    actual_sha256 = digest.hexdigest()
+    if expected_sha256 is not None and not secrets.compare_digest(actual_sha256, expected_sha256):
+        return None, "远程产物缓存摘要校验失败"
+    return actual_sha256, None
 
 
 def run_payload(run: TrainingRun, task: TrainingTask) -> dict:
@@ -243,14 +300,32 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
         if task.status in ACTIVE or task.deleted_reason != "remote_delete_pending":
             raise HTTPException(409, "任务当前不能永久删除")
         if payload.success:
-            for historical in task.runs:
-                shutil.rmtree(remote_trace_root(historical.id), ignore_errors=True)
-            for other in db.scalars(select(RemoteOperation).where(RemoteOperation.task_id == task.id)):
-                if other.id != operation.id:
-                    other.status = "cancelled"
-                for path in (operation_file(other), operation_file(other, False)):
-                    path.unlink(missing_ok=True)
-            db.delete(task)
+            related_operations = list(db.scalars(select(RemoteOperation).where(
+                RemoteOperation.task_id == task.id,
+            )))
+            try:
+                # The Agent ACK covers remote files only. Center-owned history,
+                # traces and fetched checkpoints must be gone before the task row.
+                delete_task_history(task.id)
+                for historical in task.runs:
+                    trace_root = remote_trace_root(historical.id)
+                    if trace_root.exists() or trace_root.is_symlink():
+                        shutil.rmtree(trace_root)
+                for other in related_operations:
+                    for path in (operation_file(other), operation_file(other, False)):
+                        path.unlink(missing_ok=True)
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"[-1600:]
+                operation.status = "failed"
+                operation.error = f"中心关联数据清理失败：{detail}"
+                task.deleted_reason = "remote_delete_failed"
+                task.error_message = operation.error + "；远程文件已确认清理，可重试永久删除"
+                add_event(db, task.id, "remote_delete_failed", task.error_message, "error")
+            else:
+                for other in related_operations:
+                    if other.id != operation.id:
+                        other.status = "cancelled"
+                db.delete(task)
         else:
             task.deleted_reason = "remote_delete_failed"
             task.error_message = "远程文件清理失败：" + (payload.error or "未知错误")
@@ -281,8 +356,13 @@ def prepare_artifact(artifact_id: int, retry: bool = False, db: Session = Depend
     if not run or not run.execution_node_id:
         return {"status": "ready"}
     operation = matching_fetch(db, artifact)
-    if operation and operation.status == "succeeded" and operation_file(operation).is_file():
-        return {"status": "ready"}
+    if operation and operation.status == "succeeded":
+        digest, cache_error = cached_fetch_digest(operation)
+        if cache_error is None and digest is not None:
+            if (operation.payload or {}).get("sha256") is None:
+                operation.payload = {**(operation.payload or {}), "sha256": digest}
+                db.commit()
+            return {"status": "ready"}
     if operation and operation.status == "failed" and not retry:
         return {"status": "failed", "message": operation.error or "远程文件传输失败"}
     if not operation or operation.status in {"failed", "cancelled", "succeeded"}:
@@ -345,6 +425,10 @@ def upload_chunk(node_id: str, operation_id: str, payload: ArtifactChunk, reques
         if digest.hexdigest() != payload.sha256:
             raise HTTPException(409, "文件校验失败，请重新传输")
         os.replace(path, operation_file(operation))
+        # Keep the Agent-provided content digest with the durable fetch record.
+        # Model-test history uses it to request the exact checkpoint bytes even
+        # when a later manifest updates the same Artifact row in place.
+        operation.payload = {**operation.payload, "sha256": payload.sha256}
         operation.status = "succeeded"
     db.commit()
     return {"status": operation.status, "offset": payload.offset + len(data)}

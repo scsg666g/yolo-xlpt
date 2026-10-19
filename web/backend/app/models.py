@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -71,6 +71,7 @@ class TrainingTask(Base):
     metrics: Mapped[list["MetricPoint"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="task", cascade="all, delete-orphan")
     events: Mapped[list["TaskEvent"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    model_tests: Mapped[list["ModelTest"]] = relationship(back_populates="task", cascade="all, delete-orphan")
 
 
 class TrainingRun(Base):
@@ -158,6 +159,75 @@ class TaskEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     task: Mapped[TrainingTask] = relationship(back_populates="events")
     run: Mapped[TrainingRun | None] = relationship(back_populates="events")
+
+
+class ModelTest(Base):
+    __tablename__ = "model_tests"
+    __table_args__ = (
+        Index("ix_model_tests_task_created_id", "task_id", "created_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("training_tasks.id", ondelete="CASCADE"), index=True)
+    # run_id is the Attempt open in the canvas. source_run_id produced the tested weight.
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("training_runs.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    source_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("training_runs.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    artifact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    artifact_name: Mapped[str] = mapped_column(String(255))
+    model_name: Mapped[str] = mapped_column(String(255))
+    # Content identity is immutable even when the linked Artifact row is
+    # refreshed in place by a later local scan or remote manifest.
+    model_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rerun_of_test_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_attempt_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="uploading", index=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    iou: Mapped[float] = mapped_column(Float)
+    imgsz: Mapped[int] = mapped_column(Integer, default=640)
+    device: Mapped[str] = mapped_column(String(32), default="CPU")
+    model_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    timings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    storage_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    delete_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    task: Mapped[TrainingTask] = relationship(back_populates="model_tests")
+    run: Mapped[TrainingRun | None] = relationship(foreign_keys=[run_id])
+    source_run: Mapped[TrainingRun | None] = relationship(foreign_keys=[source_run_id])
+    artifact: Mapped[Artifact | None] = relationship(foreign_keys=[artifact_id])
+    images: Mapped[list["ModelTestImage"]] = relationship(
+        back_populates="test", cascade="all, delete-orphan", order_by="ModelTestImage.ordinal",
+    )
+
+
+class ModelTestImage(Base):
+    __tablename__ = "model_test_images"
+    __table_args__ = (UniqueConstraint("test_id", "ordinal", name="uq_model_test_image_ordinal"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    test_id: Mapped[str] = mapped_column(ForeignKey("model_tests.id", ondelete="CASCADE"), index=True)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    original_name: Mapped[str] = mapped_column(String(255))
+    declared_size: Mapped[int] = mapped_column(Integer)
+    stored_size: Mapped[int] = mapped_column(Integer, default=0)
+    uploaded: Mapped[bool] = mapped_column(Boolean, default=False)
+    detections: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    objects: Mapped[list] = mapped_column(JSON, default=list)
+    timings: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    test: Mapped[ModelTest] = relationship(back_populates="images")
 
 
 class RemoteOperation(Base):

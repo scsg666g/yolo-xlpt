@@ -10,6 +10,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from .database import SessionLocal
+from .model_test_storage import delete_task_history
 from .models import RemoteOperation, TrainingTask, utcnow
 from .services import add_event, permanently_delete_task_files
 
@@ -147,6 +148,7 @@ class LocalDeletionWorker:
         else:
             try:
                 permanently_delete_task_files(task_snapshot)
+                delete_task_history(task_snapshot.id)
             except Exception as exc:
                 # A malformed path or an unexpected filesystem error must become
                 # a visible failed operation, not an invisible "running" hang.

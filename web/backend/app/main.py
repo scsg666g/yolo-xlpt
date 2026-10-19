@@ -27,7 +27,13 @@ from .dataset_uploads import (
     management_router as dataset_management_router,
     router as dataset_upload_router,
 )
-from .inference import router as inference_router, worker as inference_worker
+from .inference import (
+    cancel_task_tests,
+    model_test_lifecycle,
+    router as inference_router,
+    stage_task_test_cancellation,
+    worker as inference_worker,
+)
 from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete
 from .parameter_catalog import load_parameter_catalog
@@ -594,48 +600,63 @@ def rename_task(task_id: str, payload: TaskRename, db: Session = Depends(get_db)
 @app.post("/api/tasks/{task_id}/trash", status_code=204)
 @app.delete("/api/tasks/{task_id}", status_code=204, deprecated=True)
 def delete_task(task_id: str, db: Session = Depends(get_db)):
-    task = get_task_or_404(db, task_id)
-    if task.status in {"queued", "starting", "running", "stopping"}:
-        raise HTTPException(409, "运行中或排队中的任务不能删除")
-    task.deleted_at = utcnow()
-    task.deleted_reason = "soft_delete"
-    add_event(db, task.id, "soft_deleted", "任务已移入回收站")
-    db.commit()
+    with model_test_lifecycle():
+        task = get_task_or_404(db, task_id)
+        if task.status in {"queued", "starting", "running", "stopping"}:
+            raise HTTPException(409, "运行中或排队中的任务不能删除")
+        task.deleted_at = utcnow()
+        task.deleted_reason = "soft_delete"
+        stage_task_test_cancellation(task.id, db)
+        add_event(db, task.id, "soft_deleted", "任务已移入回收站")
+        db.commit()
+        cancel_task_tests(task.id, bind=db.get_bind())
 
 
 @app.post("/api/tasks/{task_id}/restore", response_model=TaskRead)
 def restore_task(task_id: str, db: Session = Depends(get_db)):
-    task = get_task_or_404(db, task_id, include_deleted=True)
-    if not task.deleted_at:
-        raise HTTPException(409, "任务当前不在回收站")
-    if task.deleted_reason == "remote_delete_pending":
-        raise HTTPException(409, "远程文件清理已提交，不能恢复；请等待 Agent 返回结果")
-    if task.deleted_reason == "remote_delete_failed":
-        raise HTTPException(409, "远程清理可能已删除部分文件，请重试清理；该任务不能恢复")
-    if task.deleted_reason == "local_delete_pending":
-        raise HTTPException(409, "本机文件清理已提交，不能恢复；请等待清理结果")
-    if task.deleted_reason == "local_delete_failed":
-        raise HTTPException(409, "本机文件可能已部分清理，请重试清理；该任务不能恢复")
-    task.deleted_at = None
-    task.deleted_reason = None
-    add_event(db, task.id, "restored", "任务已从回收站恢复")
-    db.commit()
-    db.refresh(task)
-    return task
+    with model_test_lifecycle():
+        task = get_task_or_404(db, task_id, include_deleted=True)
+        if not task.deleted_at:
+            raise HTTPException(409, "任务当前不在回收站")
+        if task.deleted_reason == "remote_delete_pending":
+            raise HTTPException(409, "远程文件清理已提交，不能恢复；请等待 Agent 返回结果")
+        if task.deleted_reason == "remote_delete_failed":
+            raise HTTPException(409, "远程清理可能已删除部分文件，请重试清理；该任务不能恢复")
+        if task.deleted_reason == "local_delete_pending":
+            raise HTTPException(409, "本机文件清理已提交，不能恢复；请等待清理结果")
+        if task.deleted_reason == "local_delete_failed":
+            raise HTTPException(409, "本机文件可能已部分清理，请重试清理；该任务不能恢复")
+        task.deleted_at = None
+        task.deleted_reason = None
+        add_event(db, task.id, "restored", "任务已从回收站恢复")
+        db.commit()
+        db.refresh(task)
+        return task
 
 
 @app.delete("/api/tasks/{task_id}/permanent", status_code=202)
 def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
-    task = get_task_or_404(db, task_id, include_deleted=True)
-    if task.status in {"queued", "starting", "running", "stopping"}:
-        raise HTTPException(409, "运行中或排队中的任务不能永久删除")
-    if task.execution_node_id:
-        queue_delete(db, task)
+    with model_test_lifecycle():
+        task = get_task_or_404(db, task_id, include_deleted=True)
+        if task.status in {"queued", "starting", "running", "stopping"}:
+            raise HTTPException(409, "运行中或排队中的任务不能永久删除")
+        if not task.deleted_at:
+            # This is a recoverable checkpoint. If cancellation is interrupted,
+            # the task remains in the recycle bin and no file deletion is queued.
+            task.deleted_at = utcnow()
+            task.deleted_reason = "soft_delete"
+        stage_task_test_cancellation(task.id, db, purge=True)
         db.commit()
-        return JSONResponse(status_code=202, content={"status": "pending", "message": "等待远程 Agent 清理文件；确认后删除任务记录"})
-    queue_local_delete(db, task)
-    db.commit()
-    return JSONResponse(status_code=202, content={"status": "pending", "message": "已提交本机文件清理；可在回收站查看进度"})
+        # Always sweep terminal records too: an earlier crash may have left a
+        # pinned model copy even when no active database row remains.
+        cancel_task_tests(task.id, purge=True, bind=db.get_bind())
+        if task.execution_node_id:
+            queue_delete(db, task)
+            db.commit()
+            return JSONResponse(status_code=202, content={"status": "pending", "message": "等待远程 Agent 清理文件；确认后删除任务记录"})
+        queue_local_delete(db, task)
+        db.commit()
+        return JSONResponse(status_code=202, content={"status": "pending", "message": "已提交本机文件清理；可在回收站查看进度"})
 
 
 @app.patch("/api/tasks/{task_id}/layout", response_model=TaskRead)

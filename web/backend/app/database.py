@@ -47,6 +47,14 @@ def migrate_database() -> Path | None:
     artifact_columns = {column["name"] for column in inspector.get_columns("artifacts")}
     event_columns = {column["name"] for column in inspector.get_columns("task_events")}
     run_columns = {column["name"] for column in inspector.get_columns("training_runs")} if inspector.has_table("training_runs") else set()
+    model_test_columns = (
+        {column["name"] for column in inspector.get_columns("model_tests")}
+        if inspector.has_table("model_tests") else set()
+    )
+    model_test_indexes = (
+        {index["name"] for index in inspector.get_indexes("model_tests")}
+        if model_test_columns else set()
+    )
     display_order_needs_repair = False
     if "display_order" in task_columns:
         with engine.connect() as connection:
@@ -69,6 +77,11 @@ def migrate_database() -> Path | None:
         or (bool(run_columns) and "claim_lease" not in run_columns)
         or (bool(run_columns) and "claim_expires_at" not in run_columns)
         or (bool(run_columns) and "claim_confirmed" not in run_columns)
+        or (bool(model_test_columns) and "model_sha256" not in model_test_columns)
+        or (bool(model_test_columns) and "model_size" not in model_test_columns)
+        or (bool(model_test_columns) and "rerun_of_test_id" not in model_test_columns)
+        or (bool(model_test_columns) and "ix_model_tests_task_created_id" not in model_test_indexes)
+        or (bool(model_test_columns) and "ix_model_tests_rerun_of_test_id" not in model_test_indexes)
     )
     if not needs_migration:
         return None
@@ -129,6 +142,21 @@ def migrate_database() -> Path | None:
         if "run_id" not in event_columns:
             connection.execute(text("ALTER TABLE task_events ADD COLUMN run_id VARCHAR(64)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_task_events_run_id ON task_events (run_id)"))
+        if model_test_columns and "model_sha256" not in model_test_columns:
+            connection.execute(text("ALTER TABLE model_tests ADD COLUMN model_sha256 VARCHAR(64)"))
+        if model_test_columns and "model_size" not in model_test_columns:
+            connection.execute(text("ALTER TABLE model_tests ADD COLUMN model_size INTEGER"))
+        if model_test_columns and "rerun_of_test_id" not in model_test_columns:
+            connection.execute(text("ALTER TABLE model_tests ADD COLUMN rerun_of_test_id VARCHAR(32)"))
+        if model_test_columns:
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_model_tests_task_created_id "
+                "ON model_tests (task_id, created_at, id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_model_tests_rerun_of_test_id "
+                "ON model_tests (rerun_of_test_id)"
+            ))
         if "run_id" not in metric_columns:
             connection.execute(text("PRAGMA foreign_keys=OFF"))
             connection.execute(text("""

@@ -9,6 +9,8 @@ from sqlalchemy import create_engine, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
 import app.database as database_module
+import app.local_deletions as local_deletions_module
+import app.model_test_storage as model_test_storage
 import app.services as services_module
 from app.database import Base, configure_sqlite_connection
 from app.database import get_db
@@ -584,6 +586,8 @@ def test_legacy_schema_migration_creates_backup_and_run_columns(tmp_path: Path, 
         connection.execute(text("CREATE TABLE metric_points (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, epoch INTEGER NOT NULL, elapsed FLOAT NOT NULL, \"values\" JSON NOT NULL, created_at DATETIME NOT NULL, UNIQUE(task_id, epoch))"))
         connection.execute(text("CREATE TABLE artifacts (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, kind VARCHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, modified_at DATETIME)"))
         connection.execute(text("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, level VARCHAR(16) NOT NULL, event_type VARCHAR(40) NOT NULL, message TEXT NOT NULL, payload JSON NOT NULL, created_at DATETIME NOT NULL)"))
+        connection.execute(text("CREATE TABLE model_tests (id VARCHAR(32) PRIMARY KEY, task_id VARCHAR(64) NOT NULL, created_at DATETIME NOT NULL)"))
+        connection.execute(text("INSERT INTO model_tests (id, task_id, created_at) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'legacy-task', '2026-01-01 00:00:00')"))
     monkeypatch.setattr(database_module, "engine", legacy_engine)
 
     backup = database_module.migrate_database()
@@ -594,6 +598,29 @@ def test_legacy_schema_migration_creates_backup_and_run_columns(tmp_path: Path, 
     assert "run_id" in {column["name"] for column in inspector.get_columns("metric_points")}
     assert "run_id" in {column["name"] for column in inspector.get_columns("artifacts")}
     assert "run_id" in {column["name"] for column in inspector.get_columns("task_events")}
+    model_test_columns = {column["name"] for column in inspector.get_columns("model_tests")}
+    assert {"model_sha256", "model_size", "rerun_of_test_id"} <= model_test_columns
+    model_test_indexes = {index["name"] for index in inspector.get_indexes("model_tests")}
+    assert {"ix_model_tests_task_created_id", "ix_model_tests_rerun_of_test_id"} <= model_test_indexes
+    with legacy_engine.connect() as connection:
+        assert connection.scalar(text("SELECT COUNT(*) FROM model_tests")) == 1
+
+
+def test_model_test_migration_repairs_missing_history_indexes(tmp_path: Path, monkeypatch):
+    database_path = tmp_path / "missing-history-indexes.db"
+    legacy_engine = create_engine(f"sqlite:///{database_path}")
+    Base.metadata.create_all(legacy_engine)
+    with legacy_engine.begin() as connection:
+        connection.execute(text("DROP INDEX ix_model_tests_task_created_id"))
+        connection.execute(text("DROP INDEX ix_model_tests_rerun_of_test_id"))
+    monkeypatch.setattr(database_module, "engine", legacy_engine)
+
+    backup = database_module.migrate_database()
+
+    assert backup and backup.exists()
+    indexes = {index["name"] for index in inspect(legacy_engine).get_indexes("model_tests")}
+    assert {"ix_model_tests_task_created_id", "ix_model_tests_rerun_of_test_id"} <= indexes
+    assert database_module.migrate_database() is None
 
 
 def test_backfill_registers_existing_task_as_attempt_one(tmp_path: Path, monkeypatch):
@@ -703,11 +730,15 @@ def test_permanent_delete_rejects_outside_run_directory(tmp_path: Path, monkeypa
         raise AssertionError("outside run directory should be rejected")
 
 
-def test_soft_delete_filters_task_list_and_restore(tmp_path: Path):
+def test_soft_delete_filters_task_list_and_restore(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "model-test-history")
     session = make_session(tmp_path)
     task = make_task("task-delete", status="completed")
     session.add(task)
     session.commit()
+    history_file = model_test_storage.test_history_root(task.id, "a" * 32) / "detections.json"
+    history_file.parent.mkdir(parents=True)
+    history_file.write_text("{}", encoding="utf-8")
 
     def override_db():
         yield session
@@ -716,10 +747,12 @@ def test_soft_delete_filters_task_list_and_restore(tmp_path: Path):
     try:
         client = TestClient(app)
         assert client.post(f"/api/tasks/{task.id}/trash").status_code == 204
+        assert history_file.is_file()
         assert client.get("/api/tasks").json() == []
         deleted = client.get("/api/tasks?include_deleted=true").json()
         assert deleted[0]["deleted_at"] is not None
         assert client.post(f"/api/tasks/{task.id}/restore").status_code == 200
+        assert history_file.is_file()
         assert client.get("/api/tasks").json()[0]["id"] == task.id
     finally:
         app.dependency_overrides.clear()
@@ -871,6 +904,7 @@ def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_
 
     monkeypatch.setattr(services_module, "RUNS_ROOT", runs_root)
     monkeypatch.setattr(services_module, "RUNTIME_ROOT", runtime_root)
+    monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "model-test-history")
     session = make_session(tmp_path)
     task = make_task(
         "task-permanent", status="completed", model_path=str(model_path),
@@ -889,6 +923,9 @@ def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_
         TaskEvent(task_id=task.id, run_id=run.id, event_type="completed", message="done", payload={}),
     ])
     session.commit()
+    history_file = model_test_storage.test_history_root(task.id, "b" * 32) / "results" / "0.jpg"
+    history_file.parent.mkdir(parents=True)
+    history_file.write_bytes(b"detection result")
 
     def override_db():
         yield session
@@ -908,8 +945,52 @@ def test_permanent_delete_endpoint_removes_database_records_and_owned_files(tmp_
         assert session.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id)) is None
         assert not run_dir.exists()
         assert not runtime_dir.exists()
+        assert not model_test_storage.task_history_root(task.id).exists()
         assert model_path.exists()
         assert data_path.exists()
+    finally:
+        app.dependency_overrides.clear()
+        session.close()
+
+
+def test_local_history_cleanup_failure_keeps_task_retryable(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(services_module, "RUNS_ROOT", tmp_path / "runs")
+    monkeypatch.setattr(services_module, "RUNTIME_ROOT", tmp_path / "runtime")
+    monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "model-test-history")
+    session = make_session(tmp_path)
+    task = make_task("task-history-retry", status="completed")
+    session.add(task)
+    session.commit()
+    history_file = model_test_storage.test_history_root(task.id, "e" * 32) / "detections.json"
+    history_file.parent.mkdir(parents=True)
+    history_file.write_text("{}", encoding="utf-8")
+
+    def override_db():
+        yield session
+
+    def cleanup_failure(_task_id: str) -> None:
+        raise PermissionError("history is read-only")
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        assert client.delete(f"/api/tasks/{task.id}/permanent").status_code == 202
+        monkeypatch.setattr(local_deletions_module, "delete_task_history", cleanup_failure)
+        worker = LocalDeletionWorker(session_factory=lambda: session)
+        assert worker.process_one()
+        retained = session.get(TrainingTask, task.id)
+        assert retained is not None
+        assert retained.deleted_reason == "local_delete_failed"
+        assert "PermissionError" in retained.error_message
+        assert history_file.is_file()
+
+        monkeypatch.setattr(
+            local_deletions_module, "delete_task_history", model_test_storage.delete_task_history,
+        )
+        assert client.delete(f"/api/tasks/{task.id}/permanent").status_code == 202
+        assert worker.process_one()
+        assert session.get(TrainingTask, task.id) is None
+        assert not model_test_storage.task_history_root(task.id).exists()
     finally:
         app.dependency_overrides.clear()
         session.close()

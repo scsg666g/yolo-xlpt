@@ -11,6 +11,20 @@ SOURCE_PROJECT_ROOT = WEB_ROOT.parent
 PLATFORM_INSTANCE_NAME = os.getenv("PLATFORM_INSTANCE_NAME", SOURCE_PROJECT_ROOT.name).strip()[:80] or SOURCE_PROJECT_ROOT.name
 
 
+def nonnegative_int_env(name: str, default: int) -> int:
+    """Read a byte-count setting and fail early on an unsafe deployment value."""
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} 必须是非负整数（单位：字节）") from exc
+    if parsed < 0:
+        raise RuntimeError(f"{name} 必须是非负整数（单位：字节）")
+    return parsed
+
+
 def project_path(value: str | Path, *, base: Path = SOURCE_PROJECT_ROOT) -> Path:
     """Resolve configured relative paths against this checkout, not the shell CWD."""
     path = Path(value).expanduser()
@@ -26,6 +40,22 @@ DATA_ROOT = project_path(os.getenv("PLATFORM_DATA_ROOT", "web/data"), base=PROJE
 RUNS_ROOT = project_path(os.getenv("PLATFORM_RUNS_ROOT", str(DATA_ROOT / "runs")), base=PROJECT_ROOT)
 RUNTIME_ROOT = project_path(os.getenv("PLATFORM_RUNTIME_ROOT", str(DATA_ROOT / "task_runtime")), base=PROJECT_ROOT)
 LOG_ROOT = project_path(os.getenv("PLATFORM_LOG_ROOT", str(DATA_ROOT / "log")), base=PROJECT_ROOT)
+
+# Persistent model-test files are user-owned data. Keep a reserve large enough
+# for normalized originals, annotated outputs, and their ZIP export. A value of
+# zero disables a quota or minimum-free-space check intentionally.
+MODEL_TEST_HISTORY_QUOTA_BYTES = nonnegative_int_env(
+    "PLATFORM_MODEL_TEST_HISTORY_QUOTA_BYTES", 20 * 1024**3,
+)
+MODEL_TEST_TASK_QUOTA_BYTES = nonnegative_int_env(
+    "PLATFORM_MODEL_TEST_TASK_QUOTA_BYTES", 5 * 1024**3,
+)
+MODEL_TEST_MIN_FREE_BYTES = nonnegative_int_env(
+    "PLATFORM_MODEL_TEST_MIN_FREE_BYTES", 2 * 1024**3,
+)
+MODEL_TEST_IMAGE_RESERVE_BYTES = nonnegative_int_env(
+    "PLATFORM_MODEL_TEST_IMAGE_RESERVE_BYTES", 64 * 1024**2,
+)
 
 
 def resolve_database_url(value: str) -> str:

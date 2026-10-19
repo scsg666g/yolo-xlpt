@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelTest, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelTest, ModelTestPage, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -42,11 +42,39 @@ const deletionTimeout = '删除请求超时，后台可能已经受理。请关�
 
 export const api = {
   health: (signal?: AbortSignal) => requestWithTimeout<PlatformHealth>('/api/health', { signal }, 8_000, '健康检查超时'),
-  createModelTest: (artifact_id: number, confidence: number, iou: number, files: File[], signal: AbortSignal) =>
-    requestWithTimeout<ModelTest>('/api/model-tests', { method: 'POST', body: JSON.stringify({ artifact_id, confidence, iou, files: files.map(({ name, size }) => ({ name, size })) }), signal }),
+  createModelTest: (
+    artifact_id: number,
+    confidence: number,
+    iou: number,
+    files: File[],
+    signal: AbortSignal,
+    run_id?: string | null,
+    rerun_of_test_id?: string | null,
+  ) => requestWithTimeout<ModelTest>('/api/model-tests', {
+    method: 'POST',
+    body: JSON.stringify({
+      artifact_id,
+      confidence,
+      iou,
+      run_id: run_id || undefined,
+      rerun_of_test_id: rerun_of_test_id || undefined,
+      files: files.map(({ name, size }) => ({ name, size })),
+    }),
+    signal,
+  }),
+  modelTests: (taskId: string, signal?: AbortSignal, cursor?: string, limit = 50, runId?: string | null) => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (cursor) params.set('cursor', cursor)
+    if (runId) params.set('run_id', runId)
+    return requestWithTimeout<ModelTestPage>(`/api/tasks/${encodeURIComponent(taskId)}/model-tests?${params}`, { signal })
+  },
+  taskModelTest: (taskId: string, testId: string, signal?: AbortSignal) =>
+    requestWithTimeout<ModelTest>(`/api/tasks/${encodeURIComponent(taskId)}/model-tests/${encodeURIComponent(testId)}`, { signal }),
   uploadModelTestImage: (id: string, index: number, file: File, signal: AbortSignal) =>
     requestWithTimeout<void>(`/api/model-tests/${id}/images/${index}`, { method: 'PUT', body: file, headers: { 'Content-Type': 'application/octet-stream' }, signal }, 120_000),
   startModelTest: (id: string, signal: AbortSignal) => requestWithTimeout<ModelTest>(`/api/model-tests/${id}/start`, { method: 'POST', signal }, 120_000),
+  abandonModelTest: (id: string, keepalive = false) =>
+    request<ModelTest>(`/api/model-tests/${id}/abandon`, { method: 'POST', keepalive }),
   modelTest: (id: string, signal: AbortSignal) => requestWithTimeout<ModelTest>(`/api/model-tests/${id}`, { signal }),
   deleteModelTest: (id: string) => requestWithTimeout<void>(`/api/model-tests/${id}`, { method: 'DELETE' }),
   createDatasetUpload: (name: string, files: Array<{ path: string; size: number }>, signal: AbortSignal) =>

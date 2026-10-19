@@ -299,11 +299,26 @@ export interface TrainingParameterDefinition {
 }
 export interface ModelTest {
   id: string
-  status: 'uploading' | 'preparing' | 'queued' | 'running' | 'completed' | 'failed'
+  status: 'uploading' | 'preparing' | 'queued' | 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled'
+  task_id?: string
+  run_id?: string | null
+  source_run_id?: string | null
+  artifact_id?: number | null
+  artifact_name?: string | null
+  model_name?: string | null
+  model_sha256?: string | null
+  model_size?: number | null
+  rerun_of_test_id?: string | null
+  attempt_number?: number | null
+  source_attempt_number?: number | null
+  created_at?: string | null
+  started_at?: string | null
+  finished_at?: string | null
+  storage_bytes?: number
   confidence: number
   iou: number
   error: string | null
-  expires_at: number
+  expires_at?: number | null
   model: {
     weight_name: string
     weight_size: number
@@ -324,4 +339,13 @@ export interface ModelTest {
     objects: Array<{ class_id: number; class_name: string; confidence: number; bbox_xyxy: number[] }>
     timings: { preprocess?: number; inference?: number; postprocess?: number }
   }>
+}
+
+export interface ModelTestSummary extends Omit<ModelTest, 'timings' | 'files'> {
+  files: Array<Pick<ModelTest['files'][number], 'name' | 'size' | 'uploaded' | 'detections'>>
+}
+
+export interface ModelTestPage {
+  items: ModelTestSummary[]
+  next_cursor: string | null
 }

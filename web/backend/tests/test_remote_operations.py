@@ -1,4 +1,5 @@
 """Remote lifecycle integration with a real Agent and files isolated in tmp_path."""
+import hashlib
 import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +10,7 @@ from urllib.error import HTTPError
 import pytest
 from sqlalchemy import event, select
 
+import app.model_test_storage as model_test_storage
 import app.remote_operations as operations
 from app.models import ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utcnow
 from app.services import create_training_run
@@ -62,18 +64,32 @@ def claim(client, credential):
                        json={}, headers=headers(credential)).json()["operation"]
 
 
+def execute_through(client, credential, config, agent, operation_id):
+    while work := claim(client, credential):
+        agent.execute_operation(config, work, threading.Event())
+        if work["id"] == operation_id:
+            return work
+    raise AssertionError(f"remote operation was not claimed: {operation_id}")
+
+
 def test_remote_delete_confirm_retry_and_local_isolation(monitoring_client, agent, tmp_path, monkeypatch):
     client, factory = monitoring_client
     credential, config, payload = remote_run(client, factory, tmp_path)
     monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "model-test-history")
     monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
     task_id = payload["task_id"]
+    history_file = model_test_storage.test_history_root(task_id, "c" * 32) / "results" / "0.jpg"
+    history_file.parent.mkdir(parents=True)
+    history_file.write_bytes(b"remote detection result")
     task_url = f"/api/tasks/{task_id}"
     other_dir = tmp_path / "output/detect/another-task/attempt-001"
     other_dir.mkdir(parents=True)
     (other_dir / "keep.txt").write_text("untouched")
     assert client.post(task_url + "/trash").status_code == 204
+    assert history_file.is_file()
     assert client.post(task_url + "/restore").status_code == 200
+    assert history_file.is_file()
     assert client.delete(task_url + "/permanent").status_code == 202
     assert client.delete(task_url + "/permanent").status_code == 202
     with factory() as db:
@@ -89,6 +105,7 @@ def test_remote_delete_confirm_retry_and_local_isolation(monitoring_client, agen
     assert client.post(endpoint, json=result, headers=headers(credential)).status_code == 200
     with factory() as db:
         assert db.get(TrainingTask, task_id).deleted_reason == "remote_delete_failed"
+    assert history_file.is_file()
     assert client.delete(task_url + "/permanent").status_code == 202
     work = claim(client, credential)
     agent.execute_operation(config, work, threading.Event())
@@ -96,6 +113,7 @@ def test_remote_delete_confirm_retry_and_local_isolation(monitoring_client, agen
     assert (other_dir / "keep.txt").read_text() == "untouched"
     assert (tmp_path / "model.pt").read_bytes() == b"base model"
     assert (tmp_path / "data.yaml").is_file()
+    assert not model_test_storage.task_history_root(task_id).exists()
     with factory() as db:
         assert db.get(TrainingTask, task_id) is None
         assert not db.scalars(select(TrainingRun)).all()
@@ -103,6 +121,50 @@ def test_remote_delete_confirm_retry_and_local_isolation(monitoring_client, agen
     result = {"lease": work["lease"], "success": True}
     endpoint = f"/api/compute/nodes/{credential['node']['id']}/agent/operations/{work['id']}/result"
     assert client.post(endpoint, json=result, headers=headers(credential)).json()["status"] == "succeeded"
+
+
+def test_remote_delete_keeps_task_retryable_when_center_cleanup_fails(
+    monitoring_client, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "model-test-history")
+    task_id = payload["task_id"]
+    history_file = model_test_storage.test_history_root(task_id, "d" * 32) / "detections.json"
+    history_file.parent.mkdir(parents=True)
+    history_file.write_text("{}", encoding="utf-8")
+
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+    work = claim(client, credential)
+    endpoint = f"/api/compute/nodes/{credential['node']['id']}/agent/operations/{work['id']}/result"
+
+    def cleanup_failure(_task_id: str) -> None:
+        raise PermissionError("history is read-only")
+
+    monkeypatch.setattr(operations, "delete_task_history", cleanup_failure)
+    result = client.post(endpoint, json={"lease": work["lease"], "success": True}, headers=headers(credential))
+    assert result.status_code == 200
+    assert result.json()["status"] == "failed"
+    with factory() as db:
+        task = db.get(TrainingTask, task_id)
+        assert task is not None
+        assert task.deleted_reason == "remote_delete_failed"
+        assert "中心关联数据清理失败" in task.error_message
+    assert history_file.is_file()
+
+    monkeypatch.setattr(operations, "delete_task_history", model_test_storage.delete_task_history)
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+    retry = claim(client, credential)
+    retry_endpoint = f"/api/compute/nodes/{credential['node']['id']}/agent/operations/{retry['id']}/result"
+    retried = client.post(
+        retry_endpoint, json={"lease": retry["lease"], "success": True}, headers=headers(credential),
+    )
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "succeeded"
+    with factory() as db:
+        assert db.get(TrainingTask, task_id) is None
+    assert not model_test_storage.task_history_root(task_id).exists()
 
 
 def test_remote_delete_refreshes_references_before_dispatch(monitoring_client, agent, tmp_path, monkeypatch):
@@ -249,6 +311,12 @@ def test_manifest_resume_and_chunked_download(monitoring_client, agent, tmp_path
     download = client.get(f"/api/artifacts/{weight['id']}/download")
     assert download.status_code == 200
     assert download.content == (Path(payload["run_dir"]) / "weights/last.pt").read_bytes()
+    with factory() as db:
+        fetched = db.scalar(select(RemoteOperation).where(
+            RemoteOperation.kind == "fetch", RemoteOperation.status == "succeeded",
+        ))
+        assert fetched is not None
+        assert fetched.payload["sha256"] == hashlib.sha256(download.content).hexdigest()
     response = client.post(f"/api/tasks/{payload['task_id']}/resume")
     assert response.status_code == 200, response.text
     assert response.json()["completed_epochs"] == 3
@@ -258,6 +326,82 @@ def test_manifest_resume_and_chunked_download(monitoring_client, agent, tmp_path
         assert new_run.checkpoint_path == weight["path"]
         assert new_run.run_dir != payload["run_dir"]
     assert client.delete(f"/api/tasks/{payload['task_id']}/permanent").status_code == 409
+
+
+def test_prepare_refetches_same_size_corrupt_succeeded_cache(
+    monitoring_client, agent, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential, config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    agent.report_manifest(config, payload)
+    weight = next(
+        artifact for artifact in client.get(f"/api/tasks/{payload['task_id']}/artifacts").json()
+        if artifact["name"] == "weights/last.pt"
+    )
+    prepare_url = f"/api/artifacts/{weight['id']}/prepare"
+    first = client.post(prepare_url).json()
+    work = execute_through(client, credential, config, agent, first["operation_id"])
+    assert work["id"] == first["operation_id"]
+    assert client.post(prepare_url).json()["status"] == "ready"
+
+    with factory() as db:
+        original = db.get(RemoteOperation, work["id"])
+        cached = operations.operation_file(original)
+        expected = (Path(payload["run_dir"]) / "weights/last.pt").read_bytes()
+        cached.write_bytes(b"x" * len(expected))
+
+    replacement = client.post(prepare_url).json()
+    assert replacement["status"] == "pending"
+    assert replacement["operation_id"] != work["id"]
+    repeated = client.post(prepare_url).json()
+    assert repeated["operation_id"] == replacement["operation_id"]
+    with factory() as db:
+        fetches = list(db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id == payload["task_id"],
+            RemoteOperation.kind == "fetch",
+        )))
+        assert len(fetches) == 2
+
+    retry = execute_through(client, credential, config, agent, replacement["operation_id"])
+    assert retry["id"] == replacement["operation_id"]
+    assert client.post(prepare_url).json()["status"] == "ready"
+    assert client.get(f"/api/artifacts/{weight['id']}/download").content == expected
+
+
+def test_prepare_backfills_legacy_cache_digest_without_refetch(
+    monitoring_client, agent, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential, config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    agent.report_manifest(config, payload)
+    weight = next(
+        artifact for artifact in client.get(f"/api/tasks/{payload['task_id']}/artifacts").json()
+        if artifact["name"] == "weights/last.pt"
+    )
+    prepare_url = f"/api/artifacts/{weight['id']}/prepare"
+    first = client.post(prepare_url).json()
+    execute_through(client, credential, config, agent, first["operation_id"])
+    with factory() as db:
+        original = db.get(RemoteOperation, first["operation_id"])
+        original.payload = {key: value for key, value in original.payload.items() if key != "sha256"}
+        old_cache = operations.operation_file(original)
+        old_bytes = old_cache.read_bytes()
+        db.commit()
+
+    assert client.post(prepare_url).json()["status"] == "ready"
+    assert old_cache.read_bytes() == old_bytes
+    assert client.post(prepare_url).json()["status"] == "ready"
+    with factory() as db:
+        fetches = list(db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id == payload["task_id"],
+            RemoteOperation.kind == "fetch",
+        )))
+        assert len(fetches) == 1
+        assert fetches[0].payload["sha256"] == hashlib.sha256(old_bytes).hexdigest()
 
 
 def test_agent_delete_validates_entire_plan_and_symlinks(agent, training, tmp_path):
