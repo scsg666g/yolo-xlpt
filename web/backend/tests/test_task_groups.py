@@ -60,8 +60,17 @@ def test_group_crud_rejects_duplicate_names(group_client):
     assert [group["id"] for group in client.get("/api/task-groups").json()] == [first["id"]]
 
 
+def test_new_groups_are_listed_before_existing_groups(group_client):
+    client, _ = group_client
+    existing = create_group(client, "已有分组")
+    created = create_group(client, "新分组")
+
+    assert [group["id"] for group in client.get("/api/task-groups").json()] == [created["id"], existing["id"]]
+
+
 def test_create_group_from_ungrouped_tasks_is_atomic(group_client):
     client, db = group_client
+    existing = create_group(client, "已有分组")
     first = add_task(db, "first", "火")
     second = add_task(db, "second", "烟", status="completed")
 
@@ -72,6 +81,7 @@ def test_create_group_from_ungrouped_tasks_is_atomic(group_client):
 
     assert response.status_code == 201
     group = response.json()
+    assert [item["id"] for item in client.get("/api/task-groups").json()] == [group["id"], existing["id"]]
     db.expire_all()
     assert db.get(TrainingTask, first.id).group_id == group["id"]
     assert db.get(TrainingTask, second.id).group_id == group["id"]

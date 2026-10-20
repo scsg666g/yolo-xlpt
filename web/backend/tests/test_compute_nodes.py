@@ -358,11 +358,112 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
                        json={"status": "stopped", "exit_code": -15}).status_code == 200
     with factory() as db:
         assert db.get(TrainingRun, run_id).status == "stopped"
+        from app.models import GpuReservation
+        assert db.scalar(select(GpuReservation.resource_key).where(GpuReservation.run_id == run_id)) is None
         assert db.get(TrainingRun, run_id).error_message == "收到平台停止指令，训练进程已停止"
         event = db.scalar(select(TaskEvent).where(TaskEvent.run_id == run_id, TaskEvent.event_type == "stop_requested"))
         assert event.payload["source_ip"] == "testclient"
         assert event.payload["run_id"] == run_id
         assert "请求来源：testclient" in event.message
+
+
+def _queue_remote_run(db, node_id, task_id, device):
+    task = TrainingTask(
+        id=task_id, name=task_id, task_type="detect", execution_node_id=node_id,
+        model_path="/remote/model.pt", data_path="/remote/data.yaml",
+        device=device, config={"remote_output_root": "/remote/runs"},
+    )
+    db.add(task)
+    db.flush()
+    run = create_training_run(db, task, "fresh")
+    run.parameter_snapshot = {**(run.parameter_snapshot or {}), "device": device}
+    return run
+
+
+def test_parallel_agent_requires_real_gpu_uuid_and_skips_busy_head_of_line(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Parallel Agent")
+    node_id = credential["node"]["id"]
+    node_gpus = [
+        {"index": 0, "uuid": "GPU-A", "name": "A"},
+        {"index": 1, "uuid": "GPU-B", "name": "B"},
+    ]
+    report = sample(node_gpus)
+    report["training"]["gpu_parallelism"] = True
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=report).status_code == 200
+    with factory() as db:
+        first = _queue_remote_run(db, node_id, "parallel-first", "0")
+        second = _queue_remote_run(db, node_id, "parallel-second", "1")
+        third = _queue_remote_run(db, node_id, "parallel-third", "2")
+        third_id = third.id
+        db.commit()
+
+    endpoint = f"/api/compute/nodes/{node_id}/agent/poll"
+    first_claim = client.post(endpoint, headers=headers(credential)).json()["task"]
+    assert first_claim["gpu_assignment"] == [{"uuid": "GPU-A", "index": 0}]
+    second_claim = client.post(endpoint, headers=headers(credential)).json()["task"]
+    assert second_claim["gpu_assignment"] == [{"uuid": "GPU-B", "index": 1}]
+    no_claim = client.post(endpoint, headers=headers(credential)).json()
+    assert no_claim["task"] is None
+    with factory() as db:
+        assert db.get(TrainingRun, third_id).status == "queued"
+
+
+def test_parallel_agent_fails_closed_for_missing_uuid_or_unknown_gpu_index(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "UUID Agent")
+    node_id = credential["node"]["id"]
+    report = sample([{"index": 0, "uuid": "", "name": "No UUID"}])
+    report["training"]["gpu_parallelism"] = True
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=report).status_code == 200
+    with factory() as db:
+        missing = _queue_remote_run(db, node_id, "missing-uuid", "0")
+        unknown = _queue_remote_run(db, node_id, "unknown-index", "4")
+        ids = {missing.id, unknown.id}
+        db.commit()
+    response = client.post(f"/api/compute/nodes/{node_id}/agent/poll", headers=headers(credential)).json()
+    assert response["task"] is None and "GPU" in response["message"]
+    with factory() as db:
+        assert all(db.get(TrainingRun, run_id).status == "queued" for run_id in ids)
+
+
+def test_remote_cpu_claim_is_serialized_with_gpu_claim(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "CPU Serializer")
+    node_id = credential["node"]["id"]
+    report = sample([{"index": 0, "uuid": "GPU-A", "name": "A"}])
+    report["training"]["gpu_parallelism"] = True
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=report).status_code == 200
+    with factory() as db:
+        _queue_remote_run(db, node_id, "gpu-first", "0")
+        cpu = _queue_remote_run(db, node_id, "cpu-second", "cpu")
+        cpu_id = cpu.id
+        db.commit()
+    endpoint = f"/api/compute/nodes/{node_id}/agent/poll"
+    assert client.post(endpoint, headers=headers(credential)).json()["task"]["task_id"] == "gpu-first"
+    assert client.post(endpoint, headers=headers(credential)).json()["task"] is None
+    with factory() as db:
+        assert db.get(TrainingRun, cpu_id).status == "queued"
+
+
+def test_remote_legacy_agent_remains_node_serial(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Old Agent")
+    node_id = credential["node"]["id"]
+    report = sample([{"index": 0, "uuid": "GPU-A", "name": "A"},
+                     {"index": 1, "uuid": "GPU-B", "name": "B"}])
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=report).status_code == 200
+    with factory() as db:
+        _queue_remote_run(db, node_id, "legacy-first", "0")
+        second = _queue_remote_run(db, node_id, "legacy-second", "1")
+        second_id = second.id
+        db.commit()
+    endpoint = f"/api/compute/nodes/{node_id}/agent/poll"
+    first = client.post(endpoint, headers=headers(credential)).json()["task"]
+    assert first["task_id"] == "legacy-first" and first["gpu_assignment"] == []
+    assert client.post(endpoint, headers=headers(credential)).json()["task"] is None
+    with factory() as db:
+        assert db.get(TrainingRun, second_id).status == "queued"
 
 
 def test_remote_claim_lease_requires_confirmation(monitoring_client):
@@ -624,16 +725,18 @@ def test_remote_poll_rejects_changed_output_roots_and_advances_queue(monitoring_
         db.commit()
     poll_url = f"/api/compute/nodes/{node_id}/agent/poll"
     response = client.post(poll_url, headers=headers(credential))
-    assert response.status_code == 200 and response.json()["task"] is None
-    assert "training_output_roots" in response.json()["message"]
+    assert response.status_code == 200
+    # A rejected queued claim must not block a later valid task on the same
+    # Agent poll. The invalid run retains its own failure event for diagnosis.
+    assert response.json()["task"]["task_id"] == "valid-output"
     with factory() as db:
         task = db.get(TrainingTask, "changed-output")
         assert task.status == task.runs[0].status == "failed"
         assert task.runs[0].finished_at is not None and task.runs[0].pid is None
         assert task.error_message == task.runs[0].error_message
         assert len(task.events) == 1 and task.events[0].event_type == "failed"
-    next_claim = client.post(poll_url, headers=headers(credential))
-    assert next_claim.json()["task"]["task_id"] == "valid-output"
+        valid = db.get(TrainingTask, "valid-output")
+        assert valid.status == valid.runs[0].status == "starting"
 
 
 def test_stop_between_remote_claim_and_confirmation_is_idempotent(monitoring_client):

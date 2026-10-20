@@ -42,7 +42,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-当前脚本为 **Agent 1.9.0**，配套开发平台为 **1.2.1**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍可向当前中心领取训练：
+当前脚本为 **Agent 2.0.0**，配套开发平台为 **1.3.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0，同节点不同 GPU 并行需要 Agent 2.0.0。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -55,6 +55,7 @@ python3 monitor_agent.py --config agent-config.json
 | 训练就绪门禁、层级输出根锁、共享根删除保护和恢复结果判定 | 1.8.0 | 中心按版本、`last_seen_at` 和 `training.ready` 控制训练入口；同机多 Agent 必须使用同一专用系统账户才能共享完整 workspace 保护 |
 | 相对路径配置、中文字段说明和输出目录能力上报 | 1.8.1 | 开发平台使用上报目录帮助选择并校验远程输出路径；旧中心可继续接入 Agent，但不会自动获得新版页面和校验逻辑 |
 | GPU 进程与训练 Run 关联 | 1.9.0 | Agent 给受管训练进程传递非敏感运行标识，并通过 Linux `/proc` 检查 GPU PID 的父进程链；中心再核验平台实例、节点、Run 和任务。环境不可读、旧进程或链路不完整时保留“无法确认”，不按 PID 猜测 |
+| 同节点按 GPU 并行与多 Run 恢复 | 2.0.0 | 上报 `training.gpu_parallelism=true`；按稳定 GPU UUID 加宿主机锁，同卡互斥，多卡整组获取；单个 Agent 可管理并恢复多个活动 Run |
 
 当前中心在创建、启动、续训、重新训练和领取阶段都会拒绝低于 1.8.0 的 Agent。只需监控的旧 Agent 仍可上报算力，但不应用于新的远程训练。下例假设 Agent 配置目录与项目目录 `yolo` 是兄弟目录，按服务器实际布局调整：
 
@@ -85,15 +86,15 @@ Agent 1.8.1 及以上按下表解析路径，不依赖启动终端所在目录�
 
 例如 `runs` 与 `ultralytics/runs` 是项目下的两个独立目录，将后者加入访问目录并不会自动把它加入输出目录。Agent 1.8.1 在 `training.output_roots` 中回传解析后的输出范围，新版开发平台据此提示可用目录并在接受训练前校验路径；最终文件存在性、权限、符号链接和目录边界仍由远程 Agent 检查。1.8.0 未上报该字段时保持兼容。原有任务与 Attempt 的路径快照不会随 Agent 配置自动迁移，应逐一核对；为历史产物保留访问目录，也不代表允许新训练写入该目录或允许绕过共享 owner 删除保护。
 
-`training_lock_file` 仍可选，默认位于 `training_cwd/.yolo-forge-training.lock`，用于保持单个 workspace 的兼容互斥；锁文件由 YOLO 子进程继承，Agent 意外结束时不会在训练存活期间提前释放。Agent 1.8.0 另外在 `${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/` 中对 `training_output_roots` 建立层级意向锁：相同根目录或父子根目录必然互斥，不相交的兄弟根目录可以并行。因此同一系统用户下的两个 1.8.0 Agent 不需要为了输出目录保护而手工填成同一个 `training_lock_file`。若为兼容旧部署而显式共用该文件，它仍是全局互斥锁，会让不相交的兄弟输出根也串行。
+`training_lock_file` 仍可选，默认位于 `training_cwd/.yolo-forge-training.lock`。Agent 2.0.0 以共享方式持有该兼容锁，使新版的多个 Run 可以并行，同时继续与使用独占锁的旧 Agent 和文件删除操作协调；锁由 YOLO 子进程继承，Agent 意外结束时不会在训练存活期间提前释放。Agent 1.8.0 起还在 `${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/` 中对 `training_output_roots` 建立层级意向锁：相同根目录或父子根目录必然互斥，不相交的兄弟根目录可以并行。因此同一系统用户下的多个 Agent 不需要为了输出目录保护而手工填成同一个 `training_lock_file`。
 
-workspace 登记以 `node_id` 的稳定哈希作为 owner，不依赖配置文件路径或进程 PID。永久删除前，Agent 会在持有层级锁的情况下检查共享根目录的其他存活 owner；只要另一个 Agent 仍声明与删除目标重叠的输出根，就拒绝删除并返回可重试错误。这套协调使用权限为 `0700` 的用户私有状态目录，因此同机多 Agent 必须使用同一专用系统账户才能共享完整的层级锁和删除 owner 保护。不同账户即使显式共用 `training_lock_file`，也只获得较粗的训练互斥，无法共享 workspace 删除登记。这些锁不约束中心本机调度器或平台外启动的 YOLO 进程，也不是按 GPU 分配的全主机资源调度器。两套平台仍需各自的节点 ID、Token 和 Agent 配置。
+workspace 登记以 `node_id` 的稳定哈希作为 owner，不依赖配置文件路径或进程 PID。永久删除前，Agent 会在持有层级锁的情况下检查共享根目录的其他存活 owner；只要另一个 Agent 仍声明与删除目标重叠的输出根，就拒绝删除并返回可重试错误。Agent 2.0.0 还以 `nvidia-smi` 返回的稳定 GPU UUID 建立宿主机 `flock`：单卡任务独占对应 UUID，多卡任务按 UUID 排序后一次获取整组锁，避免同卡并发和交叉等待；新中心下发 GPU 分配后，如果设备 UUID 缺失或与当前编号映射不匹配，Agent 会拒绝该 Run，不会退回仅凭设备编号加锁。所有协调状态都位于权限为 `0700` 的用户私有状态目录，因此同机多 Agent 必须使用同一专用系统账户才能共享 GPU 锁、层级锁和删除 owner 保护。不同账户无法获得这套主机级协调。中心本机调度器和平台外启动的 YOLO 进程不受远程 Agent 锁约束。两套平台仍需各自的节点 ID、Token 和 Agent 配置。
 
-在新建任务弹窗选择已注册的远程服务器，再输入远程机器上真实的模型文件、数据集 YAML 和输出根目录的绝对路径。数据集须已在远程服务器可用；中台不会上传或复制它们。中心以自己记录的 `last_seen_at` 判定在线，不使用远程采样时钟作为连通性依据；同时要求 Agent 版本至少为 1.8.0，且最近上报中 `training.enabled=true` 与 `training.ready=true`。任一条件不满足时，创建、启动、续训、重新训练和领取都会返回具体原因；Agent 自身也会暂停领取。任务按节点隔离排队，同一节点一次领取一项训练。指标和最近 100 行日志回传到中台，完整日志与权重保存在远程机器。
+在新建任务弹窗选择已注册的远程服务器，再输入远程机器上真实的模型文件、数据集 YAML 和输出根目录的绝对路径。数据集须已在远程服务器可用；中台不会上传或复制它们。中心以自己记录的 `last_seen_at` 判定在线，不使用远程采样时钟作为连通性依据；同时要求 Agent 版本至少为 1.8.0，且最近上报中 `training.enabled=true` 与 `training.ready=true`。任一条件不满足时，创建、启动、续训、重新训练和领取都会返回具体原因；Agent 自身也会暂停领取。Agent 2.0.0 会独立上报 `training.gpu_parallelism=true`，表示协议支持按 GPU 并行；中心还会检查训练就绪状态与 GPU 预约后才下发。旧 Agent 或缺少该能力字段的节点一次只领取一项训练。CPU 和 MPS 任务不占中心 GPU 预约，但远程节点仍按串行规则一次处理一项训练。指标和最近 100 行日志回传到中台，完整日志与权重保存在远程机器。
 
 Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Batch 的输入张量、网络层统计、损失和采样图片，并增量上传到中台的过程解析接口。平台不会上传完整特征图、模型权重或数据集；采样图片单张最多 512 KiB。采集失败不会中断训练，网络暂时不可用时会在下一次轮询重试。若远程服务器资源紧张，可在配置中设置 `"enable_training_trace": false`，关闭过程采集但保留普通训练、指标和日志回传。替换 Agent 后需重新领取或重新启动训练，已经运行的旧 Attempt 不会补采历史 Batch。
 
-中心从源码配置动态生成参数目录，Agent 1.9.0 与平台 1.2.1 的发布目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
+中心从源码配置动态生成参数目录，Agent 2.0.0 与平台 1.3.0 的发布目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
 
 ### 远程任务与文件操作（Agent 1.3.0）
 
@@ -130,11 +131,11 @@ Agent 1.6.0 开始在协议中使用随机租约，并在启动 YOLO 前向中�
 
 Agent 1.8.0 保留 1.7.0 的同租约确认重试与确认前停止保护。网络响应丢失时不启动 YOLO，而是保留活动记录后继续确认；平台明确拒绝过期租约时才放弃。用户在领取和确认之间点击停止时，中心会确认租约并返回 `stop=true`，Agent 不创建训练进程，直接回传已停止。
 
-训练结束时先将最终状态、日志尾部及未确认指标写到 **Agent 配置文件旁的 `.training-state/<运行 ID>.json`**，收到中台确认后才删除。Agent 重启后也会重试这些文件，补传完成前不领取下一项训练。此目录不含 Token，但含训练日志，应保持私有权限，并在升级时保留；认证或路径错误需修正后才能补传。
+训练结束时先将最终状态、日志尾部及未确认指标写到 **Agent 配置文件旁的 `.training-state/<运行 ID>.json`**，收到中台确认后才删除。Agent 重启后会按运行分别重试这些文件。此目录不含 Token，但含训练日志，应保持私有权限，并在升级时保留；认证或路径错误需修正后才能补传。
 
 平台停止指令和 Agent 退出会分别显示对应原因，不再统一标记为用户停止。平台停止事件记录请求时间、运行 ID 和连接来源 IP；经网关访问时可能记录网关地址，来源 IP 不能直接代表具体操作者。网络失联不自动判定训练失败或停止。
 
-Agent 将活动任务、启动命令、PID、Linux 进程启动时刻、命令行哈希和 boot ID 写入 `.training-state/active/`，不写入 Token。强制结束 Agent 后训练进程仍存活时，新 Agent 只在进程身份完全匹配时接管进度和停止指令，不启动重复训练。接管的进程自然结束后，Agent 1.8.0 使用已完成 Epoch、`best.pt` / `last.pt` 和日志完成标记综合判定：证据足够时回传 `completed`，无法确认时回传 `interrupted` 并保留产物供核对，不再一律标记为失败。正常收到 SIGINT/SIGTERM 时 Agent 仍会先停止它管理的训练并回传状态。
+Agent 将每个活动任务的启动命令、PID、Linux 进程启动时刻、命令行哈希、boot ID 和 GPU 分配写入 `.training-state/active/`，不写入 Token。强制结束 Agent 后多个训练进程仍存活时，Agent 2.0.0 会逐项校验身份并恢复所有匹配的 Run；身份不完整或冲突的记录不会被接管，也不会触发重复训练。接管的进程自然结束后，Agent 使用已完成 Epoch、`best.pt` / `last.pt` 和日志完成标记综合判定：证据足够时回传 `completed`，无法确认时回传 `interrupted` 并保留产物供核对。正常收到 SIGINT/SIGTERM 时 Agent 会向所有受管训练发送停止信号，等待各线程收尾并分别回传状态。
 
 远程任务停止后长时间保持 `stopping` 时，先登录对应训练服务器，根据 Attempt、命令和 PID 确认该 YOLO 进程已经结束。停止状态持续至少 30 秒后，当前训练画布才显示“解除占用”；再按页面提示明确确认远程进程已停止。该操作只将当前 Attempt 标记为 `interrupted` 并解除中心的节点占用，**不会向远程进程发送终止信号**。若旧进程仍在运行就解除占用，新任务可能与它同时占用 GPU。当前 Attempt 已变化或停止状态刚刚更新时，中心会拒绝这次操作，应刷新后重新核对。
 
@@ -155,7 +156,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `1.9.0`，核对现有配置和输出目录后，再替换并验证连接：
+确认输出为 `2.0.0`，核对现有配置和输出目录后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -226,9 +227,9 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 1.9.0），在算力页查看 `training.ready` 及原因，再检查 Agent 日志与 `.training-state/active/` |
+| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.0.0）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
 | 训练输出目录被拒绝 | 比较 `--check-config` 的解析结果与任务输出路径，分别核对访问目录和 `training_output_roots`；两者均通过才能训练，修改本机待复制配置不会自动更新远端进程 |
-| 任务不领取、锁一直被占用 | 检查活动训练进程、`training_lock_file`、`${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/locks/` 和各 Agent 的 `training_output_roots`；锁文件存在本身不表示锁仍被持有 |
+| 任务不领取、锁一直被占用 | 检查活动训练进程、中心 GPU 预约、`training_lock_file`、`${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/` 下的 GPU / 输出根锁和各 Agent 的 `training_output_roots`；锁文件存在本身不表示锁仍被持有 |
 | 永久删除提示共享 workspace 正在使用 | 查看同一系统用户下其他 1.8.0+ Agent 的节点和输出根配置；停止或调整重叠的存活 Agent 后重试，不要手工删除登记来绕过保护 |
 | 远程任务长时间“正在停止” | 先到远程服务器确认当前 Attempt 的 YOLO 进程已结束；停止超过 30 秒后才可在训练画布使用“解除占用”，该操作不会终止远程进程 |
 | 页面参数与远程命令不同 | 对照固定 `TRAINING_KEYS`、标量限制和远程 YOLO 版本，再检查实际命令与 `args.yaml` |

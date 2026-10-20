@@ -548,32 +548,21 @@ def test_concurrent_polls_keep_one_active_run_per_server(monitoring_client):
             db.flush()
             create_training_run(db, task, "fresh")
         db.commit()
-    waiting, release = threading.Event(), threading.Event()
-    engine = factory.kw["bind"]
-
-    def delay_first_queue_read(conn, cursor, statement, parameters, context, executemany):
-        # Pause after the occupancy check. Another poll claims the first task,
-        # so this poll subsequently sees the second queued task.
-        if "ORDER BY training_runs.queued_at" in statement and not waiting.is_set():
-            waiting.set()
-            assert release.wait(5), "concurrent poll did not finish"
-
-    event.listen(engine, "before_cursor_execute", delay_first_queue_read)
+    barrier = threading.Barrier(2)
     endpoint = f"/api/compute/nodes/{node_id}/agent/poll"
-    try:
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            delayed = executor.submit(client.post, endpoint, headers=headers(credential))
-            try:
-                assert waiting.wait(5)
-                first = client.post(endpoint, headers=headers(credential))
-                assert first.status_code == 200 and first.json()["task"]
-            finally:
-                release.set()
-            second = delayed.result(timeout=5)
-            assert second.status_code == 200 and second.json()["task"] is None
-    finally:
-        release.set()
-        event.remove(engine, "before_cursor_execute", delay_first_queue_read)
+
+    def poll_together():
+        barrier.wait(timeout=5)
+        return client.post(endpoint, headers=headers(credential))
+
+    # Force both requests to begin their claim at the same time. The node
+    # claim lock must serialize them so the legacy Agent gets only one Run.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(poll_together) for _ in range(2)]
+        responses = [future.result(timeout=10) for future in futures]
+    assert all(response.status_code == 200 for response in responses)
+    claims = [response.json()["task"] for response in responses]
+    assert sum(claim is not None for claim in claims) == 1
     with factory() as db:
         statuses = [run.status for run in db.scalars(select(TrainingRun))]
         assert sorted(statuses) == ["queued", "starting"]

@@ -37,6 +37,16 @@ from .config import (
     YOLO_BIN,
 )
 from .database import SessionLocal
+from .gpu_reservations import (
+    acquire_node_claim_lock,
+    node_serial_assignment,
+    non_gpu_assignment,
+    reserve_recovery_conflict,
+    release_gpu_reservations,
+    release_terminal_gpu_reservations,
+    reserve_gpu_resources,
+    resolve_gpu_assignments,
+)
 from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .parameter_catalog import training_parameter_keys
 
@@ -874,6 +884,8 @@ class TrainingScheduler:
 
     def _recover_processes(self) -> None:
         with self.session_factory() as db:
+            release_terminal_gpu_reservations(db)
+            local_gpus = gpu_inventory()
             candidates = db.scalars(select(TrainingRun).where(
                 TrainingRun.execution_node_id.is_(None),
                 (
@@ -897,6 +909,23 @@ class TrainingScheduler:
                     run.error_message = None
                     run.finished_at = None
                     mirror_run_to_task(task, run)
+                    device = str((run.parameter_snapshot or {}).get("device", task.device) or "").strip().lower()
+                    if device in {"cpu", "mps"}:
+                        assignments = [non_gpu_assignment("local", run.id, device)]
+                    else:
+                        assignments = resolve_gpu_assignments(
+                            device, local_gpus, node_id="local",
+                        ) or [node_serial_assignment("local")]
+                    if not reserve_gpu_resources(
+                        db, run_id=run.id, node_id="local", assignments=assignments,
+                    ):
+                        # The process is already alive and cannot safely be
+                        # interrupted during reconciliation. Keep a durable
+                        # node-wide guard until this process reaches terminal
+                        # state, so another active run's eventual cleanup
+                        # cannot expose the disputed GPU to a new launch.
+                        reserve_recovery_conflict(db, run_id=run.id, node_id="local")
+                        logger.warning("local_gpu_reservation_recovery_conflict run_id=%s", run.id)
                     with self._process_lock:
                         self.processes[task.id] = ManagedTrainingProcess(
                             run_id=run.id, pid=pid, command=list(run.command or []),
@@ -922,6 +951,7 @@ class TrainingScheduler:
                     "平台已取消本机训练启动，训练进程尚未启动"
                     if stopped_during_start else "平台服务重启后未发现受管训练进程"
                 )
+                release_gpu_reservations(db, run.id)
                 if task:
                     mirror_run_to_task(task, run)
                     add_event(
@@ -997,8 +1027,30 @@ class TrainingScheduler:
             ]
         return command
 
-    def _claim_queued_run(self, db, run_id: str) -> bool:
+    def _claim_queued_run(
+        self,
+        db,
+        run_id: str,
+        assignments: list[dict[str, Any]] | None = None,
+    ) -> bool:
         """Durably claim a queued local run before any process can be created."""
+        acquire_node_claim_lock(db, "local")
+        candidate = db.get(TrainingRun, run_id)
+        candidate_task = db.get(TrainingTask, candidate.task_id) if candidate else None
+        if not candidate or not candidate_task:
+            db.rollback()
+            return False
+        if assignments is None:
+            device = str((candidate.parameter_snapshot or {}).get("device", candidate_task.device) or "").strip().lower()
+            if device in {"cpu", "mps"}:
+                assignments = [non_gpu_assignment("local", candidate.id, device)]
+            elif device and all(part.strip().isdigit() for part in device.split(",")):
+                assignments = resolve_gpu_assignments(device, gpu_inventory(), node_id="local")
+                if assignments is None:
+                    db.rollback()
+                    return False
+            else:
+                assignments = [node_serial_assignment("local")]
         claimed = db.execute(
             update(TrainingRun).where(
                 TrainingRun.id == run_id,
@@ -1010,6 +1062,11 @@ class TrainingScheduler:
         if claimed.rowcount != 1:
             db.rollback()
             return False
+        if not reserve_gpu_resources(
+            db, run_id=run_id, node_id="local", assignments=assignments,
+        ):
+            db.rollback()
+            return False
         db.expire_all()
         run = db.get(TrainingRun, run_id)
         task = db.get(TrainingTask, run.task_id) if run else None
@@ -1018,6 +1075,7 @@ class TrainingScheduler:
                 run.status = "interrupted"
                 run.error_message = "训练队列记录已失效，未启动进程"
                 run.finished_at = utcnow()
+                release_gpu_reservations(db, run.id)
             db.commit()
             return False
         mirror_run_to_task(task, run)
@@ -1045,6 +1103,7 @@ class TrainingScheduler:
         if task and run:
             mirror_run_to_task(task, run)
             add_event(db, task.id, "stopped", run.error_message, run_id=run.id)
+            release_gpu_reservations(db, run.id)
         db.commit()
         return True
 
@@ -1066,6 +1125,7 @@ class TrainingScheduler:
         if task and run:
             mirror_run_to_task(task, run)
             add_event(db, task.id, "failed", event_message, "error", run_id=run.id)
+            release_gpu_reservations(db, run.id)
         db.commit()
 
     def _launch(self, db, task: TrainingTask, run: TrainingRun) -> None:
@@ -1203,6 +1263,7 @@ class TrainingScheduler:
             )
             if cancelled.rowcount == 1:
                 transition = "stopped"
+                release_gpu_reservations(db, run_id)
             else:
                 stopping = db.execute(
                     update(TrainingRun).where(
@@ -1297,6 +1358,7 @@ class TrainingScheduler:
             sync_artifacts(db, task, run)
             self._last_artifact_scan.pop(run_id, None)
             add_event(db, task.id, run.status, message, level, run_id=run.id)
+            release_gpu_reservations(db, run.id)
             with self._process_lock:
                 if self.processes.get(task_id) is managed:
                     self.processes.pop(task_id, None)
@@ -1308,13 +1370,25 @@ class TrainingScheduler:
             queued_ids = db.scalars(select(TrainingRun.id).where(
                 TrainingRun.status == "queued", TrainingRun.execution_node_id.is_(None),
             ).order_by(TrainingRun.queued_at)).all()
+            local_gpus = gpu_inventory()
             for run_id in queued_ids:
                 db.expire_all()
                 run = db.get(TrainingRun, run_id)
                 task = db.get(TrainingTask, run.task_id) if run else None
                 if not run or not task or task.current_run_id != run.id or not self._available(db, task):
                     continue
-                if not self._claim_queued_run(db, run.id):
+                device = str((run.parameter_snapshot or {}).get("device", task.device) or "").strip().lower()
+                if device in {"cpu", "mps"}:
+                    assignments = [non_gpu_assignment("local", run.id, device)]
+                elif device and all(part.strip().isdigit() for part in device.split(",")):
+                    assignments = resolve_gpu_assignments(device, local_gpus, node_id="local")
+                    if assignments is None:
+                        # Inventory doesn't confirm this GPU index. Leave the
+                        # run queued instead of launching without a reservation.
+                        continue
+                else:
+                    assignments = [node_serial_assignment("local")]
+                if not self._claim_queued_run(db, run.id, assignments):
                     continue
                 db.expire_all()
                 claimed_run = db.get(TrainingRun, run.id)

@@ -242,6 +242,7 @@ export interface ComputeNode extends ComputeNodeSettings {
     output_writable: boolean
     output_roots?: string[]
     lock_occupied: boolean
+    gpu_parallelism?: boolean
   } | null
   hostname: string | null
   summary: {

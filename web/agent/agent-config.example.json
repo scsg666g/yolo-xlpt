@@ -2,6 +2,7 @@
   "_comments": {
     "format": "标准 JSON；中文注释放在 _comments 中，不要使用 // 或 #。相对路径需要 Agent 1.8.1 或以上版本。",
     "process_attribution": "GPU 进程关联需要 Agent 1.9.0 或以上版本；通过非敏感运行标识和 Linux /proc 父进程链识别，无需额外配置。",
+    "gpu_parallelism": "Agent 2.0.0 可报告按 GPU 并行能力；中心需支持 GPU UUID 预约后才会按卡调度，否则仍串行领取。",
     "center_url": "远程服务器能够访问的中心平台或代理地址；迁移服务器时修改这里。",
     "node_id": "从对应平台下载的节点 ID，必须与 token 配套；两套平台不可共用。",
     "token": "替换为平台签发的真实凭证；配置文件权限设为 600，不提交 Git。",
@@ -12,7 +13,7 @@
     "allowed_training_roots": "模型、数据集 YAML、输出等允许访问的最小目录。相对路径基于 training_cwd，目录须已存在。保留历史目录不代表允许新训练写入。",
     "training_output_roots": "允许写入训练结果的目录，必须位于 allowed_training_roots 中。相对路径基于 training_cwd，目录须存在且可写。两个平台的输出目录不能相同或互为父子；不要只修改 allowed_training_roots。空列表兼容旧配置，会使用全部访问允许目录，建议明确配置。",
     "yolo_bin": "仅写 yolo 时从运行环境 PATH 查找。带 / 的相对路径以 training_cwd 为基准；需要指定 Conda 环境时填写对应程序路径。",
-    "training_lock_file": "相对路径基于 training_cwd。相同工作目录默认共享训练锁，避免并行抢占；不要删除运行中的锁文件或改锁名绕过保护。",
+    "training_lock_file": "相对路径基于 training_cwd。Agent 2.0.0 对兼容锁使用共享锁并按 GPU UUID 互斥；旧 Agent 使用独占锁。不要删除运行中的锁文件或改锁名绕过保护。",
     "enable_training_trace": "是否启用真实 Batch 过程采样；对支持的新训练生效，会增加采样开销。",
     "deployment": "填写身份和目录后执行 --check-config，核对解析后的路径；变更配置需在训练空闲时重启 Agent。示例目录仅供参考，按服务器实际布局调整。"
   },

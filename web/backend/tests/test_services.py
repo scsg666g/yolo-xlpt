@@ -20,7 +20,7 @@ from app.database import get_db
 from app.main import app
 import app.main as main_module
 from app.local_deletions import LocalDeletionWorker
-from app.models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from app.models import Artifact, GpuReservation, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.schemas import TaskConfigUpdate, TaskCreate, TaskRead
 from app.services import (
     TrainingScheduler,
@@ -105,6 +105,34 @@ def test_scheduler_claim_is_atomic_across_scheduler_instances(tmp_path: Path):
         assert db.get(TrainingTask, "task-atomic-claim").status == "starting"
 
 
+def test_local_scheduler_keeps_gpu_run_queued_when_inventory_lacks_requested_index(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'missing-gpu-index.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with session_factory() as db:
+        task = make_task("task-missing-gpu", status="queued", device="3")
+        run = TrainingRun(
+            id="run-missing-gpu", task=task, attempt_number=1, launch_mode="fresh", status="queued",
+            model_path=task.model_path, data_path=task.data_path, parameter_snapshot={"device": "3"},
+        )
+        task.current_run_id = run.id
+        db.add_all([task, run])
+        db.commit()
+
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    monkeypatch.setattr(services_module, "gpu_inventory", lambda: [])
+    monkeypatch.setattr(scheduler, "_poll_processes", lambda _db: None)
+    launched = []
+    monkeypatch.setattr(scheduler, "_launch", lambda *_args: launched.append(True))
+    scheduler._run_once()
+
+    with session_factory() as db:
+        assert db.get(TrainingRun, "run-missing-gpu").status == "queued"
+        assert db.get(TrainingTask, "task-missing-gpu").status == "queued"
+        assert db.query(GpuReservation).count() == 0
+    assert launched == []
+
+
 def test_popen_happens_after_durable_claim_and_final_db_failure_is_recoverable(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'launch-recovery.db'}")
     Base.metadata.create_all(engine)
@@ -125,6 +153,9 @@ def test_popen_happens_after_durable_claim_and_final_db_failure_is_recoverable(t
     scheduler = TrainingScheduler(session_factory=session_factory)
     command = ["fake-yolo", "detect", "train"]
     monkeypatch.setattr(scheduler, "_command", lambda *_args: command)
+    monkeypatch.setattr(services_module, "gpu_inventory", lambda: [
+        {"index": 0, "uuid": "GPU-TEST", "name": "test GPU"},
+    ])
     monkeypatch.setattr(services_module, "RUNTIME_ROOT", tmp_path / "runtime")
     monkeypatch.setattr(services_module, "prepare_dataset_config", lambda _raw, destination: destination)
 

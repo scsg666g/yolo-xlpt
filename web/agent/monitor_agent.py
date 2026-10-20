@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.9.0"
+VERSION = "2.0.0"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
@@ -280,7 +280,7 @@ def training_capability(config: dict) -> dict:
         return {"enabled": False, "ready": False, "reason": "远程训练未启用",
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
                 "python_version": platform.python_version(), "output_writable": False,
-                "lock_occupied": False, "output_roots": []}
+                "lock_occupied": False, "output_roots": [], "gpu_parallelism": True}
     reported_roots = []
     try:
         reported_roots = [str(root) for root in configured_output_roots(config)]
@@ -318,13 +318,13 @@ def training_capability(config: dict) -> dict:
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": _configured_yolo_version(yolo),
                 "python_version": platform.python_version(), "output_writable": True,
                 "lock_occupied": occupied,
-                "output_roots": reported_roots}
+                "output_roots": reported_roots, "gpu_parallelism": True}
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
                 "python_version": platform.python_version(), "output_writable": False,
                 "lock_occupied": False,
-                "output_roots": reported_roots}
+                "output_roots": reported_roots, "gpu_parallelism": True}
 
 
 def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
@@ -528,6 +528,51 @@ def process_holds_training_lock(config: dict, pid: int) -> bool:
     return False
 
 
+def process_holds_task_locks(config: dict, task: dict, pid: int) -> bool:
+    """Check that a recovered process inherited every reservation for its Run."""
+    if type(pid) is not int or pid <= 0:
+        return False
+    # Pre-2.0 tasks have no assignment payload and inherited only the shared
+    # workspace lock. Keep recognizing those processes so restart recovery can
+    # continue monitoring them instead of treating their live lock as a conflict.
+    if "gpu_assignment" not in task:
+        return process_holds_training_lock(config, pid)
+    assignment = normalize_gpu_assignment(task)
+    paths = [configured_training_lock(config)]
+    roots = configured_output_roots(config)
+    output_root = (task.get("parameters") or {}).get("remote_output_root")
+    if output_root:
+        roots = _normalized_output_roots([*roots, Path(output_root).resolve()])
+    lock_directory = workspace_state_dir(config) / "locks"
+    for value in _output_lock_requests(roots):
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+        paths.append(lock_directory / f"{digest}.lock")
+    if assignment:
+        gpu_directory = workspace_state_dir(config) / "gpu-locks"
+        for item in assignment:
+            digest = hashlib.sha256(item["uuid"].encode("utf-8")).hexdigest()
+            paths.append(gpu_directory / f"{digest}.lock")
+    try:
+        descriptors = list(Path(f"/proc/{pid}/fd").iterdir())
+    except OSError:
+        return False
+    held = set()
+    for descriptor in descriptors:
+        try:
+            info = descriptor.stat()
+        except OSError:
+            continue
+        held.add((info.st_dev, info.st_ino))
+    for path in paths:
+        try:
+            info = path.stat()
+        except OSError:
+            return False
+        if (info.st_dev, info.st_ino) not in held:
+            return False
+    return True
+
+
 def acquire_agent_instance_lock(config: dict):
     """Prevent two processes from polling with the same on-disk node config."""
     directory = Path(config["training_state_dir"])
@@ -611,12 +656,14 @@ def _output_lock_requests(roots: list[Path]) -> dict[str, int]:
     return requests
 
 
-def acquire_output_root_locks(config: dict, additional_roots: list[Path] | None = None) -> LockBundle | None:
-    """Use hierarchical intention locks so parent/child roots conflict but sibling roots do not."""
+def acquire_output_root_locks(config: dict, additional_roots: list[Path] | None = None,
+                              *, shared: bool = False) -> LockBundle | None:
+    """Lock output scopes; shared holders are active 2.x runs and exclusive holders mutate files."""
     roots = configured_output_roots(config)
     if additional_roots:
         roots = _normalized_output_roots([*roots, *additional_roots])
-    requests = _output_lock_requests(roots)
+    requests = ({path: fcntl.LOCK_SH for path in _output_lock_requests(roots)}
+                if shared else _output_lock_requests(roots))
     directory = workspace_state_dir(config) / "locks"
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
@@ -637,6 +684,167 @@ def acquire_output_root_locks(config: dict, additional_roots: list[Path] | None 
         _release_lock_handles(handles)
         raise
     return LockBundle(handles)
+
+
+def _gpu_identity_rows(binary: str) -> list[dict]:
+    """Read the launch-time GPU index/UUID identity map used to verify a center reservation."""
+    try:
+        output = query(binary, ["--query-gpu=index,uuid", "--format=csv,noheader,nounits"])
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("无法核对平台分配的 GPU；nvidia-smi 不可用") from exc
+    rows = []
+    for row in csv.reader(output.splitlines()):
+        if len(row) != 2:
+            continue
+        index = number(row[0], True)
+        uuid = row[1].strip()
+        if index is None or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", uuid):
+            continue
+        rows.append({"index": index, "uuid": uuid})
+    indexes = [row["index"] for row in rows]
+    uuids = [row["uuid"] for row in rows]
+    if not rows or len(indexes) != len(set(indexes)) or len(uuids) != len(set(uuids)):
+        raise ValueError("无法建立唯一的 GPU 索引与 UUID 映射")
+    return rows
+
+
+def normalize_gpu_assignment(task: dict) -> list[dict] | None:
+    """Validate the center payload structure and requested-device ordering without trusting it."""
+    if "gpu_assignment" not in task:
+        return None  # Old centers retain the legacy server-wide serialization path.
+    raw = task.get("gpu_assignment")
+    if not isinstance(raw, list) or len(raw) > 128:
+        raise ValueError("平台下发的 GPU 分配格式无效")
+    requested = str((task.get("parameters") or {}).get("device", "")).strip().lower()
+    if requested in {"cpu", "mps"}:
+        if raw:
+            raise ValueError("CPU/MPS 任务不应包含 GPU 分配")
+        return []
+    if not re.fullmatch(r"\d+(?:,\d+)*", requested):
+        raise ValueError("训练设备不是可验证的 GPU 索引列表")
+    requested_indexes = [int(value) for value in requested.split(",")]
+    if not raw or len(raw) != len(requested_indexes):
+        raise ValueError("平台分配的 GPU 数量与训练设备不一致")
+    normalized = []
+    for position, item in enumerate(raw):
+        if not isinstance(item, dict) or set(item) != {"uuid", "index"}:
+            raise ValueError("平台下发的 GPU 分配项无效")
+        index, uuid = item.get("index"), item.get("uuid")
+        if type(index) is not int or index < 0 or index != requested_indexes[position]:
+            raise ValueError("平台分配的 GPU 顺序与训练设备不一致")
+        if not isinstance(uuid, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", uuid):
+            raise ValueError("平台下发的 GPU UUID 无效")
+        normalized.append({"uuid": uuid, "index": index})
+    if (len({item["uuid"] for item in normalized}) != len(normalized)
+            or len({item["index"] for item in normalized}) != len(normalized)):
+        raise ValueError("平台下发的 GPU 分配包含重复设备")
+    return normalized
+
+
+def validate_gpu_assignment(config: dict, task: dict) -> list[dict] | None:
+    assignment = normalize_gpu_assignment(task)
+    if assignment is None or not assignment:
+        return None
+    inventory = _gpu_identity_rows(config.get("nvidia_smi_bin", "nvidia-smi"))
+    by_index = {item["index"]: item["uuid"] for item in inventory}
+    for item in assignment:
+        if by_index.get(item["index"]) != item["uuid"]:
+            raise ValueError(
+                f"GPU {item['index']} 的当前 UUID 与平台分配不一致，已拒绝启动训练"
+            )
+    return assignment
+
+
+def _acquire_gpu_uuid_locks(config: dict, task: dict, assignment: list[dict]) -> LockBundle | None:
+    directory = workspace_state_dir(config) / "gpu-locks"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    handles = []
+    try:
+        for item in sorted(assignment, key=lambda value: value["uuid"]):
+            digest = hashlib.sha256(item["uuid"].encode("utf-8")).hexdigest()
+            handle = (directory / f"{digest}.lock").open("a+", encoding="utf-8")
+            os.chmod(handle.name, 0o600)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                handle.close()
+                _release_lock_handles(handles)
+                return None
+            handle.seek(0)
+            handle.truncate()
+            json.dump({"node_id": config["node_id"], "run_id": task.get("run_id"),
+                       "gpu_uuid": item["uuid"], "acquired_at": datetime.now(timezone.utc).isoformat()}, handle)
+            handle.flush()
+            handles.append(handle)
+    except Exception:
+        _release_lock_handles(handles)
+        raise
+    return LockBundle(handles)
+
+
+def acquire_parallel_training_lock(config: dict, task: dict) -> LockBundle | None:
+    """Reserve assigned GPUs while sharing the legacy workspace gate with other 2.x runs."""
+    assignment = validate_gpu_assignment(config, task)
+    if not assignment:
+        raise ValueError("并行训练缺少可验证的 GPU 分配")
+    lock_path = configured_training_lock(config)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = lock_path.open("a+", encoding="utf-8")
+    os.chmod(lock_path, 0o660)
+    try:
+        fcntl.flock(legacy.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        legacy.close()
+        return None
+    output_root = Path(task["parameters"]["remote_output_root"]).resolve()
+    root_locks = acquire_output_root_locks(config, [output_root], shared=True)
+    if root_locks is None:
+        _release_lock_handles([legacy])
+        return None
+    gpu_locks = _acquire_gpu_uuid_locks(config, task, assignment)
+    if gpu_locks is None:
+        release_training_lock(root_locks)
+        _release_lock_handles([legacy])
+        return None
+    return LockBundle([legacy, *root_locks.handles, *gpu_locks.handles])
+
+
+def acquire_task_training_lock(config: dict, task: dict):
+    """Use GPU-scoped 2.x reservations, falling back to the legacy exclusive protocol."""
+    assignment = normalize_gpu_assignment(task)
+    if assignment:
+        return acquire_parallel_training_lock(config, task)
+    return acquire_training_lock(config)
+
+
+def training_launch_environment(config: dict, task: dict) -> dict[str, str]:
+    """Map a verified UUID reservation into a compact CUDA device namespace."""
+    environment = training_process_environment(config, task)
+    assignment = normalize_gpu_assignment(task)
+    if not assignment:
+        return environment
+    assignment = validate_gpu_assignment(config, task) or []
+    if not assignment:
+        raise ValueError("平台分配的 GPU 在启动时不可用")
+    environment["CUDA_VISIBLE_DEVICES"] = ",".join(item["uuid"] for item in assignment)
+    return environment
+
+
+def training_command_for_assignment(command: list[str], task: dict) -> list[str]:
+    """Rewrite requested physical indices to logical CUDA indices after masking visibility."""
+    assignment = normalize_gpu_assignment(task)
+    if not assignment:
+        return command
+    logical = ",".join(str(index) for index in range(len(assignment)))
+    rewritten = list(command)
+    for index, value in enumerate(rewritten):
+        if value.startswith("device="):
+            rewritten[index] = "device=" + logical
+            break
+    else:
+        raise ValueError("训练命令中缺少设备参数")
+    return rewritten
 
 
 def _workspace_registry_lock(config: dict):
@@ -1016,27 +1224,35 @@ def clear_active_run(config: dict, run_id: str) -> None:
     active_state_path(config, run_id).unlink(missing_ok=True)
 
 
-def load_active_run(config: dict) -> dict | None:
+def load_active_runs(config: dict) -> list[dict]:
+    """Load every durable Run independently, pruning acknowledged terminal markers."""
     directory = Path(config["training_state_dir"]) / "active"
     if not directory.exists():
-        return None
+        return []
     paths = sorted(directory.glob("*.json"))
-    if len(paths) > 1:
-        raise ValueError("检测到多个活动训练状态，已阻止继续领取任务")
-    if not paths:
-        return None
-    state = json.loads(paths[0].read_text(encoding="utf-8"))
-    run_id = paths[0].stem
-    if (state.get("version") != ACTIVE_STATE_VERSION or state.get("node_id") != config["node_id"] or
-            state.get("run_id") != run_id or state.get("phase") not in {"claimed", "confirmed", "launching", "running"} or
-            not isinstance(state.get("task"), dict) or state["task"].get("run_id") != run_id):
-        raise ValueError("活动训练状态文件无效，已阻止继续领取任务")
-    # A terminal payload is authoritative if the Agent stopped between writing
-    # it and removing the active marker.
-    if (Path(config["training_state_dir"]) / f"{run_id}.json").is_file():
-        paths[0].unlink(missing_ok=True)
-        return None
-    return state
+    states = []
+    for path in paths:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        run_id = path.stem
+        if (state.get("version") != ACTIVE_STATE_VERSION or state.get("node_id") != config["node_id"] or
+                state.get("run_id") != run_id or state.get("phase") not in {"claimed", "confirmed", "launching", "running"} or
+                not isinstance(state.get("task"), dict) or state["task"].get("run_id") != run_id):
+            raise ValueError("活动训练状态文件无效，已阻止继续领取任务")
+        # A terminal payload is authoritative if the Agent stopped between writing
+        # it and removing the active marker.
+        if (Path(config["training_state_dir"]) / f"{run_id}.json").is_file():
+            path.unlink(missing_ok=True)
+            continue
+        states.append(state)
+    return states
+
+
+def load_active_run(config: dict) -> dict | None:
+    """Backward-compatible single-Run accessor used by older Agent integrations."""
+    states = load_active_runs(config)
+    if len(states) > 1:
+        raise ValueError("检测到多个活动训练状态；请使用 load_active_runs()")
+    return states[0] if states else None
 
 
 def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None,
@@ -1456,8 +1672,16 @@ def prepare_trace_command(config: dict, task: dict, command: list[str]) -> list[
     state_dir.mkdir(parents=True, exist_ok=True)
     runner = state_dir / "training_trace_runner.py"
     if not runner.is_file() or runner.read_text(encoding="utf-8") != REMOTE_TRACE_RUNNER:
-        runner.write_text(REMOTE_TRACE_RUNNER, encoding="utf-8")
-        os.chmod(runner, 0o700)
+        temporary = runner.with_name(f".{runner.name}.{threading.get_ident()}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(REMOTE_TRACE_RUNNER)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, 0o700)
+            temporary.replace(runner)
+        finally:
+            temporary.unlink(missing_ok=True)
     yolo_bin = str(config.get("yolo_bin", ""))
     python_bin = str(Path(yolo_bin).parent / "python") if "/" in yolo_bin else sys.executable
     if not Path(python_bin).is_file():
@@ -1596,25 +1820,63 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
     """Monitor an orphaned, identity-verified process without starting a duplicate."""
     lock = training_lock
     release_lock = lock is not None
+    task = state["task"]
     if lock is None and not process_holds_lock:
-        lock = acquire_training_lock(config)
+        try:
+            lock = acquire_task_training_lock(config, task)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            identity = _recovery_identity(state)
+            if identity is not None:
+                LOGGER.error("无法验证恢复任务 %s 的本地资源锁，保留进程与活动记录：%s",
+                             task.get("run_id"), exc)
+                return
+            completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+            latest = latest or task.get("latest_metrics", {})
+            path = _save_terminal_for_retry(config, task, {
+                "status": "failed", "error_message": f"恢复训练时无法验证 GPU/工作区资源分配：{str(exc)[:3500]}",
+                "exit_code": 1, "completed_epochs": max(completed, task.get("completed_epochs", 0)),
+                "progress": task.get("progress", 0), "latest_metrics": latest, "metrics": metrics,
+                "log_tail": recent_log_lines(Path(task["log_path"])),
+                "command": state.get("command") or [], "run_dir": task.get("run_dir")})
+            _deliver_terminal_once(config, path)
+            return
         release_lock = lock is not None
     if lock is None and not process_holds_lock:
-        LOGGER.warning("共享训练锁已被占用，暂不接管活动训练记录")
+        identity = _recovery_identity(state)
+        if identity is not None:
+            LOGGER.error("Run %s 的进程仍在运行，但 Agent 无法确认其完整资源锁；保留活动状态并拒绝重复启动",
+                         task.get("run_id"))
+            return
+        completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+        latest = latest or task.get("latest_metrics", {})
+        path = _save_terminal_for_retry(config, task, {
+            "status": "failed", "error_message": "恢复训练时 GPU 或工作区资源锁已被占用；为避免重复训练，未重新启动",
+            "exit_code": 1, "completed_epochs": max(completed, task.get("completed_epochs", 0)),
+            "progress": task.get("progress", 0), "latest_metrics": latest, "metrics": metrics,
+            "log_tail": recent_log_lines(Path(task["log_path"])),
+            "command": state.get("command") or [], "run_dir": task.get("run_dir")})
+        _deliver_terminal_once(config, path)
         return
-    task = state["task"]
     run_id = task["run_id"]
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}"
     try:
         identity = _recovery_identity(state)
-        if process_holds_lock and (identity is None or not process_holds_training_lock(config, identity["pid"])):
+        holds_expected_locks = False
+        if identity:
+            try:
+                holds_expected_locks = (process_holds_task_locks(config, task, identity["pid"])
+                                        if "gpu_assignment" in task else
+                                        process_holds_training_lock(config, identity["pid"]))
+            except (OSError, ValueError, TypeError):
+                holds_expected_locks = False
+        if process_holds_lock and (identity is None or not holds_expected_locks):
             process_holds_lock = False
-            lock = acquire_training_lock(config)
+            lock = acquire_task_training_lock(config, task)
             release_lock = lock is not None
             if lock is None:
                 LOGGER.warning("活动训练进程已不再持有共享锁，且锁已被其他 Agent 占用，暂不接管")
                 return
-            identity = _recovery_identity(state)
+        identity = _recovery_identity(state)
         try:
             control = api_json(config, endpoint + "/control")
         except (OSError, ValueError, HTTPError, URLError):
@@ -1759,12 +2021,14 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             request_stop("platform_stop")
 
     try:
-        command = prepare_trace_command(config, task, build_training_command(config, task))
+        command = build_training_command(config, task)
+        command = training_command_for_assignment(command, task)
+        command = prepare_trace_command(config, task, command)
         save_active_run(config, task, "launching", command=command)
         log_path = Path(task["log_path"])
         with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
             log_handle.write(f"\n[{datetime.now(timezone.utc).isoformat()}] REMOTE COMMAND {shlex.join(command)}\n")
-            environment = training_process_environment(config, task)
+            environment = training_launch_environment(config, task)
             inherited_locks = (training_lock.filenos() if isinstance(training_lock, LockBundle)
                                else (training_lock.fileno(),))
             process = subprocess.Popen(command, cwd=config["training_cwd"], env=environment, stdout=log_handle,
@@ -1872,10 +2136,36 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
 
 
 def run_remote_task(config: dict, task: dict, stop: threading.Event, training_lock=None) -> None:
-    """Run one task while holding the server-wide lock until all final reporting finishes."""
-    lock = training_lock or acquire_training_lock(config)
+    """Run one task while holding its GPU/workspace reservations through final reporting."""
+    try:
+        lock = training_lock if training_lock is not None else acquire_task_training_lock(config, task)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        lock = None
+        lock_error = str(exc)
+    else:
+        lock_error = "远程 Agent 未能取得该 Run 的 GPU 或输出目录锁，训练未启动"
     if lock is None:
-        LOGGER.warning("本机已有另一个 Agent 在训练，拒绝并发启动任务 %s", task.get("run_id"))
+        LOGGER.error("Run %s 的本地资源锁不可用，训练未启动", task.get("run_id"))
+        try:
+            save_active_run(config, task, "claimed")
+            stop_requested = confirm_remote_claim(config, task, stop)
+            status = "stopped" if stop_requested else "failed"
+            error = None if stop_requested else lock_error[:4000]
+            path = _save_terminal_for_retry(config, task, {
+                "status": status, "error_message": error, "stop_reason": "platform_stop" if stop_requested else None,
+                "exit_code": None if stop_requested else 1,
+                "completed_epochs": task.get("completed_epochs", 0),
+                "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {}),
+                "metrics": [], "log_tail": recent_log_lines(Path(task["log_path"])),
+                "run_dir": task.get("run_dir")})
+            _deliver_terminal_once(config, path)
+        except ClaimConfirmationPending as exc:
+            LOGGER.warning("%s；稍后重新确认资源冲突 Run", exc)
+        except ClaimRejected as exc:
+            clear_active_run(config, task["run_id"])
+            LOGGER.warning("%s；资源冲突 Run 未启动", exc)
+        except Exception:
+            LOGGER.exception("无法收尾未取得资源锁的 Run %s", task.get("run_id"))
         return
     try:
         save_active_run(config, task, "claimed")
@@ -1967,9 +2257,8 @@ def main() -> int:
         signal.signal(signum, lambda *_: stop.set())
     failures = 0
     interval = config["report_interval_seconds"]
-    active_training: threading.Thread | None = None
+    active_training: dict[str, tuple[threading.Thread, threading.Event]] = {}
     active_operation: threading.Thread | None = None
-    training_stop = threading.Event()
     last_unready_reason: str | None = None
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
                 "已启用" if config["enable_training"] else "未启用")
@@ -1993,63 +2282,89 @@ def main() -> int:
                         active_operation.start()
                 except (HTTPError, URLError, OSError, ValueError, TypeError):
                     LOGGER.warning("远程文件操作轮询失败，下次心跳重试")
-            if config["enable_training"] and not args.once and (active_training is None or not active_training.is_alive()):
-                training_lock = None
+            if config["enable_training"] and not args.once:
                 try:
-                    if not retry_pending_finals(config):
-                        stop.wait(delay)
-                        continue
-                    active_state = load_active_run(config)
-                    process_lock = False
-                    if active_state and active_state["phase"] in {"launching", "running"}:
-                        identity = _recovery_identity(active_state)
-                        process_lock = bool(identity and process_holds_training_lock(config, identity["pid"]))
-                    if process_lock:
-                        training_stop = threading.Event()
-                        active_training = threading.Thread(target=recover_remote_task,
-                                                          args=(config, active_state, training_stop, None, True),
-                                                          name="remote-training", daemon=True)
-                        active_training.start()
-                        LOGGER.info("已识别并接管持有共享锁的训练进程 %s", active_state["run_id"])
-                    elif not active_state and not training_ready:
+                    pending_finals_ready = retry_pending_finals(config)
+                    if not pending_finals_ready:
+                        delay = max(delay, interval)
+                    active_states = load_active_runs(config)
+                    for run_id, (worker, _worker_stop) in list(active_training.items()):
+                        if not worker.is_alive():
+                            active_training.pop(run_id, None)
+                    known = set(active_training)
+                    for active_state in active_states:
+                        task = active_state["task"]
+                        run_id = active_state["run_id"]
+                        if run_id in known:
+                            continue
+                        worker_stop = threading.Event()
+                        identity = (_recovery_identity(active_state)
+                                    if active_state["phase"] in {"launching", "running"} else None)
+                        process_lock = False
+                        if identity:
+                            try:
+                                process_lock = process_holds_task_locks(config, task, identity["pid"])
+                            except (OSError, ValueError, TypeError):
+                                process_lock = False
+                        if process_lock:
+                            worker = threading.Thread(
+                                target=recover_remote_task,
+                                args=(config, active_state, worker_stop, None, True),
+                                name=f"remote-training-{run_id[:8]}", daemon=True)
+                            LOGGER.info("已识别并接管训练进程 %s（持有其 GPU 与输出目录锁）", run_id)
+                        elif active_state["phase"] in {"claimed", "confirmed"}:
+                            worker = threading.Thread(target=run_remote_task,
+                                                      args=(config, task, worker_stop),
+                                                      name=f"remote-training-{run_id[:8]}", daemon=True)
+                            LOGGER.info("正在恢复尚未启动的远程任务 %s", run_id)
+                        else:
+                            worker = threading.Thread(target=recover_remote_task,
+                                                      args=(config, active_state, worker_stop),
+                                                      name=f"remote-training-{run_id[:8]}", daemon=True)
+                            LOGGER.info("正在恢复远程任务 %s", run_id)
+                        active_training[run_id] = (worker, worker_stop)
+                        worker.start()
+
+                    active_states = load_active_runs(config)
+                    legacy_active = any(not (state["task"].get("gpu_assignment") or [])
+                                        for state in active_states)
+                    if legacy_active:
+                        # Old centers and CPU runs keep the node-wide serial contract.
+                        pass
+                    elif not pending_finals_ready:
+                        # Keep retrying terminal acknowledgments before asking the
+                        # center for more work, so local state cannot grow unbounded.
+                        LOGGER.warning("仍有训练最终状态待平台确认，暂停领取新任务")
+                    elif not training_ready:
                         reason = str(capability.get("reason") or "训练环境未就绪")
                         if reason != last_unready_reason:
                             LOGGER.warning("远程训练未就绪，暂停领取新任务：%s", reason)
                             last_unready_reason = reason
                     else:
                         last_unready_reason = None
-                        training_lock = acquire_training_lock(config)
-                        if training_lock is None:
-                            stop.wait(min(delay, 5))
-                            continue
-                        if active_state:
-                            training_stop = threading.Event()
-                            target = (run_remote_task if active_state["phase"] in {"claimed", "confirmed"}
-                                      else recover_remote_task)
-                            argument = active_state["task"] if target is run_remote_task else active_state
-                            active_training = threading.Thread(target=target,
-                                                              args=(config, argument, training_stop, training_lock),
-                                                              name="remote-training", daemon=True)
-                            active_training.start()
-                            training_lock = None  # ownership transferred to the training thread
-                            LOGGER.info("已加载未完成的远程任务 %s", active_state["run_id"])
-                        else:
+                        # The center arbitrates each GPU UUID reservation. Continue
+                        # claiming while it has independently schedulable work.
+                        for _ in range(16):
                             response = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/poll", "POST", {})
                             task = response.get("task")
-                            if task:
-                                save_active_run(config, task, "claimed")
-                                training_stop = threading.Event()
-                                active_training = threading.Thread(target=run_remote_task,
-                                                                  args=(config, task, training_stop, training_lock),
-                                                                  name="remote-training", daemon=True)
-                                active_training.start()
-                                training_lock = None  # ownership transferred to the training thread
-                                LOGGER.info("已领取远程任务 %s / Attempt %s", task.get("task_id"),
-                                            task.get("attempt_number"))
+                            if not task:
+                                break
+                            run_id = task["run_id"]
+                            save_active_run(config, task, "claimed")
+                            worker_stop = threading.Event()
+                            worker = threading.Thread(target=run_remote_task,
+                                                      args=(config, task, worker_stop),
+                                                      name=f"remote-training-{run_id[:8]}", daemon=True)
+                            active_training[run_id] = (worker, worker_stop)
+                            worker.start()
+                            LOGGER.info("已领取远程任务 %s / Attempt %s / Run %s", task.get("task_id"),
+                                        task.get("attempt_number"), run_id)
+                            if not (task.get("gpu_assignment") or []):
+                                # The payload came from an older center or CPU path.
+                                # Never ask it for another task in this cycle.
+                                break
                 except (HTTPError, URLError, OSError, ValueError, TypeError):
                     LOGGER.warning("远程任务轮询失败，将在下次心跳重试")
-                finally:
-                    release_training_lock(training_lock)
         except HTTPError as exc:
             # Do not log response bodies, headers or configuration containing secrets.
             LOGGER.warning("上报返回 HTTP %s。401 请检查 Token；403 请检查节点是否禁用；422 请检查采样与时钟。", exc.code)
@@ -2066,11 +2381,12 @@ def main() -> int:
         if args.once:
             return finish(0)
         stop.wait(delay + (random.random() if failures else 0))
-    if active_training and active_training.is_alive():
-        training_stop.set()
-        active_training.join(timeout=20)
+    for _worker, worker_stop in active_training.values():
+        worker_stop.set()
+    for worker, _worker_stop in active_training.values():
+        worker.join()
     if active_operation and active_operation.is_alive():
-        active_operation.join(timeout=20)
+        active_operation.join()
     LOGGER.info("Agent 已停止")
     return finish(0)
 

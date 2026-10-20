@@ -29,6 +29,7 @@ from .compute_nodes import (
     router as compute_nodes_router,
 )
 from .database import Base, SessionLocal, engine, get_db, migrate_database
+from .gpu_reservations import release_gpu_reservations
 from .dataset_uploads import (
     cleanup_managed_dataset_workdirs,
     managed_dataset_mutation,
@@ -186,6 +187,11 @@ def reject_duplicate_group_name(db: Session, name: str, *, exclude_id: str | Non
         raise HTTPException(409, "训练分组名称已存在")
 
 
+def next_task_group_display_order(db: Session) -> int:
+    first_order = db.scalar(select(func.min(TaskGroup.display_order)))
+    return (first_order if first_order is not None else 0) - 1000
+
+
 def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
     run = db.scalar(select(TrainingRun).where(TrainingRun.id == run_id, TrainingRun.task_id == task_id))
     if not run:
@@ -302,7 +308,7 @@ def create_task_group(payload: TaskGroupCreate, db: Session = Depends(get_db)):
     group = TaskGroup(
         id=uuid.uuid4().hex[:16],
         name=payload.name,
-        display_order=(db.scalar(select(func.coalesce(func.max(TaskGroup.display_order), 0))) or 0) + 1000,
+        display_order=next_task_group_display_order(db),
     )
     db.add(group)
     db.commit()
@@ -327,7 +333,7 @@ def create_task_group_from_tasks(payload: TaskGroupCreateFromTasks, db: Session 
     group = TaskGroup(
         id=uuid.uuid4().hex[:16],
         name=payload.name,
-        display_order=(db.scalar(select(func.coalesce(func.max(TaskGroup.display_order), 0))) or 0) + 1000,
+        display_order=next_task_group_display_order(db),
     )
     db.add(group)
     db.flush()
@@ -614,6 +620,7 @@ def stop_task(task_id: str, request: Request, db: Session = Depends(get_db)):
         ))
         if cancelled.rowcount == 1:
             transition = "stopped"
+            release_gpu_reservations(db, run.id)
         else:
             stopping = db.execute(update(TrainingRun).where(
                 TrainingRun.id == run.id,
@@ -695,6 +702,9 @@ def force_interrupt_remote_task(task_id: str, payload: RemoteInterruptConfirmati
         payload={"source_ip": source_ip, "confirmed_at": requested_at.isoformat(), "run_id": run.id},
         run_id=run.id,
     )
+    # The operator explicitly confirmed the remote process has exited, so its
+    # durable GPU reservation can now be released with the terminal transition.
+    release_gpu_reservations(db, run.id)
     db.commit()
     db.refresh(task)
     return task

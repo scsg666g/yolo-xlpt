@@ -255,7 +255,7 @@ export function Dashboard() {
   function saveGroup(group: TaskGroup, assignedTaskIds: string[] = []) {
     setGroups((current) => {
       const existing = current.some((item) => item.id === group.id)
-      return existing ? current.map((item) => item.id === group.id ? group : item) : [...current, group]
+      return existing ? current.map((item) => item.id === group.id ? group : item) : [group, ...current]
     })
     if (assignedTaskIds.length) {
       const assigned = new Set(assignedTaskIds)

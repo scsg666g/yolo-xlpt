@@ -129,6 +129,25 @@ class TrainingRun(Base):
     metrics: Mapped[list["MetricPoint"]] = relationship(back_populates="run")
     artifacts: Mapped[list["Artifact"]] = relationship(back_populates="run")
     events: Mapped[list["TaskEvent"]] = relationship(back_populates="run")
+    gpu_reservations: Mapped[list["GpuReservation"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan",
+    )
+
+
+class GpuReservation(Base):
+    """Durable ownership of a physical GPU or a node-wide serial slot."""
+    __tablename__ = "gpu_reservations"
+
+    resource_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("training_runs.id", ondelete="CASCADE"), index=True,
+    )
+    node_id: Mapped[str] = mapped_column(String(64), index=True)
+    gpu_uuid: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    gpu_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    run: Mapped[TrainingRun] = relationship(back_populates="gpu_reservations")
 
 
 class MetricPoint(Base):

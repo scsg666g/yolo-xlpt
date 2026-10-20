@@ -28,6 +28,13 @@ from sqlalchemy.orm import Session
 
 from .config import DATA_ROOT, WEB_ROOT, platform_instance_id
 from .database import get_db
+from .gpu_reservations import (
+    acquire_node_claim_lock,
+    node_serial_assignment,
+    release_gpu_reservations,
+    reserve_gpu_resources,
+    resolve_gpu_assignments,
+)
 from .models import ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
 from .process_attribution import inspect_process_owner
@@ -138,6 +145,7 @@ class TrainingCapability(BaseModel):
     python_version: str | None = Field(default=None, max_length=100)
     output_writable: bool = False
     lock_occupied: bool = False
+    gpu_parallelism: bool = False
     output_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
 
     @field_validator("output_roots")
@@ -301,6 +309,11 @@ def remote_training_unavailable_reason(node: ComputeNode | None, *, now: datetim
     if not capability.get("ready"):
         return str(capability.get("reason") or "远程训练环境未就绪")[:400]
     return None
+
+
+def remote_gpu_parallelism_supported(node: ComputeNode) -> bool:
+    capability = (node.snapshot or {}).get("training")
+    return bool(isinstance(capability, dict) and capability.get("gpu_parallelism") is True)
 
 
 def remote_output_root_unavailable_reason(node: ComputeNode | None, output_root: Any) -> str | None:
@@ -606,6 +619,13 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     if unavailable:
         return {"task": None, "poll_interval_seconds": 5,
                 "required_agent_version": REQUIRED_AGENT_VERSION, "message": unavailable}
+    # Serialize all claims for this node. Reservation keys alone cannot
+    # arbitrate a node-wide legacy/automatic claim against a UUID claim.
+    acquire_node_claim_lock(db, node_id)
+    # Terminal rows can be left behind when the process exited between two
+    # heartbeats. Reconcile their durable GPU ownership before selecting work.
+    from .gpu_reservations import release_terminal_gpu_reservations
+    release_terminal_gpu_reservations(db)
     now = utcnow()
     # If a stop arrived after delivery but before confirmation, the Agent is
     # contractually forbidden to start the process. Retire an abandoned claim
@@ -629,84 +649,128 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
             if retired_run and retired_task and retired_task.current_run_id == retired_run.id:
                 mirror_run_to_task(retired_task, retired_run)
                 add_event(db, retired_task.id, "stopped", retired_run.error_message, run_id=retired_run.id)
+            release_gpu_reservations(db, expired_stopping_id)
             db.commit()
+            acquire_node_claim_lock(db, node_id)
     expired = db.scalar(select(TrainingRun).where(
         TrainingRun.execution_node_id == node_id, TrainingRun.status == "starting",
         TrainingRun.claim_lease.is_not(None), TrainingRun.claim_confirmed.is_(False),
         TrainingRun.claim_expires_at < now,
     ).order_by(TrainingRun.queued_at).limit(1))
-    if db.scalar(select(TrainingRun.id).where(TrainingRun.execution_node_id == node_id,
-        TrainingRun.status.in_(["starting", "running", "stopping"]),
-        TrainingRun.id != (expired.id if expired else ""))):
-        return {"task": None, "poll_interval_seconds": 5}
-    # A task is delivered once, by atomically switching queued -> starting.
-    run = expired or db.scalar(select(TrainingRun).where(
-        TrainingRun.execution_node_id == node_id, TrainingRun.status == "queued"
-    ).order_by(TrainingRun.queued_at, TrainingRun.id).limit(1))
-    if not run:
-        return {"task": None, "poll_interval_seconds": 5}
-    task = db.get(TrainingTask, run.task_id)
-    if not task or task.deleted_at or task.current_run_id != run.id:
-        run.status = "failed"
-        run.error_message = "任务已删除或不再是当前运行，未执行"
-        run.finished_at = utcnow()
-        db.commit()
-        return {"task": None, "poll_interval_seconds": 5}
-    snapshot = run.parameter_snapshot or {}
-    output_error = remote_output_root_unavailable_reason(node, snapshot.get("remote_output_root"))
-    if output_error:
-        # The Agent configuration can change after a task was queued. Retire
-        # only an unclaimed run (or an expired, unconfirmed lease) so a stale
-        # poll cannot overwrite a concurrent successful claim or stop.
-        rejected = db.execute(update(TrainingRun).where(
-            TrainingRun.id == run.id,
-            ((TrainingRun.status == "queued") | ((TrainingRun.status == "starting") &
-              TrainingRun.claim_confirmed.is_(False) & (TrainingRun.claim_expires_at < now))),
-        ).values(status="failed", pid=None, finished_at=now, error_message=output_error)
-          .execution_options(synchronize_session=False))
-        if rejected.rowcount == 1:
-            db.refresh(run)
-            mirror_run_to_task(task, run)
-            add_event(db, task.id, "failed", output_error, run_id=run.id)
-            db.commit()
-        else:
-            db.rollback()
-        return {"task": None, "poll_interval_seconds": 5, "message": output_error}
-    run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
-    claimed_at = utcnow()
-    lease = secrets.token_hex(16)
-    # Check node occupancy again in the atomic claim, since another poll may
-    # start a different queued run between the earlier SELECTs.
-    occupied = select(TrainingRun.id).where(
+    capability_parallel = remote_gpu_parallelism_supported(node)
+    remote_gpus = ((node.snapshot or {}).get("gpus") or [])
+    queued = db.scalars(select(TrainingRun).where(
         TrainingRun.execution_node_id == node_id,
-        TrainingRun.status.in_(["starting", "running", "stopping"]),
-        TrainingRun.id != run.id,
-    ).exists()
-    claimed = db.execute(update(TrainingRun).where(
-        TrainingRun.id == run.id,
-        ((TrainingRun.status == "queued") | ((TrainingRun.status == "starting") &
-          TrainingRun.claim_confirmed.is_(False) & (TrainingRun.claim_expires_at < claimed_at))),
-        ~occupied,
-    ).values(status="starting", started_at=claimed_at, process_started_at=claimed_at,
-             claim_lease=lease, claim_expires_at=claimed_at + timedelta(seconds=90) if lease else None,
-             claim_confirmed=False,
-             run_dir=run_dir, log_path=str(remote_log_path(snapshot["remote_output_root"], task.id, run.attempt_number))))
-    if claimed.rowcount != 1:
-        db.rollback()
-        return {"task": None, "poll_interval_seconds": 5}
-    db.refresh(run)
-    mirror_run_to_task(task, run)
-    add_event(db, task.id, "remote_claimed", f"远程服务器已领取 Attempt {run.attempt_number:03d}", run_id=run.id)
+        TrainingRun.status == "queued",
+    ).order_by(TrainingRun.queued_at, TrainingRun.id)).all()
+    candidates = ([expired] if expired else []) + [item for item in queued if not expired or item.id != expired.id]
+    last_message = None
+    for run in candidates:
+        task = db.get(TrainingTask, run.task_id)
+        if not task or task.deleted_at or task.current_run_id != run.id:
+            run.status = "failed"
+            run.error_message = "任务已删除或不再是当前运行，未执行"
+            run.finished_at = utcnow()
+            release_gpu_reservations(db, run.id)
+            db.commit()
+            acquire_node_claim_lock(db, node_id)
+            continue
+        snapshot = run.parameter_snapshot or {}
+        output_error = remote_output_root_unavailable_reason(node, snapshot.get("remote_output_root"))
+        if output_error:
+            rejected = db.execute(update(TrainingRun).where(
+                TrainingRun.id == run.id,
+                ((TrainingRun.status == "queued") | ((TrainingRun.status == "starting") &
+                  TrainingRun.claim_confirmed.is_(False) & (TrainingRun.claim_expires_at < now))),
+            ).values(status="failed", pid=None, finished_at=now, error_message=output_error)
+              .execution_options(synchronize_session=False))
+            if rejected.rowcount == 1:
+                db.refresh(run)
+                mirror_run_to_task(task, run)
+                add_event(db, task.id, "failed", output_error, run_id=run.id)
+                release_gpu_reservations(db, run.id)
+                db.commit()
+                acquire_node_claim_lock(db, node_id)
+            else:
+                db.rollback()
+                acquire_node_claim_lock(db, node_id)
+            last_message = output_error
+            continue
+
+        device = snapshot.get("device", task.device)
+        normalized_device = str(device or "").strip().lower()
+        is_gpu_request = normalized_device not in {"", "cpu", "mps"}
+        if not capability_parallel:
+            assignments = [node_serial_assignment(node_id)]
+            exclusive_node = True
+        elif is_gpu_request:
+            # A parallel-capable Agent must provide a UUID for every requested
+            # CUDA index. Unknown indices and missing inventory fail closed.
+            parts = [part.strip() for part in normalized_device.split(",")]
+            valid_indices = bool(parts) and all(part.isdigit() for part in parts)
+            indices = list(dict.fromkeys(int(part) for part in parts)) if valid_indices else []
+            inventory_indices = {
+                gpu.get("index") for gpu in remote_gpus
+                if isinstance(gpu, dict) and type(gpu.get("index")) is int
+            }
+            if not indices or any(index not in inventory_indices for index in indices):
+                last_message = "任务请求的 GPU 编号未出现在远程 Agent 的设备清单中，任务继续排队"
+                continue
+            assignments = resolve_gpu_assignments(
+                device, remote_gpus, node_id=node_id, require_uuid=True,
+            )
+            if assignments is None:
+                last_message = "远程 Agent 未上报请求 GPU 的 UUID，任务继续排队"
+                continue
+            exclusive_node = False
+        else:
+            # The current Agent treats a task without gpu_assignment as a
+            # node-exclusive legacy claim; avoid claiming CPU/MPS alongside
+            # another run until the Agent protocol can explicitly acknowledge
+            # independent non-CUDA execution.
+            assignments = [node_serial_assignment(node_id)]
+            exclusive_node = True
+
+        claimed_at = utcnow()
+        lease = secrets.token_hex(16)
+        run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
+        with db.begin_nested() as candidate_tx:
+            claimed = db.execute(update(TrainingRun).where(
+                TrainingRun.id == run.id,
+                ((TrainingRun.status == "queued") | ((TrainingRun.status == "starting") &
+                  TrainingRun.claim_confirmed.is_(False) & (TrainingRun.claim_expires_at < claimed_at))),
+            ).values(status="starting", started_at=claimed_at, process_started_at=claimed_at,
+                     claim_lease=lease, claim_expires_at=claimed_at + timedelta(seconds=90),
+                     claim_confirmed=False, run_dir=run_dir,
+                     log_path=str(remote_log_path(snapshot["remote_output_root"], task.id, run.attempt_number))))
+            if claimed.rowcount != 1 or not reserve_gpu_resources(
+                db, run_id=run.id, node_id=node_id, assignments=assignments,
+                exclusive_node=exclusive_node,
+            ):
+                candidate_tx.rollback()
+                continue
+        db.refresh(run)
+        mirror_run_to_task(task, run)
+        add_event(db, task.id, "remote_claimed", f"远程服务器已领取 Attempt {run.attempt_number:03d}", run_id=run.id)
+        db.commit()
+        return {"poll_interval_seconds": 5, "task": {
+            "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
+            "platform_instance_id": platform_instance_id(),
+            "task_type": task.task_type, "launch_mode": run.launch_mode,
+            "model_path": run.model_path, "data_path": run.data_path,
+            "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir, "claim_lease": lease,
+            "completed_epochs": run.completed_epochs, "progress": run.progress, "latest_metrics": run.latest_metrics,
+            "log_path": run.log_path, "parameters": snapshot,
+            "gpu_assignment": [
+                {"uuid": item.get("uuid"), "index": item.get("index")}
+                for item in assignments if item.get("uuid")
+            ],
+        }}
     db.commit()
-    return {"poll_interval_seconds": 5, "task": {
-        "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
-        "platform_instance_id": platform_instance_id(),
-        "task_type": task.task_type, "launch_mode": run.launch_mode,
-        "model_path": run.model_path, "data_path": run.data_path,
-        "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir, "claim_lease": lease,
-        "completed_epochs": run.completed_epochs, "progress": run.progress, "latest_metrics": run.latest_metrics,
-        "log_path": run.log_path, "parameters": snapshot,
-    }}
+    result = {"task": None, "poll_interval_seconds": 5}
+    if last_message:
+        result["message"] = last_message
+    return result
 
 
 class ClaimConfirmation(BaseModel):
@@ -807,6 +871,7 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
                   "error" if effective_status == "failed" else "info",
                   payload={"exit_code": run.exit_code, "stop_reason": payload.stop_reason,
                            "stop_requested": bool(run.stop_requested)}, run_id=run.id)
+        release_gpu_reservations(db, run.id)
     elif effective_status != prior_status:
         add_event(db, task.id, effective_status, f"远程训练状态：{effective_status}", run_id=run.id)
     mirror_run_to_task(task, run)

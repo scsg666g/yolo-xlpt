@@ -88,6 +88,155 @@ def test_remote_detect_command_includes_training_trace_runner(agent, training, t
     assert (Path(config["training_state_dir"]) / "training_trace_runner.py").is_file()
 
 
+def test_remote_trace_runner_rewrite_is_atomic_and_keeps_complete_file(agent, training, monkeypatch):
+    config, task = training
+    config["enable_training_trace"] = True
+    config["yolo_bin"] = str(Path(config["training_cwd"]) / "fake-yolo")
+    Path(config["yolo_bin"]).write_text("#!/bin/sh\n")
+    Path(config["yolo_bin"]).chmod(0o700)
+    writes = []
+    original_replace = Path.replace
+
+    def track_replace(path, target):
+        writes.append(path.read_text(encoding="utf-8"))
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", track_replace)
+    for _ in range(2):
+        agent.prepare_trace_command(config, task, [config["yolo_bin"], "detect", "train"])
+    runner = Path(config["training_state_dir"]) / "training_trace_runner.py"
+    assert runner.read_text(encoding="utf-8") == agent.REMOTE_TRACE_RUNNER
+    assert writes == [agent.REMOTE_TRACE_RUNNER]
+    assert not list(runner.parent.glob("*.tmp"))
+
+
+def test_gpu_assignment_validates_inventory_and_maps_devices(agent, training, monkeypatch):
+    config, task = training
+    task["parameters"]["device"] = "0,2"
+    task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-a"}, {"index": 2, "uuid": "GPU-c"}]
+    monkeypatch.setattr(agent, "query", lambda *_args: "0, GPU-a\n1, GPU-b\n2, GPU-c\n")
+
+    assignment = agent.validate_gpu_assignment(config, task)
+    environment = agent.training_launch_environment(config, task)
+    command = ["yolo", "detect", "train", "device=0,2"]
+    mapped = agent.training_command_for_assignment(command, task)
+
+    assert assignment == task["gpu_assignment"]
+    assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-a,GPU-c"
+    assert mapped[-1] == "device=0,1"
+    task["gpu_assignment"][0]["uuid"] = "GPU-wrong"
+    with pytest.raises(ValueError, match="UUID"):
+        agent.validate_gpu_assignment(config, task)
+
+
+def test_gpu_assignment_uses_per_uuid_locks_and_conflicts_with_legacy_lock(agent, training, monkeypatch):
+    config, task = training
+    task["parameters"]["device"] = "0"
+    task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-a"}]
+    monkeypatch.setattr(agent, "query", lambda *_args: "0, GPU-a\n")
+
+    parallel = agent.acquire_task_training_lock(config, task)
+    assert parallel is not None
+    try:
+        assert agent.acquire_task_training_lock(config, task) is None
+        # Existing pre-2.0 Agents take the exclusive legacy gate and must not
+        # overlap with a 2.0 GPU-scoped run.
+        assert agent.acquire_training_lock(config) is None
+    finally:
+        agent.release_training_lock(parallel)
+
+    legacy = agent.acquire_training_lock(config)
+    assert legacy is not None
+    try:
+        assert agent.acquire_task_training_lock(config, task) is None
+    finally:
+        agent.release_training_lock(legacy)
+
+
+def test_different_gpu_uuid_locks_can_be_held_at_the_same_time(agent, training, monkeypatch):
+    config, first_task = training
+    first_task["parameters"]["device"] = "0"
+    first_task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-A"}]
+    second_task = {**first_task, "run_id": "b" * 32, "parameters": {
+        **first_task["parameters"], "device": "1"},
+        "gpu_assignment": [{"index": 1, "uuid": "GPU-B"}]}
+    monkeypatch.setattr(agent, "query", lambda *_args: "0, GPU-A\n1, GPU-B\n")
+
+    first = agent.acquire_task_training_lock(config, first_task)
+    second = agent.acquire_task_training_lock(config, second_task)
+    try:
+        assert first is not None and second is not None
+        assert first.filenos() != second.filenos()
+    finally:
+        agent.release_training_lock(second)
+        agent.release_training_lock(first)
+
+
+def test_recovery_detects_child_holding_gpu_and_workspace_lock_bundle(agent, training, monkeypatch):
+    config, task = training
+    task["parameters"]["device"] = "0"
+    task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-A"}]
+    monkeypatch.setattr(agent, "query", lambda *_args: "0, GPU-A\n")
+    lock = agent.acquire_task_training_lock(config, task)
+    assert lock is not None
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                               pass_fds=lock.filenos())
+    lock.close()
+    try:
+        assert agent.process_holds_task_locks(config, task, process.pid)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+    recovered = agent.acquire_task_training_lock(config, task)
+    assert recovered is not None
+    agent.release_training_lock(recovered)
+
+
+def test_recovery_recognizes_legacy_process_holding_only_workspace_lock(agent, training):
+    config, task = training
+    lock = agent.acquire_training_lock(config)
+    assert lock is not None
+    workspace_fd = lock.handles[0].fileno()
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                               pass_fds=(workspace_fd,))
+    lock.close()
+    try:
+        assert "gpu_assignment" not in task
+        assert agent.process_holds_task_locks(config, task, process.pid)
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+    recovered = agent.acquire_training_lock(config)
+    assert recovered is not None
+    agent.release_training_lock(recovered)
+
+
+def test_gpu_assignment_rejects_malformed_or_unverified_payload(agent, training, monkeypatch):
+    config, task = training
+    task["parameters"]["device"] = "0,1"
+    task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-a"}]
+    with pytest.raises(ValueError, match="数量"):
+        agent.normalize_gpu_assignment(task)
+
+    task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-a"}, {"index": 1, "uuid": "GPU-b"}]
+    monkeypatch.setattr(agent, "query", lambda *_args: (_ for _ in ()).throw(OSError("offline")))
+    with pytest.raises(ValueError, match="核对"):
+        agent.validate_gpu_assignment(config, task)
+
+
+def test_multiple_active_runs_load_independently(agent, training):
+    config, first = training
+    second = {**first, "run_id": "b" * 32, "task_id": "task-2"}
+    agent.save_active_run(config, first, "running")
+    agent.save_active_run(config, second, "running")
+
+    states = agent.load_active_runs(config)
+
+    assert {state["run_id"] for state in states} == {first["run_id"], second["run_id"]}
+    with pytest.raises(ValueError, match="多个活动训练状态"):
+        agent.load_active_run(config)
+
+
 def test_training_environment_includes_only_valid_owner_markers(agent):
     config = {"node_id": "b" * 32}
     task = {"platform_instance_id": "c" * 32, "run_id": "a" * 32, "task_id": "d" * 32}
@@ -502,6 +651,46 @@ def test_unknown_claim_confirmation_is_persisted_for_same_lease_retry(agent, tra
     assert state["phase"] == "claimed"
     assert state["task"]["claim_lease"] == task["claim_lease"]
     assert not list(Path(config["training_state_dir"]).glob("*.json"))
+
+
+def test_pending_final_acknowledgment_blocks_new_task_claims(agent, tmp_path, monkeypatch):
+    calls = []
+    config = {"enable_training": True, "node_id": "b" * 32,
+              "nvidia_smi_bin": "nvidia-smi", "report_interval_seconds": 5,
+              "training_state_dir": str(tmp_path / "state")}
+
+    class StopEvent:
+        def __init__(self):
+            self.stopped = False
+        def is_set(self):
+            return self.stopped
+        def set(self):
+            self.stopped = True
+        def wait(self, _seconds):
+            self.stopped = True
+            return True
+
+    monkeypatch.setattr(agent, "load_config", lambda _path: config)
+    monkeypatch.setattr(agent, "acquire_agent_instance_lock", lambda _config: object())
+    monkeypatch.setattr(agent, "release_training_lock", lambda _lock: None)
+    monkeypatch.setattr(agent, "register_workspace", lambda _config: None)
+    monkeypatch.setattr(agent, "collect", lambda *_args: {
+        "training": {"ready": True}, "compute": {"gpus": []}})
+    monkeypatch.setattr(agent, "send", lambda *_args: 5)
+    monkeypatch.setattr(agent, "retry_pending_finals", lambda _config: False)
+    monkeypatch.setattr(agent, "load_active_runs", lambda _config: [])
+
+    def api(_config, path, method="GET", payload=None):
+        calls.append(path)
+        return {"operation": None} if path.endswith("/operations/poll") else {"task": None}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    monkeypatch.setattr(agent.threading, "Event", StopEvent)
+    monkeypatch.setattr(sys, "argv", ["monitor_agent.py", "--config", "unused.json"])
+
+    assert agent.main() == 0
+    assert any(path.endswith("/operations/poll") for path in calls)
+    assert not any(path.endswith("/agent/poll") for path in calls)
 
 
 def test_active_state_is_private_and_rejects_reused_pid(agent, training):
