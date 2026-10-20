@@ -304,9 +304,18 @@ function TaskCanvasInner() {
     if (['queued', 'starting', 'running', 'stopping', 'stopped', 'interrupted', 'failed', 'completed'].includes(viewTask.status)) return viewTask.status as PanelNodeData['activity']
     return undefined
   }, [isCurrentRun, viewTask])
+  const displayedDataPath = isCurrentRun && task ? task.data_path : viewTask?.data_path || ''
+  const displayedModelPath = isCurrentRun && task ? task.model_path : viewTask?.model_path || ''
+  const dataPathChanged = Boolean(isCurrentRun && selectedRun && task && selectedRun.data_path !== task.data_path)
+  const modelPathChanged = Boolean(isCurrentRun && selectedRun && task && selectedRun.model_path !== task.model_path)
+  const resourceConfig = useMemo(
+    () => isCurrentRun && task ? task.config : viewTask?.config || {},
+    [isCurrentRun, task, viewTask],
+  )
+  const remoteResource = Boolean(task?.execution_node_id)
   const nodeData = useMemo<Record<string, PanelNodeData> | null>(() => viewTask ? {
-    dataset: { title: viewTask.data_path.split('/').pop() || '数据集', kicker: `DATASET${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Database size={17} />, content: <><p className="mono path-value">{viewTask.data_path}</p>{row('配置状态', viewTask.config.path_issues && (viewTask.config.path_issues as { data_missing?: boolean }).data_missing ? <span className="bad">路径失效</span> : <span className="good">可用</span>)}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换训练数据集</div>}</> },
-    model: { title: viewTask.model_path.split('/').pop() || '基础模型', kicker: `MODEL${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Box size={17} />, accent: '#6da8ff', content: <><p className="mono path-value">{viewTask.model_path}</p>{row('任务类型', viewTask.task_type)}{row('预训练', viewTask.config.pretrained === false ? '关闭' : '启用')}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换基础模型</div>}</> },
+    dataset: { title: displayedDataPath.split('/').pop() || '数据集', kicker: `DATASET${!isCurrentRun ? ' · 历史快照' : dataPathChanged ? ' · 重新训练使用' : ' · 双击编辑'}`, icon: <Database size={17} />, content: <><p className="mono path-value">{displayedDataPath}</p>{dataPathChanged && selectedRun && <div className="resource-snapshot-note"><span>当前 Attempt 使用</span><code>{selectedRun.data_path}</code><small>重新训练将使用上方新路径</small></div>}{remoteResource ? row('路径校验', <span className="check-pending">Agent 启动时检查</span>) : row('配置状态', resourceConfig.path_issues && (resourceConfig.path_issues as { data_missing?: boolean }).data_missing ? <span className="bad">路径失效</span> : <span className="good">可用</span>)}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换训练数据集</div>}</> },
+    model: { title: displayedModelPath.split('/').pop() || '基础模型', kicker: `MODEL${!isCurrentRun ? ' · 历史快照' : modelPathChanged ? ' · 重新训练使用' : ' · 双击编辑'}`, icon: <Box size={17} />, accent: '#6da8ff', content: <><p className="mono path-value">{displayedModelPath}</p>{modelPathChanged && selectedRun && <div className="resource-snapshot-note"><span>当前 Attempt 使用</span><code>{selectedRun.model_path}</code><small>重新训练将使用上方新路径</small></div>}{remoteResource && row('路径校验', <span className="check-pending">Agent 启动时检查</span>)}{row('任务类型', viewTask.task_type)}{row('预训练', viewTask.config.pretrained === false ? '关闭' : '启用')}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换基础模型</div>}</> },
     config: { title: '超参数配置', kicker: `CONFIGURATION${isCurrentRun ? ' · 双击编辑' : ' · 历史快照'}`, icon: <Braces size={17} />, accent: '#d99cff', content: <><div className="node-grid">{row('Epochs', viewTask.epochs)}{row('Batch', viewTask.batch)}{row('Image', viewTask.imgsz)}{row('Optimizer', viewTask.optimizer)}{row('Workers', viewTask.workers)}{row('Patience', String(viewTask.config.patience ?? '—'))}</div>{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击添加或修改训练参数</div>}</> },
     runtime: { title: `GPU ${viewTask.device}`, kicker: 'RUNTIME · 双击查看', icon: <Cpu size={17} />, accent: '#ffba6b', activity: nodeActivity, content: <>{row('进程 PID', viewTask.pid || '—')}{row('输出目录', viewTask.run_dir ? viewTask.run_dir.split('/').slice(-4).join('/') : '等待创建')}{row('训练环境', 'PyTorch · CUDA')}</> },
     weights: { title: '模型权重', kicker: 'CHECKPOINTS · 双击查看', icon: <Save size={17} />, accent: '#7da8ff', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: <div className="weight-node-list">{[{ artifact: bestWeight, label: '最佳模型', name: 'best.pt', Icon: Trophy }, { artifact: lastWeight, label: '最新模型', name: 'last.pt', Icon: History }].map(({ artifact, label, name, Icon }) => <div className={`weight-mini-card ${artifact ? '' : 'pending'}`} key={name}><div className="weight-mini-icon"><Icon size={15} /></div><div><span>{label}</span><strong>{artifact?.name.split('/').pop() || name}</strong><small title={name === 'best.pt' ? bestWeightOrigin : ''}>{artifact ? `${formatBytes(artifact.size)}${name === 'best.pt' && bestWeightOrigin ? ` · ${bestWeightOrigin}` : ''}` : '等待训练生成'}</small></div>{artifact && <ArtifactDownload artifact={artifact} className="nodrag nowheel" title={`下载 ${name}`}><Download size={15} /></ArtifactDownload>}{artifact && name === 'best.pt' && <button className="weight-test-button nodrag nowheel" disabled={!!testDisabledReason} title={testDisabledReason || '测试模型'} onDoubleClick={(event) => event.stopPropagation()} onClick={() => { setTestingArtifact(artifact); setModelTestOpen(true) }}><ScanEye size={12} />测试模型</button>}</div>)}</div> },
@@ -316,7 +325,7 @@ function TaskCanvasInner() {
     trace: { title: '训练过程解析', kicker: 'TRAINING TRACE · 双击打开', icon: <Workflow size={17} />, accent: '#f08bba', content: <><div className="trace-node-summary"><div><strong>真实 Batch</strong><span>输入 · 损失 · 梯度</span></div><div><strong>本机检测</strong><span>按需采样</span></div></div><div className="node-edit-hint"><Maximize size={12} />双击打开逐步解析</div></> },
     artifacts: { title: '训练产物', kicker: 'ARTIFACTS · 双击查看', icon: <FileArchive size={17} />, accent: '#ffd56d', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: regularArtifacts.length ? <div className="artifact-list">{regularArtifacts.slice(0, 12).map((item) => <div key={item.id} className={isCurrentRun && newArtifactIds.includes(item.id) ? `artifact-updated artifact-flash-${artifactPulse}` : ''}><FileText size={14} /><span>{item.name}{isCurrentRun && newArtifactIds.includes(item.id) && <em>已更新</em>}</span><small>{formatBytes(item.size)}</small></div>)}</div> : <div className="node-empty">暂无训练产物</div> },
     inference: { title: '模型测试', kicker: 'MODEL TEST · 双击打开', icon: <ScanEye size={17} />, accent: '#b3a0ff', content: <>{row('测试权重', bestWeight ? `best.pt${bestWeightOrigin ? ` · ${bestWeightOrigin}` : ''}` : '等待训练生成')}{row('检测方式', '图片 · 置信度筛选')}<div className="node-edit-hint"><Maximize size={12} />原图对比 · 双击放大 · 下载结果</div><button className="button ghost nodrag nowheel model-test-node-button" title={bestWeight && !testDisabledReason ? '打开模型测试' : '查看历史记录'} onDoubleClick={(event) => event.stopPropagation()} onClick={() => { setTestingArtifact(bestWeight || null); setModelTestOpen(true) }}><ScanEye size={14} />{bestWeight && !testDisabledReason ? '测试模型' : '历史记录'}</button></> },
-  } : null, [viewTask, isCurrentRun, selectedRun, metrics, regularArtifacts, logs, latest, nodeActivity, epochPulse, logPulse, artifactPulse, motionAllowed, newArtifactIds, bestWeight, bestWeightOrigin, lastWeight, testDisabledReason])
+  } : null, [viewTask, isCurrentRun, selectedRun, metrics, regularArtifacts, logs, latest, nodeActivity, epochPulse, logPulse, artifactPulse, motionAllowed, newArtifactIds, bestWeight, bestWeightOrigin, lastWeight, testDisabledReason, displayedDataPath, displayedModelPath, dataPathChanged, modelPathChanged, remoteResource, resourceConfig])
 
   useEffect(() => {
     if (!task || !nodeData) return
@@ -362,6 +371,27 @@ function TaskCanvasInner() {
       } finally {
         mutationPending.current = false
         setWorking(false)
+      }
+    }
+  }
+
+  async function saveResource(mode: 'dataset' | 'model', path: string) {
+    if (!task || mutationPending.current) throw new Error('其他任务操作正在进行，请稍后重试')
+    mutationPending.current = true
+    cancelPendingRefresh()
+    setNotice('')
+    try {
+      const updated = await api.updateResources(task.id, mode === 'dataset' ? { data_path: path } : { model_path: path })
+      cancelPendingRefresh()
+      setTask(updated)
+      setEditingResource(null)
+      setNotice(`${mode === 'dataset' ? '数据集' : '模型'}路径已更新，重新训练将使用新配置`)
+      window.setTimeout(() => setNotice(''), 2600)
+    } finally {
+      try {
+        await refresh({ allowDuringMutation: true, preferredRunId: selectedRunId })
+      } finally {
+        mutationPending.current = false
       }
     }
   }
@@ -467,7 +497,7 @@ function TaskCanvasInner() {
       <div className="canvas-legend"><span><i className={currentIsActive && !syncDelayed && !outputWaiting ? 'green live' : 'green'} />{flowLabel}</span><span>{events.length} 条任务事件</span><span>拖拽节点 · 滚轮缩放 · 空白处平移</span></div>
     </div>
     <EditParametersModal task={task} open={editingParameters} onClose={() => setEditingParameters(false)} onSaved={(updated) => { setTask(updated); setEditingParameters(false); setNotice('训练参数已保存'); window.setTimeout(() => setNotice(''), 1800) }} />
-    <EditResourceModal task={task} mode={editingResource} onClose={() => setEditingResource(null)} onSaved={(updated) => { setTask(updated); setEditingResource(null); setNotice('训练资源已更新'); window.setTimeout(() => setNotice(''), 1800) }} />
+    <EditResourceModal task={task} mode={editingResource} onClose={() => setEditingResource(null)} onSave={saveResource} />
     <LogViewerModal task={viewTask} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
     <CanvasDetailModal kind={detailKind} task={viewTask} run={selectedRun} metrics={metrics} artifacts={artifacts} effectiveBestWeight={effectiveBestWeight} events={events} onClose={() => setDetailKind(null)} onTest={(artifact) => { setDetailKind(null); setTestingArtifact(artifact); setModelTestOpen(true) }} testDisabledReason={testDisabledReason} />
     <TrainingTraceModal task={viewTask} run={selectedRun} open={viewingTrace} onClose={() => setViewingTrace(false)} />

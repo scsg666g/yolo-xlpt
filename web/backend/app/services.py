@@ -29,6 +29,7 @@ from .config import (
     LOG_ROOT,
     MODEL_ROOTS,
     NVIDIA_SMI_BIN,
+    platform_instance_id,
     RUNTIME_ROOT,
     RUNS_ROOT,
     TRAINING_MKL_THREADING_LAYER,
@@ -63,10 +64,17 @@ def supported_training_keys() -> set[str]:
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def training_environment() -> dict[str, str]:
+def training_environment(*, task_id: str | None = None, run_id: str | None = None) -> dict[str, str]:
     """Build a stable environment for PyTorch and its DDP worker processes."""
     environment = os.environ.copy()
     environment["MKL_THREADING_LAYER"] = TRAINING_MKL_THREADING_LAYER
+    if task_id and run_id:
+        environment.update({
+            "YOLO_FORGE_INSTANCE_ID": platform_instance_id(),
+            "YOLO_FORGE_NODE_ID": "local",
+            "YOLO_FORGE_RUN_ID": run_id,
+            "YOLO_FORGE_TASK_ID": task_id,
+        })
     return environment
 
 
@@ -1107,7 +1115,7 @@ class TrainingScheduler:
             process = subprocess.Popen(
                 command,
                 cwd=ULTRALYTICS_ROOT,
-                env=training_environment(),
+                env=training_environment(task_id=task.id, run_id=run.id),
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,

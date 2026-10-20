@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Database, FileCheck2, FolderSearch, LoaderCircle, X } from 'lucide-react'
 import { api, formatBytes } from '../api'
 import type { ResourceFile, Resources, TrainingTask } from '../types'
@@ -8,12 +8,13 @@ interface Props {
   task: TrainingTask | null
   mode: 'dataset' | 'model' | null
   onClose: () => void
-  onSaved: (task: TrainingTask) => void
+  onSave: (mode: 'dataset' | 'model', path: string) => Promise<void>
 }
 
-export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
+export function EditResourceModal({ task, mode, onClose, onSave }: Props) {
   const [resources, setResources] = useState<Resources | null>(null)
   const [path, setPath] = useState('')
+  const [originalPath, setOriginalPath] = useState('')
   const [search, setSearch] = useState('')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -21,7 +22,14 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
   const sessionKey = task && mode ? `${task.id}:${mode}` : ''
   const initializedSession = useRef('')
   latestTask.current = task
-  const dialogRef = useModalFocus<HTMLFormElement>(Boolean(sessionKey), onClose, {
+  const normalizedPath = path.trim()
+  const dirty = normalizedPath !== originalPath
+  const requestClose = useCallback(() => {
+    if (saving) return
+    if (dirty && !window.confirm('当前路径尚未保存，确定放弃修改吗？')) return
+    onClose()
+  }, [dirty, onClose, saving])
+  const dialogRef = useModalFocus<HTMLFormElement>(Boolean(sessionKey), requestClose, {
     canClose: !saving,
     initialFocusSelector: '[data-modal-initial-focus]',
   })
@@ -37,7 +45,9 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
     initializedSession.current = key
     let active = true
     setResources(null)
-    setPath(mode === 'dataset' ? currentTask.data_path : currentTask.model_path)
+    const initialPath = mode === 'dataset' ? currentTask.data_path : currentTask.model_path
+    setPath(initialPath)
+    setOriginalPath(initialPath.trim())
     setSearch(''); setError('')
     if (!currentTask.execution_node_id) {
       api.resources().then((data) => { if (active) setResources(data) }).catch((reason) => { if (active) setError(reason.message) })
@@ -57,11 +67,10 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
-    if (!task || !mode) return
+    if (!task || !mode || !normalizedPath || !dirty) return
     setSaving(true); setError('')
     try {
-      const updated = await api.updateResources(task.id, isDataset ? { data_path: path } : { model_path: path })
-      onSaved(updated)
+      await onSave(mode, normalizedPath)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '保存失败')
     } finally { setSaving(false) }
@@ -70,9 +79,9 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
   function selectFile(file: ResourceFile) { setPath(file.path) }
 
   const titleId = `resource-modal-title-${mode}`
-  return <div className="modal-backdrop resource-backdrop" onMouseDown={() => { if (!saving) onClose() }}>
+  return <div className="modal-backdrop resource-backdrop" onMouseDown={requestClose}>
     <form ref={dialogRef} className="modal resource-modal" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onSubmit={save} onMouseDown={(event) => event.stopPropagation()}>
-      <header><div className="modal-heading"><div className={`heading-icon ${isDataset ? 'dataset-icon' : 'model-icon'}`}>{isDataset ? <Database size={18} /> : <Box size={18} />}</div><div><span className="eyebrow">{isDataset ? 'DATASET SOURCE' : 'MODEL WEIGHTS'}</span><h2 id={titleId}>{isDataset ? '更换训练数据集' : '更换基础模型'}</h2><p>双击节点可随时重新绑定有效资源</p></div></div><button type="button" className="icon-button" data-modal-initial-focus aria-label={`关闭${isDataset ? '更换数据集' : '更换模型'}窗口`} disabled={saving} onClick={onClose}><X size={20} /></button></header>
+      <header><div className="modal-heading"><div className={`heading-icon ${isDataset ? 'dataset-icon' : 'model-icon'}`}>{isDataset ? <Database size={18} /> : <Box size={18} />}</div><div><span className="eyebrow">{isDataset ? 'DATASET SOURCE' : 'MODEL WEIGHTS'}</span><h2 id={titleId}>{isDataset ? '更换训练数据集' : '更换基础模型'}</h2><p>双击节点可随时重新绑定有效资源</p></div></div><button type="button" className="icon-button" data-modal-initial-focus aria-label={`关闭${isDataset ? '更换数据集' : '更换模型'}窗口`} disabled={saving} onClick={requestClose}><X size={20} /></button></header>
       <div className="modal-body">
         {locked && <div className="alert warning">任务正在运行或排队，请停止任务后再更换资源。</div>}
         {currentMissing && <div className="alert error">当前路径已经失效，请从下方选择服务器中存在的文件。</div>}
@@ -85,7 +94,7 @@ export function EditResourceModal({ task, mode, onClose, onSaved }: Props) {
           {!files.length && <div className="resource-empty">没有找到匹配的文件</div>}
         </div></>}
       </div>
-      <footer><span className="parameter-note">{task.execution_node_id ? '远程 Agent 将验证路径及权限' : '仅允许选择平台批准目录中的文件'}</span><button type="button" className="button ghost" onClick={onClose}>取消</button><button className="button primary" disabled={saving || locked || !path}>{saving && <LoaderCircle size={16} className="spin" />}保存{isDataset ? '数据集' : '模型'}</button></footer>
+      <footer><div className="resource-footer-note"><span>{task.execution_node_id ? '远程 Agent 将验证路径及权限' : '仅允许选择平台批准目录中的文件'}</span>{dirty && <strong>有未保存的修改</strong>}</div><button type="button" className="button ghost" disabled={saving} onClick={requestClose}>取消</button><button className="button primary" disabled={saving || locked || !normalizedPath || !dirty}>{saving && <LoaderCircle size={16} className="spin" />}{saving ? '保存中' : `保存${isDataset ? '数据集' : '模型'}`}</button></footer>
     </form>
   </div>
 }

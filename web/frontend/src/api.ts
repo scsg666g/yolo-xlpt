@@ -119,7 +119,8 @@ export const api = {
     epochs: number; batch: number; imgsz: number; device: string; workers: number; optimizer: string; config: Record<string, unknown>; custom_config: Record<string, unknown>
   }) => request<TrainingTask>(`/api/tasks/${id}/config`, { method: 'PATCH', body: JSON.stringify(payload) }),
   updateResources: (id: string, payload: { model_path?: string; data_path?: string }) =>
-    request<TrainingTask>(`/api/tasks/${id}/resources`, { method: 'PATCH', body: JSON.stringify(payload) }),
+    requestWithTimeout<TrainingTask>(`/api/tasks/${id}/resources`, { method: 'PATCH', body: JSON.stringify(payload) }, 15_000,
+      '保存资源路径超时，后台可能已经受理。请关闭窗口后重新打开确认。'),
   metrics: (id: string) => request<MetricPoint[]>(`/api/tasks/${id}/metrics`),
   artifacts: (id: string) => request<Artifact[]>(`/api/tasks/${id}/artifacts`),
   events: (id: string) => request<TaskEvent[]>(`/api/tasks/${id}/events`),

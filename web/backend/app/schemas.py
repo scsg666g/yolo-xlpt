@@ -140,8 +140,15 @@ class TaskConfigUpdate(BaseModel):
 
 
 class TaskResourceUpdate(BaseModel):
-    model_path: str | None = None
-    data_path: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: str | None = Field(default=None, min_length=1)
+    data_path: str | None = Field(default=None, min_length=1)
+
+    @field_validator("model_path", "data_path", mode="before")
+    @classmethod
+    def strip_resource_path(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
 
 
 class RemoteInterruptConfirmation(BaseModel):

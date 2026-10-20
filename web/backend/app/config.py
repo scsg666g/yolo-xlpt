@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
+import uuid
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 
@@ -112,3 +114,35 @@ DATASET_ROOTS = [PROJECT_ROOT / "数据集", ULTRALYTICS_ROOT / "xl"]
 
 for directory in (DATA_ROOT, RUNS_ROOT, RUNTIME_ROOT, LOG_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
+
+
+def platform_instance_id() -> str:
+    """Return a stable installation ID stored beneath the configured data root."""
+    configured = os.getenv("PLATFORM_INSTANCE_ID", "").strip().lower()
+    if configured:
+        if not re.fullmatch(r"[0-9a-f]{32}", configured):
+            raise RuntimeError("PLATFORM_INSTANCE_ID 必须是 32 位十六进制 ID")
+        return configured
+
+    identity_file = DATA_ROOT / ".platform-instance-id"
+    try:
+        value = identity_file.read_text(encoding="ascii").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{32}", value):
+            return value
+        raise RuntimeError("平台实例 ID 文件格式无效")
+    except FileNotFoundError:
+        value = uuid.uuid4().hex
+        temporary = DATA_ROOT / f".platform-instance-id.{value}.tmp"
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+                handle.write(value + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, identity_file)
+                return value
+            except FileExistsError:
+                return platform_instance_id()
+        finally:
+            temporary.unlink(missing_ok=True)

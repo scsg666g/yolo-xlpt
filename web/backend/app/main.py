@@ -527,9 +527,10 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     previous_epochs = (previous.parameter_snapshot or {}).get("epochs") if previous else None
     if previous and (
         (previous_epochs is not None and task.epochs != previous_epochs)
+        or task.model_path != previous.model_path
         or task.data_path != previous.data_path
     ):
-        raise HTTPException(409, "断点续训沿用上一 Attempt 的总轮数和数据集，请恢复原配置或选择重新训练")
+        raise HTTPException(409, "断点续训沿用上一 Attempt 的总轮数、基础模型和数据集，请恢复原配置或选择重新训练")
     if task.execution_node_id:
         node = db.get(ComputeNode, task.execution_node_id)
         reject_unavailable_remote_training(node, 409)

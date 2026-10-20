@@ -523,6 +523,113 @@ def test_rename_rejects_invalid_names_and_missing_tasks(tmp_path: Path):
         session.close()
 
 
+def test_remote_resource_update_preserves_history_and_feeds_next_attempt(tmp_path: Path):
+    session = make_session(tmp_path)
+    task = make_task(
+        "task-resource-update",
+        status="completed",
+        execution_node_id="remote-node",
+        model_path="/remote/models/base.pt",
+        data_path="/remote/datasets/old.yaml",
+        config={
+            "model": "/remote/models/base.pt",
+            "data": "/remote/datasets/old.yaml",
+            "remote_output_root": "/remote/runs",
+        },
+    )
+    run = TrainingRun(
+        id="run-resource-old",
+        task=task,
+        attempt_number=1,
+        launch_mode="fresh",
+        status="completed",
+        model_path=task.model_path,
+        data_path=task.data_path,
+        parameter_snapshot={"config": dict(task.config)},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        response = client.patch(
+            f"/api/tasks/{task.id}/resources",
+            json={"data_path": "  /remote/datasets/new.yaml\n"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["data_path"] == "/remote/datasets/new.yaml"
+        assert response.json()["config"]["data"] == "/remote/datasets/new.yaml"
+
+        session.expire_all()
+        persisted_task = session.get(TrainingTask, task.id)
+        persisted_run = session.get(TrainingRun, run.id)
+        assert persisted_task.data_path == "/remote/datasets/new.yaml"
+        assert persisted_run.data_path == "/remote/datasets/old.yaml"
+        event = session.scalar(select(TaskEvent).where(
+            TaskEvent.task_id == task.id,
+            TaskEvent.event_type == "resource_updated",
+        ))
+        assert event.payload == {"data_path": "/remote/datasets/new.yaml"}
+
+        next_run = create_training_run(session, persisted_task, "retry")
+        assert next_run.attempt_number == 2
+        assert next_run.data_path == "/remote/datasets/new.yaml"
+        assert persisted_run.data_path == "/remote/datasets/old.yaml"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
+
+
+def test_remote_resource_update_rejects_invalid_or_active_changes(tmp_path: Path):
+    session = make_session(tmp_path)
+    task = make_task(
+        "task-resource-invalid",
+        status="failed",
+        execution_node_id="remote-node",
+        model_path="/remote/models/base.pt",
+        data_path="/remote/datasets/original.yaml",
+        config={"remote_output_root": "/remote/runs"},
+    )
+    session.add(task)
+    session.commit()
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        invalid_payloads = [
+            {},
+            {"data_path": " \t\n "},
+            {"data_path": "relative/data.yaml"},
+            {"data_path": "/remote/datasets/\u0000bad.yaml"},
+            {"data_path": "/remote/datasets/new.yaml", "unknown": True},
+        ]
+        for payload in invalid_payloads:
+            response = client.patch(f"/api/tasks/{task.id}/resources", json=payload)
+            assert response.status_code == 422, (payload, response.text)
+
+        task.status = "running"
+        session.commit()
+        response = client.patch(
+            f"/api/tasks/{task.id}/resources",
+            json={"data_path": "/remote/datasets/new.yaml"},
+        )
+        assert response.status_code == 409
+        session.expire_all()
+        assert session.get(TrainingTask, task.id).data_path == "/remote/datasets/original.yaml"
+        assert session.scalar(select(TaskEvent).where(TaskEvent.task_id == task.id)) is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
+
+
 @pytest.mark.parametrize("field,value", [
     ("name", "  \t "),
     ("optimizer", "   "),
@@ -566,7 +673,7 @@ def test_task_config_rejects_nonfinite_custom_numbers(tmp_path: Path, value):
     session.close()
 
 
-@pytest.mark.parametrize("changed_field", ["epochs", "data_path"])
+@pytest.mark.parametrize("changed_field", ["epochs", "model_path", "data_path"])
 def test_local_resume_rejects_checkpoint_snapshot_mismatch(tmp_path: Path, changed_field: str):
     session = make_session(tmp_path)
     run_dir = tmp_path / "attempt-001"
@@ -585,6 +692,8 @@ def test_local_resume_rejects_checkpoint_snapshot_mismatch(tmp_path: Path, chang
     task.current_run_id = run.id
     if changed_field == "epochs":
         task.epochs = 21
+    elif changed_field == "model_path":
+        task.model_path = str(tmp_path / "replacement-model.pt")
     else:
         task.data_path = str(tmp_path / "replacement-data.yaml")
     session.add_all([task, run])
