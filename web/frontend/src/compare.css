@@ -12,6 +12,18 @@ body:has(.compare-page) { min-width: 0; }
 .compare-picker-search { height: 35px; margin: 12px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid #293945; border-radius: 7px; color: #667784; background: #0a1117; }
 .compare-picker-search input { flex: 1; border: 0; outline: 0; color: #c8d4dc; background: transparent; font-size: 9px; }
 .compare-picker-list { max-height: 370px; overflow: auto; padding: 0 8px 9px; }
+.compare-picker-group { border-bottom: 1px solid #202e38; }
+.compare-picker-group:last-child { border-bottom: 0; }
+.compare-picker-group > header { min-height: 38px; display: flex; align-items: center; }
+.compare-picker-group-toggle { width: 100%; min-width: 0; display: flex; align-items: center; gap: 7px; padding: 5px 7px; border: 0; border-radius: 6px; color: #a7b5bf; background: transparent; cursor: pointer; text-align: left; }
+.compare-picker-group-toggle:hover { background: #14201f; }
+.compare-picker-group-toggle:focus-visible { outline: 2px solid #70f0bd; outline-offset: 1px; }
+.compare-picker-group-toggle > svg:first-child { flex: 0 0 auto; color: #71838e; transition: transform .18s ease; }
+.compare-picker-group.is-collapsed .compare-picker-group-toggle > svg:first-child { transform: rotate(-90deg); }
+.compare-picker-group-toggle > svg:nth-child(2) { flex: 0 0 auto; color: #159a78; }
+.compare-picker-group-toggle > strong { min-width: 0; overflow: hidden; color: #d0dae1; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.compare-picker-group-toggle > small { flex: 0 0 auto; margin-left: auto; color: #71838e; font-size: 10px; }
+.compare-picker-group-items { padding-left: 7px; }
 .compare-picker-list > button { width: 100%; min-height: 54px; display: grid; grid-template-columns: 22px 1fr auto; align-items: center; gap: 9px; padding: 7px 9px; text-align: left; border: 0; border-radius: 7px; color: #a7b5bf; background: transparent; cursor: pointer; }
 .compare-picker-list > button:hover { background: #14201f; }.compare-picker-list > button:disabled { opacity: .4; cursor: not-allowed; }
 .compare-picker-list > button > i { width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid #41515d; border-radius: 4px; color: #07110e; font-style: normal; }
@@ -31,6 +43,7 @@ body:has(.compare-page) { min-width: 0; }
 .comparison-table thead th:first-child, .parameter-panel .comparison-table tbody td:first-child { position: sticky; left: 0; z-index: 2; }
 .parameter-panel .comparison-table tbody td:first-child { background: #0d151d; }
 :root[data-theme='light'] .compare-picker { border-color: #cbd9e1; background: #fff; box-shadow: 0 22px 60px rgba(40,66,80,.18); }:root[data-theme='light'] .compare-picker > header { border-color: #dde6eb; }:root[data-theme='light'] .compare-picker-search { color: #687e8b; border-color: #cbd9e1; background: #f7fafb; }:root[data-theme='light'] .compare-picker-search input { color: #294554; }:root[data-theme='light'] .compare-picker-list > button { color: #355263; }:root[data-theme='light'] .compare-picker-list > button:hover { background: #eaf6f2; }:root[data-theme='light'] .compare-picker-list > button > i { border-color: #aebfc8; }
+:root[data-theme='light'] .compare-picker-group { border-color: #e0e8ed; }:root[data-theme='light'] .compare-picker-group-toggle { color: #456170; }:root[data-theme='light'] .compare-picker-group-toggle:hover { background: #eaf6f2; }:root[data-theme='light'] .compare-picker-group-toggle > svg:first-child, :root[data-theme='light'] .compare-picker-group-toggle > small { color: #718692; }:root[data-theme='light'] .compare-picker-group-toggle > strong { color: #294758; }
 :root[data-theme='light'] .picker-done { color: #087e61; border-color: #9bcbbb; background: #eaf7f2; }:root[data-theme='light'] .picker-done:hover { border-color: #73b09c; background: #dff2ea; }
 :root[data-theme='light'] .compare-empty { color: #718692; border-color: #bdced7; background: rgba(255,255,255,.5); }:root[data-theme='light'] .compare-empty strong { color: #294758; }:root[data-theme='light'] .compare-notice { color: #5e7887; border-color: #bfd2da; background: #f5f9fb; }:root[data-theme='light'] .compare-notice strong { color: #294758; }:root[data-theme='light'] .selected-experiments article, :root[data-theme='light'] .compare-summary article, :root[data-theme='light'] .compare-panel { border-color: #d3e0e7; background: rgba(255,255,255,.92); box-shadow: 0 7px 22px rgba(40,68,82,.05); }:root[data-theme='light'] .selected-experiments h3, :root[data-theme='light'] .compare-summary article > strong, :root[data-theme='light'] .compare-panel h2 { color: #294758; }:root[data-theme='light'] .selected-experiments p { color: #6c8290; }:root[data-theme='light'] .selected-experiments article > div { background: #dce7ec; }:root[data-theme='light'] .selected-experiments footer strong { color: #294758; }:root[data-theme='light'] .compare-panel > header { border-color: #dce6eb; }:root[data-theme='light'] .compare-panel header select { color: #3c596a; border-color: #cbd9e1; background: #fff; }
 :root[data-theme='light'] .comparison-table th, :root[data-theme='light'] .comparison-table td { border-color: #e0e8ed; }:root[data-theme='light'] .comparison-table th { color: #5e7684; background: #f3f7f9; }:root[data-theme='light'] .comparison-table td { color: #3c5969; }:root[data-theme='light'] .comparison-table td:first-child { color: #627987; }:root[data-theme='light'] .comparison-table tr.different { background: #fbf6fd; }:root[data-theme='light'] .comparison-table tr.different td:not(:first-child) { color: #874ea6; }:root[data-theme='light'] .comparison-table td em { color: #874ea6; background: #f1e5f7; }
@@ -93,6 +106,7 @@ body:has(.compare-page) { min-width: 0; }
 :root[data-theme='dark'] .compare-picker-search, :root[data-theme='dark'] .compare-panel header select { color: #a7b5bf; border-color: #40525f; background: #16212b; }
 :root[data-theme='dark'] .compare-picker-list > button { color: #c0ccd4; }
 :root[data-theme='dark'] .compare-picker-list > button:hover { background: #20322f; }
+:root[data-theme='dark'] .compare-picker-group { border-color: #344754; }:root[data-theme='dark'] .compare-picker-group-toggle { color: #c0ccd4; }:root[data-theme='dark'] .compare-picker-group-toggle:hover { background: #20322f; }:root[data-theme='dark'] .compare-picker-group-toggle > strong { color: #e0e8ed; }
 :root[data-theme='dark'] .compare-empty, :root[data-theme='dark'] .compare-notice { color: #9badb8; border-color: #3d505d; background: #17242e; }
 :root[data-theme='dark'] .selected-experiments article, :root[data-theme='dark'] .compare-panel { border-color: #3a4d59; background: #18242f; box-shadow: 0 8px 22px rgba(0,0,0,.12); }
 :root[data-theme='dark'] .selected-experiments h3, :root[data-theme='dark'] .compare-panel h2, :root[data-theme='dark'] .metric-experiment-heading > span { color: #e0e8ed; }

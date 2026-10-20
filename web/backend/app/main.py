@@ -737,6 +737,14 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
             db.refresh(source)
         else:
             reject_active_remote_delete(db, source.execution_node_id)
+        # Reserve the source position and shift every visible task after it.
+        # This keeps the clone immediately before its source for all clients,
+        # including after a refresh or when another browser opens the dashboard.
+        source_order = source.display_order
+        db.execute(update(TrainingTask).where(
+            TrainingTask.deleted_at.is_(None),
+            TrainingTask.display_order >= source_order,
+        ).values(display_order=TrainingTask.display_order + 1000))
         clone = TrainingTask(
             id=uuid.uuid4().hex[:16], name=next_clone_name(db, source.name), task_type=source.task_type,
             group_id=source.group_id,
@@ -744,7 +752,7 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
             model_path=source.model_path, data_path=source.data_path, epochs=source.epochs, batch=source.batch,
             imgsz=source.imgsz, device=source.device, workers=source.workers, optimizer=source.optimizer,
             config={key: value for key, value in source.config.items() if key != "_resume_checkpoint"}, canvas_layout=source.canvas_layout.copy(),
-            display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
+            display_order=source_order,
         )
         db.add(clone)
         db.flush()

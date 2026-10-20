@@ -358,6 +358,17 @@ export function Dashboard() {
     }
   }
 
+  async function cloneTask(source: TrainingTask) {
+    const clone = await api.clone(source.id)
+    setTasks((current) => {
+      if (current.some((task) => task.id === clone.id)) return current
+      const sourceIndex = current.findIndex((task) => task.id === source.id)
+      if (sourceIndex < 0) return [...current, clone]
+      return [...current.slice(0, sourceIndex), clone, ...current.slice(sourceIndex)]
+    })
+    return clone
+  }
+
   async function syncHistoricalRuns() {
     if (syncRequest.current) return
     syncRequest.current = true
@@ -468,7 +479,7 @@ export function Dashboard() {
         {['stopped', 'interrupted'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="继续训练" aria-label={`继续训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.resume(task.id))}><RefreshCw size={15} /></button>}
         {['queued', 'starting', 'running'].includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="停止训练" aria-label={`停止训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.stop(task.id))}><Square size={14} /></button>}
         <button type="button" title="移动到分组" aria-label={`移动任务到分组：${task.name}`} onClick={(event) => { event.stopPropagation(); setMoveTarget(task) }}><FolderInput size={15} /></button>
-        <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="克隆任务" aria-label={`克隆任务：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.clone(task.id))}><Copy size={15} /></button>
+        <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="克隆任务" aria-label={`克隆任务：${task.name}`} onClick={(e) => taskAction(e, task.id, () => cloneTask(task))}><Copy size={15} /></button>
         <button type="button" title="加入实验对比" aria-label={`将${task.name}加入实验对比`} onClick={(e) => { e.stopPropagation(); navigate(`/compare?tasks=${task.id}`) }}><GitCompareArrows size={15} /></button>
         {!activeStatuses.includes(task.status) && <button type="button" disabled={taskActionIds.has(task.id)} title="删除任务" aria-label={`删除任务：${task.name}`} onClick={(e) => { e.stopPropagation(); openDeletion(task) }}><Trash2 size={15} /></button>}
         <button type="button" title="打开画布" aria-label={`打开训练画布：${task.name}`} onClick={(e) => { e.stopPropagation(); navigate(`/tasks/${task.id}/canvas`) }}><ArrowUpRight size={15} /></button>

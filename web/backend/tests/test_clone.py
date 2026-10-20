@@ -79,6 +79,22 @@ def test_cloning_original_and_copy_share_numbering(clone_client):
     assert source.config["_resume_checkpoint"] == "last.pt"
 
 
+def test_clone_is_inserted_before_source_in_persistent_order(clone_client):
+    client, db = clone_client
+    first = add_task(db, "first", "前置任务", display_order=1000)
+    source = add_task(db, "source", "火", display_order=2000)
+    last = add_task(db, "last", "后置任务", display_order=3000)
+
+    clone = client.post(f"/api/tasks/{source.id}/clone")
+    assert clone.status_code == 201
+    clone_id = clone.json()["id"]
+    ordered = client.get("/api/tasks").json()
+    assert [task["id"] for task in ordered] == [first.id, clone_id, source.id, last.id]
+
+    db.expire_all()
+    assert db.get(TrainingTask, clone_id).display_order < db.get(TrainingTask, source.id).display_order
+
+
 def test_remote_clone_does_not_take_local_dataset_lock(clone_client, monkeypatch):
     client, db = clone_client
     source = add_task(db, "remote-source", "远程任务", execution_node_id="remote-node")

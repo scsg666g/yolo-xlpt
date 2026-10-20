@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Info, Layers3, Minus, Search, Trophy, X } from 'lucide-react'
+import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Folder, Info, Layers3, Minus, Search, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import { readStoredCompareRuns, useCompareLimit, writeStoredCompareRuns } from '../preferences'
-import type { MetricPoint, TrainingRun, TrainingTask } from '../types'
+import type { MetricPoint, TaskGroup, TrainingRun, TrainingTask } from '../types'
 import { CompareRunDetailModal, type CompareRunDetails } from './CompareRunDetailModal'
 import { LineChartView } from './LineChart'
 
@@ -15,6 +15,16 @@ interface ComparisonRun {
 }
 
 const palette = ['#159a78', '#347bd1', '#a45fc7', '#e28a32', '#d95c72', '#178fa5', '#b59a28', '#7b75d6']
+const collapsedGroupsKey = 'yolo-task-groups-collapsed-v1'
+const ungroupedKey = '__ungrouped__'
+
+function initialCollapsedGroups(): Set<string> {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(collapsedGroupsKey) || '[]')
+    return new Set(Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [])
+  } catch { return new Set() }
+}
+
 const metricOptions = [
   { key: 'metrics/mAP50(B)', label: 'mAP50', group: 'accuracy' },
   { key: 'metrics/mAP50-95(B)', label: 'mAP50-95', group: 'accuracy' },
@@ -148,6 +158,7 @@ function runView(task: TrainingTask, run: TrainingRun): TrainingTask {
 export function ExperimentCompare() {
   const compareLimit = useCompareLimit()
   const [experiments, setExperiments] = useState<ComparisonRun[]>([])
+  const [groups, setGroups] = useState<TaskGroup[]>([])
   const [metrics, setMetrics] = useState<Record<string, MetricPoint[]>>({})
   const [metricErrors, setMetricErrors] = useState<Record<string, string>>({})
   const [includeIncomplete, setIncludeIncomplete] = useState(false)
@@ -161,6 +172,7 @@ export function ExperimentCompare() {
   const [evaluationMode, setEvaluationMode] = useState<'latest' | 'best'>('latest')
   const [search, setSearch] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(initialCollapsedGroups)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [params, setParams] = useSearchParams()
@@ -199,13 +211,17 @@ export function ExperimentCompare() {
     const controller = new AbortController()
     activeRequest.current = controller
     try {
-      const taskList = await api.tasks(controller.signal)
+      const [taskList, taskGroups] = await Promise.all([
+        api.tasks(controller.signal),
+        api.taskGroups(controller.signal),
+      ])
       const runLists = await Promise.all(taskList.map(async (task) => [task, await api.runs(task.id, controller.signal)] as const))
       const items = runLists.flatMap(([task, runs]) => [...runs]
         .sort((left, right) => right.attempt_number - left.attempt_number)
         .map((run) => ({ id: run.id, task, run, view: runView(task, run) })))
       if (version !== requestVersion.current) return
       setExperiments(items)
+      setGroups(taskGroups)
       const normalizedIds = selectedIds.map((id) => {
         const exactRun = items.find((item) => item.id === id)
         if (exactRun) return exactRun.id
@@ -252,6 +268,10 @@ export function ExperimentCompare() {
 
   useEffect(() => () => detailRequest.current?.abort(), [])
 
+  useEffect(() => {
+    try { window.localStorage.setItem(collapsedGroupsKey, JSON.stringify([...collapsedGroups])) } catch { /* Storage may be unavailable. */ }
+  }, [collapsedGroups])
+
   function setSelection(ids: string[]) {
     invalidateActiveRequest()
     const next = [...new Set(ids)].slice(0, compareLimit)
@@ -262,6 +282,14 @@ export function ExperimentCompare() {
   function toggleTask(id: string) {
     if (selectedIds.includes(id)) setSelection(selectedIds.filter((value) => value !== id))
     else if (selectedIds.length < compareLimit) setSelection([...selectedIds, id])
+  }
+
+  function toggleGroup(key: string) {
+    setCollapsedGroups((current) => {
+      const next = new Set(current)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
   }
 
   async function loadRunDetails(item: ComparisonRun, refresh = false) {
@@ -343,14 +371,27 @@ export function ExperimentCompare() {
 
   const filteredExperiments = experiments.filter((item) => {
     const keyword = search.trim().toLowerCase()
+    const groupName = groups.find((group) => group.id === item.task.group_id)?.name.toLowerCase() || ''
     return item.task.name.toLowerCase().includes(keyword)
       || item.view.model_path.toLowerCase().includes(keyword)
+      || groupName.includes(keyword)
       || `attempt ${item.run.attempt_number}`.includes(keyword)
       || `a${String(item.run.attempt_number).padStart(3, '0')}`.includes(keyword)
   })
   const incompleteTerminalStatuses = new Set(['failed', 'stopped', 'interrupted'])
   const hiddenIncompleteCount = filteredExperiments.filter((item) => incompleteTerminalStatuses.has(item.run.status) && !selectedIds.includes(item.id)).length
   const visibleExperiments = filteredExperiments.filter((item) => !incompleteTerminalStatuses.has(item.run.status) || includeIncomplete || selectedIds.includes(item.id))
+  const groupedExperiments = useMemo(() => {
+    const knownGroupIds = new Set(groups.map((group) => group.id))
+    const views = groups.map((group) => ({
+      key: group.id,
+      name: group.name,
+      items: visibleExperiments.filter((item) => item.task.group_id === group.id),
+    })).filter((group) => group.items.length)
+    const ungroupedItems = visibleExperiments.filter((item) => !item.task.group_id || !knownGroupIds.has(item.task.group_id))
+    if (ungroupedItems.length) views.push({ key: ungroupedKey, name: '未分组', items: ungroupedItems })
+    return views
+  }, [groups, visibleExperiments])
   const hasIncompleteSelected = selected.some((item) => item.run.status !== 'completed')
   const detailItem = detailRunId ? experiments.find((item) => item.id === detailRunId) : undefined
   const experimentCount = Math.max(selected.length, 1)
@@ -366,18 +407,28 @@ export function ExperimentCompare() {
       <header><div><strong>选择参与对比的训练运行</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；可选择每个任务的任意历史 Attempt</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
       <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务、模型或 Attempt" /></div>
       <label className="compare-incomplete-filter"><input type="checkbox" checked={includeIncomplete} onChange={(event) => setIncludeIncomplete(event.target.checked)} /><span>显示失败、已停止和已中断运行</span><small>当前筛选另有 {hiddenIncompleteCount} 个未选</small></label>
-      <div className="compare-picker-list">{visibleExperiments.length ? visibleExperiments.map((item) => {
-        const checked = selectedIds.includes(item.id)
-        return <div className="compare-run-option" key={item.id}>
-          <div className="compare-run-option-row">
-            <button className="compare-run-select" onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个运行` : undefined}>
-              <i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i>
-              <span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span>
-              <em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em>
+      <div className="compare-picker-list">{groupedExperiments.length ? groupedExperiments.map((group) => {
+        const collapsed = collapsedGroups.has(group.key)
+        return <section className={`compare-picker-group${collapsed ? ' is-collapsed' : ''}`} key={group.key}>
+          <header>
+            <button type="button" className="compare-picker-group-toggle" aria-expanded={!collapsed} aria-controls={`compare-picker-group-${group.key}`} onClick={() => toggleGroup(group.key)}>
+              <ChevronDown size={15} /><Folder size={15} /><strong>{group.name}</strong><small>{group.items.length} 个运行</small>
             </button>
-            <button className="compare-run-details-toggle" aria-haspopup="dialog" aria-expanded={detailRunId === item.id} aria-label={`查看 ${item.task.name} Attempt ${item.run.attempt_number} 详情`} onClick={() => openRunDetails(item)} title="打开运行详情"><Info size={14} /><span>{item.run.status === 'interrupted' ? '中断详情' : item.run.status === 'failed' ? '失败详情' : item.run.status === 'stopped' ? '停止详情' : '查看详情'}</span></button>
-          </div>
-        </div>
+          </header>
+          {!collapsed && <div id={`compare-picker-group-${group.key}`} className="compare-picker-group-items">{group.items.map((item) => {
+            const checked = selectedIds.includes(item.id)
+            return <div className="compare-run-option" key={item.id}>
+              <div className="compare-run-option-row">
+                <button className="compare-run-select" onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个运行` : undefined}>
+                  <i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i>
+                  <span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span>
+                  <em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em>
+                </button>
+                <button className="compare-run-details-toggle" aria-haspopup="dialog" aria-expanded={detailRunId === item.id} aria-label={`查看 ${item.task.name} Attempt ${item.run.attempt_number} 详情`} onClick={() => openRunDetails(item)} title="打开运行详情"><Info size={14} /><span>{item.run.status === 'interrupted' ? '中断详情' : item.run.status === 'failed' ? '失败详情' : item.run.status === 'stopped' ? '停止详情' : '查看详情'}</span></button>
+              </div>
+            </div>
+          })}</div>}
+        </section>
       }) : <p className="compare-picker-no-results">没有匹配的训练运行。</p>}</div>
     </div>}
     {detailItem && <CompareRunDetailModal task={detailItem.task} run={detailItem.run} view={detailItem.view} details={runDetails[detailItem.id]} onClose={closeRunDetails} onRefresh={() => void loadRunDetails(detailItem, true)} />}
