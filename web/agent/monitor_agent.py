@@ -913,7 +913,7 @@ def process_owner_hint(pid: int, active_roots: dict[int, dict], max_depth: int =
             break
         chain.append(current)
         environment = process_environment(current)
-        if not chain:
+        if len(chain) == 1:
             leaf_environment_accessible = environment is not None
         if environment:
             marker = {

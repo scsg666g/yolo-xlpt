@@ -1,6 +1,7 @@
 {
   "_comments": {
     "format": "标准 JSON；中文注释放在 _comments 中，不要使用 // 或 #。相对路径需要 Agent 1.8.1 或以上版本。",
+    "process_attribution": "GPU 进程关联需要 Agent 1.9.0 或以上版本；通过非敏感运行标识和 Linux /proc 父进程链识别，无需额外配置。",
     "center_url": "远程服务器能够访问的中心平台或代理地址；迁移服务器时修改这里。",
     "node_id": "从对应平台下载的节点 ID，必须与 token 配套；两套平台不可共用。",
     "token": "替换为平台签发的真实凭证；配置文件权限设为 600，不提交 Git。",

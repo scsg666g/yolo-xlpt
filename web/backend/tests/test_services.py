@@ -776,8 +776,28 @@ def test_prepare_dataset_config_makes_dataset_root_absolute(tmp_path: Path, monk
     assert destination.parent.name == "runtime"
 
 
-def test_training_environment_uses_gnu_mkl_threading_layer():
-    assert training_environment()["MKL_THREADING_LAYER"] == "GNU"
+def test_training_environment_adds_nonsecret_run_markers(monkeypatch):
+    monkeypatch.setattr(services_module, "platform_instance_id", lambda: "c" * 32)
+
+    environment = training_environment(task_id="d" * 32, run_id="a" * 32)
+
+    assert environment["MKL_THREADING_LAYER"] == "GNU"
+    assert environment["YOLO_FORGE_INSTANCE_ID"] == "c" * 32
+    assert environment["YOLO_FORGE_NODE_ID"] == "local"
+    assert environment["YOLO_FORGE_RUN_ID"] == "a" * 32
+    assert environment["YOLO_FORGE_TASK_ID"] == "d" * 32
+    assert "YOLO_FORGE_CLAIM_LEASE" not in environment
+
+
+def test_platform_instance_id_is_persisted_under_configured_data_root(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(config_module, "DATA_ROOT", tmp_path)
+
+    first = config_module.platform_instance_id()
+    second = config_module.platform_instance_id()
+
+    assert first == second
+    assert len(first) == 32
+    assert (tmp_path / ".platform-instance-id").read_text(encoding="ascii").strip() == first
 
 
 def test_yolo_bin_resolution_prefers_config_then_python_environment_then_path(tmp_path, monkeypatch):

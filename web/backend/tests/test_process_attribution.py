@@ -55,38 +55,38 @@ def test_process_owner_uses_inherited_runtime_marker(tmp_path: Path):
 
 def test_process_owner_falls_back_to_verified_launcher_ancestor(tmp_path: Path):
     process_tree(tmp_path)
-    root = {\"instance_id\": INSTANCE_ID, \"node_id\": NODE_ID, \"run_id\": RUN_ID,
-            \"task_id\": TASK_ID, \"root_pid\": 400}
+    root = {"instance_id": INSTANCE_ID, "node_id": NODE_ID, "run_id": RUN_ID,
+            "task_id": TASK_ID, "root_pid": 400}
 
     hint = inspect_process_owner(501, validated_roots={400: [root]}, proc_root=tmp_path)
 
-    assert hint[\"match_method\"] == \"ancestor\"
-    assert hint[\"run_id\"] == RUN_ID
-    assert hint[\"root_pid\"] == 400
+    assert hint["match_method"] == "ancestor"
+    assert hint["run_id"] == RUN_ID
+    assert hint["root_pid"] == 400
 
 
 def test_process_owner_reports_conflicting_evidence_as_ambiguous(tmp_path: Path):
-    process_tree(marker(run_id="d" * 32))
-    root = {\"instance_id\": INSTANCE_ID, \"node_id\": NODE_ID, \"run_id\": RUN_ID,
-            \"task_id\": TASK_ID, \"root_pid\": 400}
+    process_tree(tmp_path, marker(run_id="d" * 32))
+    root = {"instance_id": INSTANCE_ID, "node_id": NODE_ID, "run_id": RUN_ID,
+            "task_id": TASK_ID, "root_pid": 400}
 
     hint = inspect_process_owner(501, validated_roots={400: [root]}, proc_root=tmp_path)
 
-    assert hint == {\"match_method\": \"ambiguous\", \"scan_complete\": True}
+    assert hint == {"match_method": "ambiguous", "scan_complete": True}
 
 
 def test_process_owner_does_not_call_incomplete_scan_unmanaged(tmp_path: Path):
-    process_tree()
-    (tmp_path / \"501\" / \"environ\").unlink()
+    process_tree(tmp_path, {})
+    (tmp_path / "501" / "environ").unlink()
 
     hint = inspect_process_owner(501, validated_roots={}, proc_root=tmp_path)
 
-    assert hint == {\"match_method\": \"none\", \"scan_complete\": False}
+    assert hint == {"match_method": "none", "scan_complete": False}
 
 
 def test_process_owner_marks_complete_unmarked_process_as_unmanaged(tmp_path: Path):
-    process_tree({})
+    process_tree(tmp_path, {})
 
     hint = inspect_process_owner(501, validated_roots={}, proc_root=tmp_path)
 
-    assert hint == {\"match_method\": \"none\", \"scan_complete\": True}
+    assert hint == {"match_method": "none", "scan_complete": True}

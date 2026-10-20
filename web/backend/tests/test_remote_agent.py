@@ -113,14 +113,37 @@ def test_gpu_process_owner_uses_run_marker_and_verified_ancestor(agent, monkeypa
     monkeypatch.setattr(agent, "process_environment", lambda pid: owner if pid == 501 else {})
 
     marker_hint = agent.process_owner_hint(501, {})
+    monkeypatch.setattr(agent, "process_environment", lambda _pid: {})
     ancestor_hint = agent.process_owner_hint(501, {400: {
         "instance_id": "c" * 32, "node_id": "b" * 32, "run_id": "a" * 32, "task_id": "d" * 32,
     }})
 
     assert marker_hint["match_method"] == "runtime_marker"
+    assert marker_hint["scan_complete"] is True
     assert marker_hint["run_id"] == "a" * 32
     assert ancestor_hint["match_method"] == "ancestor"
+    assert ancestor_hint["scan_complete"] is True
     assert ancestor_hint["run_id"] == "a" * 32
+
+
+def test_gpu_process_owner_marks_complete_unmatched_process_as_unmanaged(agent, monkeypatch):
+    parents = {501: 500, 500: 400, 400: 1, 1: 0}
+    monkeypatch.setattr(agent, "process_parent", lambda pid: parents.get(pid))
+    monkeypatch.setattr(agent, "process_environment", lambda _pid: {})
+
+    hint = agent.process_owner_hint(501, {})
+
+    assert hint == {"match_method": "none", "scan_complete": True}
+
+
+def test_gpu_process_owner_keeps_unreadable_process_environment_unknown(agent, monkeypatch):
+    parents = {501: 500, 500: 400, 400: 1, 1: 0}
+    monkeypatch.setattr(agent, "process_parent", lambda pid: parents.get(pid))
+    monkeypatch.setattr(agent, "process_environment", lambda pid: None if pid == 501 else {})
+
+    hint = agent.process_owner_hint(501, {})
+
+    assert hint == {"match_method": "none", "scan_complete": False}
 
 
 @pytest.mark.parametrize("stop_mode", [None, "platform_stop", "agent_shutdown"])

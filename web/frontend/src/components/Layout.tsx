@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Boxes, Check, Cpu, Database, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, Settings2, Sun, X } from 'lucide-react'
+import { Activity, Boxes, Check, Cpu, Database, FolderOpen, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import {
@@ -14,6 +14,16 @@ import {
 import type { PlatformHealth } from '../types'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
+
+const settingsSections = [
+  { id: 'overview', label: '概览', description: '平台状态与实例信息。', icon: LayoutDashboard },
+  { id: 'appearance', label: '外观', description: '当前浏览器的显示主题。', icon: Sun },
+  { id: 'training', label: '实验与训练', description: '实验对比参数。', icon: Activity },
+  { id: 'services', label: '服务状态', description: '数据库与后台服务运行状态。', icon: Cpu },
+  { id: 'storage', label: '存储与路径', description: '训练输出目录等平台路径。', icon: FolderOpen },
+] as const
+
+type SettingsSection = typeof settingsSections[number]['id']
 
 type HealthPhase = 'checking' | 'online' | 'error'
 
@@ -51,6 +61,7 @@ export function Layout() {
     document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
   )
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('overview')
   const compareLimit = useCompareLimit()
   const [compareLimitDraft, setCompareLimitDraft] = useState(compareLimit)
   const [storedCompareCount, setStoredCompareCount] = useState(0)
@@ -175,6 +186,7 @@ export function Layout() {
   const serviceLabel = health.phase === 'online' ? '训练服务在线' : health.phase === 'error' ? '训练服务异常' : '训练服务检查中'
   const serviceDescription = health.phase === 'online' ? '所有核心服务运行正常' : health.phase === 'checking' ? '正在读取平台运行状态…' : health.error || '核心服务状态异常'
   const dotColor = health.phase === 'online' ? 'var(--green)' : health.phase === 'error' ? '#ff747b' : '#d9a552'
+  const activeSettingsSection = settingsSections.find((section) => section.id === settingsSection) ?? settingsSections[0]
 
   return (
     <div className="app-shell">
@@ -217,60 +229,92 @@ export function Layout() {
             <div><span className="eyebrow">PLATFORM STATUS</span><h2 id="platform-settings-title">平台设置与状态</h2></div>
             <button type="button" className="icon-button" data-settings-initial-focus title="关闭" aria-label="关闭平台设置" onClick={closeSettings}><X size={19} /></button>
           </header>
-          <div className="modal-body">
-            <div className={`alert${health.phase === 'error' ? ' error' : health.phase === 'checking' ? ' warning' : ''}`} role={health.phase === 'error' ? 'alert' : 'status'}>{serviceDescription}</div>
-
-            <div className="parameter-section">
-              <h3>界面主题</h3>
-              <p>选择保存在当前浏览器中的显示模式。</p>
-            </div>
-            <div className="header-actions">
-              <button type="button" className={`button ${theme === 'light' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'light'} onClick={() => changeTheme('light')}><Sun size={15} />明亮主题</button>
-              <button type="button" className={`button ${theme === 'dark' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'dark'} onClick={() => changeTheme('dark')}><Moon size={15} />深色主题</button>
-            </div>
-
-            <div className="parameter-section" style={{ marginTop: 24 }}>
-              <h3>实验对比</h3>
-              <p>设置当前浏览器最多同时展示的训练运行（Attempt）数量。</p>
-            </div>
-            <div className="compare-limit-setting">
-              <div>
-                <strong>最大同时对比运行数</strong>
-                <span>允许 {COMPARE_LIMIT_MIN}～{COMPARE_LIMIT_MAX} 个，默认 {COMPARE_LIMIT_DEFAULT} 个</span>
-              </div>
-              <div className="compare-limit-controls">
-                <div className="number-stepper" aria-label="最大同时对比运行数">
-                  <button type="button" disabled={compareLimitDraft <= COMPARE_LIMIT_MIN} title="减少对比数量" aria-label="减少对比数量" onClick={() => setCompareLimitDraft((value) => Math.max(COMPARE_LIMIT_MIN, value - 1))}><Minus size={15} /></button>
-                  <output aria-live="polite">{compareLimitDraft}</output>
-                  <button type="button" disabled={compareLimitDraft >= COMPARE_LIMIT_MAX} title="增加对比数量" aria-label="增加对比数量" onClick={() => setCompareLimitDraft((value) => Math.min(COMPARE_LIMIT_MAX, value + 1))}><Plus size={15} /></button>
+          <div className="settings-layout">
+            <nav className="settings-nav" aria-label="平台设置分类">
+              <span className="settings-nav-heading">设置分类</span>
+              {settingsSections.map(({ id, label, icon: Icon }) => (
+                <button key={id} type="button" className={settingsSection === id ? 'active' : ''} aria-current={settingsSection === id ? 'page' : undefined} aria-controls="platform-settings-content" onClick={() => setSettingsSection(id)}>
+                  <Icon size={16} aria-hidden="true" />
+                  <span>{label}</span>
+                  {id === 'services' && <i className={`settings-nav-status ${health.phase}`} title={serviceLabel} aria-label={serviceLabel} />}
+                </button>
+              ))}
+            </nav>
+            <div className="modal-body settings-content" id="platform-settings-content" role="region" aria-labelledby="settings-section-title" key={settingsSection}>
+              <section className="settings-panel">
+                <div className="parameter-section settings-page-heading">
+                  <h3 id="settings-section-title">{activeSettingsSection.label}</h3>
+                  <p>{activeSettingsSection.description}</p>
                 </div>
-                <button type="button" className="icon-button" disabled={compareLimitDraft === COMPARE_LIMIT_DEFAULT} title={`恢复默认 ${COMPARE_LIMIT_DEFAULT} 个`} aria-label={`恢复默认 ${COMPARE_LIMIT_DEFAULT} 个`} onClick={() => setCompareLimitDraft(COMPARE_LIMIT_DEFAULT)}><RotateCcw size={15} /></button>
-                <button type="button" className="button primary compact" disabled={compareLimitDraft === compareLimit} onClick={applyCompareLimit}><Check size={15} />应用</button>
-              </div>
-            </div>
-            <div className={`compare-limit-message${storedCompareCount > compareLimitDraft ? ' warning' : ''}`} aria-live="polite">
-              {storedCompareCount > compareLimitDraft
-                ? `当前已选择 ${storedCompareCount} 个运行；应用后保留前 ${compareLimitDraft} 个，并移除其余 ${storedCompareCount - compareLimitDraft} 个。`
-                : compareLimitDraft === compareLimit ? `当前上限为 ${compareLimit} 个。` : `新上限 ${compareLimitDraft} 个尚未应用。`}
-            </div>
 
-            <div className="parameter-section" style={{ marginTop: 24 }}>
-              <h3>核心服务</h3>
-              <p>状态每 30 秒更新，页面隐藏时会暂停检查。</p>
-            </div>
-            <div className="metric-strip service-metric-strip" aria-label="核心服务状态">
-              <div><span>数据库</span><strong>{health.details?.database === 'ok' ? '正常' : '—'}</strong></div>
-              <div><span>训练调度器</span><strong>{workerLabel(health.details?.scheduler)}</strong></div>
-              <div><span>文件清理</span><strong>{workerLabel(health.details?.local_deletion_worker)}</strong></div>
-              <div><span>模型测试</span><strong>{workerLabel(health.details?.inference_worker)}</strong></div>
-            </div>
-            <div className="form-grid" style={{ marginTop: 18 }}>
-              <label>平台实例<input readOnly value={health.details?.instance || '—'} /></label>
-              <label>平台版本<input readOnly value={health.details?.version || import.meta.env.VITE_PLATFORM_VERSION || '—'} /></label>
-              <label>数据库延迟<input readOnly value={health.details ? `${health.details.database_latency_ms.toFixed(2)} ms` : '—'} /></label>
-              <label className="span-2">训练输出目录<input readOnly title={health.details?.runs_root || ''} value={health.details?.runs_root || '—'} /></label>
-              {health.details?.scheduler_error && <label className="span-2">当前调度错误<input readOnly title={health.details.scheduler_error} value={health.details.scheduler_error} /></label>}
-              {health.details?.scheduler_last_error && health.details.scheduler_last_error !== health.details.scheduler_error && <label className="span-2">最近调度错误<input readOnly title={health.details.scheduler_last_error} value={`${health.details.scheduler_last_error}${health.details.scheduler_last_error_at ? ` · ${dateTimeLabel(health.details.scheduler_last_error_at)}` : ''}`} /></label>}
+                {settingsSection === 'overview' && <>
+                  <div className={`alert${health.phase === 'error' ? ' error' : health.phase === 'checking' ? ' warning' : ''}`} role={health.phase === 'error' ? 'alert' : 'status'}>{serviceDescription}</div>
+                  <div className="form-grid settings-meta-grid">
+                    <label>平台实例<input readOnly value={health.details?.instance || '—'} /></label>
+                    <label>平台版本<input readOnly value={health.details?.version || import.meta.env.VITE_PLATFORM_VERSION || '—'} /></label>
+                  </div>
+                </>}
+
+                {settingsSection === 'appearance' && <>
+                  <div className="parameter-section">
+                    <h3>显示模式</h3>
+                    <p>主题保存在当前浏览器中。</p>
+                  </div>
+                  <div className="header-actions settings-theme-actions">
+                    <button type="button" className={`button ${theme === 'light' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'light'} onClick={() => changeTheme('light')}><Sun size={15} />明亮主题</button>
+                    <button type="button" className={`button ${theme === 'dark' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'dark'} onClick={() => changeTheme('dark')}><Moon size={15} />深色主题</button>
+                  </div>
+                </>}
+
+                {settingsSection === 'training' && <>
+                  <div className="parameter-section">
+                    <h3>实验对比</h3>
+                    <p>设置当前浏览器最多同时展示的训练运行（Attempt）数量。</p>
+                  </div>
+                  <div className="compare-limit-setting">
+                    <div>
+                      <strong>最大同时对比运行数</strong>
+                      <span>允许 {COMPARE_LIMIT_MIN}～{COMPARE_LIMIT_MAX} 个，默认 {COMPARE_LIMIT_DEFAULT} 个</span>
+                    </div>
+                    <div className="compare-limit-controls">
+                      <div className="number-stepper" aria-label="最大同时对比运行数">
+                        <button type="button" disabled={compareLimitDraft <= COMPARE_LIMIT_MIN} title="减少对比数量" aria-label="减少对比数量" onClick={() => setCompareLimitDraft((value) => Math.max(COMPARE_LIMIT_MIN, value - 1))}><Minus size={15} /></button>
+                        <output aria-live="polite">{compareLimitDraft}</output>
+                        <button type="button" disabled={compareLimitDraft >= COMPARE_LIMIT_MAX} title="增加对比数量" aria-label="增加对比数量" onClick={() => setCompareLimitDraft((value) => Math.min(COMPARE_LIMIT_MAX, value + 1))}><Plus size={15} /></button>
+                      </div>
+                      <button type="button" className="icon-button" disabled={compareLimitDraft === COMPARE_LIMIT_DEFAULT} title={`恢复默认 ${COMPARE_LIMIT_DEFAULT} 个`} aria-label={`恢复默认 ${COMPARE_LIMIT_DEFAULT} 个`} onClick={() => setCompareLimitDraft(COMPARE_LIMIT_DEFAULT)}><RotateCcw size={15} /></button>
+                      <button type="button" className="button primary compact" disabled={compareLimitDraft === compareLimit} onClick={applyCompareLimit}><Check size={15} />应用</button>
+                    </div>
+                  </div>
+                  <div className={`compare-limit-message${storedCompareCount > compareLimitDraft ? ' warning' : ''}`} aria-live="polite">
+                    {storedCompareCount > compareLimitDraft
+                      ? `当前已选择 ${storedCompareCount} 个运行；应用后保留前 ${compareLimitDraft} 个，并移除其余 ${storedCompareCount - compareLimitDraft} 个。`
+                      : compareLimitDraft === compareLimit ? `当前上限为 ${compareLimit} 个。` : `新上限 ${compareLimitDraft} 个尚未应用。`}
+                  </div>
+                </>}
+
+                {settingsSection === 'services' && <>
+                  <div className={`alert${health.phase === 'error' ? ' error' : health.phase === 'checking' ? ' warning' : ''}`} role={health.phase === 'error' ? 'alert' : 'status'}>{serviceDescription}</div>
+                  <div className="metric-strip service-metric-strip" aria-label="核心服务状态">
+                    <div><span>数据库</span><strong>{health.details?.database === 'ok' ? '正常' : '—'}</strong></div>
+                    <div><span>训练调度器</span><strong>{workerLabel(health.details?.scheduler)}</strong></div>
+                    <div><span>文件清理</span><strong>{workerLabel(health.details?.local_deletion_worker)}</strong></div>
+                    <div><span>模型测试</span><strong>{workerLabel(health.details?.inference_worker)}</strong></div>
+                  </div>
+                  <div className="form-grid settings-service-details">
+                    <label>数据库延迟<input readOnly value={health.details ? `${health.details.database_latency_ms.toFixed(2)} ms` : '—'} /></label>
+                    {health.details?.scheduler_error && <label className="span-2">当前调度错误<input readOnly title={health.details.scheduler_error} value={health.details.scheduler_error} /></label>}
+                    {health.details?.scheduler_last_error && health.details.scheduler_last_error !== health.details.scheduler_error && <label className="span-2">最近调度错误<input readOnly title={health.details.scheduler_last_error} value={`${health.details.scheduler_last_error}${health.details.scheduler_last_error_at ? ` · ${dateTimeLabel(health.details.scheduler_last_error_at)}` : ''}`} /></label>}
+                  </div>
+                </>}
+
+                {settingsSection === 'storage' && <>
+                  <div className="form-grid settings-path-grid">
+                    <label className="span-2">训练输出目录<input readOnly title={health.details?.runs_root || ''} value={health.details?.runs_root || '—'} /></label>
+                  </div>
+                  <p className="settings-readonly-note">此路径由平台运行环境提供，当前页面仅展示。</p>
+                </>}
+              </section>
             </div>
           </div>
           <footer>

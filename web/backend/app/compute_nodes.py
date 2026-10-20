@@ -388,7 +388,7 @@ def _association_from_hint(hint: dict[str, Any] | None, *, node: ComputeNode,
             "match_method": method, "sampled_at": sampled_at}
 
 
-def _associate_snapshot(node: ComputeNode, snapshot: dict, db: Session) -> dict:
+def _associate_snapshot(node: ComputeNode, snapshot: dict, db: Session, *, stale: bool = False) -> dict:
     result = {**snapshot, "gpus": []}
     process_items = [process for gpu in snapshot.get("gpus", [])
                      for process in gpu.get("processes", []) if isinstance(process, dict)]
@@ -415,7 +415,6 @@ def _associate_snapshot(node: ComputeNode, snapshot: dict, db: Session) -> dict:
         node.agent_version, PROCESS_ATTRIBUTION_AGENT_VERSION_PARTS,
     )
     sampled_at = snapshot.get("sampled_at")
-    stale = node.kind == "agent" and node.status != "online"
     for gpu in snapshot.get("gpus", []):
         gpu_copy = {**gpu, "processes": []}
         for process in gpu.get("processes", []):
@@ -480,7 +479,10 @@ def serialize_node(node: ComputeNode, *, detail: bool = False, db: Session | Non
     )
     result["required_process_attribution_agent_version"] = PROCESS_ATTRIBUTION_AGENT_VERSION
     if detail:
-        result["compute"] = _associate_snapshot(node, snapshot, db) if snapshot and db else snapshot or None
+        result["compute"] = (
+            _associate_snapshot(node, snapshot, db, stale=node.kind == "agent" and status != "online")
+            if snapshot and db else snapshot or None
+        )
     return result
 
 

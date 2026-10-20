@@ -109,11 +109,62 @@ def test_node_credentials_isolation_and_persistence(monitoring_client):
     assert detail["status"] == "online"
     assert detail["summary"] == {"gpu_count": 1, "utilization": 50, "memory_used": 6000, "memory_total": 24000, "process_count": 1}
     assert detail["compute"]["host"]["hostname"] == "remote-host"
+    assert detail["compute"]["gpus"][0]["processes"][0]["association"]["state"] == "unknown"
     assert client.get(f"/api/compute/nodes/{bid}").json()["compute"] is None
     listing = client.get("/api/compute/nodes").json()
     assert listing[0]["id"] == "local"
     assert all("compute" not in item and "token_hash" not in item and "token" not in item for item in listing)
     assert a["token"] not in json.dumps(detail)
+
+
+def test_remote_gpu_process_links_only_to_a_verified_active_run(monitoring_client, monkeypatch):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    instance_id = "c" * 32
+    monkeypatch.setattr(monitoring, "platform_instance_id", lambda: instance_id)
+    task = TrainingTask(
+        id="gpu-task", name="Remote fire", task_type="detect", status="running",
+        execution_node_id=node_id, model_path="/remote/model.pt", data_path="/remote/data.yaml", config={},
+    )
+    run = TrainingRun(
+        id="a" * 32, task=task, attempt_number=2, launch_mode="fresh", status="running",
+        execution_node_id=node_id, model_path=task.model_path, data_path=task.data_path, pid=1234,
+    )
+    with factory() as db:
+        db.add_all([task, run])
+        db.commit()
+
+    payload = sample([{
+        "index": 0, "uuid": "GPU-1", "name": "GPU X", "memory_total": 24000,
+        "memory_used": 6000, "utilization": 50, "processes": [{
+            "pid": 5678, "name": "python", "memory_used": 6000,
+            "owner_hint": {
+                "instance_id": instance_id, "node_id": node_id, "run_id": run.id,
+                "task_id": task.id, "match_method": "runtime_marker", "scan_complete": True,
+            },
+        }],
+    }])
+    payload["agent_version"] = "1.9.0"
+    response = client.post(
+        f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=payload,
+    )
+    assert response.status_code == 200, response.text
+    process = client.get(f"/api/compute/nodes/{node_id}").json()["compute"]["gpus"][0]["processes"][0]
+    assert process["association"]["state"] == "managed"
+    assert process["association"]["task_id"] == task.id
+    assert process["association"]["run_id"] == run.id
+    assert process["association"]["task_name"] == task.name
+    assert process["association"]["attempt_number"] == 2
+
+    payload["compute"]["gpus"][0]["processes"][0]["owner_hint"]["instance_id"] = "f" * 32
+    response = client.post(
+        f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=payload,
+    )
+    assert response.status_code == 200, response.text
+    foreign = client.get(f"/api/compute/nodes/{node_id}").json()["compute"]["gpus"][0]["processes"][0]["association"]
+    assert foreign["state"] == "other_platform"
+    assert "task_name" not in foreign
 
 
 def test_offline_disabled_rotation_and_removal(monitoring_client):
