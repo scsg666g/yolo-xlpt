@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { Activity, ChevronDown, Cpu, Gauge, HardDrive, MemoryStick, Pencil, Plus, RefreshCw, Search, Server, Settings2, Thermometer, Trash2, Zap } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { api, formatBytes } from '../api'
-import type { ComputeNode, ComputeResources as ComputeData, GpuInfo, GpuProcess, TrainingTask } from '../types'
+import type { ComputeNode, ComputeResources as ComputeData, GpuInfo, GpuProcess } from '../types'
 import { ComputeNodeModal } from './ComputeNodeModal'
 
 function memoryLabel(value: number | null | undefined): string {
@@ -24,7 +25,47 @@ function processRows(gpus: GpuInfo[]): Array<GpuProcess & { gpuIndex: number }> 
   return gpus.flatMap((gpu) => (gpu.processes || []).map((process) => ({ ...process, gpuIndex: gpu.index })))
 }
 
-function ComputeDetails({ data, tasks, nodeId }: { data: ComputeData; tasks: TrainingTask[]; nodeId: string }) {
+function associationText(association: GpuProcess['association']): string {
+  if (!association) return '归属无法确认'
+  switch (association.state) {
+    case 'managed': return `${association.task_name || '平台训练'} · Attempt ${String(association.attempt_number || 1).padStart(3, '0')}`
+    case 'other_node': return `${association.task_name || '本平台任务'} · 其他节点`
+    case 'other_platform': return '其他 YOLO Forge 实例'
+    case 'unmanaged': return '未关联当前实例'
+    case 'orphaned': return '任务记录已结束'
+    case 'ambiguous': return '归属冲突'
+    case 'stale': return association.task_name
+      ? `上次采样：${association.task_name} · 当前待确认`
+      : '上次采样结果 · 当前待确认'
+    default: return '归属无法确认'
+  }
+}
+
+function associationTitle(association: GpuProcess['association']): string | undefined {
+  if (!association) return undefined
+  const method = association.match_method === 'runtime_marker' ? '训练运行标识'
+    : association.match_method === 'ancestor' ? '进程父链'
+      : association.match_method === 'launcher' ? '启动进程' : ''
+  return [association.reason, method && `关联依据：${method}`,
+    association.root_pid && `启动 PID：${association.root_pid}`,
+    association.sampled_at && `采样时间：${new Date(association.sampled_at).toLocaleString('zh-CN', { hour12: false })}`]
+    .filter(Boolean).join(' · ') || undefined
+}
+
+function AssociationCell({ process }: { process: GpuProcess }) {
+  const association = process.association
+  const label = associationText(association)
+  const title = associationTitle(association)
+  if (association?.task_id && (association.state === 'managed' || association.state === 'other_node')) {
+    return <Link className={`linked-task ${association.state === 'other_node' ? 'other-node' : ''}`}
+      to={`/tasks/${association.task_id}/canvas`} title={title}>
+      {label}
+    </Link>
+  }
+  return <span className={`process-association ${association?.state || 'unknown'}`} title={title}>{label}</span>
+}
+
+function ComputeDetails({ data, associationSupported }: { data: ComputeData; associationSupported: boolean }) {
   const processes = useMemo(() => processRows(data?.gpus || []), [data])
   const summary = useMemo(() => {
     const gpus = data?.gpus || []
@@ -75,10 +116,10 @@ function ComputeDetails({ data, tasks, nodeId }: { data: ComputeData; tasks: Tra
       <section className="compute-lower-grid">
         <article className="compute-panel process-panel">
           <header><div><Activity size={17} /><span><strong>GPU 计算进程</strong><small>来自 nvidia-smi 的实时占用信息</small></span></div><em>{processes.length} 个进程</em></header>
-          {processes.length ? <div className="process-table"><table><thead><tr><th>GPU</th><th>PID</th><th>进程</th><th>关联训练任务</th><th>占用显存</th></tr></thead><tbody>{processes.map((process) => {
-            const task = tasks.find((item) => item.pid === process.pid && (item.execution_node_id || 'local') === nodeId)
-            return <tr key={`${process.gpuIndex}-${process.pid}`}><td>GPU {process.gpuIndex}</td><td className="mono">{process.pid}</td><td>{process.name}</td><td>{task ? <span className="linked-task">{task.name}</span> : <span className="muted-value">{nodeId === 'local' ? '非平台任务' : '暂未关联任务'}</span>}</td><td>{memoryLabel(process.memory_used)}</td></tr>
-          })}</tbody></table></div> : <div className="no-process"><Activity size={22} /><span>当前没有 GPU 计算进程</span></div>}
+          {!associationSupported && <div className="process-attribution-note">当前 Agent 只上报 GPU PID。升级到 1.9.0 后可识别远程训练任务；现有训练不受影响。</div>}
+          {processes.length ? <div className="process-table"><table><thead><tr><th>GPU</th><th>PID</th><th>进程</th><th>关联训练任务</th><th>占用显存</th></tr></thead><tbody>{processes.map((process) => (
+            <tr key={`${process.gpuIndex}-${process.pid}`}><td>GPU {process.gpuIndex}</td><td className="mono">{process.pid}</td><td>{process.name}</td><td><AssociationCell process={process} /></td><td>{memoryLabel(process.memory_used)}</td></tr>
+          ))}</tbody></table></div> : <div className="no-process"><Activity size={22} /><span>当前没有 GPU 计算进程</span></div>}
         </article>
 
         <article className="compute-panel host-panel">
@@ -102,7 +143,6 @@ export function ComputeResources() {
   const [nodes, setNodes] = useState<ComputeNode[]>([])
   const [details, setDetails] = useState<Record<string, ComputeNode>>({})
   const [detailErrors, setDetailErrors] = useState<Record<string, string>>({})
-  const [tasks, setTasks] = useState<TrainingTask[]>([])
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [autoRefresh, setAutoRefresh] = useState(true)
@@ -157,9 +197,6 @@ export function ComputeResources() {
         else errors[ids[index]] = result.reason instanceof Error ? result.reason.message : '服务器详情读取失败'
       })
       setDetails((previous) => ({ ...previous, ...successful })); setDetailErrors(errors)
-      if (ids.length) {
-        try { const latest = await api.tasks(current.signal); if (version === requestId.current) setTasks(latest) } catch { /* GPU data remains available. */ }
-      }
     } catch (reason) {
       if (current.signal.aborted) return
       setError(reason instanceof SyntaxError ? '算力接口尚未就绪，请重启后端以加载新功能。' : reason instanceof Error ? reason.message : '算力信息加载失败')
@@ -285,7 +322,7 @@ export function ComputeResources() {
           {node.status === 'disabled' && <div className="node-warning">监控已禁用，Agent 上报将被拒绝。下方为此前保存的数据。</div>}
           {node.status === 'pending' && <div className="node-info">等待 Agent 接入。点击右侧“接入配置”，在对应服务器启动只读 Agent。</div>}
           {detailErrors[node.id] && <div className="alert error">{detailErrors[node.id]} · 此前采样尚未刷新</div>}
-          {data ? <ComputeDetails data={data} tasks={tasks} nodeId={node.id} />
+          {data ? <ComputeDetails data={data} associationSupported={node.process_attribution_supported} />
             : <div className="node-no-data"><Server size={26} /><span>{details[node.id] ? '这台服务器尚未上报算力数据' : '正在读取服务器详情…'}</span>{node.kind === 'agent' && <button className="button compact" onClick={() => setModal({ node, connect: true })}>查看接入步骤</button>}</div>}
         </div>}
       </section>

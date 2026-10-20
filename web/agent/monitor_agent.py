@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.8.1"
+VERSION = "1.9.0"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
@@ -164,7 +164,7 @@ def query(binary: str, arguments: list[str]) -> str:
     return subprocess.check_output([binary, *arguments], text=True, timeout=5, stderr=subprocess.STDOUT)
 
 
-def collect_gpus(binary: str) -> tuple[list[dict], str | None]:
+def collect_gpus(binary: str, config: dict | None = None) -> tuple[list[dict], str | None]:
     fields = ["index", "uuid", "name", "driver_version", "memory.total", "memory.used", "memory.free",
               "utilization.gpu", "utilization.memory", "temperature.gpu", "power.draw", "power.limit",
               "clocks.current.graphics", "clocks.current.memory"]
@@ -190,6 +190,14 @@ def collect_gpus(binary: str) -> tuple[list[dict], str | None]:
                 processes.setdefault(uuid, []).append({"pid": parsed_pid, "name": Path(name).name[:255], "memory_used": number(memory, True)})
     except (OSError, subprocess.SubprocessError):
         message = "GPU 指标已采集，计算进程查询不可用"
+    active_roots = active_attribution_roots(config) if config else {}
+    attribution_cache: dict[int, dict] = {}
+    for processes_for_gpu in processes.values():
+        for process in processes_for_gpu:
+            pid = process["pid"]
+            if pid not in attribution_cache:
+                attribution_cache[pid] = process_owner_hint(pid, active_roots)
+            process["owner_hint"] = attribution_cache[pid]
     numeric = {"memory_total": 4, "memory_used": 5, "memory_free": 6, "utilization": 7,
                "memory_utilization": 8, "temperature": 9, "power_draw": 10, "power_limit": 11,
                "graphics_clock": 12, "memory_clock": 13}
@@ -332,7 +340,7 @@ def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
         load_average = [round(value, 2) for value in os.getloadavg()]
     except (AttributeError, OSError):
         load_average = []
-    gpus, message = collect_gpus(binary)
+    gpus, message = collect_gpus(binary, config)
     payload = {
         "agent_version": VERSION,
         "compute": {
@@ -833,6 +841,128 @@ def process_identity_matches(identity: dict | None) -> bool:
         return False
     current = process_identity(identity["pid"])
     return bool(current and current == identity)
+
+
+def process_parent(pid: int) -> int | None:
+    """Read a PID's parent from procfs, returning None when it is not inspectable."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        closing = raw.rfind(")")
+        fields = raw[closing + 2:].split()
+        if closing < 0 or not fields or fields[0] == "Z":
+            return None
+        return int(fields[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_environment(pid: int) -> dict[str, str] | None:
+    try:
+        entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    result = {}
+    for entry in entries:
+        key, separator, value = entry.partition(b"=")
+        if separator:
+            result[os.fsdecode(key)] = os.fsdecode(value)
+    return result
+
+
+def active_attribution_roots(config: dict | None) -> dict[int, dict]:
+    """Load only live root identities from this Agent's durable active state."""
+    roots: dict[int, dict] = {}
+    if not config:
+        return roots
+    directory = Path(config.get("training_state_dir", "")) / "active"
+    try:
+        paths = list(directory.glob("*.json"))
+    except OSError:
+        return roots
+    for path in paths:
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(state, dict):
+                continue
+            task = state.get("task") if isinstance(state, dict) else None
+            identity = state.get("process") if isinstance(state, dict) else None
+            if (state.get("version") != ACTIVE_STATE_VERSION or state.get("node_id") != config.get("node_id")
+                    or state.get("phase") != "running" or not isinstance(task, dict)
+                    or not process_identity_matches(identity)):
+                continue
+            roots[identity["pid"]] = {"instance_id": task.get("platform_instance_id"),
+                                       "node_id": config["node_id"], "run_id": task.get("run_id"),
+                                       "task_id": task.get("task_id")}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+    return roots
+
+
+def process_owner_hint(pid: int, active_roots: dict[int, dict], max_depth: int = 32) -> dict:
+    """Identify the run marker or verified active launcher above a GPU process."""
+    current = pid
+    chain: list[int] = []
+    markers = []
+    leaf_environment_accessible = False
+    complete = False
+    for _ in range(max_depth):
+        if current <= 0 or current in chain:
+            break
+        parent = process_parent(current)
+        if parent is None:
+            break
+        chain.append(current)
+        environment = process_environment(current)
+        if not chain:
+            leaf_environment_accessible = environment is not None
+        if environment:
+            marker = {
+                "instance_id": environment.get("YOLO_FORGE_INSTANCE_ID"),
+                "node_id": environment.get("YOLO_FORGE_NODE_ID"),
+                "run_id": environment.get("YOLO_FORGE_RUN_ID"),
+                "task_id": environment.get("YOLO_FORGE_TASK_ID"),
+            }
+            if (re.fullmatch(r"[0-9a-f]{32}", marker["instance_id"] or "")
+                    and re.fullmatch(r"[0-9a-f]{32}", marker["run_id"] or "")
+                    and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", marker["task_id"] or "")
+                    and (marker["node_id"] == "local" or
+                         re.fullmatch(r"[0-9a-f]{32}", marker["node_id"] or ""))):
+                if marker not in markers:
+                    markers.append(marker)
+        if current == 1 or parent == 0:
+            complete = True
+            break
+        current = parent
+
+    root_candidates = [active_roots[ancestor] for ancestor in chain if ancestor in active_roots]
+    keys = {(item.get("instance_id"), item.get("node_id"), item.get("run_id"), item.get("task_id"))
+            for item in root_candidates + markers}
+    if len(keys) > 1:
+        return {"match_method": "ambiguous", "scan_complete": complete}
+    if markers:
+        return {**markers[0], "match_method": "runtime_marker", "scan_complete": complete}
+    if root_candidates:
+        return {**root_candidates[0], "match_method": "ancestor", "scan_complete": complete}
+    return {"match_method": "none", "scan_complete": complete and leaf_environment_accessible}
+
+
+def training_process_environment(config: dict, task: dict) -> dict[str, str]:
+    """Add non-secret run identifiers inherited by torchrun and DDP workers."""
+    environment = os.environ.copy()
+    environment["MKL_THREADING_LAYER"] = "GNU"
+    environment["PYTHONUNBUFFERED"] = "1"
+    markers = {
+        "YOLO_FORGE_INSTANCE_ID": task.get("platform_instance_id"),
+        "YOLO_FORGE_NODE_ID": config.get("node_id"),
+        "YOLO_FORGE_RUN_ID": task.get("run_id"),
+        "YOLO_FORGE_TASK_ID": task.get("task_id"),
+    }
+    if (re.fullmatch(r"[0-9a-f]{32}", markers["YOLO_FORGE_INSTANCE_ID"] or "")
+            and re.fullmatch(r"[0-9a-f]{32}", markers["YOLO_FORGE_RUN_ID"] or "")
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", markers["YOLO_FORGE_TASK_ID"] or "")
+            and re.fullmatch(r"[0-9a-f]{32}", markers["YOLO_FORGE_NODE_ID"] or "")):
+        environment.update({key: str(value) for key, value in markers.items()})
+    return environment
 
 
 def _process_argv(pid: int) -> list[str]:
@@ -1634,9 +1764,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
         log_path = Path(task["log_path"])
         with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
             log_handle.write(f"\n[{datetime.now(timezone.utc).isoformat()}] REMOTE COMMAND {shlex.join(command)}\n")
-            environment = os.environ.copy()
-            environment["MKL_THREADING_LAYER"] = "GNU"
-            environment["PYTHONUNBUFFERED"] = "1"
+            environment = training_process_environment(config, task)
             inherited_locks = (training_lock.filenos() if isinstance(training_lock, LockBundle)
                                else (training_lock.fileno(),))
             process = subprocess.Popen(command, cwd=config["training_cwd"], env=environment, stdout=log_handle,

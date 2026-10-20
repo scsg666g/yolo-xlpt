@@ -181,6 +181,18 @@ export interface GpuProcess {
   pid: number
   name: string
   memory_used: number | null
+  association?: {
+    state: 'managed' | 'other_node' | 'other_platform' | 'unmanaged' | 'unknown' | 'ambiguous' | 'orphaned' | 'stale'
+    last_state?: string
+    task_id?: string
+    task_name?: string
+    run_id?: string
+    attempt_number?: number
+    root_pid?: number | null
+    match_method?: 'runtime_marker' | 'ancestor' | 'launcher'
+    reason?: string
+    sampled_at?: string
+  }
 }
 
 export interface ComputeResources {
@@ -216,6 +228,8 @@ export interface ComputeNode extends ComputeNodeSettings {
   sampled_at: string | null
   agent_version: string | null
   required_agent_version: string
+  process_attribution_supported: boolean
+  required_process_attribution_agent_version: string
   training_unavailable_reason: string | null
   training: {
     enabled: boolean

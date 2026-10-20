@@ -64,7 +64,7 @@ def inspect_process_owner(
     current = pid
     chain: list[int] = []
     markers: list[dict[str, str]] = []
-    environments_readable = True
+    leaf_environment_readable = False
     complete = False
     for _ in range(max_depth):
         if current <= 0 or current in chain:
@@ -75,7 +75,8 @@ def inspect_process_owner(
         chain.append(current)
         parent, _start_ticks = stat
         environment = _proc_environment(current, proc_root)
-        environments_readable = environments_readable and environment is not None
+        if len(chain) == 1:
+            leaf_environment_readable = environment is not None
         candidate = _marker(environment)
         if candidate and candidate not in markers:
             markers.append(candidate)
@@ -101,4 +102,4 @@ def inspect_process_owner(
         return {**owner, "match_method": "runtime_marker", "scan_complete": complete}
     if root_candidates:
         return {**root_candidates[0], "match_method": "ancestor", "scan_complete": complete}
-    return {"match_method": "none", "scan_complete": complete and environments_readable}
+    return {"match_method": "none", "scan_complete": complete and leaf_environment_readable}

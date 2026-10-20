@@ -23,13 +23,14 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from .config import DATA_ROOT, WEB_ROOT
+from .config import DATA_ROOT, WEB_ROOT, platform_instance_id
 from .database import get_db
 from .models import ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
+from .process_attribution import inspect_process_owner
 
 router = APIRouter(prefix="/api/compute", tags=["compute nodes"])
 MAX_REPORT_BYTES = 1024 * 1024
@@ -39,6 +40,8 @@ MAX_TRACE_IMAGE_BYTES = 512 * 1024
 LOCAL_ID = "local"
 REQUIRED_AGENT_VERSION = "1.8.0"
 REQUIRED_AGENT_VERSION_PARTS = (1, 8, 0)
+PROCESS_ATTRIBUTION_AGENT_VERSION = "1.9.0"
+PROCESS_ATTRIBUTION_AGENT_VERSION_PARTS = (1, 9, 0)
 Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Percentage = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
 
@@ -71,6 +74,7 @@ class ProcessReport(BaseModel):
     pid: int = Field(ge=1)
     name: str = Field(max_length=255)
     memory_used: Nonnegative | None = None
+    owner_hint: dict[str, Any] | None = None
 
 
 class GpuReport(BaseModel):
@@ -321,7 +325,121 @@ def remote_output_root_unavailable_reason(node: ComputeNode | None, output_root:
     )
 
 
-def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
+def _run_query_for_node(db: Session, node: ComputeNode, run_ids: set[str] | None = None):
+    node_filter = TrainingRun.execution_node_id.is_(None) if node.kind == "local" else TrainingRun.execution_node_id == node.id
+    active_for_node = and_(node_filter, TrainingRun.status.in_(["starting", "running", "stopping"]))
+    query_filter = or_(active_for_node, TrainingRun.id.in_(run_ids)) if run_ids else active_for_node
+    return db.execute(
+        select(TrainingRun, TrainingTask).join(TrainingTask, TrainingTask.id == TrainingRun.task_id)
+        .where(query_filter)
+    ).all()
+
+
+def _association_from_hint(hint: dict[str, Any] | None, *, node: ComputeNode,
+                           current_instance_id: str, runs_by_id: dict[str, tuple[TrainingRun, TrainingTask]],
+                           sampled_at: str | None, supported: bool) -> dict[str, Any]:
+    unknown = {"state": "unknown", "reason": "无法确认该进程的训练归属"}
+    if not supported:
+        unknown["reason"] = f"远程 Agent 需升级到 {PROCESS_ATTRIBUTION_AGENT_VERSION} 才能关联 GPU 进程"
+        return {**unknown, "sampled_at": sampled_at}
+    if not isinstance(hint, dict):
+        unknown["reason"] = "Agent 未提供进程归属线索"
+        return {**unknown, "sampled_at": sampled_at}
+
+    method = hint.get("match_method")
+    if method == "ambiguous":
+        return {"state": "ambiguous", "reason": "检测到多个训练归属候选", "sampled_at": sampled_at}
+    if method == "none":
+        state = "unmanaged" if hint.get("scan_complete") is True else "unknown"
+        reason = ("未发现本实例运行标识；旧任务或其他实例任务可能无法识别"
+                  if state == "unmanaged" else "进程信息读取不完整")
+        return {"state": state, "reason": reason, "sampled_at": sampled_at}
+    if method not in {"runtime_marker", "ancestor", "launcher"}:
+        return {**unknown, "sampled_at": sampled_at}
+
+    owner_instance = hint.get("instance_id")
+    owner_node = hint.get("node_id")
+    run_id = hint.get("run_id")
+    if owner_instance and owner_instance != current_instance_id:
+        return {"state": "other_platform", "reason": "由其他 YOLO Forge 实例管理", "sampled_at": sampled_at}
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
+        return {**unknown, "sampled_at": sampled_at}
+
+    record = runs_by_id.get(run_id)
+    if record is None:
+        return {"state": "orphaned", "run_id": run_id, "reason": "进程仍带有平台标识，但当前实例没有对应 Run",
+                "match_method": method, "sampled_at": sampled_at}
+    run, task = record
+    if hint.get("task_id") and hint.get("task_id") != run.task_id:
+        return {"state": "ambiguous", "reason": "进程标识与 Run 的任务 ID 不一致", "sampled_at": sampled_at}
+    expected_node = "local" if run.execution_node_id is None else run.execution_node_id
+    if owner_node and owner_node != expected_node:
+        return {"state": "ambiguous", "reason": "进程标识与 Run 的执行节点不一致", "sampled_at": sampled_at}
+    active = run.status in {"starting", "running", "stopping"} and task.deleted_at is None
+    if not active:
+        return {"state": "orphaned", "run_id": run.id, "root_pid": run.pid,
+                "reason": "平台 Run 已结束或任务已删除，但进程仍出现在 GPU 快照中",
+                "match_method": method, "sampled_at": sampled_at}
+
+    own_node = "local" if node.kind == "local" else node.id
+    state = "managed" if expected_node == own_node else "other_node"
+    return {"state": state, "task_id": task.id, "task_name": task.name, "run_id": run.id,
+            "attempt_number": run.attempt_number, "root_pid": run.pid,
+            "match_method": method, "sampled_at": sampled_at}
+
+
+def _associate_snapshot(node: ComputeNode, snapshot: dict, db: Session) -> dict:
+    result = {**snapshot, "gpus": []}
+    process_items = [process for gpu in snapshot.get("gpus", [])
+                     for process in gpu.get("processes", []) if isinstance(process, dict)]
+    hinted_run_ids = {process.get("owner_hint", {}).get("run_id") for process in process_items
+                      if isinstance(process.get("owner_hint"), dict)
+                      and isinstance(process["owner_hint"].get("run_id"), str)}
+    rows = _run_query_for_node(db, node, hinted_run_ids)
+    runs_by_id = {run.id: (run, task) for run, task in rows}
+    instance_id = platform_instance_id()
+    validated_roots: dict[int, list[dict[str, Any]]] = {}
+    if node.kind == "local":
+        from .services import process_matches_training
+
+        for run, task in rows:
+            if run.status not in {"starting", "running", "stopping"} or not run.pid:
+                continue
+            if process_matches_training(run.pid, list(run.command or []), run.process_started_at):
+                validated_roots.setdefault(run.pid, []).append({
+                    "instance_id": instance_id, "node_id": "local", "run_id": run.id, "task_id": task.id,
+                    "root_pid": run.pid,
+                })
+
+    supported = node.kind == "local" or agent_version_at_least(
+        node.agent_version, PROCESS_ATTRIBUTION_AGENT_VERSION_PARTS,
+    )
+    sampled_at = snapshot.get("sampled_at")
+    stale = node.kind == "agent" and node.status != "online"
+    for gpu in snapshot.get("gpus", []):
+        gpu_copy = {**gpu, "processes": []}
+        for process in gpu.get("processes", []):
+            process_copy = dict(process)
+            if node.kind == "local":
+                hint = inspect_process_owner(
+                    int(process_copy.get("pid") or 0), validated_roots=validated_roots,
+                )
+            else:
+                hint = process_copy.get("owner_hint")
+            association = _association_from_hint(
+                hint, node=node, current_instance_id=instance_id, runs_by_id=runs_by_id,
+                sampled_at=sampled_at, supported=supported,
+            )
+            if stale:
+                association = {**association, "last_state": association["state"], "state": "stale"}
+                association["reason"] = "服务器已离线，显示最后一次采样的归属结果"
+            process_copy["association"] = association
+            gpu_copy["processes"].append(process_copy)
+        result["gpus"].append(gpu_copy)
+    return result
+
+
+def serialize_node(node: ComputeNode, *, detail: bool = False, db: Session | None = None) -> dict:
     snapshot = local_snapshot() if node.kind == "local" else node.snapshot or {}
     last_seen = datetime.fromisoformat(snapshot["sampled_at"]) if node.kind == "local" else node.last_seen_at
     timeout = max(30, node.report_interval_seconds * 3)
@@ -355,8 +473,14 @@ def serialize_node(node: ComputeNode, *, detail: bool = False) -> dict:
             "process_count": sum(len(gpu.get("processes", [])) for gpu in gpus),
         } if snapshot else None,
     }
+    result["process_attribution_supported"] = (
+        node.kind == "local" or agent_version_at_least(
+            node.agent_version, PROCESS_ATTRIBUTION_AGENT_VERSION_PARTS,
+        )
+    )
+    result["required_process_attribution_agent_version"] = PROCESS_ATTRIBUTION_AGENT_VERSION
     if detail:
-        result["compute"] = snapshot or None
+        result["compute"] = _associate_snapshot(node, snapshot, db) if snapshot and db else snapshot or None
     return result
 
 
@@ -401,7 +525,7 @@ def download_agent():
 
 @router.get("/nodes/{node_id}")
 def node_detail(node_id: str, db: Session = Depends(get_db)):
-    return serialize_node(node_or_404(db, node_id), detail=True)
+    return serialize_node(node_or_404(db, node_id), detail=True, db=db)
 
 
 @router.patch("/nodes/{node_id}")
@@ -574,6 +698,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     db.commit()
     return {"poll_interval_seconds": 5, "task": {
         "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
+        "platform_instance_id": platform_instance_id(),
         "task_type": task.task_type, "launch_mode": run.launch_mode,
         "model_path": run.model_path, "data_path": run.data_path,
         "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir, "claim_lease": lease,

@@ -88,6 +88,41 @@ def test_remote_detect_command_includes_training_trace_runner(agent, training, t
     assert (Path(config["training_state_dir"]) / "training_trace_runner.py").is_file()
 
 
+def test_training_environment_includes_only_valid_owner_markers(agent):
+    config = {"node_id": "b" * 32}
+    task = {"platform_instance_id": "c" * 32, "run_id": "a" * 32, "task_id": "d" * 32}
+
+    environment = agent.training_process_environment(config, task)
+
+    assert environment["YOLO_FORGE_INSTANCE_ID"] == "c" * 32
+    assert environment["YOLO_FORGE_NODE_ID"] == "b" * 32
+    assert environment["YOLO_FORGE_RUN_ID"] == "a" * 32
+    assert environment["YOLO_FORGE_TASK_ID"] == "d" * 32
+    assert "YOLO_FORGE_CLAIM_LEASE" not in environment
+
+
+def test_gpu_process_owner_uses_run_marker_and_verified_ancestor(agent, monkeypatch):
+    parents = {501: 500, 500: 400, 400: 1, 1: 0}
+    owner = {
+        "YOLO_FORGE_INSTANCE_ID": "c" * 32,
+        "YOLO_FORGE_NODE_ID": "b" * 32,
+        "YOLO_FORGE_RUN_ID": "a" * 32,
+        "YOLO_FORGE_TASK_ID": "d" * 32,
+    }
+    monkeypatch.setattr(agent, "process_parent", lambda pid: parents.get(pid))
+    monkeypatch.setattr(agent, "process_environment", lambda pid: owner if pid == 501 else {})
+
+    marker_hint = agent.process_owner_hint(501, {})
+    ancestor_hint = agent.process_owner_hint(501, {400: {
+        "instance_id": "c" * 32, "node_id": "b" * 32, "run_id": "a" * 32, "task_id": "d" * 32,
+    }})
+
+    assert marker_hint["match_method"] == "runtime_marker"
+    assert marker_hint["run_id"] == "a" * 32
+    assert ancestor_hint["match_method"] == "ancestor"
+    assert ancestor_hint["run_id"] == "a" * 32
+
+
 @pytest.mark.parametrize("stop_mode", [None, "platform_stop", "agent_shutdown"])
 def test_failed_updates_retry_metrics_and_explicit_stop(agent, training, monkeypatch, stop_mode):
     config, task = training
