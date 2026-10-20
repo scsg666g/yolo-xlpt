@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Info, Layers3, LoaderCircle, Minus, RefreshCw, Search, Trophy, X } from 'lucide-react'
+import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Info, Layers3, Minus, Search, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
-import { api, formatBytes, metricValue, statusLabel } from '../api'
+import { api, metricValue, statusLabel } from '../api'
 import { readStoredCompareRuns, useCompareLimit, writeStoredCompareRuns } from '../preferences'
-import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
+import type { MetricPoint, TrainingRun, TrainingTask } from '../types'
+import { CompareRunDetailModal, type CompareRunDetails } from './CompareRunDetailModal'
 import { LineChartView } from './LineChart'
 
 interface ComparisonRun {
@@ -11,16 +12,6 @@ interface ComparisonRun {
   task: TrainingTask
   run: TrainingRun
   view: TrainingTask
-}
-
-interface RunDetails {
-  loading: boolean
-  errors: string[]
-  metrics?: MetricPoint[]
-  artifacts?: Artifact[]
-  bestWeight?: EffectiveBestWeight
-  events?: TaskEvent[]
-  logs?: { lines: string[]; path: string | null }
 }
 
 const palette = ['#159a78', '#347bd1', '#a45fc7', '#e28a32', '#d95c72', '#178fa5', '#b59a28', '#7b75d6']
@@ -126,14 +117,6 @@ function elapsedLabel(seconds: number | undefined): string {
   return minutes ? `${minutes} 分钟 ${Math.floor(seconds % 60)} 秒` : `${Math.floor(seconds)} 秒`
 }
 
-function eventLabel(eventType: string): string {
-  return ({
-    stop_requested: '停止请求', force_interrupted: '手动标记中断', interrupted: '训练中断',
-    stopped: '训练停止', failed: '训练失败', completed: '训练完成', remote_claimed: '远程节点领取',
-    queued: '加入队列', started: '开始训练',
-  } as Record<string, string>)[eventType] || eventType
-}
-
 function runView(task: TrainingTask, run: TrainingRun): TrainingTask {
   const snapshot = run.parameter_snapshot || {}
   return {
@@ -168,9 +151,9 @@ export function ExperimentCompare() {
   const [metrics, setMetrics] = useState<Record<string, MetricPoint[]>>({})
   const [metricErrors, setMetricErrors] = useState<Record<string, string>>({})
   const [includeIncomplete, setIncludeIncomplete] = useState(false)
-  const [expandedDetailId, setExpandedDetailId] = useState<string | null>(null)
-  const [showAllArtifactDetails, setShowAllArtifactDetails] = useState<Record<string, boolean>>({})
-  const [runDetails, setRunDetails] = useState<Record<string, RunDetails>>({})
+  const [detailRunId, setDetailRunId] = useState<string | null>(null)
+  const [runDetails, setRunDetails] = useState<Record<string, CompareRunDetails>>({})
+  const detailRequest = useRef<AbortController | null>(null)
   const requestVersion = useRef(0)
   const activeRequest = useRef<AbortController | null>(null)
   const [metricKey, setMetricKey] = useState('metrics/mAP50(B)')
@@ -267,6 +250,8 @@ export function ExperimentCompare() {
     }
   }, [invalidateActiveRequest, load])
 
+  useEffect(() => () => detailRequest.current?.abort(), [])
+
   function setSelection(ids: string[]) {
     invalidateActiveRequest()
     const next = [...new Set(ids)].slice(0, compareLimit)
@@ -280,15 +265,20 @@ export function ExperimentCompare() {
   }
 
   async function loadRunDetails(item: ComparisonRun, refresh = false) {
-    if (!refresh && runDetails[item.id]) return
-    setRunDetails((current) => ({ ...current, [item.id]: { ...current[item.id], loading: true, errors: [] } }))
+    detailRequest.current?.abort()
+    detailRequest.current = null
+    if (!refresh && runDetails[item.id]?.loaded) return
+    const controller = new AbortController()
+    detailRequest.current = controller
+    setRunDetails((current) => ({ ...current, [item.id]: { ...current[item.id], loading: true, loaded: current[item.id]?.loaded || false, errors: [] } }))
     const results = await Promise.allSettled([
-      api.runMetrics(item.task.id, item.run.id),
-      api.runArtifacts(item.task.id, item.run.id),
-      api.runEffectiveBestWeight(item.task.id, item.run.id),
-      api.runEvents(item.task.id, item.run.id),
-      api.runLogs(item.task.id, item.run.id),
+      api.runMetrics(item.task.id, item.run.id, controller.signal),
+      api.runArtifacts(item.task.id, item.run.id, controller.signal),
+      api.runEffectiveBestWeight(item.task.id, item.run.id, controller.signal),
+      api.runEvents(item.task.id, item.run.id, controller.signal),
+      api.runLogs(item.task.id, item.run.id, controller.signal),
     ])
+    if (controller.signal.aborted) return
     const [metricsResult, artifactsResult, weightResult, eventsResult, logsResult] = results
     const errors = results.flatMap((result) => result.status === 'rejected'
       ? [result.reason instanceof Error ? result.reason.message : '部分运行详情加载失败'] : [])
@@ -296,6 +286,7 @@ export function ExperimentCompare() {
       ...current,
       [item.id]: {
         loading: false,
+        loaded: true,
         errors,
         ...(metricsResult.status === 'fulfilled' ? { metrics: metricsResult.value } : {}),
         ...(artifactsResult.status === 'fulfilled' ? { artifacts: artifactsResult.value } : {}),
@@ -304,15 +295,18 @@ export function ExperimentCompare() {
         ...(logsResult.status === 'fulfilled' ? { logs: logsResult.value } : {}),
       },
     }))
+    if (detailRequest.current === controller) detailRequest.current = null
   }
 
-  function toggleRunDetails(item: ComparisonRun) {
-    if (expandedDetailId === item.id) {
-      setExpandedDetailId(null)
-      return
-    }
-    setExpandedDetailId(item.id)
+  function openRunDetails(item: ComparisonRun) {
+    setDetailRunId(item.id)
     void loadRunDetails(item)
+  }
+
+  function closeRunDetails() {
+    detailRequest.current?.abort()
+    detailRequest.current = null
+    setDetailRunId(null)
   }
 
   const differentDatasets = new Set(selected.map((item) => item.view.data_path)).size > 1
@@ -358,6 +352,7 @@ export function ExperimentCompare() {
   const hiddenIncompleteCount = filteredExperiments.filter((item) => incompleteTerminalStatuses.has(item.run.status) && !selectedIds.includes(item.id)).length
   const visibleExperiments = filteredExperiments.filter((item) => !incompleteTerminalStatuses.has(item.run.status) || includeIncomplete || selectedIds.includes(item.id))
   const hasIncompleteSelected = selected.some((item) => item.run.status !== 'completed')
+  const detailItem = detailRunId ? experiments.find((item) => item.id === detailRunId) : undefined
   const experimentCount = Math.max(selected.length, 1)
   const experimentLayout = {
     '--experiment-count': experimentCount,
@@ -373,17 +368,6 @@ export function ExperimentCompare() {
       <label className="compare-incomplete-filter"><input type="checkbox" checked={includeIncomplete} onChange={(event) => setIncludeIncomplete(event.target.checked)} /><span>显示失败、已停止和已中断运行</span><small>当前筛选另有 {hiddenIncompleteCount} 个未选</small></label>
       <div className="compare-picker-list">{visibleExperiments.length ? visibleExperiments.map((item) => {
         const checked = selectedIds.includes(item.id)
-        const details = runDetails[item.id]
-        const expanded = expandedDetailId === item.id
-        const lastMetricEpoch = details?.metrics?.at(-1)?.epoch
-        const logTail = details?.logs?.lines.slice(-12) || []
-        const artifactPriority = (artifact: Artifact) => {
-          const name = artifact.name.split('/').at(-1)
-          if (artifact.kind !== 'weight') return 3
-          return name === 'best.pt' ? 0 : name === 'last.pt' ? 1 : 2
-        }
-        const orderedArtifacts = [...(details?.artifacts || [])].sort((left, right) => artifactPriority(left) - artifactPriority(right) || left.name.localeCompare(right.name))
-        const visibleArtifacts = showAllArtifactDetails[item.id] ? orderedArtifacts : orderedArtifacts.slice(0, 8)
         return <div className="compare-run-option" key={item.id}>
           <div className="compare-run-option-row">
             <button className="compare-run-select" onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个运行` : undefined}>
@@ -391,34 +375,12 @@ export function ExperimentCompare() {
               <span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span>
               <em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em>
             </button>
-            <button className="compare-run-details-toggle" aria-expanded={expanded} aria-label={`${expanded ? '收起' : '查看'} ${item.task.name} Attempt ${item.run.attempt_number} 详情`} onClick={() => toggleRunDetails(item)} title={`${expanded ? '收起' : '查看'}运行详情`}><Info size={14} /><span>{expanded ? '收起' : item.run.status === 'interrupted' ? '中断详情' : item.run.status === 'failed' ? '失败详情' : item.run.status === 'stopped' ? '停止详情' : '查看详情'}</span></button>
+            <button className="compare-run-details-toggle" aria-haspopup="dialog" aria-expanded={detailRunId === item.id} aria-label={`查看 ${item.task.name} Attempt ${item.run.attempt_number} 详情`} onClick={() => openRunDetails(item)} title="打开运行详情"><Info size={14} /><span>{item.run.status === 'interrupted' ? '中断详情' : item.run.status === 'failed' ? '失败详情' : item.run.status === 'stopped' ? '停止详情' : '查看详情'}</span></button>
           </div>
-          {expanded && <section className="compare-run-details" aria-label={`${item.task.name} Attempt ${item.run.attempt_number} 运行详情`}>
-            <header><strong>运行诊断</strong><button onClick={() => void loadRunDetails(item, true)} disabled={details?.loading} title="刷新运行详情">{details?.loading ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />}刷新</button></header>
-            <div className="run-detail-facts">
-              <span>状态<strong className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</strong></span>
-              <span>累计进度<strong>{item.view.completed_epochs} / {item.view.epochs} 轮</strong></span>
-              <span>本次指标<strong>{details?.metrics ? `${details.metrics.length} 条${lastMetricEpoch ? ` · 最近第 ${lastMetricEpoch} 轮` : ''}` : details?.loading ? '读取中' : details?.errors.length ? '读取失败' : '暂无数据'}</strong></span>
-            </div>
-            {item.run.error_message
-              ? <div className="run-detail-reason"><strong>结束说明</strong><p>{item.run.error_message}</p></div>
-              : incompleteTerminalStatuses.has(item.run.status) && <div className="run-detail-reason"><strong>结束说明</strong><p>平台没有记录额外的结束说明，请结合运行事件和日志末尾判断。</p></div>}
-            {details?.errors.length ? <p className="run-detail-load-error">部分详情读取失败：{details.errors.join('；')}</p> : null}
-            {details?.bestWeight && <div className="run-detail-weight"><strong>最佳权重记录</strong>{details.bestWeight.artifact
-              ? <p>{details.bestWeight.artifact.name}{details.bestWeight.inherited && details.bestWeight.source_attempt_number ? ` · 来自 Attempt ${String(details.bestWeight.source_attempt_number).padStart(3, '0')}` : ''} · {formatBytes(details.bestWeight.artifact.size)}。这是产物记录，尚未验证文件可读或模型可加载。</p>
-              : <p>没有找到 best.pt 产物记录；远程产物可能尚未同步。</p>}</div>}
-            {details?.artifacts && <div className="run-detail-artifacts"><strong>产物记录（{details.artifacts.length}）</strong>{details.artifacts.length
-              ? <><ul>{visibleArtifacts.map((artifact) => <li key={artifact.id}><span>{artifact.name}</span><small>{artifact.kind} · {formatBytes(artifact.size)}</small></li>)}</ul>{orderedArtifacts.length > 8 && <button className="run-detail-more" onClick={() => setShowAllArtifactDetails((current) => ({ ...current, [item.id]: !current[item.id] }))}>{showAllArtifactDetails[item.id] ? '收起' : `显示其余 ${orderedArtifacts.length - visibleArtifacts.length} 项`}</button>}</>
-              : <p>当前没有已登记的产物。</p>}</div>}
-            {details?.events && <div className="run-detail-events"><strong>运行事件（最近 {details.events.length} 条）</strong>{details.events.length
-              ? <ul>{details.events.slice(0, 6).map((event) => <li key={event.id}><time>{new Date(event.created_at).toLocaleString()}</time><span><b>{eventLabel(event.event_type)}</b>{event.message}</span></li>)}</ul>
-              : <p>没有该 Attempt 的独立运行事件记录。</p>}</div>}
-            {details?.logs && <div className="run-detail-logs"><strong>日志末尾{details.logs.path ? ` · ${details.logs.path}` : ''}</strong><pre>{logTail.length ? logTail.join('\n') : '暂无日志内容'}</pre></div>}
-            {details?.loading && <p className="run-detail-loading"><LoaderCircle size={13} className="spin" />正在读取事件、指标、产物和日志…</p>}
-          </section>}
         </div>
       }) : <p className="compare-picker-no-results">没有匹配的训练运行。</p>}</div>
     </div>}
+    {detailItem && <CompareRunDetailModal task={detailItem.task} run={detailItem.run} view={detailItem.view} details={runDetails[detailItem.id]} onClose={closeRunDetails} onRefresh={() => void loadRunDetails(detailItem, true)} />}
     {error && <div className="alert error">{error}</div>}
     {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练运行</strong><span>{compareLimit === 2 ? '请选择 2 个运行' : `可同时选择 2～${compareLimit} 个运行`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练运行</button></div> : <>
       {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个训练运行才能对比</strong><span>当前只有一个运行，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}

@@ -75,6 +75,7 @@ export interface TrainingRun {
   attempt_number: number
   launch_mode: 'fresh' | 'resume' | 'retry'
   status: TaskStatus
+  execution_node_id: string | null
   pid: number | null
   process_started_at: string | null
   command: string[]
