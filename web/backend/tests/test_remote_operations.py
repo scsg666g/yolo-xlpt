@@ -12,8 +12,9 @@ from sqlalchemy import event, select
 
 import app.model_test_storage as model_test_storage
 import app.remote_operations as operations
-from app.models import ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utcnow
+from app.models import Artifact, ComputeNode, MetricPoint, ModelTest, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.parameter_catalog import training_parameter_keys
+from app.run_deletions import validate_attempt_deletion
 from app.services import create_training_run
 from test_compute_nodes import create, headers, monitoring_client, sample
 from test_remote_agent import agent, training
@@ -190,6 +191,223 @@ def test_remote_delete_keeps_task_retryable_when_center_cleanup_fails(
     with factory() as db:
         assert db.get(TrainingTask, task_id) is None
     assert not model_test_storage.task_history_root(task_id).exists()
+
+
+def test_remote_attempt_delete_retries_and_preserves_history_and_other_attempt(
+    monitoring_client, agent, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential, config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    task_id, run_id = payload["task_id"], payload["run_id"]
+    task_url = f"/api/tasks/{task_id}"
+    second_dir = Path(payload["output_root"]) / "detect" / task_id / "attempt-002"
+    second_log = Path(payload["output_root"]) / ".platform-logs" / "20261021" / task_id / "attempt-002.log"
+    second_dir.mkdir(parents=True)
+    (second_dir / "keep.txt").write_text("other Attempt")
+    second_log.parent.mkdir(parents=True, exist_ok=True)
+    second_log.write_text("other Attempt log")
+
+    with factory() as db:
+        task = db.get(TrainingTask, task_id)
+        first = db.get(TrainingRun, run_id)
+        # Simulate an older remote record whose root and run-level node field
+        # were not persisted. Its canonical run_dir is enough to recover root.
+        first.execution_node_id = None
+        first.parameter_snapshot = {}
+        task.config = {}
+        second = TrainingRun(
+            id="remote-attempt-two", task_id=task_id, attempt_number=2, status="stopped",
+            execution_node_id=credential["node"]["id"], model_path=task.model_path,
+            data_path=task.data_path, run_dir=str(second_dir), log_path=str(second_log),
+        )
+        task.current_run_id = second.id
+        task.run_dir = str(second_dir)
+        task.log_path = str(second_log)
+        artifact = Artifact(
+            task_id=task_id, run_id=first.id, kind="weight", name="weights/last.pt",
+            path=str(Path(payload["run_dir"]) / "weights/last.pt"), size=12,
+        )
+        db.add_all([
+            second,
+            artifact,
+            MetricPoint(task_id=task_id, run_id=first.id, epoch=1, elapsed=1, values={"map": 0.5}),
+            TaskEvent(task_id=task_id, run_id=first.id, event_type="epoch", message="epoch 1", payload={}),
+        ])
+        db.flush()
+        db.add(ModelTest(
+            id="e" * 32, task_id=task_id, run_id=first.id, source_run_id=first.id,
+            artifact_id=artifact.id, artifact_name=artifact.name, model_name=artifact.name,
+            confidence=0.25, iou=0.7, status="completed",
+        ))
+        db.commit()
+
+    delete_url = f"{task_url}/runs/{run_id}"
+    response = client.delete(delete_url)
+    assert response.status_code == 202, response.text
+    failed_work = claim(client, credential)
+    assert failed_work["payload"]["scope"] == "attempt"
+    assert failed_work["payload"]["runs"][0]["output_root"] == payload["output_root"]
+    result_url = f"/api/compute/nodes/{credential['node']['id']}/agent/operations/{failed_work['id']}/result"
+    failed = client.post(
+        result_url,
+        json={"lease": failed_work["lease"], "success": False, "error": "temporary offline"},
+        headers=headers(credential),
+    )
+    assert failed.status_code == 200 and failed.json()["status"] == "failed"
+    with factory() as db:
+        assert db.get(TrainingRun, run_id) is not None
+        assert db.get(TrainingTask, task_id) is not None
+
+    # A failed remote cleanup remains retryable from the same UI action.
+    retried = client.delete(delete_url)
+    assert retried.status_code == 202, retried.text
+    retry_work = claim(client, credential)
+    assert retry_work["payload"]["scope"] == "attempt"
+    agent.execute_operation(config, retry_work, threading.Event())
+
+    with factory() as db:
+        assert db.get(TrainingTask, task_id) is not None
+        assert db.get(TrainingRun, run_id) is None
+        assert db.get(TrainingRun, "remote-attempt-two") is not None
+        assert db.scalar(select(MetricPoint).where(MetricPoint.run_id == run_id)) is None
+        assert db.scalar(select(TaskEvent).where(TaskEvent.run_id == run_id)) is None
+        assert db.scalar(select(Artifact).where(Artifact.run_id == run_id)) is None
+        history = db.get(ModelTest, "e" * 32)
+        assert history is not None
+        assert history.run_id is None and history.source_run_id is None and history.artifact_id is None
+    assert not Path(payload["run_dir"]).exists()
+    assert not Path(payload["log_path"]).exists()
+    assert (second_dir / "keep.txt").read_text() == "other Attempt"
+    assert second_log.read_text() == "other Attempt log"
+
+
+def test_remote_attempt_delete_rejects_unresolvable_legacy_directory(monitoring_client, tmp_path):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    with factory() as db:
+        task = db.get(TrainingTask, payload["task_id"])
+        run = db.get(TrainingRun, payload["run_id"])
+        task.config = {}
+        run.parameter_snapshot = {}
+        run.run_dir = str(tmp_path / "not-a-canonical-attempt")
+        db.commit()
+
+    response = client.delete(f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}")
+    assert response.status_code == 409
+    assert "输出根目录" in response.json()["detail"]
+    with factory() as db:
+        assert db.get(TrainingRun, payload["run_id"]) is not None
+        assert not db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id == payload["task_id"],
+            RemoteOperation.kind == "delete",
+        )).all()
+
+
+def test_remote_attempt_delete_requires_supported_agent_version(monitoring_client, tmp_path):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "1.7.0"
+        db.commit()
+
+    response = client.delete(f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}")
+    assert response.status_code == 409
+    assert "1.8.0" in response.json()["detail"]
+    with factory() as db:
+        assert not db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id == payload["task_id"],
+            RemoteOperation.kind == "delete",
+        )).all()
+
+
+def test_remote_legacy_flat_attempt_requires_agent_201(monitoring_client, tmp_path):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    with factory() as db:
+        node = db.get(ComputeNode, credential["node"]["id"])
+        node.agent_version = "2.0.0"
+        task = db.get(TrainingTask, payload["task_id"])
+        run = db.get(TrainingRun, payload["run_id"])
+        legacy_root = Path(payload["run_dir"]).parent
+        run.run_dir = task.run_dir = str(legacy_root)
+        db.commit()
+
+    response = client.delete(f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}")
+    assert response.status_code == 409
+    assert "2.0.1" in response.json()["detail"]
+    with factory() as db:
+        assert not db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id == payload["task_id"],
+            RemoteOperation.kind == "delete",
+        )).all()
+
+
+def test_remote_legacy_flat_attempt_delete_preserves_canonical_child(
+    monitoring_client, agent, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential, config, payload = remote_run(client, factory, tmp_path)
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    task_id, first_id = payload["task_id"], payload["run_id"]
+    task_root = Path(payload["run_dir"]).parent
+    first_dir = Path(payload["run_dir"])
+    for child in list(first_dir.iterdir()):
+        child.rename(task_root / child.name)
+    first_dir.rmdir()
+    first_weight = task_root / "weights" / "last.pt"
+    second_dir = task_root / "attempt-002"
+    second_log = Path(payload["output_root"]) / ".platform-logs" / "20261021" / task_id / "attempt-002.log"
+    second_dir.mkdir()
+    marker = second_dir / "keep.txt"
+    marker.write_text("canonical child")
+    second_log.parent.mkdir(parents=True, exist_ok=True)
+    second_log.write_text("canonical log")
+
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "2.0.1"
+        task = db.get(TrainingTask, task_id)
+        first = db.get(TrainingRun, first_id)
+        first.run_dir = str(task_root)
+        first.log_path = str(task_root / "platform.log")
+        (task_root / "platform.log").write_text("legacy log")
+        second = TrainingRun(
+            id="remote-flat-second", task_id=task_id, attempt_number=2, status="stopped",
+            execution_node_id=credential["node"]["id"], model_path=task.model_path,
+            data_path=task.data_path, run_dir=str(second_dir), log_path=str(second_log),
+            parameter_snapshot={"remote_output_root": payload["output_root"]},
+        )
+        task.current_run_id = second.id
+        task.run_dir = str(second_dir)
+        task.log_path = str(second_log)
+        db.add_all([
+            second,
+            Artifact(
+                task_id=task_id, run_id=first.id, kind="weight", name="weights/last.pt",
+                path=str(first_weight), size=first_weight.stat().st_size,
+            ),
+        ])
+        db.flush()
+        # Deleting the canonical child first must also pass despite the legacy
+        # run storing its task-container path.
+        validate_attempt_deletion(db, task, second)
+        db.commit()
+
+    response = client.delete(f"/api/tasks/{task_id}/runs/{first_id}")
+    assert response.status_code == 202, response.text
+    work = claim(client, credential)
+    assert work["payload"]["runs"][0]["layout"] == "legacy_flat"
+    agent.execute_operation(config, work, threading.Event())
+
+    with factory() as db:
+        assert db.get(TrainingRun, first_id) is None
+        assert db.get(TrainingRun, "remote-flat-second") is not None
+    assert not first_weight.exists()
+    assert not (task_root / "platform.log").exists()
+    assert marker.read_text() == "canonical child"
+    assert second_log.read_text() == "canonical log"
 
 
 def test_remote_delete_refreshes_references_before_dispatch(monitoring_client, agent, tmp_path, monkeypatch):

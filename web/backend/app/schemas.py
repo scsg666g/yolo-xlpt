@@ -225,6 +225,9 @@ class RunRead(BaseModel):
     finished_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    deletion_status: Literal["pending", "running", "failed", "succeeded"] | None = None
+    deletion_error: str | None = None
+    deletion_requested_at: datetime | None = None
 
 
 class MetricRead(BaseModel):

@@ -43,13 +43,14 @@ from .inference import (
     stage_task_test_cancellation,
     worker as inference_worker,
 )
-from .models import Artifact, ComputeNode, MetricPoint, TaskEvent, TaskGroup, TrainingRun, TrainingTask, utcnow
-from .local_deletions import local_deletion_worker, queue_local_delete
+from .models import Artifact, ComputeNode, MetricPoint, RemoteOperation, TaskEvent, TaskGroup, TrainingRun, TrainingTask, utcnow
+from .local_deletions import local_deletion_worker, queue_local_delete, queue_local_run_delete
 from .parameter_catalog import is_finite_number, load_parameter_catalog, validate_parameter_values
 from .remote_operations import (
     active_remote_delete,
     matching_fetch,
     operation_file,
+    queue_attempt_delete,
     queue_delete,
     queue_scan,
     router as remote_operations_router,
@@ -73,6 +74,7 @@ from .services import (
     validate_dataset_config,
     validate_input_path,
 )
+from .run_deletions import active_attempt_delete_operation, attempt_deletion_state
 
 logger = logging.getLogger("yolo-platform.requests")
 _task_snapshot = ""
@@ -197,6 +199,16 @@ def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
     if not run:
         raise HTTPException(404, "训练运行不存在")
     return run
+
+
+def serialize_run(db: Session, run: TrainingRun) -> RunRead:
+    """Add durable deletion operation state without changing the run table."""
+    status, error, operation = attempt_deletion_state(db, run)
+    return RunRead.model_validate(run).model_copy(update={
+        "deletion_status": status,
+        "deletion_error": error,
+        "deletion_requested_at": operation.created_at if operation else None,
+    })
 
 
 def reject_active_remote_delete(db: Session, node_id: str) -> None:
@@ -794,6 +806,8 @@ def delete_task(task_id: str, db: Session = Depends(get_db)):
         task = get_task_or_404(db, task_id)
         if task.status in {"queued", "starting", "running", "stopping"}:
             raise HTTPException(409, "运行中或排队中的任务不能删除")
+        if active_attempt_delete_operation(db, task.id):
+            raise HTTPException(409, "该任务已有 Attempt 文件清理正在进行，请等待完成后再移入回收站")
         task.deleted_at = utcnow()
         task.deleted_reason = "soft_delete"
         stage_task_test_cancellation(task.id, db)
@@ -830,6 +844,8 @@ def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
         task = get_task_or_404(db, task_id, include_deleted=True)
         if task.status in {"queued", "starting", "running", "stopping"}:
             raise HTTPException(409, "运行中或排队中的任务不能永久删除")
+        if active_attempt_delete_operation(db, task.id):
+            raise HTTPException(409, "该任务已有 Attempt 文件清理正在进行，请等待完成后再删除任务")
         if not task.deleted_at:
             # This is a recoverable checkpoint. If cancellation is interrupted,
             # the task remains in the recycle bin and no file deletion is queued.
@@ -993,12 +1009,38 @@ def task_logs(task_id: str, tail: int = Query(default=400, ge=20, le=5000), db: 
 @app.get("/api/tasks/{task_id}/runs", response_model=list[RunRead])
 def task_runs(task_id: str, db: Session = Depends(get_db)):
     get_task_or_404(db, task_id)
-    return db.scalars(select(TrainingRun).where(TrainingRun.task_id == task_id).order_by(TrainingRun.attempt_number.desc())).all()
+    runs = db.scalars(select(TrainingRun).where(TrainingRun.task_id == task_id).order_by(TrainingRun.attempt_number.desc())).all()
+    return [serialize_run(db, run) for run in runs]
 
 
 @app.get("/api/tasks/{task_id}/runs/{run_id}", response_model=RunRead)
 def task_run(task_id: str, run_id: str, db: Session = Depends(get_db)):
-    return get_run_or_404(db, task_id, run_id)
+    return serialize_run(db, get_run_or_404(db, task_id, run_id))
+
+
+@app.delete("/api/tasks/{task_id}/runs/{run_id}", status_code=202)
+def delete_training_run(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    """Queue deletion of one terminal Attempt and its owned files."""
+    with model_test_lifecycle():
+        task = get_task_or_404(db, task_id)
+        run = get_run_or_404(db, task_id, run_id)
+        try:
+            if task.execution_node_id or run.execution_node_id:
+                node_id = task.execution_node_id or run.execution_node_id
+                reject_active_remote_delete(db, node_id)
+                operation = queue_attempt_delete(db, task, run)
+                message = "已提交远程 Attempt 文件清理，完成后删除记录"
+            else:
+                operation = queue_local_run_delete(db, task, run)
+                message = "已提交本机 Attempt 文件清理，完成后删除记录"
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        db.commit()
+        return JSONResponse(status_code=202, content={
+            "status": operation.status,
+            "operation_id": operation.id,
+            "message": message,
+        })
 
 
 @app.get("/api/tasks/{task_id}/runs/{run_id}/metrics", response_model=list[MetricRead])

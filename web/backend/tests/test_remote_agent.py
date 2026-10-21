@@ -599,6 +599,37 @@ def test_delete_refuses_while_training_owns_output_root(agent, training):
         agent.release_training_lock(lock)
 
 
+def test_delete_legacy_flat_attempt_preserves_canonical_children(agent, training):
+    config, task = training
+    output_root = Path(task["parameters"]["remote_output_root"])
+    task_root = output_root / task["task_type"] / task["task_id"]
+    legacy_weight = task_root / "weights" / "last.pt"
+    canonical_dir = task_root / "attempt-002"
+    legacy_weight.parent.mkdir(parents=True)
+    legacy_weight.write_bytes(b"legacy")
+    canonical_dir.mkdir()
+    marker = canonical_dir / "keep.txt"
+    marker.write_text("canonical")
+    log = task_root / "platform.log"
+    log.write_text("legacy log")
+    payload = {
+        **task,
+        "attempt_number": 1,
+        "run_dir": str(task_root),
+        "log_path": str(log),
+        "output_root": str(output_root),
+        "layout": "legacy_flat",
+    }
+
+    with pytest.raises(ValueError, match="仅允许在删除"):
+        agent.operation_paths(config, payload)
+    agent.delete_remote_files(config, {"runs": [payload]})
+
+    assert not legacy_weight.exists() and not log.exists()
+    assert marker.read_text() == "canonical"
+    agent.delete_remote_files(config, {"runs": [payload]})  # idempotent after a lost ACK
+
+
 def test_claim_confirmation_retries_lost_response_and_honors_stop(agent, training, monkeypatch):
     config, task = training
     task["claim_lease"] = "c" * 32

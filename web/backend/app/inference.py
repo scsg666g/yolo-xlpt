@@ -55,6 +55,7 @@ from .models import (
     utcnow,
 )
 from .remote_operations import cached_fetch_digest, matching_fetch, operation_file
+from .run_deletions import attempt_delete_operation
 from .services import failure_detail, path_is_within, training_environment
 
 router = APIRouter(tags=["model-tests"])
@@ -943,6 +944,8 @@ def _create_test(payload: TestCreate, db: Session):
     context_run = db.get(TrainingRun, payload.run_id) if payload.run_id else source_run
     if not context_run or context_run.task_id != task.id:
         raise HTTPException(422, "当前 Attempt 与模型权重不属于同一训练任务")
+    if attempt_delete_operation(db, source_run, active_only=True) or attempt_delete_operation(db, context_run, active_only=True):
+        raise HTTPException(409, "当前 Attempt 已进入清理队列，不能新建模型检测")
     rerun_source = get_record(db, payload.rerun_of_test_id) if payload.rerun_of_test_id else None
     expected_sha256 = None
     expected_size = None

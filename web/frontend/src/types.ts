@@ -95,6 +95,10 @@ export interface TrainingRun {
   finished_at: string | null
   created_at: string
   updated_at: string
+  /** Attempt 文件异步清理状态；旧 API 可能暂时不返回这些字段。 */
+  deletion_status?: 'pending' | 'running' | 'failed' | 'succeeded' | null
+  deletion_error?: string | null
+  deletion_requested_at?: string | null
 }
 
 export interface MetricPoint {

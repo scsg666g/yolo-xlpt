@@ -126,6 +126,10 @@ export const api = {
   events: (id: string) => request<TaskEvent[]>(`/api/tasks/${id}/events`),
   logs: (id: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/logs?tail=240`),
   runs: (id: string, signal?: AbortSignal) => requestWithTimeout<TrainingRun[]>(`/api/tasks/${id}/runs`, { signal }),
+  deleteRun: (taskId: string, runId: string) => requestWithTimeout<{ status: 'pending' | 'running' | 'failed' | 'succeeded'; message: string }>(
+    `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}`,
+    { method: 'DELETE' }, 30_000, '删除 Attempt 请求超时，后台可能已经受理，请稍后刷新确认状态',
+  ),
   runMetrics: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<MetricPoint[]>(`/api/tasks/${id}/runs/${runId}/metrics`, { signal }),
   runArtifacts: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<Artifact[]>(`/api/tasks/${id}/runs/${runId}/artifacts`, { signal }),
   runEffectiveBestWeight: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<EffectiveBestWeight>(`/api/tasks/${id}/runs/${runId}/effective-best-weight`, { signal }),

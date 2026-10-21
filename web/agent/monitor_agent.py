@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
@@ -1370,7 +1370,13 @@ def build_training_command(config: dict, task: dict) -> list[str]:
     return command
 
 
-def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = False) -> tuple[Path, Path | None]:
+def operation_paths(
+    config: dict,
+    payload: dict,
+    *,
+    allow_missing_root: bool = False,
+    allow_legacy_flat: bool = False,
+) -> tuple[Path, Path | None]:
     """Validate all deletion/scan/fetch targets against an exact task/Attempt layout."""
     task_id, task_type = payload["task_id"], payload["task_type"]
     attempt = payload["attempt_number"]
@@ -1392,9 +1398,17 @@ def operation_paths(config: dict, payload: dict, *, allow_missing_root: bool = F
     if not enclosing_roots:
         raise ValueError("输出根目录不在 Agent 允许目录内")
     run_dir = Path(payload["run_dir"])
-    expected = root / task_type / task_id / f"attempt-{attempt:03d}"
+    layout = payload.get("layout", "canonical")
+    if layout == "legacy_flat":
+        if not allow_legacy_flat or attempt != 1:
+            raise ValueError("旧版平铺 Attempt 仅允许在删除操作中清理")
+        expected = root / task_type / task_id
+    elif layout == "canonical":
+        expected = root / task_type / task_id / f"attempt-{attempt:03d}"
+    else:
+        raise ValueError("Attempt 目录布局无效")
     if run_dir != expected or run_dir.resolve() != expected or run_dir.is_symlink():
-        raise ValueError("只能操作该任务的独立 Attempt 目录")
+        raise ValueError("只能操作该任务的受管 Attempt 目录")
     log = Path(payload["log_path"]) if payload.get("log_path") else None
     if log is not None:
         legacy = run_dir / "platform.log"
@@ -1441,8 +1455,11 @@ def delete_remote_files(config: dict, payload: dict) -> None:
     try:
         # Validate the complete plan before deleting the first file. rmtree never
         # follows directory symlinks inside an owned Attempt.
-        plans = [operation_paths(config, run, allow_missing_root=True) for run in payload["runs"]]
-        targets = list(plans)
+        plans = [
+            (*operation_paths(config, run, allow_missing_root=True, allow_legacy_flat=True),
+             run.get("layout", "canonical"))
+            for run in payload["runs"]
+        ]
         target_roots = _normalized_output_roots(requested_roots)
         if workspace_delete_conflicts(config, target_roots):
             raise ValueError(
@@ -1451,20 +1468,46 @@ def delete_remote_files(config: dict, payload: dict) -> None:
             )
         protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
         protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
-        for run_dir, log in targets:
+        deletion_targets = []
+        for run_dir, log, layout in plans:
             if (run_dir.exists() and not run_dir.is_dir()) or (log and log.exists() and not log.is_file()):
                 raise ValueError("Attempt 或日志的文件类型不正确，已拒绝清理")
+            if layout == "legacy_flat":
+                # The old first Attempt wrote directly into the task container.
+                # Preserve every Attempt-shaped child, including orphaned rows,
+                # and remove only root-level legacy output.
+                owned = [
+                    child for child in run_dir.iterdir()
+                    if not re.fullmatch(r"attempt-\d{3,}", child.name)
+                ] if run_dir.is_dir() else []
+            else:
+                owned = [run_dir]
+            for target in owned:
+                if target.parent.resolve() != run_dir.resolve() and layout == "legacy_flat":
+                    raise ValueError("旧版 Attempt 清理目标超出任务目录")
+                for path in protected:
+                    if path == target or target in path.parents:
+                        raise ValueError("任务目录包含仍被引用的模型、数据或训练程序，已拒绝清理")
             for path in protected:
-                if path == run_dir or run_dir in path.parents or (log and path == log):
+                if log and path == log:
                     raise ValueError("任务目录包含仍被引用的模型、数据或训练程序，已拒绝清理")
-        for run_dir, log in targets:
-            if run_dir.exists():
-                if not run_dir.is_dir():
-                    raise ValueError("Attempt 路径不是目录")
-                shutil.rmtree(run_dir)
+            deletion_targets.append((run_dir, log, layout, owned))
+        for run_dir, log, layout, owned in deletion_targets:
+            for target in owned:
+                if target.is_symlink() or target.is_file():
+                    target.unlink(missing_ok=True)
+                elif target.exists():
+                    if not target.is_dir():
+                        raise ValueError("Attempt 清理目标类型无效")
+                    shutil.rmtree(target)
             if log:
                 log.unlink(missing_ok=True)
-            for parent in {run_dir.parent, log.parent if log else run_dir.parent}:
+            cleanup_parents = {run_dir.parent, log.parent if log else run_dir.parent}
+            if layout == "legacy_flat":
+                # Remove the old task container only when it is now empty.  A
+                # canonical attempt-NNN child makes rmdir fail and is retained.
+                cleanup_parents.add(run_dir)
+            for parent in cleanup_parents:
                 try:
                     parent.rmdir()  # remove empty task directory only
                 except OSError:

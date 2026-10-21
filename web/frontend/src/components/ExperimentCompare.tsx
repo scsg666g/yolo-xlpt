@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Folder, Info, Layers3, Minus, Search, Trophy, X } from 'lucide-react'
+import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Folder, Info, Layers3, LoaderCircle, Minus, Search, Trash2, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import { readStoredCompareRuns, useCompareLimit, writeStoredCompareRuns } from '../preferences'
@@ -17,12 +17,20 @@ interface ComparisonRun {
 const palette = ['#159a78', '#347bd1', '#a45fc7', '#e28a32', '#d95c72', '#178fa5', '#b59a28', '#7b75d6']
 const collapsedGroupsKey = 'yolo-task-groups-collapsed-v1'
 const ungroupedKey = '__ungrouped__'
+const activeRunStatuses = new Set<TrainingRun['status']>(['queued', 'starting', 'running', 'stopping'])
 
 function initialCollapsedGroups(): Set<string> {
   try {
     const value = JSON.parse(window.localStorage.getItem(collapsedGroupsKey) || '[]')
     return new Set(Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [])
   } catch { return new Set() }
+}
+
+function deletionStatusLabel(status: TrainingRun['deletion_status']): string {
+  if (status === 'failed') return '清理失败'
+  if (status === 'succeeded') return '已清理'
+  if (status === 'pending' || status === 'running') return '清理中'
+  return ''
 }
 
 const metricOptions = [
@@ -175,6 +183,10 @@ export function ExperimentCompare() {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(initialCollapsedGroups)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [deleteTarget, setDeleteTarget] = useState<ComparisonRun | null>(null)
+  const [deleteError, setDeleteError] = useState('')
+  const [deleteNotice, setDeleteNotice] = useState('')
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null)
   const [params, setParams] = useSearchParams()
   const [selectedIds, setSelectedIds] = useState<string[]>(() => {
     const incoming = (params.get('runs') || params.get('tasks') || '').split(',').filter(Boolean)
@@ -224,12 +236,23 @@ export function ExperimentCompare() {
       setGroups(taskGroups)
       const normalizedIds = selectedIds.map((id) => {
         const exactRun = items.find((item) => item.id === id)
-        if (exactRun) return exactRun.id
-        const taskRuns = items.filter((item) => item.task.id === id)
+        if (exactRun) return exactRun.run.deletion_status ? undefined : exactRun.id
+        const taskRuns = items.filter((item) => item.task.id === id && !item.run.deletion_status)
         return taskRuns.find((item) => item.id === item.task.current_run_id)?.id || taskRuns[0]?.id
       }).filter(Boolean) as string[]
       const limitedIds = normalizedIds.slice(0, compareLimit)
       if (limitedIds.join(',') !== selectedIds.join(',')) setSelectedIds(limitedIds)
+      const deletingIds = new Set(items.filter((item) => item.run.deletion_status).map((item) => item.id))
+      if (deletingIds.size) {
+        setRunDetails((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
+        setMetrics((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
+        setMetricErrors((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
+        if (detailRunId && deletingIds.has(detailRunId)) {
+          detailRequest.current?.abort()
+          detailRequest.current = null
+          setDetailRunId(null)
+        }
+      }
       const selectedItems = limitedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
       const results = await Promise.allSettled(selectedItems.map((item) => api.runMetrics(item.task.id, item.run.id, controller.signal)))
       if (version !== requestVersion.current) return
@@ -247,7 +270,7 @@ export function ExperimentCompare() {
       if (activeRequest.current === controller) activeRequest.current = null
       if (!controller.signal.aborted && version === requestVersion.current) setLoading(false)
     }
-  }, [compareLimit, selectedIds])
+  }, [compareLimit, detailRunId, selectedIds])
 
   useEffect(() => {
     let cancelled = false
@@ -279,7 +302,67 @@ export function ExperimentCompare() {
     setBaselineId((current) => next.includes(current) ? current : next[0] || '')
   }
 
+  function removeRunFromComparison(id: string) {
+    invalidateActiveRequest()
+    setSelectedIds((current) => current.filter((value) => value !== id))
+    setBaselineId((current) => current === id ? '' : current)
+    setMetrics((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+    setMetricErrors((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+    setRunDetails((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+  }
+
+  function openDeleteRun(item: ComparisonRun) {
+    if (deletingRunId) return
+    if (activeRunStatuses.has(item.run.status)) {
+      setError('训练进行中不能删除 Attempt，请先停止训练并等待状态稳定。')
+      return
+    }
+    if (item.run.deletion_status === 'pending' || item.run.deletion_status === 'running') return
+    setDeleteError('')
+    setDeleteNotice('')
+    setDeleteTarget(item)
+  }
+
+  async function confirmDeleteRun() {
+    const target = deleteTarget
+    if (!target || deletingRunId) return
+    if (activeRunStatuses.has(target.run.status)) {
+      setDeleteError('训练进行中不能删除 Attempt，请先停止训练并等待状态稳定。')
+      return
+    }
+    setDeletingRunId(target.id)
+    setDeleteError('')
+    try {
+      const result = await api.deleteRun(target.task.id, target.run.id)
+      setExperiments((current) => current.map((item) => item.id === target.id
+        ? { ...item, run: { ...item.run, deletion_status: result.status, deletion_error: null } }
+        : item))
+      removeRunFromComparison(target.id)
+      if (detailRunId === target.id) closeRunDetails()
+      setDeleteTarget(null)
+      setDeleteNotice(result.message || 'Attempt 清理已提交，正在等待后台完成。')
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : '删除 Attempt 失败，请稍后重试')
+    } finally {
+      setDeletingRunId(null)
+    }
+  }
+
   function toggleTask(id: string) {
+    const item = experiments.find((candidate) => candidate.id === id)
+    if (item?.run.deletion_status) return
     if (selectedIds.includes(id)) setSelection(selectedIds.filter((value) => value !== id))
     else if (selectedIds.length < compareLimit) setSelection([...selectedIds, id])
   }
@@ -380,7 +463,8 @@ export function ExperimentCompare() {
   })
   const incompleteTerminalStatuses = new Set(['failed', 'stopped', 'interrupted'])
   const hiddenIncompleteCount = filteredExperiments.filter((item) => incompleteTerminalStatuses.has(item.run.status) && !selectedIds.includes(item.id)).length
-  const visibleExperiments = filteredExperiments.filter((item) => !incompleteTerminalStatuses.has(item.run.status) || includeIncomplete || selectedIds.includes(item.id))
+  const visibleExperiments = filteredExperiments.filter((item) => !incompleteTerminalStatuses.has(item.run.status)
+    || includeIncomplete || selectedIds.includes(item.id) || Boolean(item.run.deletion_status))
   const groupedExperiments = useMemo(() => {
     const knownGroupIds = new Set(groups.map((group) => group.id))
     const views = groups.map((group) => ({
@@ -417,13 +501,19 @@ export function ExperimentCompare() {
           </header>
           {!collapsed && <div id={`compare-picker-group-${group.key}`} className="compare-picker-group-items">{group.items.map((item) => {
             const checked = selectedIds.includes(item.id)
+            const deletionStatus = item.run.deletion_status
+            const isDeleting = deletionStatus === 'pending' || deletionStatus === 'running'
+            const active = activeRunStatuses.has(item.run.status)
+            const deleteDisabled = active || isDeleting || deletingRunId === item.id
+            const deleteTitle = active ? '训练进行中，停止后才能删除 Attempt' : isDeleting ? 'Attempt 文件正在清理' : deletionStatus === 'failed' ? '清理失败，点击重试' : '删除该 Attempt 的训练文件'
             return <div className="compare-run-option" key={item.id}>
               <div className="compare-run-option-row">
-                <button className="compare-run-select" onClick={() => toggleTask(item.id)} disabled={!checked && selectedIds.length >= compareLimit} title={!checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个运行` : undefined}>
+                <button className="compare-run-select" onClick={() => toggleTask(item.id)} disabled={Boolean(deletionStatus) || (!checked && selectedIds.length >= compareLimit)} title={deletionStatus ? `${deletionStatusLabel(deletionStatus)}，不可加入对比` : !checked && selectedIds.length >= compareLimit ? `最多同时选择 ${compareLimit} 个运行` : undefined}>
                   <i className={checked ? 'checked' : ''}>{checked && <Check size={12} />}</i>
-                  <span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small></span>
-                  <em className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</em>
+                  <span><strong>{item.task.name} · Attempt {String(item.run.attempt_number).padStart(3, '0')}</strong><small>{item.view.model_path.split('/').pop()} · Epoch {item.view.completed_epochs}/{item.view.epochs}</small>{deletionStatus && <small className={`compare-run-deletion-state ${deletionStatus === 'failed' ? 'failed' : ''}`} role={deletionStatus === 'failed' ? 'alert' : 'status'}>{deletionStatus === 'failed' ? (item.run.deletion_error || '清理失败，可重试') : `${deletionStatusLabel(deletionStatus)}，已从对比中移除`}</small>}</span>
+                  <em className={`status ${deletionStatus ? `deletion-${deletionStatus}` : item.run.status}`}>{deletionStatus ? deletionStatusLabel(deletionStatus) : statusLabel(item.run.status)}</em>
                 </button>
+                <button type="button" className="compare-run-delete" disabled={deleteDisabled} aria-label={`${deleteTitle}：${item.task.name} Attempt ${item.run.attempt_number}`} title={deleteTitle} onClick={() => openDeleteRun(item)}>{deletingRunId === item.id ? <LoaderCircle size={14} className="spin" /> : <Trash2 size={14} />}</button>
                 <button className="compare-run-details-toggle" aria-haspopup="dialog" aria-expanded={detailRunId === item.id} aria-label={`查看 ${item.task.name} Attempt ${item.run.attempt_number} 详情`} onClick={() => openRunDetails(item)} title="打开运行详情"><Info size={14} /><span>{item.run.status === 'interrupted' ? '中断详情' : item.run.status === 'failed' ? '失败详情' : item.run.status === 'stopped' ? '停止详情' : '查看详情'}</span></button>
               </div>
             </div>
@@ -432,6 +522,14 @@ export function ExperimentCompare() {
       }) : <p className="compare-picker-no-results">没有匹配的训练运行。</p>}</div>
     </div>}
     {detailItem && <CompareRunDetailModal task={detailItem.task} run={detailItem.run} view={detailItem.view} details={runDetails[detailItem.id]} onClose={closeRunDetails} onRefresh={() => void loadRunDetails(detailItem, true)} />}
+    {deleteTarget && <div className="modal-backdrop compare-run-delete-backdrop" onMouseDown={() => !deletingRunId && setDeleteTarget(null)}>
+      <div className="modal compare-run-delete-modal" role="dialog" aria-modal="true" aria-labelledby="compare-run-delete-title" onMouseDown={(event) => event.stopPropagation()}>
+        <header><div className="compare-run-delete-heading"><Trash2 size={19} /><div><span className="eyebrow">DELETE TRAINING ATTEMPT</span><h2 id="compare-run-delete-title">删除训练 Attempt</h2><p>{deleteTarget.task.name} · Attempt {String(deleteTarget.run.attempt_number).padStart(3, '0')}</p></div></div><button type="button" className="icon-button" title="关闭" aria-label="关闭删除 Attempt 弹窗" disabled={Boolean(deletingRunId)} onClick={() => setDeleteTarget(null)}><X size={18} /></button></header>
+        <div className="compare-run-delete-body"><p>此操作会清理该 Attempt 的训练目录、独立日志、权重、指标图表和 Trace 文件。</p><ul><li>保留任务配置、其他 Attempt、基础模型和数据集。</li><li>独立保存的模型检测历史不会删除。</li><li>{deleteTarget.task.execution_node_id ? '远程任务会等待 Agent 确认清理；失败时保留记录并可重试。' : '本地任务会在后台清理；失败时保留记录并可重试。'}</li></ul>{deleteError && <div className="alert error" role="alert">{deleteError}</div>}</div>
+        <footer><span>删除后该 Attempt 将从实验对比中移除。</span><button type="button" className="button ghost" disabled={Boolean(deletingRunId)} onClick={() => setDeleteTarget(null)}>取消</button><button type="button" className="button danger" disabled={Boolean(deletingRunId)} onClick={() => void confirmDeleteRun()}>{deletingRunId ? <><LoaderCircle size={14} className="spin" />提交中…</> : <><Trash2 size={14} />{deleteTarget.run.deletion_status === 'failed' ? '重试清理' : '确认删除 Attempt'}</>}</button></footer>
+      </div>
+    </div>}
+    {deleteNotice && <div className="compare-notice compare-delete-success" role="status"><Check size={17} /><div><strong>Attempt 清理已提交</strong><span>{deleteNotice}</span></div></div>}
     {error && <div className="alert error">{error}</div>}
     {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练运行</strong><span>{compareLimit === 2 ? '请选择 2 个运行' : `可同时选择 2～${compareLimit} 个运行`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练运行</button></div> : <>
       {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个训练运行才能对比</strong><span>当前只有一个运行，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}

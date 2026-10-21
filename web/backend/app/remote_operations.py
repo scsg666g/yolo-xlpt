@@ -27,12 +27,23 @@ from .compute_nodes import (
 )
 from .database import get_db
 from .model_test_storage import delete_task_history
-from .models import Artifact, RemoteOperation, TrainingRun, TrainingTask, utcnow
+from .models import Artifact, ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utcnow
+from .run_deletions import (
+    LEGACY_FLAT_LAYOUT,
+    attempt_delete_operation,
+    delete_attempt_records,
+    is_attempt_payload,
+    remote_attempt_layout,
+    remote_output_root_for_run,
+    validate_attempt_deletion,
+)
 from .services import add_event, artifact_kind
 
 router = APIRouter()
 CACHE_ROOT = DATA_ROOT / "remote-artifacts"
 ACTIVE = {"queued", "starting", "running", "stopping"}
+LEGACY_FLAT_DELETE_AGENT_VERSION = "2.0.1"
+LEGACY_FLAT_DELETE_AGENT_VERSION_PARTS = (2, 0, 1)
 
 
 def operation_file(operation: RemoteOperation, complete: bool = True) -> Path:
@@ -95,9 +106,16 @@ def cached_fetch_digest(
 
 
 def run_payload(run: TrainingRun, task: TrainingTask) -> dict:
+    output_root = remote_output_root_for_run(task, run)
+    layout = None
+    if output_root:
+        try:
+            layout = remote_attempt_layout(task, run)[0]
+        except ValueError:
+            pass
     return {"task_id": task.id, "task_type": task.task_type, "run_id": run.id,
             "attempt_number": run.attempt_number, "run_dir": run.run_dir, "log_path": run.log_path,
-            "output_root": (run.parameter_snapshot or {}).get("remote_output_root")}
+            "output_root": output_root, **({"layout": layout} if layout else {})}
 
 
 def enqueue(db: Session, node_id: str, task_id: str, kind: str, payload: dict) -> RemoteOperation:
@@ -110,6 +128,20 @@ def enqueue(db: Session, node_id: str, task_id: str, kind: str, payload: dict) -
 
 def queue_scan(db: Session, task: TrainingTask, run: TrainingRun) -> None:
     if not run.execution_node_id or not run.run_dir or task.deleted_at:
+        return
+    try:
+        if remote_attempt_layout(task, run)[0] == LEGACY_FLAT_LAYOUT:
+            # Scanning the legacy task container would incorrectly attribute
+            # newer attempt-NNN children to Attempt 001. Legacy outputs already
+            # indexed by the center remain available until deletion.
+            return
+    except ValueError:
+        return
+    if any(
+        operation.kind == "delete" and operation.status in {"pending", "running"}
+        and is_attempt_payload(operation.payload, run.id)
+        for operation in db.scalars(select(RemoteOperation).where(RemoteOperation.task_id == task.id))
+    ):
         return
     latest = db.scalar(select(RemoteOperation).where(
         RemoteOperation.task_id == task.id, RemoteOperation.kind == "scan",
@@ -140,17 +172,63 @@ def queue_delete(db: Session, task: TrainingTask) -> None:
     add_event(db, task.id, "remote_delete_queued", "等待远程 Agent 清理该任务文件；确认后删除记录")
 
 
-def live_protected_paths(db: Session, node_id: str, deleting_task_id: str) -> list[str]:
+def queue_attempt_delete(db: Session, task: TrainingTask, run: TrainingRun) -> RemoteOperation:
+    """Queue one remote Attempt for Agent cleanup while retaining its task."""
+    validate_attempt_deletion(db, task, run)
+    if not task.execution_node_id:
+        raise ValueError("本机 Attempt 应使用本机删除队列")
+    if run.execution_node_id not in {None, task.execution_node_id}:
+        raise ValueError("Attempt 所属远程节点与任务不一致，已拒绝清理")
+    node = db.get(ComputeNode, task.execution_node_id)
+    if not node or not agent_version_at_least(node.agent_version):
+        raise ValueError(f"远程 Agent 版本过低或节点不存在，请升级到 {REQUIRED_AGENT_VERSION} 或以上版本后重试")
+    payload_run = run_payload(run, task)
+    if not payload_run["output_root"]:
+        raise ValueError("远程 Attempt 缺少可验证的输出根目录，请检查远程训练路径配置")
+    if payload_run.get("layout") == LEGACY_FLAT_LAYOUT and not agent_version_at_least(
+        node.agent_version, LEGACY_FLAT_DELETE_AGENT_VERSION_PARTS,
+    ):
+        raise ValueError(
+            f"旧版平铺 Attempt 需要远程 Agent {LEGACY_FLAT_DELETE_AGENT_VERSION} "
+            "或以上版本才能安全单独清理"
+        )
+    if active_remote_delete(db, task.execution_node_id):
+        raise ValueError("该远程服务器正在清理其他任务文件，请稍后重试")
+    payload = {
+        "scope": "attempt",
+        "run_id": run.id,
+        "attempt_number": run.attempt_number,
+        "runs": [payload_run],
+        "protected_paths": live_protected_paths(db, task.execution_node_id, task.id, deleting_run_id=run.id),
+    }
+    operation = enqueue(db, task.execution_node_id, task.id, "delete", payload)
+    add_event(db, task.id, "run_delete_queued", f"已提交远程 Attempt {run.attempt_number:03d} 文件清理", run_id=run.id)
+    return operation
+
+
+def live_protected_paths(
+    db: Session,
+    node_id: str,
+    deleting_task_id: str,
+    *,
+    deleting_run_id: str | None = None,
+) -> list[str]:
     """Return current references that a queued remote deletion must preserve."""
     protected: set[str] = set()
-    tasks = db.scalars(select(TrainingTask).where(
-        TrainingTask.execution_node_id == node_id,
-        TrainingTask.id != deleting_task_id,
-    ))
+    tasks = db.scalars(select(TrainingTask).where(TrainingTask.execution_node_id == node_id))
     for task in tasks:
+        if task.id == deleting_task_id and deleting_run_id is None:
+            continue
+        # Task resources are shared by all its Attempts and must never be
+        # removed by an Attempt-scoped operation.
         protected.update(path for path in (task.model_path, task.data_path) if path)
         for run in task.runs:
+            if task.id == deleting_task_id and deleting_run_id and run.id == deleting_run_id:
+                continue
             protected.update(path for path in (run.model_path, run.data_path, run.checkpoint_path) if path)
+            protected.update(
+                artifact.path for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id))
+            )
     return sorted(protected)
 
 
@@ -188,6 +266,8 @@ def report_artifacts(node_id: str, run_id: str, payload: Manifest, request: Requ
     task = db.get(TrainingTask, run.task_id)
     if not task or task.deleted_at:
         raise HTTPException(409, "任务已进入回收站，停止同步产物")
+    if attempt_delete_operation(db, run, active_only=True):
+        raise HTTPException(409, "该 Attempt 已进入清理队列，停止同步产物")
     paths = []
     for item in payload.items:
         relative = PurePosixPath(item.name)
@@ -239,8 +319,23 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
     operation_payload = operation.payload
     if operation.kind == "delete":
         task = db.get(TrainingTask, operation.task_id)
-        if (not task or task.execution_node_id != node_id or task.status in ACTIVE or
-                task.deleted_reason != "remote_delete_pending"):
+        attempt_scope = (operation.payload or {}).get("scope") == "attempt"
+        target_run = db.get(TrainingRun, (operation.payload or {}).get("run_id")) if attempt_scope else None
+        invalid_attempt = (
+            attempt_scope and (
+                not task or not target_run or target_run.task_id != operation.task_id
+                or task.execution_node_id != node_id
+                or target_run.execution_node_id not in {None, node_id}
+                or target_run.status in ACTIVE
+            )
+        )
+        invalid_task = (
+            not attempt_scope and (
+                not task or task.execution_node_id != node_id or task.status in ACTIVE
+                or task.deleted_reason != "remote_delete_pending"
+            )
+        )
+        if invalid_attempt or invalid_task:
             cancelled = db.execute(update(RemoteOperation).where(
                 RemoteOperation.id == operation.id,
                 RemoteOperation.status == operation.status,
@@ -255,7 +350,12 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
         # references immediately before dispatch so newly-created tasks are safe.
         operation_payload = {
             **operation.payload,
-            "protected_paths": live_protected_paths(db, node_id, operation.task_id),
+            "protected_paths": live_protected_paths(
+                db,
+                node_id,
+                operation.task_id,
+                deleting_run_id=(operation.payload or {}).get("run_id") if attempt_scope else None,
+            ),
         }
     lease = secrets.token_hex(16)
     claimed = db.execute(update(RemoteOperation).where(
@@ -299,7 +399,52 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
     if not payload.success and operation.kind == "fetch":
         operation_file(operation, False).unlink(missing_ok=True)
     task = db.get(TrainingTask, operation.task_id)
+    attempt_scope = operation.kind == "delete" and (operation.payload or {}).get("scope") == "attempt"
+    target_run = db.get(TrainingRun, (operation.payload or {}).get("run_id")) if attempt_scope else None
+    if attempt_scope:
+        if (
+            not task or not target_run or target_run.task_id != operation.task_id
+            or task.execution_node_id != node_id
+            or target_run.execution_node_id not in {None, node_id}
+            or target_run.status in ACTIVE
+        ):
+            raise HTTPException(409, "该 Attempt 当前不能永久删除")
+        try:
+            validate_attempt_deletion(db, task, target_run, ignore_operation_id=operation.id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
     if operation.kind == "delete" and task:
+        if attempt_scope:
+            if payload.success:
+                try:
+                    trace_root = remote_trace_root(target_run.id)
+                    if trace_root.exists() or trace_root.is_symlink():
+                        shutil.rmtree(trace_root)
+                    related_operations = list(db.scalars(select(RemoteOperation).where(
+                        RemoteOperation.task_id == task.id,
+                    )))
+                    for other in related_operations:
+                        # Fetch operations keep the run id in their payload but
+                        # are not deletion payloads. Remove their center cache
+                        # as well so a deleted Attempt cannot leave a stale
+                        # weight available for later downloads.
+                        same_run = (other.payload or {}).get("run_id") == target_run.id
+                        if other.id == operation.id or is_attempt_payload(other.payload, target_run.id) or same_run:
+                            for path in (operation_file(other), operation_file(other, False)):
+                                path.unlink(missing_ok=True)
+                    delete_attempt_records(db, task.id, target_run.id)
+                    add_event(db, task.id, "run_deleted", f"远程 Attempt {operation.payload.get('attempt_number', '')} 已删除")
+                except Exception as exc:
+                    detail = f"{type(exc).__name__}: {exc}"[-1600:]
+                    operation.status = "failed"
+                    operation.error = f"中心关联数据清理失败：{detail}"
+                    add_event(db, task.id, "run_delete_failed", operation.error, "error")
+            else:
+                operation.status = "failed"
+                operation.error = "远程文件清理失败：" + (payload.error or "未知错误")
+                add_event(db, task.id, "run_delete_failed", operation.error, "error")
+            db.commit()
+            return {"status": operation.status}
         if task.status in ACTIVE or task.deleted_reason != "remote_delete_pending":
             raise HTTPException(409, "任务当前不能永久删除")
         if payload.success:
@@ -358,6 +503,8 @@ def prepare_artifact(artifact_id: int, retry: bool = False, db: Session = Depend
     run = db.get(TrainingRun, artifact.run_id)
     if not run or not run.execution_node_id:
         return {"status": "ready"}
+    if attempt_delete_operation(db, run, active_only=True):
+        raise HTTPException(409, "该 Attempt 已进入清理队列，不能准备远程权重")
     operation = matching_fetch(db, artifact)
     if operation and operation.status == "succeeded":
         digest, cache_error = cached_fetch_digest(operation)

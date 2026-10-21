@@ -47,7 +47,7 @@ from .gpu_reservations import (
     reserve_gpu_resources,
     resolve_gpu_assignments,
 )
-from .models import Artifact, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .models import Artifact, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .parameter_catalog import training_parameter_keys
 
 
@@ -210,7 +210,19 @@ def remote_log_path(output_root: str, task_id: str, attempt_number: int, when: d
 def create_training_run(
     db, task: TrainingTask, launch_mode: str, checkpoint_path: Path | None = None,
 ) -> TrainingRun:
-    attempt = (db.scalar(select(func.max(TrainingRun.attempt_number)).where(TrainingRun.task_id == task.id)) or 0) + 1
+    attempt = db.scalar(select(func.max(TrainingRun.attempt_number)).where(TrainingRun.task_id == task.id)) or 0
+    # Keep Attempt numbers monotonic after a deleted run.  Completed deletion
+    # operations are durable tombstones, so a later run cannot reuse an old
+    # directory/log identity and be confused with historical records.
+    for operation in db.scalars(select(RemoteOperation).where(RemoteOperation.task_id == task.id)):
+        payload = operation.payload or {}
+        if payload.get("scope") != "attempt":
+            continue
+        try:
+            attempt = max(attempt, int(payload.get("attempt_number", 0)))
+        except (TypeError, ValueError):
+            continue
+    attempt += 1
     attempt_name = f"attempt-{attempt:03d}"
     run = TrainingRun(
         id=uuid.uuid4().hex,
@@ -591,6 +603,14 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
     run = run or current_run(db, task)
     if not run or run.execution_node_id or not run.run_dir:
         return
+    if any(
+        operation.kind in {"local_delete", "delete"}
+        and operation.status in {"pending", "running"}
+        and (operation.payload or {}).get("scope") == "attempt"
+        and (operation.payload or {}).get("run_id") == run.id
+        for operation in db.scalars(select(RemoteOperation).where(RemoteOperation.task_id == task.id))
+    ):
+        return
     csv_path = Path(run.run_dir) / "results.csv"
     if not csv_path.exists():
         return
@@ -691,6 +711,14 @@ def effective_best_weight(db, run: TrainingRun) -> tuple[Artifact | None, Traini
 def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> None:
     run = run or current_run(db, task)
     if not run or run.execution_node_id or not run.run_dir:
+        return
+    if any(
+        operation.kind in {"local_delete", "delete"}
+        and operation.status in {"pending", "running"}
+        and (operation.payload or {}).get("scope") == "attempt"
+        and (operation.payload or {}).get("run_id") == run.id
+        for operation in db.scalars(select(RemoteOperation).where(RemoteOperation.task_id == task.id))
+    ):
         return
     root = Path(run.run_dir)
     known = {

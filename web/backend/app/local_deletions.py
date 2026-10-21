@@ -11,7 +11,13 @@ from sqlalchemy.orm import selectinload
 
 from .database import SessionLocal
 from .model_test_storage import delete_task_history
-from .models import RemoteOperation, TrainingTask, utcnow
+from .models import RemoteOperation, TrainingRun, TrainingTask, utcnow
+from .run_deletions import (
+    delete_attempt_files,
+    delete_attempt_records,
+    is_attempt_payload,
+    validate_attempt_deletion,
+)
 from .services import add_event, permanently_delete_task_files
 
 logger = logging.getLogger("yolo-platform.local-deletions")
@@ -19,11 +25,12 @@ LOCAL_NODE_ID = "__local__"
 
 
 def queue_local_delete(db, task: TrainingTask) -> RemoteOperation:
-    existing = db.scalar(select(RemoteOperation).where(
+    operations = db.scalars(select(RemoteOperation).where(
         RemoteOperation.task_id == task.id,
         RemoteOperation.kind == "local_delete",
         RemoteOperation.status.in_(["pending", "running"]),
-    ))
+    )).all()
+    existing = next((operation for operation in operations if (operation.payload or {}).get("scope") != "attempt"), None)
     if existing:
         return existing
     operation = RemoteOperation(
@@ -35,6 +42,28 @@ def queue_local_delete(db, task: TrainingTask) -> RemoteOperation:
     task.deleted_reason = "local_delete_pending"
     task.error_message = None
     add_event(db, task.id, "local_delete_queued", "已提交本机训练文件清理")
+    return operation
+
+
+def queue_local_run_delete(db, task: TrainingTask, run: TrainingRun) -> RemoteOperation:
+    """Queue cleanup for one local Attempt without moving the task to trash."""
+    validate_attempt_deletion(db, task, run)
+    operation = RemoteOperation(
+        id=uuid.uuid4().hex,
+        node_id=LOCAL_NODE_ID,
+        task_id=task.id,
+        kind="local_delete",
+        status="pending",
+        payload={
+            "scope": "attempt",
+            "run_id": run.id,
+            "attempt_number": run.attempt_number,
+            "run_dir": run.run_dir,
+            "log_path": run.log_path,
+        },
+    )
+    db.add(operation)
+    add_event(db, task.id, "run_delete_queued", f"已提交本机 Attempt {run.attempt_number:03d} 文件清理", run_id=run.id)
     return operation
 
 
@@ -81,7 +110,21 @@ class LocalDeletionWorker:
                         operation.error = error
                         operation.updated_at = utcnow()
                     if task:
-                        if error:
+                        payload = operation.payload if operation else {}
+                        run_id = payload.get("run_id") if payload.get("scope") == "attempt" else None
+                        if run_id:
+                            if error:
+                                add_event(db, task.id, "run_delete_failed", f"Attempt 文件清理失败：{error}", "error")
+                            else:
+                                try:
+                                    delete_attempt_records(db, task.id, run_id)
+                                except Exception as exc:
+                                    operation.status = "failed"
+                                    operation.error = f"中心记录清理失败：{type(exc).__name__}: {exc}"
+                                    add_event(db, task.id, "run_delete_failed", f"Attempt 记录清理失败：{operation.error}", "error")
+                                else:
+                                    add_event(db, task.id, "run_deleted", f"Attempt {payload.get('attempt_number', '')} 已删除")
+                        elif error:
                             task.deleted_reason = "local_delete_failed"
                             task.error_message = f"本机文件清理失败：{error}"
                             add_event(db, task.id, "local_delete_failed", task.error_message, "error")
@@ -112,6 +155,8 @@ class LocalDeletionWorker:
     def process_one(self) -> bool:
         """Claim one operation, remove files without holding a DB transaction, then record result."""
         task_snapshot = None
+        run_snapshot = None
+        preflight_error = None
         operation_id = None
         try:
             with self.session_factory() as db:
@@ -135,6 +180,21 @@ class LocalDeletionWorker:
                     TrainingTask.id == operation.task_id,
                 ).options(selectinload(TrainingTask.runs)))
                 if task_snapshot:
+                    if is_attempt_payload(operation.payload, operation.payload.get("run_id", "")):
+                        run_id = operation.payload.get("run_id")
+                        run_snapshot = next((item for item in task_snapshot.runs if item.id == run_id), None)
+                        if run_snapshot is None:
+                            preflight_error = "待清理 Attempt 记录不存在"
+                        else:
+                            try:
+                                validate_attempt_deletion(
+                                    db,
+                                    task_snapshot,
+                                    run_snapshot,
+                                    ignore_operation_id=operation.id,
+                                )
+                            except ValueError as exc:
+                                preflight_error = str(exc)
                     db.expunge(task_snapshot)
         except Exception:
             # A failure after claiming must not strand the row in "running".
@@ -145,6 +205,13 @@ class LocalDeletionWorker:
         error = None
         if task_snapshot is None:
             error = "待清理任务记录不存在"
+        elif preflight_error:
+            error = preflight_error
+        elif run_snapshot:
+            try:
+                delete_attempt_files(task_snapshot, run_snapshot)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
         else:
             try:
                 permanently_delete_task_files(task_snapshot)
