@@ -24,6 +24,13 @@ export interface PlatformHealth {
   runs_root: string
 }
 
+export interface PlatformStorageHealth {
+  path: string
+  status: 'writable' | 'read_only' | 'missing' | 'not_directory' | 'unavailable'
+  free_bytes: number | null
+  total_bytes: number | null
+}
+
 export interface TrainingTask {
   id: string
   name: string
@@ -233,6 +240,7 @@ export interface ComputeNode extends ComputeNodeSettings {
   sampled_at: string | null
   agent_version: string | null
   required_agent_version: string
+  training_version_supported?: boolean
   process_attribution_supported: boolean
   required_process_attribution_agent_version: string
   training_unavailable_reason: string | null
@@ -245,6 +253,7 @@ export interface ComputeNode extends ComputeNodeSettings {
     python_version: string | null
     output_writable: boolean
     output_roots?: string[]
+    model_test_roots?: string[]
     lock_occupied: boolean
     gpu_parallelism?: boolean
   } | null
@@ -337,6 +346,19 @@ export interface TrainingParameterDefinition {
 
 export type ModelAssetSourceType = 'local_path' | 'remote_path'
 export type ModelAssetStatus = 'preparing' | 'ready' | 'failed'
+export type YoloTaskType = 'detect' | 'segment' | 'classify' | 'pose' | 'obb'
+
+export interface ModelPrediction {
+  class_id?: number
+  class_name: string
+  confidence: number
+  bbox_xyxy?: number[]
+  mask_available?: boolean
+  mask_polygon_xy?: number[][]
+  keypoints?: Array<{ index: number; x: number; y: number; confidence: number | null }>
+  obb_points?: number[][]
+  obb_xywhr?: number[]
+}
 
 export interface ModelAsset {
   id: string
@@ -378,6 +400,7 @@ export interface ModelTest {
   model_name?: string | null
   model_sha256?: string | null
   model_size?: number | null
+  task_type?: YoloTaskType | null
   rerun_of_test_id?: string | null
   attempt_number?: number | null
   source_attempt_number?: number | null
@@ -405,6 +428,7 @@ export interface ModelTest {
     execution_node_id?: string | null
     execution_node_name?: string | null
     task_name?: string | null
+    task_type?: YoloTaskType | null
     sha256?: string | null
     history_group?: {
       kind: 'task_group' | 'ungrouped' | 'standalone_model'
@@ -421,13 +445,14 @@ export interface ModelTest {
     size: number
     uploaded: boolean
     detections: number | null
-    objects: Array<{ class_id: number; class_name: string; confidence: number; bbox_xyxy: number[] }>
+    prediction_count?: number | null
+    objects: ModelPrediction[]
     timings: { preprocess?: number; inference?: number; postprocess?: number }
   }>
 }
 
 export interface ModelTestSummary extends Omit<ModelTest, 'timings' | 'files'> {
-  files: Array<Pick<ModelTest['files'][number], 'name' | 'size' | 'uploaded' | 'detections'>>
+  files: Array<Pick<ModelTest['files'][number], 'name' | 'size' | 'uploaded' | 'detections' | 'prediction_count'>>
 }
 
 export interface ModelTestPage {

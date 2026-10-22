@@ -845,6 +845,38 @@ button { color: inherit; }
 .settings-service-details { margin-top: 0; }
 .settings-path-grid { max-width: 680px; }
 .settings-readonly-note { margin: -12px 0 0; color: var(--muted); font-size: 10px; }
+.settings-overview-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 4px; }
+.settings-overview-actions > span { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; }
+.settings-inline-status, .settings-inline-error, .settings-empty-state { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.settings-inline-status { color: var(--green); }
+.settings-inline-error { color: #a66c19; }
+:root[data-theme='dark'] .settings-inline-error { color: #f2c274; }
+.settings-subsection-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding-top: 6px; border-top: 1px solid var(--line); }
+.settings-subsection-heading h4 { margin: 0; color: var(--text); font-size: 11px; }
+.settings-subsection-heading > span { color: var(--muted); font-size: 9px; text-align: right; }
+.settings-node-list, .settings-storage-nodes { display: grid; }
+.settings-node-row, .settings-storage-node { min-width: 0; display: grid; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.settings-node-primary, .settings-storage-node-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.settings-node-primary strong, .settings-storage-node-heading strong { color: var(--text); font-size: 10px; }
+.settings-status-badge { display: inline-flex; align-items: center; min-height: 20px; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); background: var(--panel-2); font-size: 8px; white-space: nowrap; }
+.settings-status-badge.online { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--line)); background: color-mix(in srgb, var(--green) 8%, var(--panel)); }
+.settings-status-badge.offline, .settings-status-badge.disabled { color: #bd5960; border-color: color-mix(in srgb, #bd5960 34%, var(--line)); background: color-mix(in srgb, #bd5960 8%, var(--panel)); }
+:root[data-theme='dark'] .settings-status-badge.offline, :root[data-theme='dark'] .settings-status-badge.disabled { color: #ff9a9e; }
+.settings-status-badge.pending { color: #a66c19; border-color: color-mix(in srgb, #c28b36 34%, var(--line)); background: color-mix(in srgb, #c28b36 8%, var(--panel)); }
+:root[data-theme='dark'] .settings-status-badge.pending { color: #f2c274; }
+.settings-node-details { display: flex; flex-wrap: wrap; gap: 7px 16px; color: var(--muted); font-size: 9px; }
+.settings-capability.warning { color: #a66c19; }
+:root[data-theme='dark'] .settings-capability.warning { color: #f2c274; }
+.settings-node-row > small, .settings-storage-node > small { color: var(--muted); font-size: 9px; }
+.settings-storage-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); background: var(--panel-2); font-size: 10px; }
+.settings-storage-summary strong { color: var(--text); }
+.settings-storage-summary.ready strong { color: var(--green); }
+.settings-storage-summary.warning strong { color: #a66c19; }
+:root[data-theme='dark'] .settings-storage-summary.warning strong { color: #f2c274; }
+.settings-storage-node details { color: var(--muted); font-size: 9px; }
+.settings-storage-node summary { width: fit-content; cursor: pointer; }
+.settings-storage-roots { display: grid; gap: 6px; margin-top: 8px; }
+.settings-storage-roots code { color: var(--text); font: 400 9px "DM Mono", monospace; overflow-wrap: anywhere; }
 
 @media (max-width: 760px) {
   .platform-settings-modal { width: min(680px, calc(100vw - 20px)); height: min(780px, calc(100dvh - 20px)); min-height: min(460px, calc(100dvh - 20px)); }
@@ -863,4 +895,11 @@ button { color: inherit; }
   .platform-settings-modal .compare-limit-setting { padding: 11px; }
   .platform-settings-modal .compare-limit-controls { gap: 5px; }
   .platform-settings-modal > footer { padding: 12px 14px; }
+}
+
+@media (max-width: 520px) {
+  .settings-overview-actions, .settings-storage-summary { align-items: flex-start; flex-direction: column; }
+  .settings-subsection-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+  .settings-subsection-heading > span { text-align: left; }
+  .settings-node-details { flex-direction: column; gap: 5px; }
 }

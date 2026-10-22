@@ -269,6 +269,7 @@ def test_remote_online_status_uses_center_receive_time_when_agent_clock_lags(mon
     detail = client.get(f"/api/compute/nodes/{credential['node']['id']}").json()
     assert detail["status"] == "online"
     assert detail["required_agent_version"] == "1.8.0"
+    assert detail["training_version_supported"] is True
     assert detail["training_unavailable_reason"] is None
 
 
@@ -284,12 +285,15 @@ def test_serialized_node_uses_platform_training_gate_over_agent_ready_flag(monit
 
     detail = client.get(f"/api/compute/nodes/{node_id}").json()
     assert detail["training"]["ready"] is True
+    assert detail["training_version_supported"] is False
     assert detail["training_unavailable_reason"] == "请将远程 Agent 升级到 1.8.0 或以上版本"
 
     current = sample()
     assert client.post(f"/api/compute/nodes/{node_id}/report",
                        headers=headers(credential), json=current).status_code == 200
-    assert client.get(f"/api/compute/nodes/{node_id}").json()["training_unavailable_reason"] is None
+    current_detail = client.get(f"/api/compute/nodes/{node_id}").json()
+    assert current_detail["training_version_supported"] is True
+    assert current_detail["training_unavailable_reason"] is None
 
 
 def test_agent_download_and_cpu_report_schema(monitoring_client, tmp_path, monkeypatch):

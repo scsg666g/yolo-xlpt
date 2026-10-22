@@ -521,6 +521,9 @@ def serialize_node(node: ComputeNode, *, detail: bool = False, db: Session | Non
         "last_seen_at": as_utc(last_seen).isoformat() if last_seen else None,
         "sampled_at": snapshot.get("sampled_at"), "agent_version": node.agent_version,
         "required_agent_version": REQUIRED_AGENT_VERSION,
+        "training_version_supported": (
+            node.kind == "local" or agent_version_at_least(node.agent_version)
+        ),
         "training_unavailable_reason": (
             remote_training_unavailable_reason(node) if node.kind == "agent" else None
         ),

@@ -13,6 +13,7 @@ import { EditParametersModal } from './EditParametersModal'
 import { EditResourceModal } from './EditResourceModal'
 import { LogViewerModal } from './LogViewerModal'
 import { ModelTestModal } from './ModelTestModal'
+import { isSupportedModelTestTask, modelTestMetrics } from './ModelTestShared'
 import { TrainingTraceModal } from './TrainingTraceModal'
 
 const nodeTypes = { panel: CanvasNode }
@@ -284,16 +285,17 @@ function TaskCanvasInner() {
     ? `继承自 Attempt ${String(effectiveBestWeight.source_attempt_number).padStart(3, '0')}` : ''
   const modelTestAttempt = inheritedBestWeight ? effectiveBestWeight?.source_attempt_number : selectedRun?.attempt_number
   const modelTestBestMetric = useMemo(() => {
-    if (inheritedBestWeight) return null
+    if (inheritedBestWeight || !isSupportedModelTestTask(viewTask?.task_type)) return null
+    const metricKey = modelTestMetrics[viewTask.task_type].key
     let best: { epoch: number; value: number } | null = null
     for (const point of metrics) {
-      const value = point.values['metrics/mAP50-95(B)']
+      const value = point.values[metricKey]
       if (typeof value === 'number' && Number.isFinite(value) && (!best || value > best.value)) best = { epoch: point.epoch, value }
     }
     return best
-  }, [inheritedBestWeight, metrics])
+  }, [inheritedBestWeight, metrics, viewTask?.task_type])
   const lastWeight = weightArtifacts.find((artifact) => artifact.name.split('/').pop() === 'last.pt')
-  const testDisabledReason = viewTask?.task_type !== 'detect' ? '目前支持目标检测模型'
+  const testDisabledReason = !isSupportedModelTestTask(viewTask?.task_type) ? '当前模型任务类型暂不支持图片测试'
     : ['queued', 'starting', 'running', 'stopping'].includes(viewTask?.status || '') ? '训练结束或停止后可测试' : null
   const syncAge = Math.max(0, Math.floor((clock - lastSyncedAt) / 1000))
   const outputAge = Math.max(0, Math.floor((clock - lastOutputAt) / 1000))
@@ -326,7 +328,7 @@ function TaskCanvasInner() {
     logs: { title: '实时训练日志', kicker: 'LIVE OUTPUT · 双击放大', icon: <Terminal size={17} />, accent: '#95a3b3', pulse: isCurrentRun && motionAllowed ? logPulse : undefined, content: <><pre className="log-view">{logs.length ? logs.slice(-18).map((line, index, visibleLines) => <span key={index} className={index === visibleLines.length - 1 && isCurrentRun && logPulse ? `log-new-line log-flash-${logPulse}` : ''}>{line}{index < visibleLines.length - 1 ? '\n' : ''}</span>) : '等待训练日志…'}</pre><div className="node-edit-hint"><Maximize size={12} />双击打开大屏日志</div></> },
     trace: { title: '训练过程解析', kicker: 'TRAINING TRACE · 双击打开', icon: <Workflow size={17} />, accent: '#f08bba', content: <><div className="trace-node-summary"><div><strong>真实 Batch</strong><span>输入 · 损失 · 梯度</span></div><div><strong>本机检测</strong><span>按需采样</span></div></div><div className="node-edit-hint"><Maximize size={12} />双击打开逐步解析</div></> },
     artifacts: { title: '训练产物', kicker: 'ARTIFACTS · 双击查看', icon: <FileArchive size={17} />, accent: '#ffd56d', pulse: isCurrentRun && motionAllowed ? artifactPulse : undefined, content: regularArtifacts.length ? <div className="artifact-list">{regularArtifacts.slice(0, 12).map((item) => <div key={item.id} className={isCurrentRun && newArtifactIds.includes(item.id) ? `artifact-updated artifact-flash-${artifactPulse}` : ''}><FileText size={14} /><span>{item.name}{isCurrentRun && newArtifactIds.includes(item.id) && <em>已更新</em>}</span><small>{formatBytes(item.size)}</small></div>)}</div> : <div className="node-empty">暂无训练产物</div> },
-    inference: { title: '模型测试', kicker: 'MODEL TEST · 双击打开', icon: <ScanEye size={17} />, accent: '#b3a0ff', content: <>{row('测试权重', bestWeight ? `best.pt${bestWeightOrigin ? ` · ${bestWeightOrigin}` : ''}` : '等待训练生成')}{row('检测方式', '图片 · 置信度筛选')}<div className="node-edit-hint"><Maximize size={12} />原图对比 · 双击放大 · 下载结果</div><button className="button ghost nodrag nowheel model-test-node-button" title={bestWeight && !testDisabledReason ? '打开模型测试' : '查看历史记录'} onDoubleClick={(event) => event.stopPropagation()} onClick={() => { setTestingArtifact(bestWeight || null); setModelTestOpen(true) }}><ScanEye size={14} />{bestWeight && !testDisabledReason ? '测试模型' : '历史记录'}</button></> },
+    inference: { title: '模型测试', kicker: 'MODEL TEST · 双击打开', icon: <ScanEye size={17} />, accent: '#b3a0ff', content: <>{row('测试权重', bestWeight ? `best.pt${bestWeightOrigin ? ` · ${bestWeightOrigin}` : ''}` : '等待训练生成')}{row('测试方式', '图片 · 置信度筛选')}<div className="node-edit-hint"><Maximize size={12} />原图对比 · 双击放大 · 下载结果</div><button className="button ghost nodrag nowheel model-test-node-button" title={bestWeight && !testDisabledReason ? '打开模型测试' : '查看历史记录'} onDoubleClick={(event) => event.stopPropagation()} onClick={() => { setTestingArtifact(bestWeight || null); setModelTestOpen(true) }}><ScanEye size={14} />{bestWeight && !testDisabledReason ? '测试模型' : '历史记录'}</button></> },
   } : null, [viewTask, isCurrentRun, selectedRun, metrics, regularArtifacts, logs, latest, nodeActivity, epochPulse, logPulse, artifactPulse, motionAllowed, newArtifactIds, bestWeight, bestWeightOrigin, lastWeight, testDisabledReason, displayedDataPath, displayedModelPath, dataPathChanged, modelPathChanged, remoteResource, resourceConfig])
 
   useEffect(() => {
@@ -503,7 +505,7 @@ function TaskCanvasInner() {
     <LogViewerModal task={viewTask} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
     <CanvasDetailModal kind={detailKind} task={viewTask} run={selectedRun} metrics={metrics} artifacts={artifacts} effectiveBestWeight={effectiveBestWeight} events={events} onClose={() => setDetailKind(null)} onTest={(artifact) => { setDetailKind(null); setTestingArtifact(artifact); setModelTestOpen(true) }} testDisabledReason={testDisabledReason} />
     <TrainingTraceModal task={viewTask} run={selectedRun} open={viewingTrace} onClose={() => setViewingTrace(false)} />
-    {modelTestOpen && <ModelTestModal key={testingArtifact?.id || 'history'} artifact={testingArtifact} taskId={task.id} taskName={task.name} runId={selectedRun?.id || null} attemptNumber={modelTestAttempt} bestMetric={modelTestBestMetric} newTestDisabledReason={testDisabledReason} onClose={() => setModelTestOpen(false)} />}
+    {modelTestOpen && <ModelTestModal key={testingArtifact?.id || 'history'} artifact={testingArtifact} taskId={task.id} taskName={task.name} taskType={viewTask.task_type} runId={selectedRun?.id || null} attemptNumber={modelTestAttempt} bestMetric={modelTestBestMetric} newTestDisabledReason={testDisabledReason} onClose={() => setModelTestOpen(false)} />}
   </div>
 }
 

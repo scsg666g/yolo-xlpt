@@ -10,8 +10,8 @@ import type {
   TaskGroup, TrainingRun, TrainingTask,
 } from '../types'
 import {
-  activeModelTestStatuses, modelTestDate, modelTestDetectionLabel, modelTestStatusLabels,
-  modelTestWeightName, type SelectedImage, TestWorkspace,
+  activeModelTestStatuses, modelTestDate, modelTestParameterText, modelTestResultLabel, modelTestStatusLabels,
+  modelTestTaskLabel, modelTestTaskType, modelTestWeightName, type SelectedImage, TestWorkspace,
 } from './ModelTestShared'
 import { RegisteredModelLibrary, TrainingTaskLibrary } from './ModelLibrary'
 import '../model-tests.css'
@@ -352,7 +352,7 @@ export function ModelTests() {
       const detail = await api.modelTest(id, abort.signal)
       if (!abort.signal.aborted) setHistoryDetails((current) => ({ ...current, [id]: detail }))
     } catch (reason) {
-      if (!abort.signal.aborted) setHistoryError(reason instanceof Error ? reason.message : '加载检测详情失败')
+      if (!abort.signal.aborted) setHistoryError(reason instanceof Error ? reason.message : '加载测试详情失败')
     } finally {
       if (!abort.signal.aborted) setHistoryDetailLoading(false)
     }
@@ -592,7 +592,7 @@ export function ModelTests() {
         setRunStage('正在准备模型副本…')
         asset = await waitForAssetReady(asset, signal, asset.status === 'failed')
       }
-      setRunStage('正在创建检测记录…')
+      setRunStage('正在创建测试记录…')
       const created = rerun?.artifact_id
         ? await api.createModelTest(
           rerun.artifact_id, confidence, iou, files, signal, rerun.run_id || undefined, rerun.id,
@@ -613,7 +613,7 @@ export function ModelTests() {
         setRunStage(`正在上传 ${index + 1}/${files.length}：${files[index].name}`)
         await api.uploadModelTestImage(created.id, index, files[index], signal)
       }
-      setRunStage('正在提交检测…')
+      setRunStage('正在提交测试…')
       let current = await api.startModelTest(created.id, signal)
       lastKnown = current
       pendingUploadId.current = null
@@ -622,10 +622,10 @@ export function ModelTests() {
       while (true) {
         lastKnown = current
         setTest(current); setRunStage(modelTestStatusLabels[current.status])
-        if (current.status === 'failed') throw new Error(current.error || '检测失败')
-        if (current.status === 'cancelled') throw new Error('检测已取消')
+        if (current.status === 'failed') throw new Error(current.error || '测试失败')
+        if (current.status === 'cancelled') throw new Error('测试已取消')
         if (current.status === 'completed') break
-        if (Date.now() > deadline) throw new Error('等待检测超时，任务会继续运行，请稍后在历史记录中查看')
+        if (Date.now() > deadline) throw new Error('等待测试超时，任务会继续运行，请稍后在历史记录中查看')
         await sleep(1500, signal)
         current = await api.modelTest(created.id, signal)
       }
@@ -658,7 +658,7 @@ export function ModelTests() {
           setRunStage(`${modelTestStatusLabels[lastKnown.status]} · 本页状态同步中断`)
           setRunError(uploadIncomplete
             ? `${message}；图片上传或提交状态待确认，可取消本次上传后重试`
-            : `${message}；检测已提交到后台并会继续运行，请在全局历史中刷新查看`)
+            : `${message}；测试已提交到后台并会继续运行，请在全局历史中刷新查看`)
         } else {
           setRunError(message)
           setRunStage(modelTestStatusLabels.failed)
@@ -689,10 +689,10 @@ export function ModelTests() {
         try {
           const current = await api.modelTest(id, statusController.signal)
           setTest(current); setRunStage(modelTestStatusLabels[current.status])
-          setRunError('检测已经提交到后台，可在全局历史中继续查看')
+          setRunError('测试已经提交到后台，可在全局历史中继续查看')
           await refreshHistory(undefined, true)
         } catch (statusReason) {
-          setRunError(statusReason instanceof Error ? statusReason.message : '读取检测状态失败，请刷新历史记录确认')
+          setRunError(statusReason instanceof Error ? statusReason.message : '读取测试状态失败，请刷新历史记录确认')
         }
       } else {
         setRunError(requestError.message || '取消上传失败，请到历史记录确认状态')
@@ -730,8 +730,8 @@ export function ModelTests() {
   async function deleteHistory(item: ModelTestSummary) {
     const active = activeModelTestStatuses.has(item.status)
     if (!window.confirm(active
-      ? '这条检测仍在处理中。删除将取消检测并清理已上传的图片，确定继续吗？'
-      : '删除后原图、检测结果和下载文件都无法恢复，确定删除吗？')) return
+      ? '这条测试仍在处理中。删除将取消测试并清理已上传的图片，确定继续吗？'
+      : '删除后原图、测试结果和下载文件都无法恢复，确定删除吗？')) return
     historyRefreshVersion.current += 1
     historyLoadingVersion.current += 1
     historyLoadMoreController.current?.abort()
@@ -748,7 +748,7 @@ export function ModelTests() {
       setHistorySelectedId((current) => current === item.id ? null : current)
       setHistoryImage(0)
     } catch (reason) {
-      setHistoryError(reason instanceof Error ? reason.message : '删除检测记录失败')
+      setHistoryError(reason instanceof Error ? reason.message : '删除测试记录失败')
     } finally {
       setDeletingId(null)
     }
@@ -806,7 +806,9 @@ export function ModelTests() {
     : sourceType === 'training_artifact' ? Boolean(selectedArtifact) : selectedAsset?.status === 'ready'
   const completed = test?.status === 'completed'
   const failed = runStage === modelTestStatusLabels.failed
-  const parametersChanged = completed && (confidence !== test.confidence || iou !== test.iou)
+  const currentTaskType = modelTestTaskType(test || rerunSource) || (sourceType === 'training_artifact' ? selectedTask?.task_type : null)
+  const classification = currentTaskType === 'classify'
+  const parametersChanged = completed && (confidence !== test.confidence || (!classification && iou !== test.iou))
   const hasPendingUpload = Boolean(pendingUploadId.current)
   const currentResult = completed ? `/api/model-tests/${test.id}/images/${selectedImage}/result` : ''
   const displayedSource = test || rerunSource
@@ -834,11 +836,11 @@ export function ModelTests() {
   }
 
   return <div className={`page model-tests-page${dragging ? ' is-dragging' : ''}`} onDragEnter={dragEnter} onDragOver={dragOver} onDragLeave={dragLeave} onDrop={dropImages}>
-    {dragging && <div className="model-tests-drop-indicator"><Upload size={42} /><strong>松开添加图片</strong><span>图片将加入当前检测</span></div>}
+    {dragging && <div className="model-tests-drop-indicator"><Upload size={42} /><strong>松开添加图片</strong><span>图片将加入当前测试</span></div>}
     <header className="page-header model-tests-header">
-      <div><span className="eyebrow">MODEL TEST CENTER</span><h1>模型测试</h1><p>选择本机路径、训练产物或远程 Agent 模型，上传图片完成独立检测。</p></div>
+      <div><span className="eyebrow">MODEL TEST CENTER</span><h1>模型测试</h1><p>选择本机路径、训练产物或远程 Agent 模型，上传图片完成独立测试。</p></div>
       <div className="model-tests-view-tabs" role="tablist" aria-label="模型测试视图">
-        <button type="button" role="tab" aria-selected={view === 'new'} className={view === 'new' ? 'active' : ''} onClick={() => setView('new')}><Sparkles size={16} />新建检测</button>
+        <button type="button" role="tab" aria-selected={view === 'new'} className={view === 'new' ? 'active' : ''} onClick={() => setView('new')}><Sparkles size={16} />新建测试</button>
         <button type="button" role="tab" aria-selected={view === 'history'} className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}><History size={16} />全局历史<span>{history.length}</span></button>
       </div>
     </header>
@@ -885,7 +887,7 @@ export function ModelTests() {
           />
           <label>训练轮次<select value={trainingRunId} disabled={running || !trainingTaskId || trainingSourceLoading} onChange={(event) => { setTrainingRunId(event.target.value); setArtifactId(null); resetCurrentResult() }}><option value="">{trainingSourceLoading ? '正在读取…' : '请选择 Attempt'}</option>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {statusLabel(run.status)} · {run.completed_epochs} Epoch</option>)}</select></label>
           <label>模型权重<select value={artifactId ?? ''} disabled={running || !trainingRunId || trainingSourceLoading} onChange={(event) => { setArtifactId(event.target.value ? Number(event.target.value) : null); resetCurrentResult() }}><option value="">{trainingSourceLoading ? '正在读取…' : artifacts.length ? '请选择权重' : '当前 Attempt 没有 .pt 产物'}</option>{artifacts.map((artifact) => <option key={artifact.id} value={artifact.id}>{artifact.name.split(/[\\/]/).pop()} · {formatBytes(artifact.size)}{artifact.kind ? ` · ${artifact.kind}` : ''}</option>)}</select></label>
-          <small><Info size={13} />远程训练产物会在第一次检测前安全传输到中心模型缓存。</small>
+          <small><Info size={13} />远程训练产物会在第一次测试前安全传输到中心模型缓存。</small>
         </section>}
 
         {sourceError && <div className="model-test-error" role="alert">{sourceError}</div>}
@@ -914,30 +916,30 @@ export function ModelTests() {
       </aside>
 
       <main className="model-test-run-panel">
-        <div className="model-tests-section-heading"><div><span>02</span><h2>上传图片并检测</h2></div><p>检测任务由中心服务执行，关闭页面不会删除已提交任务。</p></div>
+        <div className="model-tests-section-heading"><div><span>02</span><h2>上传图片并测试</h2></div><p>测试任务由中心服务执行，关闭页面不会删除已提交任务。</p></div>
         <section className={`model-test-run-source${modelReady ? ' ready' : ''}`}>
           {displayedSourceType === 'remote_path' ? <Server size={19} /> : displayedSourceType === 'training_artifact' ? <Box size={19} /> : <HardDrive size={19} />}
-          <div><span>{sourceLabels[displayedSourceType]}</span><strong>{displayedModelName}</strong><small>{displayedSource ? `当前结果固定于 SHA-256 ${displayedSource.model_sha256?.slice(0, 12) || '待记录'}…` : modelReady ? '模型来源已确认，可以提交检测' : '请先在左侧完成模型选择与校验'}</small></div>
+          <div><span>{sourceLabels[displayedSourceType]} · {modelTestTaskLabel(currentTaskType)}</span><strong>{displayedModelName}</strong><small>{displayedSource ? `当前结果固定于 SHA-256 ${displayedSource.model_sha256?.slice(0, 12) || '待记录'}…` : modelReady ? '模型来源已确认，可以提交测试' : '请先在左侧完成模型选择与校验'}</small></div>
           {modelReady ? <CheckCircle2 size={19} /> : <AlertCircle size={19} />}
         </section>
-        {rerunSource && !test && <div className="model-test-rerun-notice"><RotateCcw size={15} /><span>已载入历史图片和参数；将固定使用原检测的模型版本，并创建一条新记录。</span><button type="button" className="icon-button" title="取消重测" aria-label="取消重测" disabled={running} onClick={() => { setRerunSource(null); resetCurrentResult() }}><X size={14} /></button></div>}
+        {rerunSource && !test && <div className="model-test-rerun-notice"><RotateCcw size={15} /><span>已载入历史图片和参数；将固定使用原测试的模型版本，并创建一条新记录。</span><button type="button" className="icon-button" title="取消重测" aria-label="取消重测" disabled={running} onClick={() => { setRerunSource(null); resetCurrentResult() }}><X size={14} /></button></div>}
         <div className="model-test-run-controls">
           <button type="button" className="button ghost" disabled={running} onClick={() => input.current?.click()}><ImagePlus size={16} />{files.length ? `添加图片（${files.length}/10）` : '选择图片'}</button>
           <input ref={input} hidden disabled={running} type="file" accept=".jpg,.jpeg,.png,.webp,.bmp" multiple onChange={(event) => chooseImages(event.target.files)} />
           <div className="model-test-slider"><label htmlFor="standalone-confidence">置信度 Conf <strong>{confidence.toFixed(2)}</strong></label><input id="standalone-confidence" type="range" min="0.01" max="1" step="0.01" value={confidence} disabled={running} onChange={(event) => setConfidence(Number(event.target.value))} /></div>
-          <div className="model-test-slider"><label htmlFor="standalone-iou">NMS IoU <strong>{iou.toFixed(2)}</strong></label><input id="standalone-iou" type="range" min="0.01" max="1" step="0.01" value={iou} disabled={running} onChange={(event) => setIou(Number(event.target.value))} /></div>
-          <button type="button" className="button primary" disabled={running || sourceBusy || hasPendingUpload || !modelReady || !files.length} onClick={() => void runModelTest()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{completed ? '再次检测' : '运行检测'}</button>
+          <div className="model-test-slider" title={classification ? '分类模型没有检测框，不使用 IoU' : undefined}><label htmlFor="standalone-iou">NMS IoU <strong>{classification ? '不适用' : iou.toFixed(2)}</strong></label><input id="standalone-iou" type="range" min="0.01" max="1" step="0.01" value={iou} disabled={running || classification} aria-describedby="standalone-parameters-help" onChange={(event) => setIou(Number(event.target.value))} /></div>
+          <button type="button" className="button primary" disabled={running || sourceBusy || hasPendingUpload || !modelReady || !files.length} onClick={() => void runModelTest()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{completed ? '再次测试' : '运行测试'}</button>
         </div>
-        <p className="model-test-help">最多 10 张 · 单张 20 MB / 2000 万像素 · 总大小 100 MB · 可拖入 JPG、PNG、WEBP、BMP</p>
+        <p id="standalone-parameters-help" className="model-test-help">最多 10 张 · 单张 20 MB / 2000 万像素 · 总大小 100 MB · 可拖入 JPG、PNG、WEBP、BMP。{classification ? '分类结果按置信度筛选 Top-5；分类模型没有检测框，IoU 不适用。' : '任务类型在加载模型后自动识别；置信度筛选预测结果，IoU 仅对检测、分割、姿态和 OBB 框类任务生效。'}</p>
         {runError && <div className="model-test-error" role="alert">{runError}</div>}
-        {(runStage || running) && <div className={`model-test-status${failed ? ' failed' : ''}`} role="status">{running ? <LoaderCircle className="spin" size={14} /> : failed ? <AlertCircle size={14} /> : completed ? <CheckCircle2 size={14} /> : null}{runStage}{completed && ` · Conf ${test.confidence.toFixed(2)} · IoU ${test.iou.toFixed(2)}`}</div>}
-        {parametersChanged && <div className="model-test-parameter-notice"><Info size={15} />当前显示的是 Conf {test.confidence.toFixed(2)} · IoU {test.iou.toFixed(2)} 的历史结果；再次检测会用新阈值创建记录。</div>}
+        {(runStage || running) && <div className={`model-test-status${failed ? ' failed' : ''}`} role="status">{running ? <LoaderCircle className="spin" size={14} /> : failed ? <AlertCircle size={14} /> : completed ? <CheckCircle2 size={14} /> : null}{runStage}{completed && ` · ${modelTestParameterText(test)}`}</div>}
+        {parametersChanged && <div className="model-test-parameter-notice"><Info size={15} />当前显示的是 {modelTestParameterText(test)} 的历史结果；再次测试会用新阈值创建记录。</div>}
 
-        {!images.length ? <button type="button" className="model-test-empty standalone" onClick={() => input.current?.click()}><Upload size={34} /><strong>点击或拖入测试图片</strong><span>选好模型后，这里会显示原图和检测结果</span></button>
+        {!images.length ? <button type="button" className="model-test-empty standalone" onClick={() => input.current?.click()}><Upload size={34} /><strong>点击或拖入测试图片</strong><span>选好模型后，这里会显示原图和测试结果</span></button>
           : <TestWorkspace test={test} images={images} selected={selectedImage} onSelect={setSelectedImage} onRemove={removeImage} busy={running} failed={failed} openLightbox={openLightbox} />}
 
         <footer className="model-test-run-footer">
-          <span>{completed ? `${test.files[selectedImage]?.name || '当前图片'} · ${modelTestDetectionLabel(test.files[selectedImage]?.detections ?? null)} · 已保存到全局历史` : hasPendingUpload ? '图片尚未全部提交，可取消本次上传' : '每次检测都会保存模型摘要、参数、原图和结果图'}</span>
+          <span>{completed ? `${test.files[selectedImage]?.name || '当前图片'} · ${modelTestResultLabel(modelTestTaskType(test), test.files[selectedImage]?.prediction_count ?? test.files[selectedImage]?.detections ?? null)} · 已保存到全局历史` : hasPendingUpload ? '图片尚未全部提交，可取消本次上传' : '每次测试都会保存模型摘要、参数、原图和结果图'}</span>
           {hasPendingUpload && !running && <button type="button" className="button danger" onClick={() => void cancelPendingUpload()}><X size={15} />取消上传</button>}
           {completed && <a className="button ghost" href={`/api/model-tests/${test.id}/download`} download><FileArchive size={15} />下载全部</a>}
           {currentResult && <a className="button primary" href={`${currentResult}?download=true`} download><Download size={15} />当前结果图</a>}
@@ -947,13 +949,13 @@ export function ModelTests() {
       <header className="model-tests-history-toolbar">
         <div><SlidersHorizontal size={16} /><strong>筛选历史</strong></div>
         <label>模型来源<select value={historySource} onChange={(event) => setHistorySource(event.target.value as SourceType | '')}><option value="">全部来源</option><option value="local_path">本机路径</option><option value="training_artifact">训练产物</option><option value="remote_path">远程路径</option></select></label>
-        <label>检测状态<select value={historyStatus} onChange={(event) => setHistoryStatus(event.target.value as ModelTest['status'] | '')}><option value="">全部状态</option><option value="uploading">准备图片</option><option value="preparing">准备模型</option><option value="queued">等待测试</option><option value="running">正在检测</option><option value="cancel_requested">正在取消</option><option value="completed">检测完成</option><option value="failed">检测失败</option><option value="cancelled">已取消</option></select></label>
+        <label>测试状态<select value={historyStatus} onChange={(event) => setHistoryStatus(event.target.value as ModelTest['status'] | '')}><option value="">全部状态</option><option value="uploading">准备图片</option><option value="preparing">准备模型</option><option value="queued">等待测试</option><option value="running">正在测试</option><option value="cancel_requested">正在取消</option><option value="completed">测试完成</option><option value="failed">测试失败</option><option value="cancelled">已取消</option></select></label>
         <button type="button" className="button ghost compact" disabled={historyLoading} onClick={() => void refreshHistory()}>{historyLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}刷新</button>
       </header>
       {historyError && <div className="model-test-error model-tests-history-error" role="alert">{historyError}</div>}
       <div className="model-tests-history-layout">
         <aside className="model-test-history-sidebar">
-          {historyLoading && !history.length ? <div className="model-test-history-empty"><LoaderCircle className="spin" size={25} /><span>正在加载全局检测历史…</span></div>
+          {historyLoading && !history.length ? <div className="model-test-history-empty"><LoaderCircle className="spin" size={25} /><span>正在加载全局测试历史…</span></div>
             : history.length ? <div className="model-test-history-list">{groupedHistory.map((section) => {
               const collapsed = collapsedHistoryGroups.has(section.key)
               return <section className={`model-test-history-group${collapsed ? ' collapsed' : ''}`} key={section.key}>
@@ -964,23 +966,23 @@ export function ModelTests() {
                   return next
                 })}><ChevronDown size={14} /><FolderOpen size={15} /><strong>{section.name}</strong><span>{section.items.length}</span></button></header>
                 {!collapsed && <div className="model-test-history-group-items">{section.items.map((item) => {
-                  const objects = item.files.reduce((sum, file) => sum + (file.detections || 0), 0)
-                  const detected = item.files.filter((file) => (file.detections || 0) > 0).length
+                  const objects = item.files.reduce((sum, file) => sum + (file.prediction_count ?? file.detections ?? 0), 0)
+                  const detected = item.files.filter((file) => (file.prediction_count ?? file.detections ?? 0) > 0).length
                   return <button type="button" key={item.id} className={`model-test-history-item${selectedSummary?.id === item.id ? ' selected' : ''}`} onClick={() => { setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError('') }}>
                     <HistoryImagePreview test={item} />
                     <div><span className={`model-test-history-status ${item.status}`}><i />{modelTestStatusLabels[item.status]}</span><time>{modelTestDate(item.created_at)}</time></div>
                     <strong>{modelTestWeightName(item)}<small>{sourceDescription(item)}</small></strong>
-                    <p>{item.files.length} 张图片 · {detected} 张命中 · {objects} 个目标</p>
-                    <footer><span>Conf {item.confidence.toFixed(2)} · IoU {item.iou.toFixed(2)}</span>{typeof item.storage_bytes === 'number' && <span><HardDrive size={11} />{formatBytes(item.storage_bytes)}</span>}</footer>
+                    <p>{modelTestTaskLabel(modelTestTaskType(item))} · {item.files.length} 张图片 · {detected} 张有结果 · {modelTestResultLabel(modelTestTaskType(item), item.status === 'completed' ? objects : null)}</p>
+                    <footer><span>{modelTestParameterText(item)}</span>{typeof item.storage_bytes === 'number' && <span><HardDrive size={11} />{formatBytes(item.storage_bytes)}</span>}</footer>
                   </button>
                 })}</div>}
               </section>
             })}{historyCursor && <button type="button" className="button ghost model-test-history-more" disabled={historyLoading || historyLoadingMore} onClick={() => void loadMoreHistory()}>{historyLoadingMore ? <LoaderCircle className="spin" size={14} /> : <History size={14} />}加载更多</button>}</div>
-              : <div className="model-test-history-empty"><History size={30} /><strong>暂无匹配的检测记录</strong><span>新建检测或调整上方筛选条件</span></div>}
+              : <div className="model-test-history-empty"><History size={30} /><strong>暂无匹配的测试记录</strong><span>新建测试或调整上方筛选条件</span></div>}
         </aside>
         <section className="model-test-history-detail">
           {selectedHistory ? <>
-            <div className="model-test-history-heading"><div><span>{modelTestDate(selectedHistory.created_at)}</span><h3>{modelTestWeightName(selectedHistory)}</h3><p>{sourceDescription(selectedHistory)} · Conf {selectedHistory.confidence.toFixed(2)} · IoU {selectedHistory.iou.toFixed(2)}</p></div>{historyDetailLoading && <LoaderCircle className="spin" size={18} />}</div>
+            <div className="model-test-history-heading"><div><span>{modelTestDate(selectedHistory.created_at)}</span><h3>{modelTestWeightName(selectedHistory)}</h3><p>{sourceDescription(selectedHistory)} · {modelTestParameterText(selectedHistory)}</p></div>{historyDetailLoading && <LoaderCircle className="spin" size={18} />}</div>
             <div className="model-test-history-source-strip">
               <div><Box size={17} /><span>模型<strong>{selectedHistory.model_source_name || modelTestWeightName(selectedHistory)}</strong></span></div>
               <div><Server size={17} /><span>来源<strong>{sourceDescription(selectedHistory)}</strong></span></div>
@@ -988,7 +990,7 @@ export function ModelTests() {
               <div><Cpu size={17} /><span>执行环境<strong>{selectedHistory.model.device || 'CPU'} · {selectedHistory.model.imgsz || 640} px</strong></span></div>
             </div>
             {selectedHistory.error && <div className="model-test-error" role="alert">{selectedHistory.error}</div>}
-            {selectedHistory.status === 'completed' && !testHasExactModel(selectedHistory) && <div className="model-test-parameter-notice"><Info size={15} />这是旧版检测记录，没有完整模型摘要；现有结果仍可查看和下载，但不能按原模型重测。</div>}
+            {selectedHistory.status === 'completed' && !testHasExactModel(selectedHistory) && <div className="model-test-parameter-notice"><Info size={15} />这是旧版测试记录，没有完整模型摘要；现有结果仍可查看和下载，但不能按原模型重测。</div>}
             <TestWorkspace test={selectedHistory} selected={historyImage} onSelect={setHistoryImage} busy={activeModelTestStatuses.has(selectedHistory.status)} failed={selectedHistory.status === 'failed' || selectedHistory.status === 'cancelled'} openLightbox={openLightbox} />
             <footer className="model-tests-history-actions">
               <span>{modelTestStatusLabels[selectedHistory.status]}{selectedHistory.finished_at ? ` · ${modelTestDate(selectedHistory.finished_at)}` : ''}</span>
@@ -997,8 +999,8 @@ export function ModelTests() {
               {selectedHistory.status === 'completed' && <button type="button" className="button primary" disabled={reusingId === selectedHistory.id || !testHasExactModel(selectedHistory)} title={testHasExactModel(selectedHistory) ? '使用原图和原模型版本创建新记录' : '历史记录缺少可验证的原模型版本'} onClick={() => void reuseHistory(selectedHistory)}>{reusingId === selectedHistory.id ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}使用这些图片重测</button>}
               <button type="button" className="button danger" disabled={deletingId === selectedHistory.id} onClick={() => void deleteHistory(selectedHistory)}>{deletingId === selectedHistory.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}删除记录</button>
             </footer>
-          </> : selectedSummary && historyDetailLoading ? <div className="model-test-history-detail-empty"><LoaderCircle className="spin" size={26} /><span>正在加载检测详情…</span></div>
-            : <div className="model-test-history-detail-empty"><ScanEye size={36} /><span>选择左侧记录查看原图、检测结果和统计信息</span></div>}
+          </> : selectedSummary && historyDetailLoading ? <div className="model-test-history-detail-empty"><LoaderCircle className="spin" size={26} /><span>正在加载测试详情…</span></div>
+            : <div className="model-test-history-detail-empty"><ScanEye size={36} /><span>选择左侧记录查看原图、测试结果和统计信息</span></div>}
         </section>
       </div>
     </section>}

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Boxes, Check, Cpu, Database, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Settings2, Sun, X } from 'lucide-react'
+import { Activity, Boxes, Check, Cpu, Database, Download, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Server, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import {
@@ -11,7 +11,7 @@ import {
   writeCompareLimit,
   writeStoredCompareRuns,
 } from '../preferences'
-import type { PlatformHealth } from '../types'
+import type { ComputeNode, PlatformHealth, PlatformStorageHealth } from '../types'
 import { resetAppearance, updateAppearance, useAppearance } from '../appearance'
 import { AppearanceSettings } from './AppearanceSettings'
 
@@ -58,6 +58,23 @@ function dateTimeLabel(value: string | null | undefined) {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString('zh-CN', { hour12: false })
 }
 
+function nodeStatusLabel(status: ComputeNode['status']) {
+  return status === 'online' ? '在线' : status === 'offline' ? '离线' : status === 'disabled' ? '已禁用' : '等待接入'
+}
+
+function bytesLabel(value: number | null) {
+  if (value == null || !Number.isFinite(value)) return '—'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let amount = value
+  let unit = 0
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1 }
+  return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
+}
+
+function storageStatusLabel(status: PlatformStorageHealth['status']) {
+  return status === 'writable' ? '可写' : status === 'read_only' ? '只读' : status === 'missing' ? '目录不存在' : status === 'not_directory' ? '路径不是目录' : '不可检查'
+}
+
 export function Layout() {
   const appearance = useAppearance()
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -66,7 +83,18 @@ export function Layout() {
   const [compareLimitDraft, setCompareLimitDraft] = useState(compareLimit)
   const [storedCompareCount, setStoredCompareCount] = useState(0)
   const [health, setHealth] = useState<HealthView>({ phase: 'checking', details: null, error: '', checkedAt: null })
+  const [computeNodes, setComputeNodes] = useState<ComputeNode[]>([])
+  const [computeNodesPhase, setComputeNodesPhase] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [computeNodesError, setComputeNodesError] = useState('')
+  const [computeNodesCheckedAt, setComputeNodesCheckedAt] = useState<Date | null>(null)
+  const [storageHealth, setStorageHealth] = useState<PlatformStorageHealth | null>(null)
+  const [storagePhase, setStoragePhase] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [storageError, setStorageError] = useState('')
+  const [storageCheckedAt, setStorageCheckedAt] = useState<Date | null>(null)
+  const [diagnosticsNotice, setDiagnosticsNotice] = useState('')
   const healthController = useRef<AbortController | null>(null)
+  const nodesController = useRef<AbortController | null>(null)
+  const storageController = useRef<AbortController | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement>(null)
   const settingsDialog = useRef<HTMLElement>(null)
 
@@ -95,6 +123,48 @@ export function Layout() {
       })
     } finally {
       if (healthController.current === controller) healthController.current = null
+    }
+  }, [])
+
+  const loadComputeNodes = useCallback(async () => {
+    nodesController.current?.abort()
+    const controller = new AbortController()
+    nodesController.current = controller
+    setComputeNodesPhase('loading')
+    setComputeNodesError('')
+    try {
+      const nodes = await api.computeNodes(controller.signal)
+      if (controller.signal.aborted) return
+      setComputeNodes(nodes)
+      setComputeNodesPhase('ready')
+      setComputeNodesCheckedAt(new Date())
+    } catch (reason) {
+      if (controller.signal.aborted) return
+      setComputeNodesPhase('error')
+      setComputeNodesError(reason instanceof Error ? reason.message : '无法读取算力节点状态')
+    } finally {
+      if (nodesController.current === controller) nodesController.current = null
+    }
+  }, [])
+
+  const loadStorageHealth = useCallback(async () => {
+    storageController.current?.abort()
+    const controller = new AbortController()
+    storageController.current = controller
+    setStoragePhase('loading')
+    setStorageError('')
+    try {
+      const details = await api.storageHealth(controller.signal)
+      if (controller.signal.aborted) return
+      setStorageHealth(details)
+      setStoragePhase('ready')
+      setStorageCheckedAt(new Date())
+    } catch (reason) {
+      if (controller.signal.aborted) return
+      setStoragePhase('error')
+      setStorageError(reason instanceof Error ? reason.message : '无法检查存储目录')
+    } finally {
+      if (storageController.current === controller) storageController.current = null
     }
   }, [])
 
@@ -128,10 +198,27 @@ export function Layout() {
   }, [checkHealth])
 
   useEffect(() => {
+    if (!settingsOpen || !['overview', 'services', 'storage'].includes(settingsSection)) return
+    void loadComputeNodes()
+    const timer = window.setInterval(() => void loadComputeNodes(), HEALTH_POLL_INTERVAL_MS)
+    return () => {
+      window.clearInterval(timer)
+      nodesController.current?.abort()
+    }
+  }, [loadComputeNodes, settingsOpen, settingsSection])
+
+  useEffect(() => {
+    if (!settingsOpen || settingsSection !== 'storage') return
+    void loadStorageHealth()
+    return () => storageController.current?.abort()
+  }, [loadStorageHealth, settingsOpen, settingsSection])
+
+  useEffect(() => {
     if (!settingsOpen) return
     const trigger = settingsTrigger.current
     setCompareLimitDraft(compareLimit)
     setStoredCompareCount(readStoredCompareRuns().length)
+    setDiagnosticsNotice('')
     settingsDialog.current?.querySelector<HTMLElement>('[data-settings-initial-focus]')?.focus()
     return () => {
       if (trigger?.isConnected) trigger.focus()
@@ -141,9 +228,55 @@ export function Layout() {
   function applyCompareLimit() {
     const current = readStoredCompareRuns()
     const retained = current.slice(0, compareLimitDraft)
-    if (retained.length !== current.length) writeStoredCompareRuns(retained)
+    if (retained.length !== current.length) {
+      const removed = current.length - retained.length
+      if (!window.confirm(`当前浏览器已选择 ${current.length} 个对比运行。继续后将从对比列表移除 ${removed} 个选择，训练任务和记录不会删除。是否继续？`)) return
+      writeStoredCompareRuns(retained)
+    }
     writeCompareLimit(compareLimitDraft)
     setStoredCompareCount(retained.length)
+  }
+
+  function downloadDiagnosticsSummary() {
+    const summary = {
+      generated_at: new Date().toISOString(),
+      core_checked_at: health.checkedAt?.toISOString() || null,
+      agent_nodes_checked_at: computeNodesCheckedAt?.toISOString() || null,
+      platform_version: health.details?.version || import.meta.env.VITE_PLATFORM_VERSION || null,
+      platform_status: health.phase,
+      core_services: health.details ? {
+        database: health.details.database,
+        scheduler: health.details.scheduler,
+        local_deletion_worker: health.details.local_deletion_worker,
+        inference_worker: health.details.inference_worker,
+        database_latency_ms: health.details.database_latency_ms,
+      } : null,
+      agent_nodes: computeNodes.map((node) => ({
+        kind: node.kind,
+        status: node.status,
+        last_seen_at: node.last_seen_at,
+        agent_version: node.agent_version,
+        required_agent_version: node.required_agent_version,
+        training_version_supported: node.kind === 'local' ? null : node.training_version_supported ?? null,
+        platform_training_available: node.kind === 'local' ? null : !node.training_unavailable_reason,
+        last_reported_training_ready: node.kind === 'local' ? null : node.training?.ready ?? false,
+        gpu_process_attribution_supported: node.process_attribution_supported,
+      })),
+    }
+    const blob = new Blob([JSON.stringify(summary, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `yolo-platform-diagnostics-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    link.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    setDiagnosticsNotice('诊断摘要已下载')
+  }
+
+  function refreshSettingsStatus() {
+    void checkHealth(true)
+    void loadComputeNodes()
+    if (settingsSection === 'storage') void loadStorageHealth()
   }
 
   function closeSettings() {
@@ -181,6 +314,22 @@ export function Layout() {
   const serviceDescription = health.phase === 'online' ? '所有核心服务运行正常' : health.phase === 'checking' ? '正在读取平台运行状态…' : health.error || '核心服务状态异常'
   const dotColor = health.phase === 'online' ? 'var(--green)' : health.phase === 'error' ? '#ff747b' : '#d9a552'
   const activeSettingsSection = settingsSections.find((section) => section.id === settingsSection) ?? settingsSections[0]
+  const remoteNodes = computeNodes.filter((node) => node.kind === 'agent')
+  const onlineRemoteNodeCount = remoteNodes.filter((node) => node.status === 'online').length
+  const nodesStatusLabel = computeNodesPhase === 'loading' && !computeNodes.length ? '正在读取远程节点…'
+    : computeNodesPhase === 'loading' ? `正在刷新 · 上次结果 ${onlineRemoteNodeCount} / ${remoteNodes.length} 在线`
+    : computeNodesPhase === 'error' ? computeNodesCheckedAt
+      ? `节点刷新失败 · 上次结果 ${onlineRemoteNodeCount} / ${remoteNodes.length} 在线`
+      : '远程节点状态读取失败'
+      : `远程节点 ${onlineRemoteNodeCount} / ${remoteNodes.length} 在线`
+  const coreCheckedLabel = health.checkedAt ? health.checkedAt.toLocaleTimeString('zh-CN') : '尚未完成'
+  const nodesCheckedLabel = computeNodesCheckedAt ? computeNodesCheckedAt.toLocaleTimeString('zh-CN') : '尚未完成'
+  const storageCheckedLabel = storageCheckedAt ? storageCheckedAt.toLocaleTimeString('zh-CN') : '尚未完成'
+  const settingsCheckedLabel = settingsSection === 'storage'
+    ? `存储检查：${storageCheckedLabel} · 节点成功读取：${nodesCheckedLabel}`
+    : ['overview', 'services'].includes(settingsSection)
+      ? `核心检查：${coreCheckedLabel} · 节点成功读取：${nodesCheckedLabel}`
+      : `核心检查：${coreCheckedLabel}`
 
   return (
     <div className="app-shell">
@@ -249,6 +398,12 @@ export function Layout() {
                     <label>平台实例<input readOnly value={health.details?.instance || '—'} /></label>
                     <label>平台版本<input readOnly value={health.details?.version || import.meta.env.VITE_PLATFORM_VERSION || '—'} /></label>
                   </div>
+                  <div className="settings-overview-actions">
+                    <span><Server size={14} />{nodesStatusLabel}</span>
+                    <button type="button" className="button ghost compact" disabled={!health.details || computeNodesPhase !== 'ready'} onClick={downloadDiagnosticsSummary}><Download size={14} />下载诊断摘要</button>
+                  </div>
+                  {diagnosticsNotice && <div className="settings-inline-status" role="status">{diagnosticsNotice}</div>}
+                  {computeNodesError && <div className="settings-inline-error" role="status">节点状态暂不可用：{computeNodesError}</div>}
                 </>}
 
                 {settingsSection === 'appearance' && <AppearanceSettings />}
@@ -256,7 +411,7 @@ export function Layout() {
                 {settingsSection === 'training' && <>
                   <div className="parameter-section">
                     <h3>实验对比</h3>
-                    <p>设置当前浏览器最多同时展示的训练运行（Attempt）数量。</p>
+                    <p>只影响当前浏览器的实验对比列表，不控制训练调度或 GPU 并发。</p>
                   </div>
                   <div className="compare-limit-setting">
                     <div>
@@ -293,13 +448,52 @@ export function Layout() {
                     {health.details?.scheduler_error && <label className="span-2">当前调度错误<input readOnly title={health.details.scheduler_error} value={health.details.scheduler_error} /></label>}
                     {health.details?.scheduler_last_error && health.details.scheduler_last_error !== health.details.scheduler_error && <label className="span-2">最近调度错误<input readOnly title={health.details.scheduler_last_error} value={`${health.details.scheduler_last_error}${health.details.scheduler_last_error_at ? ` · ${dateTimeLabel(health.details.scheduler_last_error_at)}` : ''}`} /></label>}
                   </div>
+                  <div className="settings-subsection-heading"><h4>本机与远程节点</h4><span>{computeNodesCheckedAt ? `最近成功读取 ${computeNodesCheckedAt.toLocaleTimeString('zh-CN')}` : '尚未成功读取'}</span></div>
+                  {computeNodesError && <div className="settings-inline-error" role="alert">节点刷新失败：{computeNodesError}{computeNodesCheckedAt ? '；以下保留最近一次成功数据' : ''}</div>}
+                  {computeNodesPhase === 'loading' && !computeNodes.length ? <div className="settings-empty-state">正在读取节点状态…</div>
+                    : computeNodesPhase === 'error' && !computeNodes.length ? <div className="settings-empty-state">没有可用的节点状态数据</div>
+                    : computeNodes.length ? <div className="settings-node-list">{computeNodes.map((node) => {
+                      const trainingLabel = node.kind === 'local' ? '本机平台' : node.training_unavailable_reason || '训练就绪'
+                      return <div className="settings-node-row" key={node.id}>
+                        <div className="settings-node-primary"><strong>{node.name}</strong><span className={`settings-status-badge ${node.status}`}>{node.kind === 'local' ? '本机' : nodeStatusLabel(node.status)}</span></div>
+                        <div className="settings-node-details">
+                          <span>{node.kind === 'local' ? '平台服务节点' : `Agent ${node.agent_version ? `v${node.agent_version}` : '未上报'}`}</span>
+                          {node.kind === 'agent' && <span className={node.training_version_supported === false ? 'settings-capability warning' : 'settings-capability'}>{node.training_version_supported == null ? `最低训练版本 ${node.required_agent_version}+` : node.training_version_supported ? `满足训练要求 ${node.required_agent_version}+` : `需升级至 ${node.required_agent_version}+`}</span>}
+                          <span className={node.kind === 'agent' && node.training_unavailable_reason ? 'settings-capability warning' : 'settings-capability'}>{trainingLabel}</span>
+                          {node.kind === 'agent' && <span className={node.process_attribution_supported ? 'settings-capability' : 'settings-capability warning'}>{node.process_attribution_supported ? 'GPU 进程可关联' : `GPU 进程关联需 ${node.required_process_attribution_agent_version}+`}</span>}
+                        </div>
+                        {node.kind === 'agent' && <small>最近心跳：{dateTimeLabel(node.last_seen_at) || '尚未上报'}{node.status === 'offline' ? ' · 当前状态依据旧数据' : ''}</small>}
+                      </div>
+                    })}</div> : <div className="settings-empty-state">尚未登记算力节点</div>}
                 </>}
 
                 {settingsSection === 'storage' && <>
                   <div className="form-grid settings-path-grid">
-                    <label className="span-2">训练输出目录<input readOnly title={health.details?.runs_root || ''} value={health.details?.runs_root || '—'} /></label>
+                    <label className="span-2">平台服务器 · 训练输出目录<input readOnly title={storageHealth?.path || health.details?.runs_root || ''} value={storageHealth?.path || health.details?.runs_root || '—'} /></label>
                   </div>
-                  <p className="settings-readonly-note">此路径由平台运行环境提供，当前页面仅展示。</p>
+                  {storagePhase === 'loading' && <div className="settings-empty-state">正在检查平台输出目录…</div>}
+                  {storagePhase === 'error' && <div className="settings-inline-error" role="alert">{storageError}</div>}
+                  {storagePhase === 'ready' && storageHealth && <div className={`settings-storage-summary ${storageHealth.status === 'writable' ? 'ready' : 'warning'}`}>
+                    <strong>{storageStatusLabel(storageHealth.status)}</strong>
+                    <span>{storageHealth.free_bytes == null ? '可用空间未知' : `可用 ${bytesLabel(storageHealth.free_bytes)} / ${bytesLabel(storageHealth.total_bytes)}`}</span>
+                  </div>}
+                  <div className="settings-subsection-heading"><h4>远程训练输出目录</h4><span>状态来自 Agent 最近一次上报</span></div>
+                  {computeNodesError && <div className="settings-inline-error" role="alert">节点刷新失败：{computeNodesError}{computeNodesCheckedAt ? '；以下保留最近一次成功数据' : ''}</div>}
+                  {computeNodesPhase === 'loading' && !computeNodes.length ? <div className="settings-empty-state">正在读取远程 Agent 目录…</div>
+                    : computeNodesPhase === 'error' && !computeNodes.length ? <div className="settings-empty-state">没有可用的远程 Agent 目录数据</div>
+                      : remoteNodes.length ? <div className="settings-storage-nodes">{remoteNodes.map((node) => {
+                    const roots = node.training?.output_roots || []
+                    const modelRoots = node.training?.model_test_roots || []
+                    const outputStatus = node.status !== 'online'
+                      ? `上次上报：${node.training?.output_writable ? '输出目录可写' : '输出目录不可写或未知'}`
+                      : node.training?.output_writable ? '输出目录可写' : '输出目录不可写或未上报'
+                    return <div className="settings-storage-node" key={node.id}>
+                      <div className="settings-storage-node-heading"><strong>{node.name}</strong><span className={`settings-status-badge ${node.status}`}>{nodeStatusLabel(node.status)}</span><span className={node.status === 'online' && node.training?.output_writable ? 'settings-capability' : 'settings-capability warning'}>{outputStatus}</span></div>
+                      {roots.length ? <details><summary>训练输出目录 · {roots.length} 项</summary><div className="settings-storage-roots">{roots.map((root) => <code key={root}>{root}</code>)}</div></details> : <small>Agent 尚未上报允许的训练输出目录</small>}
+                      {modelRoots.length ? <details><summary>模型测试目录 · {modelRoots.length} 项</summary><div className="settings-storage-roots">{modelRoots.map((root) => <code key={root}>{root}</code>)}</div></details> : <small>Agent 尚未上报允许的模型测试目录</small>}
+                    </div>
+                  })}</div> : <div className="settings-empty-state">尚未登记远程 Agent</div>}
+                  <p className="settings-readonly-note">路径由各自的运行环境提供；本页只读取状态，不创建文件或修改目录。</p>
                 </>}
               </section>
             </div>
@@ -309,8 +503,8 @@ export function Layout() {
               <span className="appearance-save-note" role="status">{appearance.storageAvailable ? '即时生效 · 仅保存在当前浏览器' : '即时生效 · 浏览器存储不可用，刷新后可能恢复默认'}</span>
               <button type="button" className="button ghost" onClick={resetAppearance}><RotateCcw size={15} />恢复默认版</button>
             </> : <>
-              <span style={{ marginRight: 'auto' }}>{health.checkedAt ? `上次检查：${health.checkedAt.toLocaleTimeString('zh-CN')}` : '尚未完成检查'}</span>
-              <button type="button" className="button ghost" disabled={health.phase === 'checking'} onClick={() => void checkHealth(true)}><RefreshCw size={15} className={health.phase === 'checking' ? 'spin' : ''} />重新检查</button>
+              <span style={{ marginRight: 'auto' }}>{settingsCheckedLabel}</span>
+              <button type="button" className="button ghost" disabled={health.phase === 'checking'} onClick={refreshSettingsStatus}><RefreshCw size={15} className={health.phase === 'checking' ? 'spin' : ''} />重新检查</button>
             </>}
             <button type="button" className="button" onClick={closeSettings}>关闭</button>
           </footer>

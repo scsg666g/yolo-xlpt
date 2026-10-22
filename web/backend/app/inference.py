@@ -74,6 +74,14 @@ MAX_IMAGE_BYTES = 20 * 1024**2
 MAX_TOTAL_BYTES = 100 * 1024**2
 UPLOAD_TTL = 24 * 60 * 60
 ACTIVE_STATUSES = {"uploading", "preparing", "queued", "running", "cancel_requested"}
+SUPPORTED_MODEL_TASKS = {"detect", "segment", "classify", "pose", "obb"}
+TASK_PRIMARY_METRICS = {
+    "detect": ("metrics/mAP50-95(B)", "mAP50-95"),
+    "segment": ("metrics/mAP50-95(M)", "Mask mAP50-95"),
+    "classify": ("metrics/accuracy_top1", "Top-1 accuracy"),
+    "pose": ("metrics/mAP50-95(P)", "Pose mAP50-95"),
+    "obb": ("metrics/mAP50-95(B)", "OBB mAP50-95"),
+}
 
 
 class ImageSpec(BaseModel):
@@ -110,21 +118,23 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def model_summary(db: Session, artifact: Artifact, run: TrainingRun) -> dict:
+    task = db.get(TrainingTask, artifact.task_id)
+    metric_key, metric_name = TASK_PRIMARY_METRICS.get(task.task_type, (None, None)) if task else (None, None)
     best_epoch = None
     best_metric = None
-    points = db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()
-    for point in points:
-        value = point.values.get("metrics/mAP50-95(B)")
-        if isinstance(value, (int, float)) and math.isfinite(value) and (best_metric is None or value > best_metric):
-            best_epoch, best_metric = point.epoch, float(value)
-    task = db.get(TrainingTask, artifact.task_id)
+    if metric_key:
+        points = db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()
+        for point in points:
+            value = point.values.get(metric_key)
+            if isinstance(value, (int, float)) and math.isfinite(value) and (best_metric is None or value > best_metric):
+                best_epoch, best_metric = point.epoch, float(value)
     return {
         "weight_name": Path(artifact.name).name,
         "weight_size": artifact.size,
         "modified_at": artifact.modified_at.isoformat() if artifact.modified_at else None,
         "attempt_number": run.attempt_number,
         "best_epoch": best_epoch,
-        "metric_name": "mAP50-95",
+        "metric_name": metric_name,
         "metric_value": best_metric,
         "device": "CPU",
         "imgsz": 640,
@@ -133,6 +143,7 @@ def model_summary(db: Session, artifact: Artifact, run: TrainingRun) -> dict:
         "source_path": artifact.path,
         "execution_node_id": run.execution_node_id or LOCAL_NODE_ID,
         "task_name": task.name if task else None,
+        "task_type": task.task_type if task else None,
     }
 
 
@@ -155,6 +166,7 @@ def asset_model_summary(db: Session, asset: ModelAsset, *, sha256: str, size: in
         "execution_node_id": asset.execution_node_id,
         "execution_node_name": node.name if node else None,
         "task_name": None,
+        "task_type": None,
     }
 
 
@@ -196,8 +208,8 @@ def _weight_context(db: Session, artifact_id: int | None) -> tuple[Artifact, Tra
     run = db.get(TrainingRun, artifact.run_id) if artifact and artifact.run_id else None
     if not artifact or not task or task.deleted_at or not run or run.task_id != task.id:
         raise HTTPException(404, "模型权重所属的训练运行不存在")
-    if task.task_type != "detect" or artifact.kind != "weight" or Path(artifact.name).suffix.lower() != ".pt":
-        raise HTTPException(422, "图片测试目前支持目标检测任务的 .pt 权重")
+    if task.task_type not in SUPPORTED_MODEL_TASKS or artifact.kind != "weight" or Path(artifact.name).suffix.lower() != ".pt":
+        raise HTTPException(422, "图片测试支持 detect / segment / classify / pose / obb 任务的 .pt 权重")
     if run.status in {"queued", "starting", "running", "stopping"}:
         raise HTTPException(409, "请等待本次训练结束或停止后再测试模型")
     return artifact, task, run
@@ -484,6 +496,7 @@ def image_public(image: ModelTestImage) -> dict:
         "size": image.declared_size,
         "uploaded": image.uploaded,
         "detections": image.detections,
+        "prediction_count": image.detections,
         "objects": list(image.objects or []),
         "timings": dict(image.timings or {}),
     }
@@ -517,6 +530,7 @@ def record_public(record: ModelTest) -> dict:
         "confidence": record.confidence,
         "iou": record.iou,
         "model": snapshot,
+        "task_type": snapshot.get("task_type"),
         "timings": dict(record.timings) if record.timings else None,
         "files": [image_public(image) for image in sorted(record.images, key=lambda item: item.ordinal)],
         "created_at": _iso(record.created_at),
@@ -555,12 +569,14 @@ def record_summary(record: ModelTest) -> dict:
         "confidence": record.confidence,
         "iou": record.iou,
         "model": snapshot,
+        "task_type": snapshot.get("task_type"),
         "files": [
             {
                 "name": image.original_name,
                 "size": image.declared_size,
                 "uploaded": image.uploaded,
                 "detections": image.detections,
+                "prediction_count": image.detections,
             }
             for image in sorted(record.images, key=lambda item: item.ordinal)
         ],
@@ -828,6 +844,7 @@ class InferenceWorker:
                 model = work / "model.pt"
                 confidence, iou = record.confidence, record.iou
                 task_id = record.task_id
+                expected_task = (record.model_snapshot or {}).get("task_type")
 
             with self._state_changed:
                 if test_id in self._cancelled_ids:
@@ -837,7 +854,10 @@ class InferenceWorker:
                 if output.is_symlink() or not output.is_dir():
                     raise RuntimeError("检测结果目录不安全")
                 shutil.rmtree(output)
-            for stale in (directory / "summary.json", directory / "detections.json", directory / "detection-results.zip"):
+            for stale in (
+                directory / "summary.json", directory / "detections.json", directory / "results.json",
+                directory / "detection-results.zip", directory / "model-test-results.zip",
+            ):
                 stale.unlink(missing_ok=True)
 
             log = directory / "inference.log"
@@ -850,6 +870,8 @@ class InferenceWorker:
                 "--ultralytics-root", str(ULTRALYTICS_ROOT), "--confidence", str(confidence),
                 "--iou", str(iou), "--imgsz", "640",
             ]
+            if expected_task in SUPPORTED_MODEL_TASKS:
+                command.extend(["--expected-task", expected_task])
             environment = {
                 **training_environment(), "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2",
             }
@@ -887,6 +909,9 @@ class InferenceWorker:
 
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             image_results = summary.get("images", [])
+            task_type = summary.get("task_type")
+            if task_type not in SUPPORTED_MODEL_TASKS:
+                raise RuntimeError("模型推理结果缺少有效的 YOLO 任务类型")
             with self.lock:
                 with self.session_factory() as db:
                     record = db.scalar(_record_query(test_id))
@@ -897,16 +922,19 @@ class InferenceWorker:
                         raise RuntimeError("推理没有生成完整结果")
                     for index, (image, item) in enumerate(zip(images, image_results)):
                         if not (output / f"{index}.jpg").is_file():
-                            raise RuntimeError("推理没有生成完整结果，请确认模型为目标检测模型")
+                            raise RuntimeError("推理没有生成完整结果，请检查模型与当前 Ultralytics 环境是否兼容")
                         objects = item.get("objects", [])
-                        image.detections = len(objects)
+                        image.detections = int(item.get("prediction_count", len(objects)))
                         image.objects = objects
                         image.timings = item.get("timings", {})
+                    record.model_snapshot = {**(record.model_snapshot or {}), "task_type": task_type}
                     record.timings = summary.get("timings", {})
                     record.device = str(summary.get("device", "CPU"))[:32]
                     record.imgsz = int(summary.get("imgsz", 640))
                     files = [image_public(image) for image in images]
                     export = {
+                        "schema_version": 2,
+                        "task_type": task_type,
                         "model": record.model_snapshot,
                         "model_version": {"sha256": record.model_sha256, "size": record.model_size},
                         "rerun_of_test_id": record.rerun_of_test_id,
@@ -914,11 +942,13 @@ class InferenceWorker:
                         "device": record.device, "imgsz": record.imgsz,
                         "timings": record.timings, "files": files,
                     }
-                    (directory / "detections.json").write_text(
+                    results_name = "detections.json" if task_type == "detect" else "results.json"
+                    archive_name = "detection-results.zip" if task_type == "detect" else "model-test-results.zip"
+                    (directory / results_name).write_text(
                         json.dumps(export, ensure_ascii=False, indent=2), encoding="utf-8",
                     )
-                    with zipfile.ZipFile(directory / "detection-results.zip", "w", zipfile.ZIP_DEFLATED) as archive:
-                        archive.write(directory / "detections.json", "detections.json")
+                    with zipfile.ZipFile(directory / archive_name, "w", zipfile.ZIP_DEFLATED) as archive:
+                        archive.write(directory / results_name, results_name)
                         for index, image in enumerate(images):
                             original_name = re.split(r"[/\\]", image.original_name)[-1]
                             safe_name = re.sub(r"[^\w.-]+", "_", original_name).strip("._") or "image"
@@ -1481,10 +1511,12 @@ def download_test(test_id: str, db: Session = Depends(get_db)):
     record = get_record(db, test_id)
     if record.status != "completed":
         raise HTTPException(409, "检测结果尚未生成")
-    path = test_history_root(history_scope(record.task_id), record.id) / "detection-results.zip"
+    task_type = (record.model_snapshot or {}).get("task_type") or "detect"
+    filename = "detection-results.zip" if task_type == "detect" else "model-test-results.zip"
+    path = test_history_root(history_scope(record.task_id), record.id) / filename
     if not path.is_file() or path.is_symlink():
         raise HTTPException(404, "检测结果压缩包不存在")
-    return FileResponse(path, media_type="application/zip", filename="detection-results.zip")
+    return FileResponse(path, media_type="application/zip", filename=filename)
 
 
 @router.delete("/api/model-tests/{test_id}", status_code=204)

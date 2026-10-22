@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -42,6 +42,7 @@ const deletionTimeout = '删除请求超时，后台可能已经受理。请关�
 
 export const api = {
   health: (signal?: AbortSignal) => requestWithTimeout<PlatformHealth>('/api/health', { signal }, 8_000, '健康检查超时'),
+  storageHealth: (signal?: AbortSignal) => requestWithTimeout<PlatformStorageHealth>('/api/health/storage', { signal }, 8_000, '存储状态检查超时'),
   createModelTest: (
     artifact_id: number,
     confidence: number,
@@ -174,7 +175,7 @@ export const api = {
   trainingTrace: (id: string, runId: string) => request<TrainingTrace>(`/api/tasks/${id}/runs/${runId}/trace`),
   resources: () => request<Resources>('/api/resources'),
   compute: () => request<ComputeResources>('/api/compute'),
-  computeNodes: (signal?: AbortSignal) => request<ComputeNode[]>('/api/compute/nodes', { signal }),
+  computeNodes: (signal?: AbortSignal) => requestWithTimeout<ComputeNode[]>('/api/compute/nodes', { signal }, 8_000, '算力节点状态读取超时'),
   computeNode: (id: string, signal?: AbortSignal) => request<ComputeNode>(`/api/compute/nodes/${id}`, { signal }),
   createComputeNode: (payload: ComputeNodeSettings) => request<ComputeNodeCredential>('/api/compute/nodes', { method: 'POST', body: JSON.stringify(payload) }),
   updateComputeNode: (id: string, payload: ComputeNodeSettings) => request<ComputeNode>(`/api/compute/nodes/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),

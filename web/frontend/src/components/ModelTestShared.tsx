@@ -4,7 +4,7 @@ import {
   LoaderCircle, Maximize2, ScanEye, Target, X,
 } from 'lucide-react'
 import { formatBytes } from '../api'
-import type { Artifact, ModelTest, ModelTestSummary } from '../types'
+import type { Artifact, ModelTest, ModelTestSummary, YoloTaskType } from '../types'
 import '../inference.css'
 
 export interface SelectedImage {
@@ -14,8 +14,8 @@ export interface SelectedImage {
 }
 
 export const modelTestStatusLabels: Record<ModelTest['status'], string> = {
-  uploading: '准备图片', preparing: '准备模型', queued: '等待测试', running: '正在检测',
-  cancel_requested: '正在取消', completed: '检测完成', failed: '检测失败', cancelled: '已取消',
+  uploading: '准备图片', preparing: '准备模型', queued: '等待测试', running: '正在测试',
+  cancel_requested: '正在取消', completed: '测试完成', failed: '测试失败', cancelled: '已取消',
 }
 
 export const activeModelTestStatuses = new Set<ModelTest['status']>([
@@ -24,6 +24,43 @@ export const activeModelTestStatuses = new Set<ModelTest['status']>([
 
 export function modelTestDetectionLabel(count: number | null) {
   return count === null ? '结果未就绪' : count > 0 ? `检测到 ${count} 个目标` : '未检测到目标'
+}
+
+export const modelTestMetrics = {
+  detect: { key: 'metrics/mAP50-95(B)', label: 'mAP50-95' },
+  segment: { key: 'metrics/mAP50-95(M)', label: 'Mask mAP50-95' },
+  classify: { key: 'metrics/accuracy_top1', label: 'Top-1 accuracy' },
+  pose: { key: 'metrics/mAP50-95(P)', label: 'Pose mAP50-95' },
+  obb: { key: 'metrics/mAP50-95(B)', label: 'OBB mAP50-95' },
+} as const
+
+export function isSupportedModelTestTask(task: string | null | undefined): task is YoloTaskType {
+  return !!task && Object.prototype.hasOwnProperty.call(modelTestMetrics, task)
+}
+
+export function modelTestTaskType(test?: Pick<ModelTestSummary, 'task_type' | 'model'> | null): YoloTaskType | null {
+  const task = test?.task_type || test?.model.task_type
+  if (isSupportedModelTestTask(task)) return task
+  // Older snapshots predate task identification and only supported detection.
+  return test && !Object.prototype.hasOwnProperty.call(test.model, 'task_type') ? 'detect' : null
+}
+
+export function modelTestTaskLabel(task: string | null | undefined) {
+  return isSupportedModelTestTask(task)
+    ? ({ detect: '目标检测', segment: '实例分割', classify: '图像分类', pose: '姿态估计', obb: '旋转框检测' } as const)[task]
+    : '任务类型待识别'
+}
+
+export function modelTestResultLabel(task: string | null | undefined, count: number | null) {
+  if (count === null) return '结果未就绪'
+  const itemLabel = isSupportedModelTestTask(task)
+    ? ({ detect: '目标', segment: '分割实例', classify: '候选类别', pose: '个体', obb: '旋转目标' } as const)[task]
+    : '预测结果'
+  return count > 0 ? `结果 ${count} 个${itemLabel}` : '没有预测结果'
+}
+
+export function modelTestParameterText(test: Pick<ModelTestSummary, 'task_type' | 'model' | 'confidence' | 'iou'>) {
+  return `Conf ${test.confidence.toFixed(2)} · ${modelTestTaskType(test) === 'classify' ? 'IoU 不适用' : `IoU ${test.iou.toFixed(2)}`}`
 }
 
 function milliseconds(value: number | undefined) {
@@ -60,23 +97,26 @@ export function hasExactModelVersion(test: Pick<ModelTest, 'artifact_id' | 'mode
     && test.model_size >= 0
 }
 
-export function ModelStrip({ test, artifact, fallbackAttempt, bestMetric, history = false }: {
+export function ModelStrip({ test, artifact, fallbackAttempt, fallbackTask, bestMetric, history = false }: {
   test?: ModelTestSummary | null
   artifact?: Artifact | null
   fallbackAttempt?: number | null
+  fallbackTask?: string | null
   bestMetric?: { epoch: number; value: number } | null
   history?: boolean
 }) {
   const attempt = test?.source_attempt_number ?? test?.model.attempt_number ?? fallbackAttempt
-  const metric = test?.model.best_epoch && test.model.metric_value !== null
+  const metric = typeof test?.model.best_epoch === 'number' && typeof test.model.metric_value === 'number' && Number.isFinite(test.model.metric_value)
     ? { epoch: test.model.best_epoch, value: test.model.metric_value }
-    : bestMetric
+    : test ? null : bestMetric
+  const taskType = test ? modelTestTaskType(test) : fallbackTask
+  const metricName = test?.model.metric_name || (isSupportedModelTestTask(taskType) ? modelTestMetrics[taskType].label : '训练指标')
   const size = test?.model_size ?? test?.model.weight_size ?? artifact?.size
   const name = test ? modelTestWeightName(test) : artifact?.name.split('/').pop() || '当前权重不可用'
   return <section className={`model-test-model-strip${history ? ' history' : ''}`} aria-label="当前测试模型">
     <div><Box size={17} /><span>测试权重<strong>{name}{typeof size === 'number' ? ` · ${formatBytes(size)}` : ''}</strong></span></div>
     <div><FileArchive size={17} /><span>权重来源<strong>{attempt ? `Attempt ${String(attempt).padStart(3, '0')}` : '当前选中运行'}</strong></span></div>
-    <div><Gauge size={17} /><span>最高 mAP50-95<strong>{metric ? `Epoch ${metric.epoch} · ${metric.value.toFixed(4)}` : '暂无指标记录'}</strong></span></div>
+    <div><Gauge size={17} /><span>{metricName}<strong>{metric ? `Epoch ${metric.epoch} · ${metric.value.toFixed(4)}` : '暂无指标记录'}</strong></span></div>
     <div><Cpu size={17} /><span>执行环境<strong>{test?.model.device || 'CPU'} · {test?.model.imgsz || 640} px</strong></span></div>
   </section>
 }
@@ -98,11 +138,13 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
   if (!rows.length) return null
   const current = Math.max(0, Math.min(selected, rows.length - 1))
   const completed = test?.status === 'completed'
+  const taskType = modelTestTaskType(test)
+  const taskLabel = modelTestTaskLabel(taskType)
   const selectedResult = rows[current]
   const objects = completed ? selectedResult.objects : []
   const allObjects = completed ? rows.flatMap((file) => file.objects) : []
-  const detectedImages = completed ? rows.filter((file) => file.detections !== null && file.detections > 0).length : 0
-  const emptyImages = completed ? rows.filter((file) => file.detections === 0).length : 0
+  const resultImages = completed ? rows.filter((file) => (file.prediction_count ?? file.detections) !== null && (file.prediction_count ?? file.detections)! > 0).length : 0
+  const emptyImages = completed ? rows.filter((file) => (file.prediction_count ?? file.detections) === 0).length : 0
   const classCounts = allObjects.reduce<Record<string, { count: number; confidence: number }>>((counts, item) => {
     const previous = counts[item.class_name] || { count: 0, confidence: 0 }
     counts[item.class_name] = { count: previous.count + 1, confidence: previous.confidence + item.confidence }
@@ -125,35 +167,35 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
           <button className={`model-test-thumbnail-select ${current === index ? 'selected' : ''}`} onClick={() => onSelect(index)}>
             {thumbnail ? <img src={thumbnail} alt={file.name} /> : <span className="model-test-thumbnail-placeholder"><Images size={18} /></span>}
             <span title={file.name}>{file.name}</span>
-            <small className={completed && (file.detections || 0) > 0 ? 'has-detections' : ''}>{completed ? modelTestDetectionLabel(file.detections) : formatBytes(file.size)}</small>
+            <small className={completed && (file.prediction_count ?? file.detections ?? 0) > 0 ? 'has-detections' : ''}>{completed ? modelTestResultLabel(taskType, file.prediction_count ?? file.detections) : formatBytes(file.size)}</small>
           </button>
           {onRemove && <button className="model-test-remove" disabled={busy} aria-label={`移除 ${file.name}`} title="移除图片" onClick={() => onRemove(index)}><X size={14} /></button>}
         </div>
       })}
     </aside>
     <div className="model-test-main">
-      {completed && <div className="model-test-summary">共 {rows.length} 张：{detectedImages} 张检测到目标，{emptyImages} 张未检测到。</div>}
+      {completed && <div className="model-test-summary">共 {rows.length} 张 {taskLabel}图片：{resultImages} 张有结果，{emptyImages} 张没有结果。</div>}
       <div className="model-test-comparison">
-        {[{ url: original, title: '原图' }, { url: result, title: '检测结果' }].map(({ url, title }) => <section className="model-test-panel" key={title}>
+        {[{ url: original, title: '原图', kind: 'original' }, { url: result, title: taskType ? `${taskLabel}结果` : '预测结果', kind: 'result' }].map(({ url, title, kind }) => <section className="model-test-panel" key={title}>
           <div><strong>{title}</strong>{url && <button className="icon-button" title={`放大${title}`} aria-label={`放大${title}`} onClick={(event) => openLightbox(url, title, event.currentTarget)}><Maximize2 size={15} /></button>}</div>
-          {title === '检测结果' && completed && <div className={`model-test-outcome ${(selectedResult.detections || 0) > 0 ? 'detected' : 'not-detected'}`} role="status">
-            {(selectedResult.detections || 0) > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}
-            <div><strong>{(selectedResult.detections || 0) > 0 ? modelTestDetectionLabel(selectedResult.detections) : `当前置信度阈值 ${test.confidence.toFixed(2)} 下未检测到目标`}</strong>{selectedResult.detections === 0 && <p>可适当降低阈值后重新检测。这不代表图片中一定没有目标。</p>}</div>
+          {kind === 'result' && completed && <div className={`model-test-outcome ${(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? 'detected' : 'not-detected'}`} role="status">
+            {(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}
+            <div><strong>{(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? modelTestResultLabel(taskType, selectedResult.prediction_count ?? selectedResult.detections) : `当前阈值下未获得${taskLabel}预测结果`}</strong>{(selectedResult.prediction_count ?? selectedResult.detections) === 0 && <p>可适当调整阈值后重新测试；这不能单独作为图片中不存在该类内容的依据。</p>}</div>
           </div>}
           {url ? <button className="model-test-image" onDoubleClick={(event) => openLightbox(url, title, event.currentTarget)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLightbox(url, title, event.currentTarget) } }} aria-label={`${title}，双击放大`}><img src={url} alt={`${selectedResult.name} ${title}`} /></button>
-            : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '检测结果生成中…' : failed ? '检测失败，请查看错误原因' : '运行检测后，查看目标框与置信度'}</span></div>}
+            : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '模型结果生成中…' : failed ? '模型测试失败，请查看错误原因' : '运行测试后，查看模型预测结果'}</span></div>}
         </section>)}
       </div>
-      {completed && <section className="model-test-insights" aria-label="检测统计">
+      {completed && <section className="model-test-insights" aria-label="测试统计">
         <div className="model-test-stat-grid">
-          <div><Target size={17} /><span>全部目标<strong>{allObjects.length}</strong></span></div>
-          <div><Images size={17} /><span>命中图片<strong>{detectedImages}/{rows.length}</strong></span></div>
+          <div><Target size={17} /><span>{taskType === 'classify' ? '全部候选类别' : '全部预测结果'}<strong>{allObjects.length}</strong></span></div>
+          <div><Images size={17} /><span>有结果图片<strong>{resultImages}/{rows.length}</strong></span></div>
           <div><Gauge size={17} /><span>平均置信度<strong>{averageConfidence === null ? '—' : averageConfidence.toFixed(3)}</strong></span></div>
           <div><Clock3 size={17} /><span>平均推理<strong>{milliseconds(test.timings ? test.timings.inference / rows.length : undefined)}</strong></span></div>
         </div>
         <div className="model-test-detail-grid">
-          <div><h3>当前图片目标 <span>{objects.length}</span></h3>{objects.length ? <div className="model-test-object-list">{objects.map((item, index) => <div key={`${item.class_id}-${index}`}><span>#{index + 1}</span><strong>{item.class_name}</strong><em>{item.confidence.toFixed(3)}</em></div>)}</div> : <p>当前图片没有达到阈值的目标。</p>}</div>
-          <div><h3>整批类别统计 <span>{classRows.length}</span></h3>{classRows.length ? <div className="model-test-class-list">{classRows.map(([name, value]) => <div key={name}><strong>{name}</strong><span><i style={{ width: `${Math.max(8, value.count / allObjects.length * 100)}%` }} /></span><em>{value.count} · 平均 {(value.confidence / value.count).toFixed(3)}</em></div>)}</div> : <p>本次没有检测到目标。</p>}</div>
+          <div><h3>当前图片预测 <span>{objects.length}</span></h3>{objects.length ? <div className="model-test-object-list">{objects.map((item, index) => <div key={`${item.class_id ?? item.class_name}-${index}`}><span>#{index + 1}</span><strong>{item.class_name}{taskType === 'segment' && item.mask_available ? ' · 含掩码' : ''}{taskType === 'pose' && item.keypoints ? ` · ${item.keypoints.length} 个关键点` : ''}{taskType === 'obb' && item.obb_points ? ' · 旋转框' : ''}</strong><em>{item.confidence.toFixed(3)}</em></div>)}</div> : <p>当前图片没有可显示的预测结果。</p>}</div>
+          <div><h3>整批类别统计 <span>{classRows.length}</span></h3>{classRows.length ? <div className="model-test-class-list">{classRows.map(([name, value]) => <div key={name}><strong>{name}</strong><span><i style={{ width: `${Math.max(8, value.count / allObjects.length * 100)}%` }} /></span><em>{value.count} · 平均 {(value.confidence / value.count).toFixed(3)}</em></div>)}</div> : <p>本次没有预测结果。</p>}</div>
           <div><h3>性能数据</h3><dl><div><dt>模型加载</dt><dd>{milliseconds(test.timings?.model_load)}</dd></div><div><dt>预处理</dt><dd>{milliseconds(selectedResult.timings.preprocess)}</dd></div><div><dt>当前图推理</dt><dd>{milliseconds(selectedResult.timings.inference)}</dd></div><div><dt>后处理</dt><dd>{milliseconds(selectedResult.timings.postprocess)}</dd></div><div><dt>整批总耗时</dt><dd>{milliseconds(test.timings?.total)}</dd></div></dl></div>
         </div>
       </section>}

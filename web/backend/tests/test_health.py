@@ -110,3 +110,97 @@ def test_health_returns_service_unavailable_when_database_check_fails(monkeypatc
 
     assert response.status_code == 503
     assert response.json() == {"detail": "数据库暂不可用"}
+
+
+def test_storage_health_reports_configured_directory_without_writing(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_module, "RUNS_ROOT", tmp_path)
+    client = TestClient(main_module.app)
+    try:
+        response = client.get("/api/health/storage")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["path"] == str(tmp_path)
+    assert payload["status"] in {"writable", "read_only"}
+    assert isinstance(payload["free_bytes"], int)
+    assert isinstance(payload["total_bytes"], int)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_storage_health_reports_missing_directory(monkeypatch, tmp_path):
+    missing = tmp_path / "not-created"
+    monkeypatch.setattr(main_module, "RUNS_ROOT", missing)
+    client = TestClient(main_module.app)
+    try:
+        response = client.get("/api/health/storage")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": str(missing),
+        "status": "missing",
+        "free_bytes": None,
+        "total_bytes": None,
+    }
+    assert not missing.exists()
+
+
+def test_storage_health_reports_path_that_is_not_a_directory(monkeypatch, tmp_path):
+    file_path = tmp_path / "runs.txt"
+    file_path.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(main_module, "RUNS_ROOT", file_path)
+    client = TestClient(main_module.app)
+    try:
+        response = client.get("/api/health/storage")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": str(file_path),
+        "status": "not_directory",
+        "free_bytes": None,
+        "total_bytes": None,
+    }
+
+
+def test_storage_health_reports_read_only_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_module, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(main_module.os, "access", lambda *_: False)
+    client = TestClient(main_module.app)
+    try:
+        response = client.get("/api/health/storage")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["path"] == str(tmp_path)
+    assert payload["status"] == "read_only"
+    assert isinstance(payload["free_bytes"], int)
+    assert isinstance(payload["total_bytes"], int)
+
+
+def test_storage_health_reports_unavailable_when_disk_usage_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(main_module, "RUNS_ROOT", tmp_path)
+
+    def fail_disk_usage(_):
+        raise OSError("storage unavailable")
+
+    monkeypatch.setattr(main_module.shutil, "disk_usage", fail_disk_usage)
+    client = TestClient(main_module.app)
+    try:
+        response = client.get("/api/health/storage")
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "path": str(tmp_path),
+        "status": "unavailable",
+        "free_bytes": None,
+        "total_bytes": None,
+    }

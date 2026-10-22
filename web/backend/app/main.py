@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import re
+import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
@@ -286,6 +288,21 @@ def health():
             "inference_worker": inference_status,
             "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "runs_root": str(RUNS_ROOT)}
+
+
+@app.get("/api/health/storage")
+def storage_health():
+    """Inspect the platform output directory without creating test files."""
+    try:
+        if not RUNS_ROOT.exists():
+            return {"path": str(RUNS_ROOT), "status": "missing", "free_bytes": None, "total_bytes": None}
+        if not RUNS_ROOT.is_dir():
+            return {"path": str(RUNS_ROOT), "status": "not_directory", "free_bytes": None, "total_bytes": None}
+        usage = shutil.disk_usage(RUNS_ROOT)
+        status = "writable" if os.access(RUNS_ROOT, os.W_OK) else "read_only"
+        return {"path": str(RUNS_ROOT), "status": status, "free_bytes": usage.free, "total_bytes": usage.total}
+    except OSError:
+        return {"path": str(RUNS_ROOT), "status": "unavailable", "free_bytes": None, "total_bytes": None}
 
 
 @app.get("/api/resources")

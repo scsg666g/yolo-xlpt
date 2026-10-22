@@ -27,6 +27,7 @@ from app.models import (
     ModelAsset,
     ModelTest,
     ModelTestImage,
+    MetricPoint,
     RemoteOperation,
     TaskGroup,
     TrainingRun,
@@ -100,7 +101,7 @@ def upload_all(client, test_id, count=1):
         assert client.put(f"/api/model-tests/{test_id}/images/{index}", content=image_bytes()).status_code == 204
 
 
-def install_fake_process(monkeypatch, expected_images=1, seen_models=None):
+def install_fake_process(monkeypatch, expected_images=1, seen_models=None, detected_task=None):
     class FakeProcess:
         def __init__(self, command, **_kwargs):
             model = Path(command[command.index("--model") + 1])
@@ -109,6 +110,9 @@ def install_fake_process(monkeypatch, expected_images=1, seen_models=None):
             output = Path(command[command.index("--output") + 1])
             summary = Path(command[command.index("--summary") + 1])
             output.mkdir()
+            task_type = detected_task or (
+                command[command.index("--expected-task") + 1] if "--expected-task" in command else "detect"
+            )
             images = []
             for index in range(expected_images):
                 Image.new("RGB", (40, 30), "red").save(output / f"{index}.jpg")
@@ -116,11 +120,21 @@ def install_fake_process(monkeypatch, expected_images=1, seen_models=None):
                     "class_id": 0, "class_name": "person", "confidence": 0.91,
                     "bbox_xyxy": [1, 2, 20, 25],
                 }] if index == 0 else [])
+                if objects:
+                    if task_type == "classify":
+                        objects[0].pop("bbox_xyxy")
+                    elif task_type == "segment":
+                        objects[0].update(mask_available=True, mask_polygon_xy=[[1, 2], [20, 2], [20, 25]])
+                    elif task_type == "pose":
+                        objects[0]["keypoints"] = [{"index": 0, "x": 4, "y": 5, "confidence": 0.8}]
+                    elif task_type == "obb":
+                        objects[0].update(obb_points=[[1, 2], [20, 2], [20, 25], [1, 25]], obb_xywhr=[10, 10, 5, 5, 0.2])
                 images.append({
-                    "index": index, "objects": objects,
+                    "index": index, "prediction_count": len(objects), "objects": objects,
                     "timings": {"preprocess": 3, "inference": 25, "postprocess": 2},
                 })
             summary.write_text(json.dumps({
+                "task_type": task_type,
                 "device": "CPU", "imgsz": 640,
                 "timings": {
                     "model_load": 120, "preprocess": 3 * expected_images,
@@ -288,8 +302,9 @@ def test_standalone_history_groups_include_model_source_and_remote_node(
     }
 
 
+@pytest.mark.parametrize("task_type", ["detect", "segment", "classify", "pose", "obb"])
 def test_standalone_model_test_runs_without_training_task_and_has_global_history(
-    image_test_client, tmp_path, monkeypatch,
+    image_test_client, tmp_path, monkeypatch, task_type,
 ):
     client, db, artifact, _, test_worker = image_test_client
     _, model_root = configure_standalone_models(tmp_path, monkeypatch)
@@ -313,17 +328,19 @@ def test_standalone_model_test_runs_without_training_task_and_has_global_history
     assert created["model_source_path"] == "pt/standalone.pt"
     assert created["execution_node_id"] == "local"
     assert created["model_source_name"] == "standalone.pt"
+    assert created["task_type"] is None
     test_id = created["id"]
     directory = storage.test_history_root(storage.STANDALONE_HISTORY_SCOPE, test_id)
     assert directory.is_dir()
 
     upload_all(client, test_id)
     assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
-    install_fake_process(monkeypatch)
+    install_fake_process(monkeypatch, detected_task=task_type)
     assert test_worker.process_one()
 
     detail = client.get(f"/api/model-tests/{test_id}").json()
     assert detail["status"] == "completed"
+    assert detail["task_type"] == task_type
     assert detail["files"][0]["detections"] == 1
     global_history = client.get("/api/model-tests", params={"source_type": "local_path"}).json()
     assert [item["id"] for item in global_history["items"]] == [test_id]
@@ -1323,7 +1340,9 @@ def test_rejects_active_unsupported_deleted_or_outside_weights(image_test_client
     artifact.run.status = "completed"
     artifact.task.task_type = "segment"
     db.commit()
-    assert create(client, artifact).status_code == 422
+    segment_test = create(client, artifact)
+    assert segment_test.status_code == 201
+    assert segment_test.json()["task_type"] == "segment"
     artifact.task.task_type = "detect"
     artifact.task.deleted_at = utcnow()
     db.commit()
@@ -1332,6 +1351,93 @@ def test_rejects_active_unsupported_deleted_or_outside_weights(image_test_client
     artifact.path = str(tmp_path / "outside.pt")
     db.commit()
     assert create(client, artifact).status_code == 403
+
+
+@pytest.mark.parametrize("task_type", ["detect", "segment", "classify", "pose", "obb"])
+def test_training_artifacts_run_through_generic_result_history(image_test_client, monkeypatch, task_type):
+    client, _, artifact, _, test_worker = image_test_client
+    artifact.task.task_type = task_type
+    test = create(client, artifact).json()
+    test_id = test["id"]
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    install_fake_process(monkeypatch)
+
+    assert test_worker.process_one()
+
+    detail = client.get(f"/api/model-tests/{test_id}").json()
+    assert detail["task_type"] == task_type
+    assert detail["model"]["task_type"] == task_type
+    assert detail["files"][0]["prediction_count"] == 1
+    prediction = detail["files"][0]["objects"][0]
+    if task_type == "classify":
+        assert "bbox_xyxy" not in prediction
+    elif task_type == "segment":
+        assert prediction["mask_polygon_xy"] == [[1, 2], [20, 2], [20, 25]]
+    elif task_type == "pose":
+        assert prediction["keypoints"][0]["confidence"] == 0.8
+    elif task_type == "obb":
+        assert len(prediction["obb_points"]) == 4
+    download = client.get(f"/api/model-tests/{test_id}/download")
+    archive_name = "detection-results.zip" if task_type == "detect" else "model-test-results.zip"
+    results_name = "detections.json" if task_type == "detect" else "results.json"
+    assert download.headers["content-disposition"].endswith(f'filename="{archive_name}"')
+    with zipfile.ZipFile(BytesIO(download.content)) as archive:
+        assert results_name in archive.namelist()
+        exported = json.loads(archive.read(results_name))
+        assert exported["task_type"] == task_type
+        assert exported["files"][0]["objects"] == [prediction]
+
+
+def test_training_model_summary_uses_task_specific_metric(image_test_client):
+    client, db, artifact, _, _ = image_test_client
+    artifact.task.task_type = "classify"
+    db.add_all([
+        MetricPoint(
+            task_id=artifact.task_id,
+            run_id=artifact.run_id,
+            epoch=4,
+            elapsed=10,
+            values={"metrics/accuracy_top1": 0.82, "metrics/mAP50-95(B)": 0.99},
+        ),
+        MetricPoint(
+            task_id=artifact.task_id,
+            run_id=artifact.run_id,
+            epoch=5,
+            elapsed=12,
+            values={"metrics/accuracy_top1": 0.78, "metrics/mAP50-95(B)": 1.0},
+        ),
+    ])
+    db.commit()
+
+    response = create(client, artifact)
+
+    assert response.status_code == 201
+    model = response.json()["model"]
+    assert model["metric_name"] == "Top-1 accuracy"
+    assert model["best_epoch"] == 4
+    assert model["metric_value"] == 0.82
+
+
+def test_legacy_detection_history_without_task_type_remains_downloadable(image_test_client, monkeypatch):
+    client, db, artifact, _, test_worker = image_test_client
+    test_id = create(client, artifact).json()["id"]
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    install_fake_process(monkeypatch)
+    assert test_worker.process_one()
+    record = db.get(ModelTest, test_id)
+    db.refresh(record)
+    record.model_snapshot = {key: value for key, value in record.model_snapshot.items() if key != "task_type"}
+    db.commit()
+
+    detail = client.get(f"/api/model-tests/{test_id}").json()
+    assert "task_type" not in detail["model"]
+    assert detail["files"][0]["detections"] == detail["files"][0]["prediction_count"] == 1
+    download = client.get(f"/api/model-tests/{test_id}/download")
+    assert download.status_code == 200
+    with zipfile.ZipFile(BytesIO(download.content)) as archive:
+        assert "detections.json" in archive.namelist()
 
 
 def test_start_rejects_weight_changed_after_record_creation(image_test_client):
@@ -1535,11 +1641,13 @@ def test_remote_history_cache_falls_back_after_newest_candidate_is_corrupt(
     assert selected == valid_cache
 
 
-def test_remote_weight_uses_verified_center_cache(image_test_client, tmp_path, monkeypatch):
+@pytest.mark.parametrize("task_type", ["detect", "segment", "classify", "pose", "obb"])
+def test_remote_weight_uses_verified_center_cache(image_test_client, tmp_path, monkeypatch, task_type):
     client, db, artifact, _, test_worker = image_test_client
     remote_weight = b"verified-remote-weight"
     artifact.run.execution_node_id = "remote-node"
     artifact.task.execution_node_id = "remote-node"
+    artifact.task.task_type = task_type
     artifact.size = len(remote_weight)
     db.commit()
     assert create(client, artifact).status_code == 409
