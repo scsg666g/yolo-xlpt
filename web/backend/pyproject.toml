@@ -1,6 +1,6 @@
 [project]
 name = "yolo-training-platform"
-version = "1.3.0"
+version = "1.4.0"
 description = "Standalone training orchestration API for the local Ultralytics workspace"
 requires-python = ">=3.11"
 dependencies = [

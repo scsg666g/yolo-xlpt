@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 import app.compute_nodes as monitoring
 from app.database import Base, get_db
 from app.main import app
-from app.models import ComputeNode, TaskEvent, TrainingRun, TrainingTask, utcnow
+from app.models import ComputeNode, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.parameter_catalog import training_parameter_keys
 from sqlalchemy import select
 from app.services import create_training_run
@@ -193,6 +193,46 @@ def test_offline_disabled_rotation_and_removal(monitoring_client):
     assert client.get(url).status_code == 404
     assert client.delete("/api/compute/nodes/local").status_code == 409
     assert client.post("/api/compute/nodes/local/token").status_code == 409
+
+
+def test_active_model_fetch_protects_node_management(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client, "Model transfer node")
+    node_id = credential["node"]["id"]
+    operation = RemoteOperation(
+        id="f" * 32,
+        node_id=node_id,
+        task_id="model-asset:" + "a" * 32,
+        kind="fetch_model",
+        status="pending",
+        payload={"model_asset_id": "a" * 32, "path": "/models/test.pt"},
+    )
+    with factory() as db:
+        db.add(operation)
+        db.commit()
+
+    settings = {"name": "Model transfer node", "enabled": False}
+    assert client.patch(f"/api/compute/nodes/{node_id}", json=settings).status_code == 409
+    assert client.delete(f"/api/compute/nodes/{node_id}").status_code == 409
+
+    # A pending operation must not deadlock recovery when the old token is
+    # unavailable; the replacement Agent can report and claim it later.
+    assert client.post(f"/api/compute/nodes/{node_id}/token").status_code == 200
+    with factory() as db:
+        stored = db.get(RemoteOperation, operation.id)
+        stored.status = "running"
+        db.commit()
+
+    assert client.post(f"/api/compute/nodes/{node_id}/token").status_code == 409
+    assert client.patch(f"/api/compute/nodes/{node_id}", json=settings).status_code == 409
+    assert client.delete(f"/api/compute/nodes/{node_id}").status_code == 409
+
+    with factory() as db:
+        stored = db.get(RemoteOperation, operation.id)
+        stored.status = "succeeded"
+        db.commit()
+    assert client.patch(f"/api/compute/nodes/{node_id}", json=settings).status_code == 200
+    assert client.delete(f"/api/compute/nodes/{node_id}").status_code == 204
 
 
 def test_validation_stale_reports_and_cpu_only_nodes(monitoring_client):

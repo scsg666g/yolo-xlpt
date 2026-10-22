@@ -35,7 +35,7 @@ from .gpu_reservations import (
     reserve_gpu_resources,
     resolve_gpu_assignments,
 )
-from .models import ComputeNode, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .models import ComputeNode, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
 from .process_attribution import inspect_process_owner
 
@@ -49,6 +49,8 @@ REQUIRED_AGENT_VERSION = "1.8.0"
 REQUIRED_AGENT_VERSION_PARTS = (1, 8, 0)
 PROCESS_ATTRIBUTION_AGENT_VERSION = "1.9.0"
 PROCESS_ATTRIBUTION_AGENT_VERSION_PARTS = (1, 9, 0)
+REMOTE_MODEL_TEST_AGENT_VERSION = "2.0.3"
+REMOTE_MODEL_TEST_AGENT_VERSION_PARTS = (2, 0, 3)
 Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Percentage = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
 
@@ -147,12 +149,13 @@ class TrainingCapability(BaseModel):
     lock_occupied: bool = False
     gpu_parallelism: bool = False
     output_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
+    model_test_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
 
-    @field_validator("output_roots")
+    @field_validator("output_roots", "model_test_roots")
     @classmethod
     def absolute_output_roots(cls, value: list[str]) -> list[str]:
         if any(not PurePosixPath(root).is_absolute() or "\x00" in root for root in value):
-            raise ValueError("训练输出目录必须是远程服务器上的有效绝对路径")
+            raise ValueError("Agent 上报的目录必须是远程服务器上的有效绝对路径")
         return list(dict.fromkeys(posixpath.normpath(root) for root in value))
 
 
@@ -268,6 +271,17 @@ def node_or_404(db: Session, node_id: str) -> ComputeNode:
     return node
 
 
+def has_active_model_fetch(db: Session, node_id: str, *, include_pending: bool = True) -> bool:
+    statuses = ["running", "finalizing"]
+    if include_pending:
+        statuses.append("pending")
+    return db.scalar(select(RemoteOperation.id).where(
+        RemoteOperation.node_id == node_id,
+        RemoteOperation.kind == "fetch_model",
+        RemoteOperation.status.in_(statuses),
+    ).limit(1)) is not None
+
+
 def as_utc(value: datetime) -> datetime:
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
@@ -308,6 +322,40 @@ def remote_training_unavailable_reason(node: ComputeNode | None, *, now: datetim
         return "远程 Agent 未启用训练"
     if not capability.get("ready"):
         return str(capability.get("reason") or "远程训练环境未就绪")[:400]
+    return None
+
+
+def remote_model_test_unavailable_reason(
+    node: ComputeNode | None,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Return why a node cannot safely transfer a standalone model.
+
+    File operations are deliberately limited to Agents with remote training
+    enabled. Monitor-only Agents do not poll the operation queue and therefore
+    never gain read access merely by upgrading the script.
+    """
+    if not node or node.kind != "agent":
+        return "远程服务器不存在"
+    if not node.enabled:
+        return "远程服务器已禁用"
+    if not agent_version_at_least(node.agent_version, REMOTE_MODEL_TEST_AGENT_VERSION_PARTS):
+        return f"请将远程 Agent 升级到 {REMOTE_MODEL_TEST_AGENT_VERSION} 或以上版本"
+    if node.last_seen_at is None:
+        return "远程 Agent 尚未连接"
+    current = now or utcnow()
+    timeout = max(30, node.report_interval_seconds * 3)
+    if (current - as_utc(node.last_seen_at)).total_seconds() > timeout:
+        return "远程 Agent 已离线"
+    capability = (node.snapshot or {}).get("training")
+    if not isinstance(capability, dict):
+        return "远程 Agent 未上报模型测试能力"
+    if capability.get("enabled") is not True:
+        return "远程 Agent 未启用训练与受控文件操作"
+    roots = capability.get("model_test_roots")
+    if not isinstance(roots, list) or not roots:
+        return "远程 Agent 未上报 model_test_roots，请升级并重启 Agent"
     return None
 
 
@@ -545,6 +593,7 @@ def node_detail(node_id: str, db: Session = Depends(get_db)):
 
 @router.patch("/nodes/{node_id}")
 def update_node(node_id: str, payload: NodeSettings, db: Session = Depends(get_db)):
+    acquire_node_claim_lock(db, node_id)
     node = node_or_404(db, node_id)
     if node.kind == "local" and not payload.enabled:
         raise HTTPException(422, "本机监控不能禁用")
@@ -553,6 +602,8 @@ def update_node(node_id: str, payload: NodeSettings, db: Session = Depends(get_d
         TrainingRun.status.in_(["starting", "running", "stopping"]),
     ).limit(1)):
         raise HTTPException(409, "该服务器正在执行训练，请先停止并等待状态上报后再禁用")
+    if not payload.enabled and has_active_model_fetch(db, node_id):
+        raise HTTPException(409, "该服务器正在传输测试模型，请等待传输结束后再禁用")
     for key, value in payload.model_dump().items():
         setattr(node, key, value)
     db.commit()
@@ -562,6 +613,7 @@ def update_node(node_id: str, payload: NodeSettings, db: Session = Depends(get_d
 
 @router.post("/nodes/{node_id}/token")
 def rotate_token(node_id: str, db: Session = Depends(get_db)):
+    acquire_node_claim_lock(db, node_id)
     node = node_or_404(db, node_id)
     if node.kind != "agent":
         raise HTTPException(409, "本机无需 Agent Token")
@@ -570,6 +622,8 @@ def rotate_token(node_id: str, db: Session = Depends(get_db)):
         TrainingRun.status.in_(["starting", "running", "stopping"]),
     ).limit(1)):
         raise HTTPException(409, "该服务器正在执行训练，请等待完成后再更换 Token")
+    if has_active_model_fetch(db, node_id, include_pending=False):
+        raise HTTPException(409, "该服务器正在传输测试模型，请等待传输结束后再更换 Token")
     token = issue_token(node)
     # Old observations do not establish the connection of the replacement Agent.
     node.last_seen_at = None
@@ -580,9 +634,12 @@ def rotate_token(node_id: str, db: Session = Depends(get_db)):
 
 @router.delete("/nodes/{node_id}", status_code=204)
 def delete_node(node_id: str, db: Session = Depends(get_db)):
+    acquire_node_claim_lock(db, node_id)
     node = node_or_404(db, node_id)
     if node.kind == "local":
         raise HTTPException(409, "不能移除本机服务器")
+    if has_active_model_fetch(db, node_id):
+        raise HTTPException(409, "该服务器仍有测试模型等待或正在传输，请等待完成后再移除")
     if db.scalar(select(TrainingTask.id).where(TrainingTask.execution_node_id == node_id).limit(1)):
         raise HTTPException(409, "该服务器仍有关联任务，请先处理任务后再移除服务器")
     db.delete(node)

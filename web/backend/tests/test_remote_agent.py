@@ -1,4 +1,5 @@
 """Remote execution regressions, using a small dummy process rather than GPU training."""
+import base64
 import importlib.util
 import hashlib
 import json
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 
@@ -630,6 +632,155 @@ def test_delete_legacy_flat_attempt_preserves_canonical_children(agent, training
     agent.delete_remote_files(config, {"runs": [payload]})  # idempotent after a lost ACK
 
 
+def test_fetch_standalone_remote_model_uses_dedicated_root_and_stable_metadata(
+    agent, training, monkeypatch,
+):
+    config, _ = training
+    model_root = Path(config["training_cwd"]) / "pt"
+    model_root.mkdir()
+    model = model_root / "standalone.pt"
+    content = (b"checkpoint-block" * 40_000) + b"end"
+    model.write_bytes(content)
+    config["model_test_roots"] = [str(model_root)]
+    config["model_transfer_finalize_timeout_seconds"] = 321
+    operation = {
+        "id": "1" * 32,
+        "kind": "fetch_model",
+        "lease": "2" * 32,
+        "payload": {"model_asset_id": "3" * 32, "path": str(model)},
+    }
+    chunks, timeouts = [], []
+
+    def api(_config, path, method="GET", payload=None, extra_headers=None, *, timeout_seconds=20):
+        assert method == "POST" and path.endswith("/chunk")
+        chunks.append(dict(payload))
+        timeouts.append(timeout_seconds)
+        return {"status": "succeeded" if payload["final"] else "running"}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    agent.execute_operation(config, operation, threading.Event())
+
+    assert len(chunks) == 2
+    assert b"".join(base64.b64decode(chunk["data"]) for chunk in chunks) == content
+    assert [chunk["offset"] for chunk in chunks] == [0, 512 * 1024]
+    assert all(chunk["size"] == len(content) for chunk in chunks)
+    assert len({chunk["modified_at"] for chunk in chunks}) == 1
+    assert len({chunk["mtime_ns"] for chunk in chunks}) == 1
+    assert chunks[-1]["sha256"] == hashlib.sha256(content).hexdigest()
+    assert timeouts == [20, 321]
+
+
+def test_fetch_training_artifact_uses_long_timeout_only_for_final_chunk(
+    agent, training, monkeypatch,
+):
+    config, task = training
+    run_dir = Path(task["run_dir"])
+    weight = run_dir / "weights/best.pt"
+    weight.parent.mkdir(parents=True)
+    content = (b"artifact-block" * 40_000) + b"end"
+    weight.write_bytes(content)
+    info = weight.stat()
+    config["model_transfer_finalize_timeout_seconds"] = 432
+    operation = {
+        "id": "7" * 32,
+        "kind": "fetch",
+        "lease": "8" * 32,
+        "payload": {
+            **task,
+            "output_root": task["parameters"]["remote_output_root"],
+            "layout": "canonical",
+            "name": "weights/best.pt",
+            "size": len(content),
+            "modified_at": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
+        },
+    }
+    chunks, timeouts = [], []
+
+    def api(_config, path, method="GET", payload=None, extra_headers=None, *, timeout_seconds=20):
+        assert method == "POST" and path.endswith("/chunk")
+        chunks.append(dict(payload))
+        timeouts.append(timeout_seconds)
+        return {"status": "succeeded" if payload["final"] else "running"}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    agent.execute_operation(config, operation, threading.Event())
+
+    assert len(chunks) == 2
+    assert b"".join(base64.b64decode(chunk["data"]) for chunk in chunks) == content
+    assert [chunk["offset"] for chunk in chunks] == [0, 512 * 1024]
+    assert chunks[-1]["sha256"] == hashlib.sha256(content).hexdigest()
+    assert timeouts == [20, 432]
+
+
+def test_standalone_remote_model_rejects_training_roots_links_and_non_pt(
+    agent, training, tmp_path,
+):
+    config, _ = training
+    model_root = Path(config["training_cwd"]) / "pt"
+    model_root.mkdir()
+    config["model_test_roots"] = [str(model_root)]
+    payload = {"model_asset_id": "3" * 32}
+
+    training_model = Path(config["training_cwd"]) / "model.pt"
+    with pytest.raises(ValueError, match="model_test_roots"):
+        agent.remote_model_path(config, {**payload, "path": str(training_model)})
+
+    text_file = model_root / "model.onnx"
+    text_file.write_bytes(b"model")
+    with pytest.raises(ValueError, match=r"\.pt"):
+        agent.remote_model_path(config, {**payload, "path": str(text_file)})
+
+    real = model_root / "real.pt"
+    real.write_bytes(b"model")
+    linked = model_root / "linked.pt"
+    linked.symlink_to(real)
+    with pytest.raises(ValueError, match="符号链接"):
+        agent.remote_model_path(config, {**payload, "path": str(linked)})
+
+    linked_root = tmp_path / "linked-model-root"
+    linked_root.symlink_to(model_root, target_is_directory=True)
+    config["model_test_roots"] = [str(linked_root)]
+    with pytest.raises(ValueError, match="符号链接"):
+        agent.remote_model_path(config, {**payload, "path": str(linked_root / "real.pt")})
+
+
+def test_fetch_standalone_remote_model_rejects_file_replacement(
+    agent, training, monkeypatch,
+):
+    config, _ = training
+    model_root = Path(config["training_cwd"]) / "pt"
+    model_root.mkdir()
+    model = model_root / "changing.pt"
+    model.write_bytes(b"a" * (600 * 1024))
+    config["model_test_roots"] = [str(model_root)]
+    operation = {
+        "id": "4" * 32,
+        "kind": "fetch_model",
+        "lease": "5" * 32,
+        "payload": {"model_asset_id": "6" * 32, "path": str(model)},
+    }
+    chunks, results = [], []
+
+    def api(_config, path, method="GET", payload=None):
+        assert method == "POST"
+        if path.endswith("/chunk"):
+            chunks.append(dict(payload))
+            replacement = model.with_suffix(".replacement")
+            replacement.write_bytes(b"b" * (600 * 1024))
+            replacement.replace(model)
+            return {"status": "running"}
+        assert path.endswith("/result")
+        results.append(dict(payload))
+        return {"status": "failed"}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    agent.execute_operation(config, operation, threading.Event())
+
+    assert len(chunks) == 1 and chunks[0]["final"] is False
+    assert results and results[0]["success"] is False
+    assert "发生变化" in results[0]["error"]
+
+
 def test_claim_confirmation_retries_lost_response_and_honors_stop(agent, training, monkeypatch):
     config, task = training
     task["claim_lease"] = "c" * 32
@@ -966,6 +1117,9 @@ def test_commented_relative_config_is_independent_of_shell_directory(agent, tmp_
     assert loaded["training_cwd"] == str(project)
     assert loaded["allowed_training_roots"] == [str(project / "runs")]
     assert loaded["training_output_roots"] == [str(project / "runs")]
+    assert loaded["model_test_roots"] == [str(project / "pt")]
+    assert loaded["model_transfer_finalize_timeout_seconds"] == 1800
+    assert not Path(loaded["model_test_roots"][0]).exists()
     assert loaded["training_lock_file"] == str(project / "workspace.lock")
     assert loaded["yolo_bin"] == str(project / "bin/yolo")
     assert loaded["training_state_dir"] == str(path.parent / ".training-state")
@@ -975,6 +1129,16 @@ def test_commented_relative_config_is_independent_of_shell_directory(agent, tmp_
     shutil.copytree(project, moved / "project")
     relocated = agent.load_config(moved / "agent/agent-config.json")
     assert relocated["training_output_roots"] == [str(moved / "project/runs")]
+    assert relocated["model_test_roots"] == [str(moved / "project/pt")]
+
+
+@pytest.mark.parametrize("value", [59, 7201, True])
+def test_model_transfer_finalize_timeout_is_bounded_integer(agent, tmp_path, value):
+    path, _ = write_relative_config(
+        tmp_path, model_transfer_finalize_timeout_seconds=value,
+    )
+    with pytest.raises(ValueError, match="model_transfer_finalize_timeout_seconds"):
+        agent.load_config(path)
 
 
 def test_relative_outputs_preserve_containment_and_symlink_protection(agent, tmp_path):
@@ -1022,6 +1186,12 @@ def test_capability_reports_actual_outputs_with_legacy_fallback(agent, training,
     capability = agent.training_capability(config)
     assert capability["ready"] is True
     assert capability["output_roots"] == config["training_output_roots"]
+    assert capability["model_test_roots"] == []
+    missing_model_root = Path(config["training_cwd"]) / "missing-model-tests"
+    config["model_test_roots"] = [str(missing_model_root)]
+    capability = agent.training_capability(config)
+    assert capability["ready"] is True
+    assert capability["model_test_roots"] == [str(missing_model_root)]
     config.pop("training_output_roots")
     assert agent.training_capability(config)["output_roots"] == config["allowed_training_roots"]
 

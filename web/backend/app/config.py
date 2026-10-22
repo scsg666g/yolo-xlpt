@@ -95,6 +95,30 @@ MODEL_TEST_MIN_FREE_BYTES = nonnegative_int_env(
 MODEL_TEST_IMAGE_RESERVE_BYTES = nonnegative_int_env(
     "PLATFORM_MODEL_TEST_IMAGE_RESERVE_BYTES", 64 * 1024**2,
 )
+# Immutable checkpoints fetched from remote model-test roots live outside the
+# history tree, so they need their own admission limit.  The minimum-free check
+# reserves the bytes still outstanding for every active transfer instead of
+# looking only at the first chunk already written to disk.
+REMOTE_MODEL_CACHE_QUOTA_BYTES = nonnegative_int_env(
+    "PLATFORM_REMOTE_MODEL_CACHE_QUOTA_BYTES", 20 * 1024**3,
+)
+REMOTE_MODEL_CACHE_MIN_FREE_BYTES = nonnegative_int_env(
+    "PLATFORM_REMOTE_MODEL_CACHE_MIN_FREE_BYTES", 2 * 1024**3,
+)
+
+
+def project_path_list_env(name: str, default: str, *, base: Path = SOURCE_PROJECT_ROOT) -> list[Path]:
+    """Resolve an ``os.pathsep`` separated list without depending on the process CWD."""
+    configured = os.getenv(name, default)
+    values = [value.strip() for value in configured.split(os.pathsep) if value.strip()]
+    if not values:
+        raise RuntimeError(f"{name} 至少需要配置一个目录")
+    paths: list[Path] = []
+    for value in values:
+        path = project_path(value, base=base)
+        if path not in paths:
+            paths.append(path)
+    return paths
 
 
 def resolve_database_url(value: str) -> str:
@@ -111,6 +135,10 @@ DATABASE_URL = resolve_database_url(os.getenv("DATABASE_URL", "sqlite:///web/dat
 
 MODEL_ROOTS = [PROJECT_ROOT / "models", PROJECT_ROOT / "pt", ULTRALYTICS_ROOT / "weights"]
 DATASET_ROOTS = [PROJECT_ROOT / "数据集", ULTRALYTICS_ROOT / "xl"]
+# Standalone model tests intentionally have a narrower trust boundary than the
+# training model catalogue. Deployments may add roots with the platform path
+# separator (":" on Linux); relative entries stay portable across checkouts.
+MODEL_TEST_ROOTS = project_path_list_env("PLATFORM_MODEL_TEST_ROOTS", "pt", base=PROJECT_ROOT)
 
 for directory in (DATA_ROOT, RUNS_ROOT, RUNTIME_ROOT, LOG_ROOT):
     directory.mkdir(parents=True, exist_ok=True)

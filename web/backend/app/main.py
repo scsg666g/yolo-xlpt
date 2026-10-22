@@ -45,6 +45,7 @@ from .inference import (
 )
 from .models import Artifact, ComputeNode, MetricPoint, RemoteOperation, TaskEvent, TaskGroup, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete, queue_local_run_delete
+from .model_assets import router as model_assets_router
 from .parameter_catalog import is_finite_number, load_parameter_catalog, validate_parameter_values
 from .remote_operations import (
     active_remote_delete,
@@ -139,6 +140,7 @@ app = FastAPI(title="YOLO 模型训练平台", version=PLATFORM_VERSION, lifespa
 app.include_router(dataset_upload_router)
 app.include_router(dataset_management_router)
 app.include_router(inference_router)
+app.include_router(model_assets_router)
 app.include_router(compute_nodes_router)
 app.include_router(remote_operations_router)
 app.add_middleware(

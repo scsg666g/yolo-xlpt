@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelTest, ModelTestPage, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, Resources, TaskCreatePayload, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -62,6 +62,42 @@ export const api = {
     }),
     signal,
   }),
+  createStandaloneModelTest: (
+    model_asset_id: string,
+    confidence: number,
+    iou: number,
+    files: File[],
+    signal: AbortSignal,
+    rerun_of_test_id?: string | null,
+  ) => requestWithTimeout<ModelTest>('/api/model-tests', {
+    method: 'POST',
+    body: JSON.stringify({
+      model_asset_id,
+      confidence,
+      iou,
+      rerun_of_test_id: rerun_of_test_id || undefined,
+      files: files.map(({ name, size }) => ({ name, size })),
+    }),
+    signal,
+  }),
+  modelAssets: (signal?: AbortSignal) => requestWithTimeout<ModelAssetPage>('/api/model-assets', { signal }),
+  createLocalModelAsset: (path: string, name: string | undefined, signal?: AbortSignal) => requestWithTimeout<ModelAsset>('/api/model-assets/local', {
+    method: 'POST', body: JSON.stringify({ path, name: name || undefined }), signal,
+  }, 120_000, '校验模型超时，请检查路径后重试'),
+  createRemoteModelAsset: (execution_node_id: string, path: string, name: string | undefined, signal?: AbortSignal) => requestWithTimeout<ModelAsset>('/api/model-assets/remote', {
+    method: 'POST', body: JSON.stringify({ execution_node_id, path, name: name || undefined }), signal,
+  }, 120_000, '远程模型登记超时，可刷新已登记模型确认状态'),
+  prepareModelAsset: (id: string, retry = false, signal?: AbortSignal) => requestWithTimeout<ModelAsset>(
+    `/api/model-assets/${encodeURIComponent(id)}/prepare?retry=${retry}`, { method: 'POST', signal }, 120_000,
+    '模型准备超时，请稍后刷新确认状态',
+  ),
+  globalModelTests: (signal?: AbortSignal, cursor?: string, limit = 50, sourceType?: ModelAssetSourceType | 'training_artifact' | '', status?: ModelTest['status'] | '') => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (cursor) params.set('cursor', cursor)
+    if (sourceType) params.set('source_type', sourceType)
+    if (status) params.set('status', status)
+    return requestWithTimeout<ModelTestPage>(`/api/model-tests?${params}`, { signal })
+  },
   modelTests: (taskId: string, signal?: AbortSignal, cursor?: string, limit = 50, runId?: string | null) => {
     const params = new URLSearchParams({ limit: String(limit) })
     if (cursor) params.set('cursor', cursor)

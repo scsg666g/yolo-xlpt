@@ -17,10 +17,11 @@ from starlette.requests import ClientDisconnect
 
 import app.inference as inference
 import app.main as main_module
+import app.model_assets as model_assets
 import app.model_test_storage as storage
 from app.database import get_db
 from app.main import app
-from app.models import Artifact, ModelTest, ModelTestImage, RemoteOperation, TrainingRun, utcnow
+from app.models import Artifact, ModelAsset, ModelTest, ModelTestImage, RemoteOperation, TrainingRun, utcnow
 from test_services import make_session, make_task
 
 
@@ -129,6 +130,177 @@ def install_fake_process(monkeypatch, expected_images=1, seen_models=None):
             return None
 
     monkeypatch.setattr(inference.subprocess, "Popen", FakeProcess)
+
+
+def configure_standalone_models(tmp_path, monkeypatch):
+    project_root = tmp_path / "project"
+    model_root = project_root / "pt"
+    model_root.mkdir(parents=True)
+    monkeypatch.setattr(model_assets, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(model_assets, "MODEL_TEST_ROOTS", [model_root])
+    return project_root, model_root
+
+
+def test_local_model_assets_are_portable_listed_and_restricted(image_test_client, tmp_path, monkeypatch):
+    client, db, _, _, _ = image_test_client
+    project_root, model_root = configure_standalone_models(tmp_path, monkeypatch)
+    checkpoint = model_root / "yan-best.pt"
+    checkpoint.write_bytes(b"yan-checkpoint")
+
+    created = client.post("/api/model-assets/local", json={
+        "path": str(checkpoint), "name": "yan v1",
+    })
+    assert created.status_code == 201
+    asset = created.json()
+    assert asset["path"] == "pt/yan-best.pt"
+    assert asset["name"] == "yan v1"
+    assert asset["source_type"] == "local_path"
+    assert asset["execution_node_id"] == "local"
+    assert asset["sha256"] == hashlib.sha256(b"yan-checkpoint").hexdigest()
+    assert asset["size"] == len(b"yan-checkpoint")
+    db.expire_all()
+    assert db.get(ModelAsset, asset["id"]).path == "pt/yan-best.pt"
+
+    listed = client.get("/api/model-assets").json()
+    assert [item["id"] for item in listed["items"]] == [asset["id"]]
+    assert listed["local_root"] == "pt"
+    assert listed["local_roots"] == ["pt"]
+
+    # Re-registering one logical path refreshes the same reusable source.
+    checkpoint.write_bytes(b"yan-checkpoint-v2")
+    refreshed = client.post("/api/model-assets/local", json={"path": "pt/yan-best.pt"})
+    assert refreshed.status_code == 201
+    assert refreshed.json()["id"] == asset["id"]
+    assert refreshed.json()["sha256"] == hashlib.sha256(b"yan-checkpoint-v2").hexdigest()
+
+    outside = project_root / "outside.pt"
+    outside.write_bytes(b"outside")
+    assert client.post("/api/model-assets/local", json={"path": str(outside)}).status_code == 403
+    wrong_suffix = model_root / "model.onnx"
+    wrong_suffix.write_bytes(b"onnx")
+    assert client.post("/api/model-assets/local", json={"path": str(wrong_suffix)}).status_code == 422
+    symlink = model_root / "linked.pt"
+    symlink.symlink_to(checkpoint)
+    response = client.post("/api/model-assets/local", json={"path": str(symlink)})
+    assert response.status_code == 422
+    assert "符号链接" in response.json()["detail"]
+
+
+def test_standalone_model_test_runs_without_training_task_and_has_global_history(
+    image_test_client, tmp_path, monkeypatch,
+):
+    client, db, artifact, _, test_worker = image_test_client
+    _, model_root = configure_standalone_models(tmp_path, monkeypatch)
+    checkpoint = model_root / "standalone.pt"
+    checkpoint.write_bytes(b"standalone-checkpoint")
+    asset = client.post("/api/model-assets/local", json={"path": str(checkpoint)}).json()
+
+    created_response = client.post("/api/model-tests", json={
+        "model_asset_id": asset["id"],
+        "confidence": 0.3,
+        "iou": 0.6,
+        "files": [{"name": "standalone.png", "size": len(image_bytes())}],
+    })
+    assert created_response.status_code == 201
+    created = created_response.json()
+    assert created["task_id"] is None
+    assert created["run_id"] is None
+    assert created["artifact_id"] is None
+    assert created["model_asset_id"] == asset["id"]
+    assert created["model_source_type"] == "local_path"
+    assert created["model_source_path"] == "pt/standalone.pt"
+    assert created["execution_node_id"] == "local"
+    assert created["model_source_name"] == "standalone.pt"
+    test_id = created["id"]
+    directory = storage.test_history_root(storage.STANDALONE_HISTORY_SCOPE, test_id)
+    assert directory.is_dir()
+
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    install_fake_process(monkeypatch)
+    assert test_worker.process_one()
+
+    detail = client.get(f"/api/model-tests/{test_id}").json()
+    assert detail["status"] == "completed"
+    assert detail["files"][0]["detections"] == 1
+    global_history = client.get("/api/model-tests", params={"source_type": "local_path"}).json()
+    assert [item["id"] for item in global_history["items"]] == [test_id]
+    assert global_history["items"][0]["task_id"] is None
+    task_history = client.get(f"/api/tasks/{artifact.task_id}/model-tests").json()
+    assert all(item["id"] != test_id for item in task_history["items"])
+    assert client.get(f"/api/model-tests/{test_id}/download").status_code == 200
+
+    assert client.delete(f"/api/model-tests/{test_id}").status_code == 204
+    assert not directory.exists()
+    db.expire_all()
+    assert db.get(ModelTest, test_id) is None
+    assert db.get(ModelAsset, asset["id"]) is not None
+
+
+def test_historical_local_rerun_failure_does_not_poison_current_asset(
+    image_test_client, tmp_path, monkeypatch,
+):
+    client, db, _, _, test_worker = image_test_client
+    _, model_root = configure_standalone_models(tmp_path, monkeypatch)
+    checkpoint = model_root / "versioned.pt"
+    version_one = b"local-version-one"
+    version_two = b"local-version-two"
+    checkpoint.write_bytes(version_one)
+    asset = client.post("/api/model-assets/local", json={"path": str(checkpoint)}).json()
+
+    source = client.post("/api/model-tests", json={
+        "model_asset_id": asset["id"],
+        "files": [{"name": "source.png", "size": len(image_bytes())}],
+    }).json()
+    upload_all(client, source["id"])
+    assert client.post(f"/api/model-tests/{source['id']}/start").status_code == 202
+    install_fake_process(monkeypatch)
+    assert test_worker.process_one()
+    assert client.get(f"/api/model-tests/{source['id']}").json()["status"] == "completed"
+
+    checkpoint.write_bytes(version_two)
+    refreshed = client.post("/api/model-assets/local", json={"path": str(checkpoint)})
+    assert refreshed.status_code == 201
+    assert refreshed.json()["sha256"] == hashlib.sha256(version_two).hexdigest()
+
+    rerun = client.post("/api/model-tests", json={
+        "model_asset_id": asset["id"],
+        "rerun_of_test_id": source["id"],
+        "files": [{"name": "rerun.png", "size": len(image_bytes())}],
+    })
+    assert rerun.status_code == 409
+    assert rerun.json()["detail"] == "原模型权重版本已变化，无法按原权重重测"
+
+    db.expire_all()
+    current = db.get(ModelAsset, asset["id"])
+    assert current.status == "ready"
+    assert current.error is None
+    assert current.sha256 == hashlib.sha256(version_two).hexdigest()
+    assert current.size == len(version_two)
+
+
+def test_standalone_start_rejects_a_model_replaced_after_test_creation(
+    image_test_client, tmp_path, monkeypatch,
+):
+    client, db, _, _, _ = image_test_client
+    _, model_root = configure_standalone_models(tmp_path, monkeypatch)
+    checkpoint = model_root / "replaceable.pt"
+    checkpoint.write_bytes(b"version-one")
+    asset = client.post("/api/model-assets/local", json={"path": str(checkpoint)}).json()
+    created = client.post("/api/model-tests", json={
+        "model_asset_id": asset["id"],
+        "files": [{"name": "image.png", "size": len(image_bytes())}],
+    }).json()
+    upload_all(client, created["id"])
+
+    checkpoint.write_bytes(b"version-two")
+    response = client.post(f"/api/model-tests/{created['id']}/start")
+    assert response.status_code == 409
+    assert "版本已变化" in response.json()["detail"]
+    db.expire_all()
+    record = db.get(ModelTest, created["id"])
+    assert record.status == "failed"
+    assert "版本已变化" in record.error
 
 
 def test_completed_test_persists_and_is_listed_after_reopen(image_test_client, monkeypatch):

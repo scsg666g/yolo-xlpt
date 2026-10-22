@@ -21,6 +21,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def ensure_detection_model(model) -> None:
+    """Reject valid Ultralytics checkpoints for unsupported task types."""
+    if getattr(model, "task", None) != "detect":
+        raise RuntimeError("模型测试目前仅支持 YOLO 目标检测（detect）模型")
+
+
 def main() -> None:
     args = parse_args()
     sys.path.insert(0, str(Path(args.ultralytics_root).resolve()))
@@ -38,6 +44,7 @@ def main() -> None:
     started = time.perf_counter()
     model_started = time.perf_counter()
     model = YOLO(args.model)
+    ensure_detection_model(model)
     model_load_ms = (time.perf_counter() - model_started) * 1000
     names = {int(key): str(value) for key, value in model.names.items()}
     results = model.predict(

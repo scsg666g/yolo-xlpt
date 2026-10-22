@@ -30,10 +30,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.1"
+VERSION = "2.0.3"
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
+MODEL_TRANSFER_FINALIZE_TIMEOUT_SECONDS = 1800
 LOGGER = logging.getLogger("yolo-monitor-agent")
 CONFIRM_RETRY_DELAYS = (1, 2, 4, 8)
 ACTIVE_STATE_VERSION = 1
@@ -280,7 +281,8 @@ def training_capability(config: dict) -> dict:
         return {"enabled": False, "ready": False, "reason": "远程训练未启用",
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
                 "python_version": platform.python_version(), "output_writable": False,
-                "lock_occupied": False, "output_roots": [], "gpu_parallelism": True}
+                "lock_occupied": False, "output_roots": [], "gpu_parallelism": True,
+                "model_test_roots": list(config.get("model_test_roots", []))}
     reported_roots = []
     try:
         reported_roots = [str(root) for root in configured_output_roots(config)]
@@ -318,13 +320,15 @@ def training_capability(config: dict) -> dict:
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": _configured_yolo_version(yolo),
                 "python_version": platform.python_version(), "output_writable": True,
                 "lock_occupied": occupied,
-                "output_roots": reported_roots, "gpu_parallelism": True}
+                "output_roots": reported_roots, "gpu_parallelism": True,
+                "model_test_roots": list(config.get("model_test_roots", []))}
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
                 "python_version": platform.python_version(), "output_writable": False,
                 "lock_occupied": False,
-                "output_roots": reported_roots, "gpu_parallelism": True}
+                "output_roots": reported_roots, "gpu_parallelism": True,
+                "model_test_roots": list(config.get("model_test_roots", []))}
 
 
 def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
@@ -385,6 +389,24 @@ def normalized_training_paths(config: dict, path: Path) -> dict:
         result[key] = [str(config_path(value, cwd, key)) for value in values]
     result["training_lock_file"] = str(config_path(
         config.get("training_lock_file", ".yolo-forge-training.lock"), cwd, "training_lock_file"))
+    model_roots = config.get("model_test_roots", ["pt"])
+    if (not isinstance(model_roots, list) or len(model_roots) > 128 or
+            any(not isinstance(value, str) or not value.strip() or "\x00" in value for value in model_roots)):
+        raise ValueError("model_test_roots 必须是最多 128 个非空路径组成的列表")
+    # Keep these paths lexical so a configured root that is itself a symlink is
+    # still detectable when a model is requested.  Missing roots are allowed:
+    # they must not make monitoring or remote training unavailable.
+    parsed_model_roots = []
+    for value in model_roots:
+        candidate = Path(value)
+        candidate = candidate if candidate.is_absolute() else cwd / candidate
+        try:
+            normalized = Path(os.path.abspath(os.fspath(candidate)))
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError(f"model_test_roots 路径无法解析：{value}") from exc
+        if str(normalized) not in parsed_model_roots:
+            parsed_model_roots.append(str(normalized))
+    result["model_test_roots"] = parsed_model_roots
     return result
 
 
@@ -407,6 +429,11 @@ def load_config(path: Path) -> dict:
     interval = config.get("report_interval_seconds", 5)
     if type(interval) is not int or not 5 <= interval <= 300:
         raise ValueError("report_interval_seconds 必须为 5～300 的整数")
+    model_finalize_timeout = config.get(
+        "model_transfer_finalize_timeout_seconds", MODEL_TRANSFER_FINALIZE_TIMEOUT_SECONDS,
+    )
+    if type(model_finalize_timeout) is not int or not 60 <= model_finalize_timeout <= 7200:
+        raise ValueError("model_transfer_finalize_timeout_seconds 必须为 60～7200 的整数")
     binary = config.get("nvidia_smi_bin", "nvidia-smi")
     if not isinstance(binary, str) or not binary:
         raise ValueError("nvidia_smi_bin 必须是命令或可执行文件路径")
@@ -439,8 +466,10 @@ def load_config(path: Path) -> dict:
         raise ValueError("training_lock_file 的父目录必须已存在")
     return {"center_url": center, "node_id": node_id, "token": token,
             "report_interval_seconds": interval, "nvidia_smi_bin": binary,
+            "model_transfer_finalize_timeout_seconds": model_finalize_timeout,
             "enable_training": enabled, "allowed_training_roots": [str(item) for item in resolved_roots],
             "training_output_roots": [str(item) for item in resolved_outputs],
+            "model_test_roots": paths["model_test_roots"],
             "yolo_bin": yolo_bin, "training_cwd": str(cwd_path),
             "training_lock_file": str(lock_path),
             "training_state_dir": str(path.resolve().parent / ".training-state"),
@@ -1256,12 +1285,12 @@ def load_active_run(config: dict) -> dict | None:
 
 
 def api_json(config: dict, path: str, method: str = "GET", payload: dict | None = None,
-             extra_headers: dict[str, str] | None = None) -> dict:
+             extra_headers: dict[str, str] | None = None, *, timeout_seconds: int = 20) -> dict:
     data = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode() if payload is not None else None
     headers = {"Authorization": "Bearer " + config["token"], "Content-Type": "application/json"}
     headers.update(extra_headers or {})
     request = Request(config["center_url"] + path, data=data, method=method, headers=headers)
-    with build_opener(NoRedirect()).open(request, timeout=20) as response:
+    with build_opener(NoRedirect()).open(request, timeout=timeout_seconds) as response:
         body = response.read(2 * 1024 * 1024)
     return json.loads(body or b"{}")
 
@@ -1516,6 +1545,161 @@ def delete_remote_files(config: dict, payload: dict) -> None:
         release_training_lock(training_lock)
 
 
+def remote_model_path(config: dict, payload: dict) -> Path:
+    """Validate a standalone model without granting access to training roots."""
+    model_asset_id = payload.get("model_asset_id")
+    if not isinstance(model_asset_id, str) or not re.fullmatch(r"[0-9a-f]{32}", model_asset_id):
+        raise ValueError("远程模型资产标识无效")
+    raw = payload.get("path")
+    if (not isinstance(raw, str) or not raw or len(raw) > 4096 or "\x00" in raw or
+            any(ord(character) < 32 for character in raw)):
+        raise ValueError("远程模型路径无效")
+    path = Path(raw)
+    if not path.is_absolute() or path.suffix != ".pt":
+        raise ValueError("远程模型必须是 model_test_roots 内的绝对 .pt 文件路径")
+    configured = config.get("model_test_roots")
+    if configured is None:
+        configured = [str(Path(config["training_cwd"]) / "pt")]
+    if not isinstance(configured, list) or not configured:
+        raise ValueError("Agent 未配置可用的 model_test_roots")
+    roots = []
+    invalid_roots = []
+    for value in configured:
+        try:
+            root = Path(value)
+            resolved = root.resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            invalid_roots.append(str(value))
+            continue
+        if (not root.is_absolute() or root.is_symlink() or resolved != root or
+                not stat.S_ISDIR(os.stat(root, follow_symlinks=False).st_mode)):
+            invalid_roots.append(str(value))
+            continue
+        roots.append(root)
+    if not any(root in path.parents for root in roots):
+        configured_text = "、".join(str(value) for value in configured)
+        if invalid_roots:
+            raise ValueError(
+                f"远程模型路径不在可用的 model_test_roots 内：{path}；"
+                f"当前配置：{configured_text}；请检查目录是否存在且不含符号链接"
+            )
+        raise ValueError(
+            f"远程模型路径不在 Agent model_test_roots 内：{path}；"
+            f"允许目录：{configured_text}"
+        )
+    try:
+        resolved_path = path.resolve(strict=True)
+        info = os.stat(path, follow_symlinks=False)
+    except (FileNotFoundError, NotADirectoryError):
+        raise ValueError(f"远程服务器上的模型文件不存在：{path}") from None
+    except OSError as exc:
+        raise ValueError(f"无法读取远程模型文件：{path}") from exc
+    if path.is_symlink() or resolved_path != path:
+        raise ValueError("远程模型路径或其父目录包含符号链接，已拒绝读取")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("远程模型路径不是普通文件")
+    if info.st_size <= 0:
+        raise ValueError("远程模型文件为空")
+    return path
+
+
+def _file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns
+
+
+def submit_operation_chunk(
+    config: dict,
+    endpoint: str,
+    chunk: dict,
+    stop: threading.Event,
+) -> dict | None:
+    """Submit one block, waiting safely when another center worker finalizes it."""
+    final = bool(chunk.get("final"))
+    timeout = (
+        config.get(
+            "model_transfer_finalize_timeout_seconds",
+            MODEL_TRANSFER_FINALIZE_TIMEOUT_SECONDS,
+        )
+        if final else 20
+    )
+    while not stop.is_set():
+        for retry in range(3):
+            try:
+                if final:
+                    response = api_json(
+                        config,
+                        endpoint + "/chunk",
+                        "POST",
+                        chunk,
+                        timeout_seconds=timeout,
+                    )
+                else:
+                    response = api_json(config, endpoint + "/chunk", "POST", chunk)
+                break
+            except (OSError, URLError):
+                if retry == 2 or stop.wait(2):
+                    raise
+        if not final or response.get("status") == "succeeded":
+            return response
+        if response.get("status") not in {"running", "finalizing"}:
+            raise ValueError("中心未确认远程文件最终分块")
+        if stop.wait(2):
+            return None
+    return None
+
+
+def fetch_remote_model(config: dict, operation: dict, stop: threading.Event, endpoint: str) -> None:
+    """Stream one immutable standalone checkpoint through the operation channel."""
+    path = remote_model_path(config, operation["payload"])
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+            raise ValueError("远程模型不是非空普通文件")
+        identity = _file_identity(info)
+        try:
+            current_path = os.stat(path, follow_symlinks=False)
+            if path.resolve(strict=True) != path or _file_identity(current_path) != identity:
+                raise ValueError("打开模型时路径发生变化，请重试")
+        except OSError as exc:
+            raise ValueError("打开模型时路径发生变化，请重试") from exc
+        metadata = {
+            "size": info.st_size,
+            "modified_at": datetime.fromtimestamp(info.st_mtime, timezone.utc).isoformat(),
+            "mtime_ns": info.st_mtime_ns,
+        }
+        digest, offset = hashlib.sha256(), 0
+        while not stop.is_set():
+            data = handle.read(512 * 1024)
+            digest.update(data)
+            final = offset + len(data) == info.st_size
+            if _file_identity(os.fstat(handle.fileno())) != identity:
+                raise ValueError("远程模型在传输期间发生变化，请重试")
+            if final:
+                try:
+                    current_path = os.stat(path, follow_symlinks=False)
+                    if path.resolve(strict=True) != path or _file_identity(current_path) != identity:
+                        raise ValueError("远程模型在传输期间发生变化，请重试")
+                except OSError as exc:
+                    raise ValueError("远程模型在传输期间发生变化，请重试") from exc
+            chunk = {
+                "lease": operation["lease"], "offset": offset,
+                "data": base64.b64encode(data).decode("ascii"), "final": final,
+                "sha256": digest.hexdigest() if final else None,
+                **metadata,
+            }
+            response = submit_operation_chunk(config, endpoint, chunk, stop)
+            if response is None:
+                return
+            if response.get("status") == "succeeded":
+                return
+            offset += len(data)
+            if not data:
+                raise ValueError("远程模型读取不完整")
+        # The lease will expire; a restarted Agent can safely retry from byte 0.
+
+
 def execute_operation(config: dict, operation: dict, stop: threading.Event) -> None:
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/operations/{operation['id']}"
     result = {"lease": operation["lease"], "success": True}
@@ -1554,19 +1738,18 @@ def execute_operation(config: dict, operation: dict, stop: threading.Event) -> N
                              "data": base64.b64encode(data).decode("ascii"), "final": final,
                              "sha256": digest.hexdigest() if final else None}
                     # Repeat exactly the same block after a timeout; center verifies retries.
-                    for retry in range(3):
-                        try:
-                            response = api_json(config, endpoint + "/chunk", "POST", chunk)
-                            break
-                        except (OSError, URLError):
-                            if retry == 2 or stop.wait(2):
-                                raise
+                    response = submit_operation_chunk(config, endpoint, chunk, stop)
+                    if response is None:
+                        return
                     if response.get("status") == "succeeded":
                         return
                     offset += len(data)
                     if not data:
                         raise ValueError("文件读取不完整")
                 return  # lease expires and a restarted Agent can retry from zero
+        elif operation["kind"] == "fetch_model":
+            fetch_remote_model(config, operation, stop, endpoint)
+            return
         else:
             raise ValueError("未知远程操作")
     except Exception as exc:
@@ -2263,6 +2446,9 @@ def main() -> int:
             LOGGER.error("配置无效或无法读取。请使用平台生成的 JSON 文件并设置权限 chmod 600。")
         return 2
     if args.check_config:
+        LOGGER.info("model_test_roots（独立模型测试可读目录）：%s",
+                    "、".join(config["model_test_roots"]) or "未配置")
+        LOGGER.info("远程文件最终校验超时：%s 秒", config["model_transfer_finalize_timeout_seconds"])
         if config["enable_training"]:
             LOGGER.info("训练工作目录：%s", config["training_cwd"])
             LOGGER.info("allowed_training_roots（允许访问）：%s", "、".join(config["allowed_training_roots"]))

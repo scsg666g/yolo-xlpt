@@ -25,6 +25,7 @@ _RESERVATION_FILE = ".storage-reservation.json"
 _RESERVATION_VERSION = 1
 _FIXED_TEST_RESERVE_BYTES = 64 * 1024**2
 _capacity_lock = threading.RLock()
+STANDALONE_HISTORY_SCOPE = "_standalone"
 
 
 class ModelTestCapacityError(RuntimeError):
@@ -55,6 +56,11 @@ class ModelTestStorageUsage:
     task_bytes: int
     free_bytes: int
     pending_peak_bytes: int
+
+
+def history_scope(task_id: str | None) -> str:
+    """Map taskless tests to a reserved owner that cannot collide with UUID task IDs."""
+    return task_id or STANDALONE_HISTORY_SCOPE
 
 
 def _safe_child(root: Path, *parts: str) -> Path:

@@ -334,13 +334,46 @@ export interface TrainingParameterDefinition {
   default: string | number | boolean | null
   section: string
 }
+
+export type ModelAssetSourceType = 'local_path' | 'remote_path'
+export type ModelAssetStatus = 'preparing' | 'ready' | 'failed'
+
+export interface ModelAsset {
+  id: string
+  name: string
+  source_type: ModelAssetSourceType
+  execution_node_id: string | null
+  execution_node_name?: string | null
+  path: string
+  artifact_id?: number | null
+  status: ModelAssetStatus
+  error: string | null
+  size: number | null
+  sha256: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ModelAssetPage {
+  items: ModelAsset[]
+  local_root?: string
+  local_roots?: string[]
+}
+
 export interface ModelTest {
   id: string
   status: 'uploading' | 'preparing' | 'queued' | 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled'
-  task_id?: string
+  task_id?: string | null
   run_id?: string | null
   source_run_id?: string | null
   artifact_id?: number | null
+  model_asset_id?: string | null
+  model_source_type?: 'training_artifact' | ModelAssetSourceType | null
+  model_source_name?: string | null
+  model_source_path?: string | null
+  execution_node_id?: string | null
+  execution_node_name?: string | null
+  task_name?: string | null
   artifact_name?: string | null
   model_name?: string | null
   model_sha256?: string | null
@@ -360,12 +393,19 @@ export interface ModelTest {
     weight_name: string
     weight_size: number
     modified_at: string | null
-    attempt_number: number
+    attempt_number: number | null
     best_epoch: number | null
-    metric_name: string
+    metric_name: string | null
     metric_value: number | null
     device: string
     imgsz: number
+    source_type?: 'training_artifact' | ModelAssetSourceType
+    source_name?: string | null
+    source_path?: string | null
+    execution_node_id?: string | null
+    execution_node_name?: string | null
+    task_name?: string | null
+    sha256?: string | null
   }
   timings: { model_load: number; preprocess: number; inference: number; postprocess: number; total: number } | null
   files: Array<{

@@ -7,7 +7,7 @@ import yaml
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import create_engine, event, inspect, select, text
 from sqlalchemy.orm import sessionmaker
 
 import app.config as config_module
@@ -1079,19 +1079,36 @@ def test_mirror_run_to_task_uses_latest_run_state():
 def test_legacy_schema_migration_creates_backup_and_run_columns(tmp_path: Path, monkeypatch):
     database_path = tmp_path / "legacy.db"
     legacy_engine = create_engine(f"sqlite:///{database_path}")
+    event.listen(legacy_engine, "connect", configure_sqlite_connection)
     with legacy_engine.begin() as connection:
         connection.execute(text("CREATE TABLE training_tasks (id VARCHAR(64) PRIMARY KEY)"))
         connection.execute(text("CREATE TABLE metric_points (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, epoch INTEGER NOT NULL, elapsed FLOAT NOT NULL, \"values\" JSON NOT NULL, created_at DATETIME NOT NULL, UNIQUE(task_id, epoch))"))
         connection.execute(text("CREATE TABLE artifacts (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, kind VARCHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, modified_at DATETIME)"))
         connection.execute(text("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, level VARCHAR(16) NOT NULL, event_type VARCHAR(40) NOT NULL, message TEXT NOT NULL, payload JSON NOT NULL, created_at DATETIME NOT NULL)"))
         connection.execute(text("CREATE TABLE model_tests (id VARCHAR(32) PRIMARY KEY, task_id VARCHAR(64) NOT NULL, created_at DATETIME NOT NULL)"))
+        connection.execute(text("CREATE TABLE model_test_images (id INTEGER PRIMARY KEY, test_id VARCHAR(32) NOT NULL, ordinal INTEGER NOT NULL, FOREIGN KEY(test_id) REFERENCES model_tests(id) ON DELETE CASCADE)"))
         connection.execute(text("INSERT INTO model_tests (id, task_id, created_at) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'legacy-task', '2026-01-01 00:00:00')"))
+        connection.execute(text("INSERT INTO model_test_images (id, test_id, ordinal) VALUES (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 0)"))
+    reader = sqlite3.connect(database_path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM training_tasks").fetchone()
+    with legacy_engine.begin() as connection:
+        connection.execute(text("INSERT INTO training_tasks (id) VALUES ('wal-only-task')"))
+    assert database_path.with_name(f"{database_path.name}-wal").exists()
     monkeypatch.setattr(database_module, "engine", legacy_engine)
 
-    backup = database_module.migrate_database()
+    try:
+        backup = database_module.migrate_database()
+    finally:
+        reader.close()
     inspector = inspect(legacy_engine)
 
     assert backup and backup.exists()
+    assert backup.stat().st_mode & 0o777 == 0o600
+    with sqlite3.connect(backup) as backup_connection:
+        assert backup_connection.execute(
+            "SELECT id FROM training_tasks WHERE id = 'wal-only-task'"
+        ).fetchone() == ("wal-only-task",)
     assert inspector.has_table("task_groups")
     assert "group_id" in {column["name"] for column in inspector.get_columns("training_tasks")}
     assert "current_run_id" in {column["name"] for column in inspector.get_columns("training_tasks")}
@@ -1099,11 +1116,25 @@ def test_legacy_schema_migration_creates_backup_and_run_columns(tmp_path: Path, 
     assert "run_id" in {column["name"] for column in inspector.get_columns("artifacts")}
     assert "run_id" in {column["name"] for column in inspector.get_columns("task_events")}
     model_test_columns = {column["name"] for column in inspector.get_columns("model_tests")}
-    assert {"model_sha256", "model_size", "rerun_of_test_id"} <= model_test_columns
+    assert {
+        "model_sha256", "model_size", "rerun_of_test_id", "model_asset_id",
+        "model_source_type", "execution_node_id", "model_source_path",
+    } <= model_test_columns
+    task_id_column = next(
+        column for column in inspector.get_columns("model_tests") if column["name"] == "task_id"
+    )
+    assert task_id_column["nullable"] is True
+    assert inspector.has_table("model_assets")
     model_test_indexes = {index["name"] for index in inspector.get_indexes("model_tests")}
-    assert {"ix_model_tests_task_created_id", "ix_model_tests_rerun_of_test_id"} <= model_test_indexes
+    assert {
+        "ix_model_tests_task_created_id", "ix_model_tests_created_id",
+        "ix_model_tests_rerun_of_test_id",
+    } <= model_test_indexes
     with legacy_engine.connect() as connection:
         assert connection.scalar(text("SELECT COUNT(*) FROM model_tests")) == 1
+        assert connection.scalar(text("SELECT COUNT(*) FROM model_test_images")) == 1
+    image_foreign_keys = inspect(legacy_engine).get_foreign_keys("model_test_images")
+    assert image_foreign_keys[0]["referred_table"] == "model_tests"
 
 
 def test_model_test_migration_repairs_missing_history_indexes(tmp_path: Path, monkeypatch):
@@ -1113,13 +1144,57 @@ def test_model_test_migration_repairs_missing_history_indexes(tmp_path: Path, mo
     with legacy_engine.begin() as connection:
         connection.execute(text("DROP INDEX ix_model_tests_task_created_id"))
         connection.execute(text("DROP INDEX ix_model_tests_rerun_of_test_id"))
+        connection.execute(text("DROP INDEX ix_model_assets_status"))
     monkeypatch.setattr(database_module, "engine", legacy_engine)
 
     backup = database_module.migrate_database()
 
     assert backup and backup.exists()
     indexes = {index["name"] for index in inspect(legacy_engine).get_indexes("model_tests")}
-    assert {"ix_model_tests_task_created_id", "ix_model_tests_rerun_of_test_id"} <= indexes
+    assert {
+        "ix_model_tests_task_created_id", "ix_model_tests_created_id",
+        "ix_model_tests_rerun_of_test_id",
+    } <= indexes
+    asset_indexes = {index["name"] for index in inspect(legacy_engine).get_indexes("model_assets")}
+    assert database_module._MODEL_ASSET_INDEXES <= asset_indexes
+    assert database_module.migrate_database() is None
+
+
+def test_model_asset_migration_repairs_missing_unique_constraint(tmp_path: Path, monkeypatch):
+    database_path = tmp_path / "missing-model-asset-unique.db"
+    legacy_engine = create_engine(f"sqlite:///{database_path}")
+    with legacy_engine.begin() as connection:
+        connection.execute(text("CREATE TABLE training_tasks (id VARCHAR(64) PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE metric_points (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, epoch INTEGER NOT NULL, elapsed FLOAT NOT NULL, \"values\" JSON NOT NULL, created_at DATETIME NOT NULL, UNIQUE(task_id, epoch))"))
+        connection.execute(text("CREATE TABLE artifacts (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, kind VARCHAR(32) NOT NULL, name VARCHAR(255) NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL, modified_at DATETIME)"))
+        connection.execute(text("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id VARCHAR(64) NOT NULL, level VARCHAR(16) NOT NULL, event_type VARCHAR(40) NOT NULL, message TEXT NOT NULL, payload JSON NOT NULL, created_at DATETIME NOT NULL)"))
+        connection.execute(text("""
+            CREATE TABLE model_assets (
+                id VARCHAR(32) NOT NULL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                source_type VARCHAR(32) NOT NULL,
+                execution_node_id VARCHAR(64) NOT NULL,
+                path TEXT NOT NULL,
+                artifact_id INTEGER,
+                sha256 VARCHAR(64),
+                size INTEGER,
+                status VARCHAR(24) NOT NULL DEFAULT 'ready',
+                error TEXT,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+        """))
+    monkeypatch.setattr(database_module, "engine", legacy_engine)
+
+    backup = database_module.migrate_database()
+
+    assert backup and backup.exists()
+    indexes = inspect(legacy_engine).get_indexes("model_assets")
+    assert any(
+        index.get("unique")
+        and tuple(index.get("column_names") or ()) == database_module._MODEL_ASSET_UNIQUE_COLUMNS
+        for index in indexes
+    )
     assert database_module.migrate_database() is None
 
 

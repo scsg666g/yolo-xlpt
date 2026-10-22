@@ -2,7 +2,7 @@
 
 本仓库的服务模板按两套独立 checkout 配置：开发版使用 `18088`，使用版使用 `18089`。两套服务必须使用不同的 systemd 服务名，不能都安装成 `yolo-platform.service`。模板存在不代表两套服务已在目标机器安装或运行。
 
-安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.3.0**，配套远程 Agent 为 **2.0.0**。
+安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.4.0**，配套远程 Agent 为 **2.0.3**。
 
 仓库同时保存 `yolo-platform-dev.service` 和 `yolo-platform-prod.service`，分别配置两套路径和端口。环境差异放在各实例的 `.env` 中，服务模板也分开维护，减少因开发/使用版配置混用引起的冲突。
 
@@ -34,14 +34,16 @@ chmod 600 web/.env
 | `YOLO_PROJECT_ROOT` | 相对代码 checkout 解析 | 两套项目各自的根目录 |
 | `PLATFORM_DATA_ROOT` | `web/data` | 上传暂存、远程缓存、持久模型测试历史 `model-test-history/` 和临时测试工作目录 `model-test-work/` 等中心状态目录 |
 | `PLATFORM_RUNS_ROOT`、`PLATFORM_RUNTIME_ROOT`、`PLATFORM_LOG_ROOT` | 未单独设置时跟随数据根目录 | `.env.example` 已独立设置前两项，迁移数据根目录时须一起改；日志项需按需补充 |
+| `PLATFORM_MODEL_TEST_ROOTS` | 项目相对的 `pt` | 独立本机模型测试的只读边界；多个值使用操作系统路径分隔符，两个 checkout 应保持各自目录 |
 | `PLATFORM_MODEL_TEST_HISTORY_QUOTA_BYTES`、`PLATFORM_MODEL_TEST_TASK_QUOTA_BYTES` | 默认 20 GiB / 5 GiB | 中心保存的模型测试历史总量和单任务量；单位为字节，设为 `0` 才关闭对应配额 |
 | `PLATFORM_MODEL_TEST_MIN_FREE_BYTES`、`PLATFORM_MODEL_TEST_IMAGE_RESERVE_BYTES` | 默认 2 GiB / 64 MiB | 创建测试时保留的最低可用空间和每张图片的保守预留；单位为字节 |
+| `PLATFORM_REMOTE_MODEL_CACHE_QUOTA_BYTES`、`PLATFORM_REMOTE_MODEL_CACHE_MIN_FREE_BYTES` | 默认 20 GiB / 2 GiB | 独立远程模型固定缓存的总配额和接收时最低磁盘余量；单位为字节，设为 `0` 才关闭对应保护 |
 | `DATABASE_URL` | `sqlite:///web/data/platform.db` | 独立于数据根目录，修改 `PLATFORM_DATA_ROOT` 不会自动修改数据库地址 |
 | `YOLO_BIN`、`ULTRALYTICS_ROOT` | 训练程序与源码配置目录 | 参数目录来自源码，不是对实际 CLI 能力的探测 |
 | `PLATFORM_INSTANCE_NAME` | 模板分别设置 `development`、`production`，但 `.env` 中同名项优先 | 将示例的 `local` 改为对应实例名称，用健康接口核对最终生效值 |
 | `PLATFORM_VERSION` | 默认读取 checkout 根目录 `VERSION` | 通常不覆盖；仅打包无 `VERSION` 的运行环境才需要显式设置 |
 
-目录配置变更不会迁移旧文件，也不会自动更新数据库记录里的绝对路径。迁移须同时处理数据库、运行目录、模型、数据集和远程 Agent 的中心地址。
+目录配置变更不会迁移旧文件，也不会自动更新数据库记录里的绝对路径。迁移须同时处理数据库、运行目录、模型、数据集和远程 Agent 的中心地址。项目根目录的 `pt/.gitkeep` 只保证新 checkout 具有默认目录，不包含任何模型权重；各实例须自行放入或挂载 `.pt` 文件。
 
 仓库服务模板没有 `User=` / `Group=`，直接作为系统服务安装通常会以 root 运行。部署前应设置实际专用账户及组，并让其能够读取代码、`.env`、Python 环境和输入资源，写入数据库父目录及各输出目录。`UMask=0077` 和 `NoNewPrivileges=true` 不会替代账户配置，也不会修改旧文件的所有权或权限。
 
@@ -95,9 +97,9 @@ python web/deploy/backup_database.py \
   --output-dir /srv/yolo-backups
 ```
 
-脚本不会自动删除旧备份，也不包含模型、数据集、产物、日志或 `model-test-history/`。SQLite 快照中的 `model_tests`、`model_test_images` 只是模型测试索引和元数据；对应原图、结果和下载文件位于 `model-test-history/`。Backup API 不会冻结这些文件的并发变化，因此需要可完整恢复且相互匹配的模型测试历史时，必须在目标服务停止或静默期间依次生成数据库快照和复制历史目录。按上述步骤确认没有活动模型测试后，`model-test-work/` 不包含需要备份的持久结果；若在活动测试期间强行备份，有效的固定权重副本也必须与数据库状态保持同一时点，否则恢复后该测试会明确失败。
+脚本不会自动删除旧备份，也不包含模型、数据集、产物、日志或 `model-test-history/`。SQLite 快照中的 `model_assets`、`model_tests`、`model_test_images` 是模型来源、测试索引和元数据；对应原图、结果和下载文件位于 `model-test-history/`。Backup API 不会冻结这些文件的并发变化，因此需要可完整恢复且相互匹配的模型测试历史时，必须在目标服务停止或静默期间依次生成数据库快照和复制历史目录。按上述步骤确认没有活动模型测试后，`model-test-work/` 不包含需要备份的持久结果；若需要保留已抓取的远程指定模型以便 Agent 离线后继续新建检测，还应在同一时点保留 `remote-artifacts/` 内对应缓存。缓存容量检查会回收没有当前资产或历史测试引用的旧版本，因此数据库和缓存必须取自同一静默时点。若在活动测试期间强行备份，有效的固定权重副本也必须与数据库状态保持同一时点，否则恢复后该测试会明确失败。
 
-运行中的数据库文件不能仅靠复制 `.db` 作为一致备份；当前自动迁移中的备份使用 `shutil.copy2`，在 WAL 模式下不能替代升级前执行的 SQLite Backup API 备份。
+运行中的数据库文件不能仅靠复制 `.db` 作为一致备份。当前自动迁移也使用 SQLite Backup API，会包含 WAL 中已提交的数据并进行完整性检查；但它只在检测到架构变更时生成，也不包含模型测试图片等文件。升级前仍应显式执行备份脚本并按上述步骤保存成套文件。
 
 回滚需要匹配的代码版本和数据库结构。新版本已迁移数据库时，直接切换旧代码不一定兼容。先停止目标实例，保留当前状态，再按兼容版本与一致备份恢复，并核对文件路径；不要在另一实例运行时覆盖其数据库，也不要把两套实例的数据库互换。
 
@@ -124,6 +126,8 @@ curl --fail http://127.0.0.1:18088/api/health
 | 远程长期“正在停止” | 先在远程服务器确认当前 Attempt 的 YOLO 进程已结束；状态保持 `stopping` 至少 30 秒后，可在训练画布使用“解除占用”。该操作只改中心状态，不会终止远程进程 |
 | 清理记录迟迟未消失 | 永久删除为异步 202；检查回收站原因、Agent 接入和对应后台操作。输出根目录缺失、允许目录失效或挂载离线时会明确失败并保留记录，恢复路径后重试 |
 | 恢复后模型测试有记录但图片打不开 | 数据库与 `model-test-history/` 不属于同一备份时点，或历史目录未恢复；使用成套备份恢复，并核对 `PLATFORM_DATA_ROOT` 和目录权限 |
+| 远程指定模型一直准备失败 | 确认 Agent 为 2.0.3、在线并启用训练操作；在远程服务器执行 `--check-config`，确认 `.pt` 位于 `model_test_roots` 内且路径没有符号链接。大模型只在最终校验超时时，调整 `model_transfer_finalize_timeout_seconds` |
+| 远程指定模型返回 507 | 检查 `PLATFORM_REMOTE_MODEL_CACHE_QUOTA_BYTES`、`PLATFORM_REMOTE_MODEL_CACHE_MIN_FREE_BYTES` 和 `PLATFORM_DATA_ROOT` 所在磁盘；平台只会自动清理无引用旧版本，不会删除当前或历史引用版本 |
 | 日志复制失败或下载不完整 | HTTP 内网剪贴板限制与尾部导出是两个问题；HTTPS 不会把尾部变成完整日志，见 [日志说明](../README.md#日志查看与导出) |
 
 训练命令和输出在任务日志中；API 请求和服务启动信息在 journal 中。更完整的代码证据及改进优先级见 [项目分析](../../docs/project-analysis.md#当前问题与优化优先级)。
@@ -133,4 +137,6 @@ curl --fail http://127.0.0.1:18088/api/health
 - `.env`、数据库及备份建议仅允许运行账户读取；服务的 `UMask=0077` 会保护新建文件，但不会自动修改旧文件权限。
 - 平台管理页面目前没有内置用户登录。只应通过可信内网/VPN访问；跨公网必须在反向代理增加 HTTPS 和身份认证。
 - Agent Token 只保护对应节点的 Agent 接口，不等同于网页管理员认证。Token、SSH 密码和真实 `agent-config.json` 不应提交仓库。
-- 两套平台连接同一训练服务器时，为每套平台创建独立节点、Token 和 Agent 配置，并统一使用 Agent 2.0.0 及同一专用系统账户。新中心下发有效 `gpu_assignment` 后，同一账户下的 Agent 才会通过权限为 `0700` 的用户私有状态目录共享 GPU UUID 锁，并以共享方式持有 workspace 与层级输出根锁；同卡互斥由 UUID 锁保证，不同 GPU Run 可以共享配置输出根。旧中心或没有 GPU 分配的任务仍走传统独占锁路径，混合部署必须保留能够覆盖这些旧协议任务的 `training_lock_file` 或等效互斥范围。不同账户无法共享这些宿主机锁和永久删除 owner 保护。训练子进程继承锁，Agent 意外退出后也会保持到训练结束；删除操作独占重叠输出范围，共享输出根存在其他存活 owner 时也会拒绝永久删除。这些锁不限制中心本机调度器或平台外进程。
+- 本机 `PLATFORM_MODEL_TEST_ROOTS` 与远程 `model_test_roots` 只能放可信 `.pt`；PyTorch / Ultralytics 加载权重时可能执行其中携带的代码，路径和摘要校验不能安全地加载恶意权重。
+- 节点有等待或进行中的模型传输时不能禁用或移除，进行中的传输也会阻止 Token 轮换。传输进入终态后可以移除节点；中心的模型缓存和历史不会随节点删除，已固定的 `ready` 版本可继续测试，但要抓取新版本必须重新接入并登记新的节点来源。
+- 两套平台连接同一训练服务器时，为每套平台创建独立节点、Token 和 Agent 配置，并统一使用当前 Agent 2.0.3 及同一专用系统账户。新中心下发有效 `gpu_assignment` 后，同一账户下的 Agent 才会通过权限为 `0700` 的用户私有状态目录共享 GPU UUID 锁，并以共享方式持有 workspace 与层级输出根锁；同卡互斥由 UUID 锁保证，不同 GPU Run 可以共享配置输出根。旧中心或没有 GPU 分配的任务仍走传统独占锁路径，混合部署必须保留能够覆盖这些旧协议任务的 `training_lock_file` 或等效互斥范围。不同账户无法共享这些宿主机锁和永久删除 owner 保护。训练子进程继承锁，Agent 意外退出后也会保持到训练结束；删除操作独占重叠输出范围，共享输出根存在其他存活 owner 时也会拒绝永久删除。这些锁不限制中心本机调度器或平台外进程。两个 Agent 还应各自核对 `model_test_roots` 和 `model_transfer_finalize_timeout_seconds`，不要为了方便而扩大到整个项目或共享文件系统根。

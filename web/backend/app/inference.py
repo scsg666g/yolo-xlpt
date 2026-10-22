@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import hashlib
 import json
 import logging
 import math
@@ -23,13 +22,20 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
-from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select, update
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, defer, selectinload, sessionmaker
 from starlette.requests import ClientDisconnect
 
 from .config import ULTRALYTICS_ROOT, YOLO_BIN
 from .database import SessionLocal, get_db
+from .model_assets import (
+    LOCAL_NODE_ID,
+    ModelAssetPathError,
+    copy_stable_regular_file,
+    digest_stable_regular_file,
+    verify_local_asset,
+)
 from .model_test_storage import (
     HISTORY_ROOT,
     WORK_ROOT,
@@ -38,6 +44,7 @@ from .model_test_storage import (
     delete_test_work,
     directory_size,
     estimate_test_storage,
+    history_scope,
     prepare_test_history,
     reconcile_test_reservations,
     release_test_reservation,
@@ -46,7 +53,9 @@ from .model_test_storage import (
 )
 from .models import (
     Artifact,
+    ComputeNode,
     MetricPoint,
+    ModelAsset,
     ModelTest,
     ModelTestImage,
     RemoteOperation,
@@ -76,12 +85,19 @@ class ImageSpec(BaseModel):
 class TestCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    artifact_id: int
+    artifact_id: int | None = Field(default=None, gt=0)
+    model_asset_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     run_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
     rerun_of_test_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     confidence: float = Field(default=0.25, ge=0.01, le=1)
     iou: float = Field(default=0.7, ge=0.01, le=1)
     files: list[ImageSpec] = Field(min_length=1, max_length=10)
+
+    @model_validator(mode="after")
+    def one_model_source(self):
+        if (self.artifact_id is None) == (self.model_asset_id is None):
+            raise ValueError("artifact_id 与 model_asset_id 必须且只能提供一个")
+        return self
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -100,6 +116,7 @@ def model_summary(db: Session, artifact: Artifact, run: TrainingRun) -> dict:
         value = point.values.get("metrics/mAP50-95(B)")
         if isinstance(value, (int, float)) and math.isfinite(value) and (best_metric is None or value > best_metric):
             best_epoch, best_metric = point.epoch, float(value)
+    task = db.get(TrainingTask, artifact.task_id)
     return {
         "weight_name": Path(artifact.name).name,
         "weight_size": artifact.size,
@@ -110,6 +127,33 @@ def model_summary(db: Session, artifact: Artifact, run: TrainingRun) -> dict:
         "metric_value": best_metric,
         "device": "CPU",
         "imgsz": 640,
+        "source_type": "training_artifact",
+        "source_name": Path(artifact.name).name,
+        "source_path": artifact.path,
+        "execution_node_id": run.execution_node_id or LOCAL_NODE_ID,
+        "task_name": task.name if task else None,
+    }
+
+
+def asset_model_summary(db: Session, asset: ModelAsset, *, sha256: str, size: int) -> dict:
+    node = db.get(ComputeNode, asset.execution_node_id)
+    return {
+        "weight_name": asset.name,
+        "weight_size": size,
+        "sha256": sha256,
+        "modified_at": None,
+        "attempt_number": None,
+        "best_epoch": None,
+        "metric_name": None,
+        "metric_value": None,
+        "device": "CPU",
+        "imgsz": 640,
+        "source_type": asset.source_type,
+        "source_name": asset.name,
+        "source_path": asset.path,
+        "execution_node_id": asset.execution_node_id,
+        "execution_node_name": node.name if node else None,
+        "task_name": None,
     }
 
 
@@ -205,19 +249,9 @@ def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int, int]:
 
 def _digest_stable_file(path: Path) -> tuple[str, int]:
     try:
-        before = path.stat()
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-                size += len(block)
-        after = path.stat()
-    except OSError as exc:
+        return digest_stable_regular_file(path)
+    except ModelAssetPathError as exc:
         raise HTTPException(409, "固定的模型权重版本已不可用，请重新选择当前权重") from exc
-    if _file_identity(before) != _file_identity(after) or size != after.st_size:
-        raise HTTPException(409, "模型权重在读取期间发生变化，请刷新产物后重试")
-    return digest.hexdigest(), size
 
 
 def _verified_weight_version(
@@ -250,17 +284,85 @@ def _verified_weight_version(
     return path, artifact, run, actual_sha256, actual_size
 
 
+def _verified_model_asset_version(
+    db: Session,
+    model_asset_id: str | None,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> tuple[Path, ModelAsset, str, int]:
+    asset = db.get(ModelAsset, model_asset_id) if model_asset_id else None
+    if asset is None:
+        raise HTTPException(404, "模型来源不存在，请重新选择模型")
+    if asset.source_type == "remote_path":
+        from .remote_operations import RemoteModelCacheError, verified_remote_model_cache
+        try:
+            path, sha256, size = verified_remote_model_cache(
+                db,
+                asset,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+            )
+        except RemoteModelCacheError as exc:
+            # Historical tests may target an older successful cache while a
+            # newer version is being prepared. Do not overwrite that current
+            # reusable-asset state from a historical validation path. Likewise,
+            # a new test that arrives during transfer must leave the active
+            # preparation intact so the Agent can continue uploading chunks.
+            current_version = (
+                expected_sha256 is None and expected_size is None
+            ) or (
+                asset.status == "ready"
+                and asset.sha256 == expected_sha256
+                and asset.size == expected_size
+            )
+            if current_version and asset.status == "ready":
+                # Compare-and-set prevents a stale request from replacing a
+                # concurrent refresh's preparing/ready state with failed.
+                db.execute(update(ModelAsset).where(
+                    ModelAsset.id == asset.id,
+                    ModelAsset.status == "ready",
+                    ModelAsset.sha256 == asset.sha256,
+                    ModelAsset.size == asset.size,
+                ).values(
+                    status="failed",
+                    error=str(exc)[-1000:],
+                    updated_at=utcnow(),
+                ))
+                db.commit()
+            raise HTTPException(exc.status_code, str(exc)) from exc
+    elif asset.source_type == "local_path":
+        try:
+            path, sha256, size = verify_local_asset(
+                asset, expected_sha256=expected_sha256, expected_size=expected_size,
+            )
+        except ModelAssetPathError as exc:
+            # A historical rerun can ask for v1 after this reusable source has
+            # already been refreshed to v2. Its expected failure must not mark
+            # the valid current v2 asset as failed for every future test.
+            current_version = (
+                expected_sha256 is None and expected_size is None
+            ) or (
+                asset.status == "ready"
+                and asset.sha256 == expected_sha256
+                and asset.size == expected_size
+            )
+            if current_version:
+                asset.status = "failed"
+                asset.error = str(exc)[-1000:]
+                asset.updated_at = utcnow()
+                db.commit()
+            raise HTTPException(exc.status_code, str(exc)) from exc
+    else:
+        raise HTTPException(422, "当前模型来源类型不支持独立测试")
+    return path, asset, sha256, size
+
+
 def _copy_and_digest(source: Path, destination: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    size = 0
-    with source.open("rb") as reader, destination.open("xb") as writer:
-        for block in iter(lambda: reader.read(1024 * 1024), b""):
-            writer.write(block)
-            digest.update(block)
-            size += len(block)
-        writer.flush()
-        os.fsync(writer.fileno())
-    return digest.hexdigest(), size
+    try:
+        return copy_stable_regular_file(source, destination)
+    except ModelAssetPathError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
 
 
 def _pin_weight(source: Path, test_id: str, sha256: str, size: int) -> Path:
@@ -334,11 +436,12 @@ def get_record(db: Session, test_id: str, *, task_id: str | None = None) -> Mode
     record = db.scalar(_record_query(test_id))
     if not record or (task_id is not None and record.task_id != task_id):
         raise HTTPException(404, "模型检测记录不存在")
-    task = db.scalar(select(TrainingTask).where(
-        TrainingTask.id == record.task_id,
-    ).execution_options(populate_existing=True))
-    if not task or task.deleted_at:
-        raise HTTPException(404, "模型检测记录不存在")
+    if record.task_id is not None:
+        task = db.scalar(select(TrainingTask).where(
+            TrainingTask.id == record.task_id,
+        ).execution_options(populate_existing=True))
+        if not task or task.deleted_at:
+            raise HTTPException(404, "模型检测记录不存在")
     return record
 
 
@@ -355,14 +458,22 @@ def image_public(image: ModelTestImage) -> dict:
 
 def record_public(record: ModelTest) -> dict:
     expires_at = _as_utc(record.created_at).timestamp() + UPLOAD_TTL if record.status == "uploading" else None
+    snapshot = dict(record.model_snapshot or {})
     return {
         "id": record.id,
         "task_id": record.task_id,
         "run_id": record.run_id,
         "source_run_id": record.source_run_id,
         "artifact_id": record.artifact_id,
+        "model_asset_id": record.model_asset_id,
         "artifact_name": record.artifact_name,
         "model_name": record.model_name,
+        "model_source_type": record.model_source_type,
+        "model_source_name": snapshot.get("source_name") or record.model_name,
+        "model_source_path": record.model_source_path,
+        "execution_node_id": record.execution_node_id,
+        "execution_node_name": snapshot.get("execution_node_name"),
+        "task_name": snapshot.get("task_name"),
         "model_sha256": record.model_sha256,
         "model_size": record.model_size,
         "rerun_of_test_id": record.rerun_of_test_id,
@@ -372,7 +483,7 @@ def record_public(record: ModelTest) -> dict:
         "error": record.error,
         "confidence": record.confidence,
         "iou": record.iou,
-        "model": dict(record.model_snapshot or {}),
+        "model": snapshot,
         "timings": dict(record.timings) if record.timings else None,
         "files": [image_public(image) for image in sorted(record.images, key=lambda item: item.ordinal)],
         "created_at": _iso(record.created_at),
@@ -385,14 +496,22 @@ def record_public(record: ModelTest) -> dict:
 
 def record_summary(record: ModelTest) -> dict:
     expires_at = _as_utc(record.created_at).timestamp() + UPLOAD_TTL if record.status == "uploading" else None
+    snapshot = dict(record.model_snapshot or {})
     return {
         "id": record.id,
         "task_id": record.task_id,
         "run_id": record.run_id,
         "source_run_id": record.source_run_id,
         "artifact_id": record.artifact_id,
+        "model_asset_id": record.model_asset_id,
         "artifact_name": record.artifact_name,
         "model_name": record.model_name,
+        "model_source_type": record.model_source_type,
+        "model_source_name": snapshot.get("source_name") or record.model_name,
+        "model_source_path": record.model_source_path,
+        "execution_node_id": record.execution_node_id,
+        "execution_node_name": snapshot.get("execution_node_name"),
+        "task_name": snapshot.get("task_name"),
         "model_sha256": record.model_sha256,
         "model_size": record.model_size,
         "rerun_of_test_id": record.rerun_of_test_id,
@@ -402,7 +521,7 @@ def record_summary(record: ModelTest) -> dict:
         "error": record.error,
         "confidence": record.confidence,
         "iou": record.iou,
-        "model": dict(record.model_snapshot or {}),
+        "model": snapshot,
         "files": [
             {
                 "name": image.original_name,
@@ -449,13 +568,14 @@ def _error_message(exc: Exception) -> str:
     return (str(exc) or type(exc).__name__)[-1000:]
 
 
-def _settle_test_storage(task_id: str, test_id: str) -> int:
+def _settle_test_storage(task_id: str | None, test_id: str) -> int:
     """Release active capacity and return the terminal record's real size."""
+    scope = history_scope(task_id)
     try:
-        release_test_reservation(task_id, test_id)
+        release_test_reservation(scope, test_id)
     except (OSError, ValueError):
         logger.warning("model_test_reservation_release_failed test_id=%s", test_id)
-    return directory_size(test_history_root(task_id, test_id))
+    return directory_size(test_history_root(scope, test_id))
 
 
 def _persist_settled_storage(db: Session, record: ModelTest) -> None:
@@ -540,11 +660,13 @@ class InferenceWorker:
                 ModelTest.status.in_(ACTIVE_STATUSES)
             )).all()
             for record in records:
-                task = db.get(TrainingTask, record.task_id)
-                if not task or task.deleted_at or record.delete_requested or record.status == "cancel_requested":
+                task = db.get(TrainingTask, record.task_id) if record.task_id is not None else None
+                task_unavailable = record.task_id is not None and (not task or task.deleted_at)
+                scope = history_scope(record.task_id)
+                if task_unavailable or record.delete_requested or record.status == "cancel_requested":
                     record.status = "cancelled"
                     record.finished_at = record.finished_at or utcnow()
-                    transitioned.add((record.task_id, record.id))
+                    transitioned.add((scope, record.id))
                 elif record.status == "uploading":
                     continue
                 else:
@@ -553,7 +675,7 @@ class InferenceWorker:
                         record.status = "failed"
                         record.error = pin_error
                         record.finished_at = record.finished_at or utcnow()
-                        transitioned.add((record.task_id, record.id))
+                        transitioned.add((scope, record.id))
                     else:
                         retained_pins.add(record.id)
                         record.status = "queued"
@@ -562,7 +684,7 @@ class InferenceWorker:
                         record.finished_at = None
             db.commit()
             active_tests = {
-                (task_id, test_id)
+                (history_scope(task_id), test_id)
                 for task_id, test_id in db.execute(select(ModelTest.task_id, ModelTest.id).where(
                     ModelTest.status.in_(ACTIVE_STATUSES),
                 ))
@@ -571,10 +693,10 @@ class InferenceWorker:
                 reconcile_test_reservations(active_tests)
             except (OSError, ValueError):
                 logger.warning("model_test_reservation_recovery_failed", exc_info=True)
-            for task_id, test_id in transitioned:
+            for scope, test_id in transitioned:
                 record = db.get(ModelTest, test_id)
                 if record:
-                    record.storage_bytes = directory_size(test_history_root(task_id, test_id))
+                    record.storage_bytes = directory_size(test_history_root(scope, test_id))
             if transitioned:
                 db.commit()
         if WORK_ROOT.is_dir() and not WORK_ROOT.is_symlink():
@@ -596,7 +718,7 @@ class InferenceWorker:
                     if any(test_id == record.id for test_id, _ in self.uploading):
                         continue
                     try:
-                        delete_test_history(record.task_id, record.id)
+                        delete_test_history(history_scope(record.task_id), record.id)
                         delete_test_work(record.id)
                     except (OSError, ValueError):
                         logger.warning("model_test_expiry_cleanup_failed test_id=%s", record.id)
@@ -616,12 +738,15 @@ class InferenceWorker:
     def process_one(self) -> bool:
         with self.lifecycle_lock:
             with self.session_factory() as db:
-                test_id = db.scalar(select(ModelTest.id).join(
+                test_id = db.scalar(select(ModelTest.id).outerjoin(
                     TrainingTask, TrainingTask.id == ModelTest.task_id,
                 ).where(
                     ModelTest.status == "queued",
                     ModelTest.delete_requested.is_(False),
-                    TrainingTask.deleted_at.is_(None),
+                    or_(
+                        ModelTest.task_id.is_(None),
+                        and_(TrainingTask.id.is_not(None), TrainingTask.deleted_at.is_(None)),
+                    ),
                 ).order_by(ModelTest.created_at, ModelTest.id).limit(1))
                 if not test_id:
                     return False
@@ -661,7 +786,7 @@ class InferenceWorker:
                     record = db.scalar(_record_query(test_id))
                 if not record or record.status != "running" or record.delete_requested:
                     return
-                directory = test_history_root(record.task_id, record.id)
+                directory = test_history_root(history_scope(record.task_id), record.id)
                 work = test_work_root(record.id)
                 output = directory / "results"
                 pin_error = _pin_validation_error(record.id, record.model_sha256, record.model_size)
@@ -798,7 +923,7 @@ class InferenceWorker:
                     record.status = "failed"
                     record.error = _error_message(exc)
                     record.finished_at = utcnow()
-                    directory = directory or test_history_root(record.task_id, record.id)
+                    directory = directory or test_history_root(history_scope(record.task_id), record.id)
                     db.commit()
                     _persist_settled_storage(db, record)
         finally:
@@ -934,43 +1059,84 @@ def _create_test(payload: TestCreate, db: Session):
     active = db.scalar(select(func.count()).select_from(ModelTest).where(ModelTest.status.in_(ACTIVE_STATUSES))) or 0
     if active >= 20:
         raise HTTPException(429, "同时处理的测试记录已达上限，请稍后重试")
-    artifact = db.get(Artifact, payload.artifact_id)
-    source_run = db.get(TrainingRun, artifact.run_id) if artifact and artifact.run_id else None
-    task = db.scalar(select(TrainingTask).where(
-        TrainingTask.id == artifact.task_id,
-    ).execution_options(populate_existing=True)) if artifact else None
-    if not artifact or not source_run or not task or task.deleted_at:
-        raise HTTPException(404, "模型权重所属的训练运行不存在")
-    context_run = db.get(TrainingRun, payload.run_id) if payload.run_id else source_run
-    if not context_run or context_run.task_id != task.id:
-        raise HTTPException(422, "当前 Attempt 与模型权重不属于同一训练任务")
-    if attempt_delete_operation(db, source_run, active_only=True) or attempt_delete_operation(db, context_run, active_only=True):
-        raise HTTPException(409, "当前 Attempt 已进入清理队列，不能新建模型检测")
     rerun_source = get_record(db, payload.rerun_of_test_id) if payload.rerun_of_test_id else None
     expected_sha256 = None
     expected_size = None
     if rerun_source:
-        if rerun_source.task_id != task.id:
-            raise HTTPException(422, "历史检测记录与当前训练任务不一致")
         if rerun_source.status != "completed":
             raise HTTPException(409, "只能使用已完成的历史记录重测")
-        if rerun_source.artifact_id is None or rerun_source.artifact_id != artifact.id:
-            raise HTTPException(409, "历史记录的原权重关联已失效，无法按原权重重测")
         if not rerun_source.model_sha256 or rerun_source.model_size is None:
             raise HTTPException(409, "该历史记录没有精确权重版本，请改用当前权重新建检测")
         expected_sha256 = rerun_source.model_sha256
         expected_size = rerun_source.model_size
 
-    model, artifact, source_run, model_sha256, model_size = _verified_weight_version(
-        db,
-        artifact.id,
-        expected_sha256=expected_sha256,
-        expected_size=expected_size,
-    )
-    snapshot = (
-        dict(rerun_source.model_snapshot or {})
-        if rerun_source else model_summary(db, artifact, source_run)
-    )
+    task: TrainingTask | None = None
+    context_run: TrainingRun | None = None
+    source_run: TrainingRun | None = None
+    artifact: Artifact | None = None
+    asset: ModelAsset | None = None
+    if payload.artifact_id is not None:
+        artifact = db.get(Artifact, payload.artifact_id)
+        source_run = db.get(TrainingRun, artifact.run_id) if artifact and artifact.run_id else None
+        task = db.scalar(select(TrainingTask).where(
+            TrainingTask.id == artifact.task_id,
+        ).execution_options(populate_existing=True)) if artifact else None
+        if not artifact or not source_run or not task or task.deleted_at:
+            raise HTTPException(404, "模型权重所属的训练运行不存在")
+        context_run = db.get(TrainingRun, payload.run_id) if payload.run_id else source_run
+        if not context_run or context_run.task_id != task.id:
+            raise HTTPException(422, "当前 Attempt 与模型权重不属于同一训练任务")
+        if (
+            attempt_delete_operation(db, source_run, active_only=True)
+            or attempt_delete_operation(db, context_run, active_only=True)
+        ):
+            raise HTTPException(409, "当前 Attempt 已进入清理队列，不能新建模型检测")
+        if rerun_source:
+            if rerun_source.task_id != task.id:
+                raise HTTPException(422, "历史检测记录与当前训练任务不一致")
+            if rerun_source.artifact_id is None or rerun_source.artifact_id != artifact.id:
+                raise HTTPException(409, "历史记录的原权重关联已失效，无法按原权重重测")
+        model, artifact, source_run, model_sha256, model_size = _verified_weight_version(
+            db, artifact.id, expected_sha256=expected_sha256, expected_size=expected_size,
+        )
+        snapshot = (
+            dict(rerun_source.model_snapshot or {})
+            if rerun_source else model_summary(db, artifact, source_run)
+        )
+        artifact_name = rerun_source.artifact_name if rerun_source else artifact.name
+        model_name = rerun_source.model_name if rerun_source else Path(artifact.name).name
+        source_run_id = rerun_source.source_run_id if rerun_source else source_run.id
+        source_attempt_number = (
+            rerun_source.source_attempt_number if rerun_source else source_run.attempt_number
+        )
+        model_source_type = "training_artifact"
+        execution_node_id = source_run.execution_node_id or LOCAL_NODE_ID
+        model_source_path = rerun_source.model_source_path if rerun_source else artifact.path
+    else:
+        if payload.run_id is not None:
+            raise HTTPException(422, "独立模型测试不能指定训练 Attempt")
+        asset = db.get(ModelAsset, payload.model_asset_id)
+        if asset is None:
+            raise HTTPException(404, "模型来源不存在，请重新选择模型")
+        if rerun_source:
+            if rerun_source.task_id is not None:
+                raise HTTPException(422, "历史检测记录不是独立模型测试")
+            if rerun_source.model_asset_id is None or rerun_source.model_asset_id != asset.id:
+                raise HTTPException(409, "历史记录的原模型来源已失效，无法按原权重重测")
+        model, asset, model_sha256, model_size = _verified_model_asset_version(
+            db, asset.id, expected_sha256=expected_sha256, expected_size=expected_size,
+        )
+        snapshot = (
+            dict(rerun_source.model_snapshot or {})
+            if rerun_source else asset_model_summary(db, asset, sha256=model_sha256, size=model_size)
+        )
+        artifact_name = rerun_source.artifact_name if rerun_source else asset.path
+        model_name = rerun_source.model_name if rerun_source else asset.name
+        source_run_id = None
+        source_attempt_number = None
+        model_source_type = asset.source_type
+        execution_node_id = asset.execution_node_id
+        model_source_path = rerun_source.model_source_path if rerun_source else asset.path
     snapshot.update({"weight_size": model_size, "sha256": model_sha256})
 
     test_id = uuid.uuid4().hex
@@ -979,23 +1145,24 @@ def _create_test(payload: TestCreate, db: Session):
         declared_upload_bytes=declared_upload_bytes,
         image_count=len(payload.files),
     )
+    scope = history_scope(task.id if task else None)
     try:
-        directory = prepare_test_history(task.id, test_id, estimate)
+        directory = prepare_test_history(scope, test_id, estimate)
     except ModelTestCapacityError as exc:
         raise HTTPException(507, str(exc)) from exc
     try:
-        artifact_name = rerun_source.artifact_name if rerun_source else artifact.name
-        model_name = rerun_source.model_name if rerun_source else Path(artifact.name).name
-        source_run_id = rerun_source.source_run_id if rerun_source else source_run.id
-        source_attempt_number = (
-            rerun_source.source_attempt_number if rerun_source else source_run.attempt_number
-        )
         record = ModelTest(
-            id=test_id, task_id=task.id, run_id=context_run.id, source_run_id=source_run_id,
-            artifact_id=artifact.id, artifact_name=artifact_name, model_name=model_name,
+            id=test_id, task_id=task.id if task else None,
+            run_id=context_run.id if context_run else None, source_run_id=source_run_id,
+            artifact_id=artifact.id if artifact else None,
+            model_asset_id=asset.id if asset else None,
+            model_source_type=model_source_type, execution_node_id=execution_node_id,
+            model_source_path=model_source_path,
+            artifact_name=artifact_name, model_name=model_name,
             model_sha256=model_sha256, model_size=model_size,
             rerun_of_test_id=rerun_source.id if rerun_source else None,
-            attempt_number=context_run.attempt_number, source_attempt_number=source_attempt_number,
+            attempt_number=context_run.attempt_number if context_run else None,
+            source_attempt_number=source_attempt_number,
             confidence=payload.confidence, iou=payload.iou,
             model_snapshot=snapshot, status="uploading",
         )
@@ -1009,7 +1176,7 @@ def _create_test(payload: TestCreate, db: Session):
     except Exception:
         db.rollback()
         try:
-            delete_test_history(task.id, test_id)
+            delete_test_history(scope, test_id)
         except (OSError, ValueError):
             logger.warning("model_test_create_cleanup_failed test_id=%s", test_id)
         raise
@@ -1020,9 +1187,9 @@ async def upload_image(test_id: str, index: int, request: Request, db: Session =
     key = (test_id, index)
     with worker.lock:
         record = get_record(db, test_id)
-        task = db.get(TrainingTask, record.task_id)
+        task = db.get(TrainingTask, record.task_id) if record.task_id is not None else None
         images = sorted(record.images, key=lambda item: item.ordinal)
-        if not task or task.deleted_at:
+        if record.task_id is not None and (not task or task.deleted_at):
             raise HTTPException(409, "训练任务已进入回收站")
         if record.status != "uploading" or key in worker.uploading:
             raise HTTPException(409, "当前测试不能上传图片")
@@ -1034,7 +1201,7 @@ async def upload_image(test_id: str, index: int, request: Request, db: Session =
         db.commit()
         worker.uploading.add(key)
         declared_size = image.declared_size
-        directory = test_history_root(record.task_id, record.id)
+        directory = test_history_root(history_scope(record.task_id), record.id)
         destination = directory / "images" / f"{index}.jpg"
     temporary = directory / f".{index}.upload.part"
     normalized = directory / f".{index}.normalized.part"
@@ -1088,15 +1255,16 @@ def start_test(test_id: str, db: Session = Depends(get_db)):
 def _start_test(test_id: str, db: Session):
     with worker.lock:
         record = get_record(db, test_id)
-        task = db.scalar(select(TrainingTask).where(
-            TrainingTask.id == record.task_id,
-        ).execution_options(populate_existing=True))
-        if not task or task.deleted_at:
-            raise HTTPException(409, "训练任务已进入回收站")
+        if record.task_id is not None:
+            task = db.scalar(select(TrainingTask).where(
+                TrainingTask.id == record.task_id,
+            ).execution_options(populate_existing=True))
+            if not task or task.deleted_at:
+                raise HTTPException(409, "训练任务已进入回收站")
         if record.status != "uploading":
             return record_public(record)
         images = sorted(record.images, key=lambda item: item.ordinal)
-        directory = test_history_root(record.task_id, record.id)
+        directory = test_history_root(history_scope(record.task_id), record.id)
         if any(key[0] == test_id for key in worker.uploading) or not all(
             image.uploaded and (directory / "images" / f"{image.ordinal}.jpg").is_file() for image in images
         ):
@@ -1108,12 +1276,18 @@ def _start_test(test_id: str, db: Session):
         record.finished_at = None
         db.commit()
         try:
-            model, _, _, _, _ = _verified_weight_version(
-                db,
-                record.artifact_id,
-                expected_sha256=record.model_sha256,
-                expected_size=record.model_size,
-            )
+            if record.model_asset_id is not None:
+                model, _, _, _ = _verified_model_asset_version(
+                    db, record.model_asset_id,
+                    expected_sha256=record.model_sha256,
+                    expected_size=record.model_size,
+                )
+            else:
+                model, _, _, _, _ = _verified_weight_version(
+                    db, record.artifact_id,
+                    expected_sha256=record.model_sha256,
+                    expected_size=record.model_size,
+                )
             _pin_weight(model, record.id, record.model_sha256, record.model_size)
         except Exception as exc:
             db.rollback()
@@ -1149,6 +1323,57 @@ def abandon_test(test_id: str, db: Session = Depends(get_db)):
 @router.get("/api/model-tests/{test_id}")
 def test_status(test_id: str, db: Session = Depends(get_db)):
     return record_public(get_record(db, test_id))
+
+
+@router.get("/api/model-tests")
+def list_model_tests(
+    cursor: str | None = Query(default=None, max_length=512),
+    limit: int = Query(default=50, ge=1, le=100),
+    source_type: str | None = Query(default=None, max_length=32, pattern=r"^[A-Za-z0-9_-]+$"),
+    status: str | None = Query(default=None, max_length=24, pattern=r"^[A-Za-z0-9_-]+$"),
+    execution_node_id: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$"),
+    db: Session = Depends(get_db),
+):
+    """List task-bound and standalone history with one stable cursor."""
+    query = select(ModelTest).outerjoin(TrainingTask, TrainingTask.id == ModelTest.task_id).where(
+        or_(
+            ModelTest.task_id.is_(None),
+            and_(TrainingTask.id.is_not(None), TrainingTask.deleted_at.is_(None)),
+        ),
+    )
+    if source_type:
+        query = query.where(ModelTest.model_source_type == source_type)
+    if status:
+        query = query.where(ModelTest.status == status)
+    if execution_node_id:
+        query = query.where(ModelTest.execution_node_id == execution_node_id)
+    if cursor:
+        cursor_created_at, cursor_id = _decode_history_cursor(cursor)
+        query = query.where(
+            (ModelTest.created_at < cursor_created_at)
+            | ((ModelTest.created_at == cursor_created_at) & (ModelTest.id < cursor_id))
+        )
+    records = list(db.scalars(
+        query.options(
+            defer(ModelTest.timings),
+            selectinload(ModelTest.images).load_only(
+                ModelTestImage.ordinal,
+                ModelTestImage.original_name,
+                ModelTestImage.declared_size,
+                ModelTestImage.uploaded,
+                ModelTestImage.detections,
+            ),
+        )
+        .order_by(ModelTest.created_at.desc(), ModelTest.id.desc())
+        .limit(limit + 1)
+        .execution_options(populate_existing=True)
+    ).all())
+    has_more = len(records) > limit
+    records = records[:limit]
+    return {
+        "items": [record_summary(record) for record in records],
+        "next_cursor": _encode_history_cursor(records[-1]) if has_more else None,
+    }
 
 
 @router.get("/api/tasks/{task_id}/model-tests")
@@ -1210,7 +1435,7 @@ def test_image(test_id: str, index: int, kind: str, download: bool = False, db: 
         raise HTTPException(404, "图片不存在")
     if kind == "result" and record.status != "completed":
         raise HTTPException(409, "检测结果尚未生成")
-    path = test_history_root(record.task_id, record.id) / ("images" if kind == "original" else "results") / f"{index}.jpg"
+    path = test_history_root(history_scope(record.task_id), record.id) / ("images" if kind == "original" else "results") / f"{index}.jpg"
     if not path.is_file() or path.is_symlink():
         raise HTTPException(404, "图片尚未上传")
     filename = f"detection-{index + 1}.jpg" if download else None
@@ -1222,7 +1447,7 @@ def download_test(test_id: str, db: Session = Depends(get_db)):
     record = get_record(db, test_id)
     if record.status != "completed":
         raise HTTPException(409, "检测结果尚未生成")
-    path = test_history_root(record.task_id, record.id) / "detection-results.zip"
+    path = test_history_root(history_scope(record.task_id), record.id) / "detection-results.zip"
     if not path.is_file() or path.is_symlink():
         raise HTTPException(404, "检测结果压缩包不存在")
     return FileResponse(path, media_type="application/zip", filename="detection-results.zip")
@@ -1246,7 +1471,7 @@ def delete_test(test_id: str, db: Session = Depends(get_db)):
     try:
         record = get_record(db, test_id)
         delete_test_work(test_id)
-        delete_test_history(record.task_id, test_id)
+        delete_test_history(history_scope(record.task_id), test_id)
         db.delete(record)
         db.commit()
     except (OSError, ValueError) as exc:

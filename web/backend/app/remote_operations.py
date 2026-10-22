@@ -7,7 +7,10 @@ import os
 import secrets
 import shutil
 import stat
+import threading
+import time
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -17,17 +20,33 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .config import DATA_ROOT
+from .config import (
+    DATA_ROOT,
+    REMOTE_MODEL_CACHE_MIN_FREE_BYTES,
+    REMOTE_MODEL_CACHE_QUOTA_BYTES,
+)
 from .compute_nodes import (
     REQUIRED_AGENT_VERSION,
+    REMOTE_MODEL_TEST_AGENT_VERSION,
     agent_version_at_least,
     as_utc,
     authenticated_agent,
+    remote_model_test_unavailable_reason,
     remote_trace_root,
 )
 from .database import get_db
+from .gpu_reservations import acquire_node_claim_lock
 from .model_test_storage import delete_task_history
-from .models import Artifact, ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utcnow
+from .models import (
+    Artifact,
+    ComputeNode,
+    ModelAsset,
+    ModelTest,
+    RemoteOperation,
+    TrainingRun,
+    TrainingTask,
+    utcnow,
+)
 from .run_deletions import (
     LEGACY_FLAT_LAYOUT,
     attempt_delete_operation,
@@ -44,16 +63,111 @@ CACHE_ROOT = DATA_ROOT / "remote-artifacts"
 ACTIVE = {"queued", "starting", "running", "stopping"}
 LEGACY_FLAT_DELETE_AGENT_VERSION = "2.0.1"
 LEGACY_FLAT_DELETE_AGENT_VERSION_PARTS = (2, 0, 1)
+MODEL_ASSET_OPERATION_PREFIX = "model-asset:"
+MAX_REMOTE_MODEL_BYTES = 8 * 1024**3
+MAX_FILE_CHUNK_BYTES = 512 * 1024
+ACTIVE_MODEL_FETCH_STATUSES = {"pending", "running", "finalizing"}
+_MODEL_CACHE_CAPACITY_LOCK = threading.Lock()
+OPERATION_LEASE_TIMEOUT = timedelta(minutes=5)
+MODEL_FINALIZE_HEARTBEAT_SECONDS = 30
+
+
+class RemoteModelCacheError(RuntimeError):
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        super().__init__(detail)
+
+
+def model_asset_operation_scope(asset_id: str) -> str:
+    return MODEL_ASSET_OPERATION_PREFIX + asset_id
+
+
+def operation_model_asset_id(operation: RemoteOperation) -> str | None:
+    value = (operation.payload or {}).get("model_asset_id")
+    return value if isinstance(value, str) and operation.task_id == model_asset_operation_scope(value) else None
 
 
 def operation_file(operation: RemoteOperation, complete: bool = True) -> Path:
     return CACHE_ROOT / (operation.id + (".bin" if complete else ".part"))
 
 
+def _cache_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+
+
+def _same_regular_cache_file(path: Path, opened: os.stat_result) -> bool:
+    try:
+        current = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(opened.st_mode)
+        and stat.S_ISREG(current.st_mode)
+        and _cache_identity(opened) == _cache_identity(current)
+    )
+
+
+def write_cache_chunk(path: Path, *, offset: int, data: bytes) -> int:
+    """Write or verify one chunk through a no-follow file descriptor."""
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if offset == 0:
+        flags |= os.O_CREAT
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError("cache path is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        if offset == 0:
+            os.ftruncate(descriptor, 0)
+            current = 0
+        else:
+            current = opened.st_size
+        if current == offset:
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    raise OSError("cache chunk write failed")
+                view = view[written:]
+            os.fsync(descriptor)
+        elif current == offset + len(data):
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            received = bytearray()
+            while len(received) < len(data):
+                block = os.read(descriptor, len(data) - len(received))
+                if not block:
+                    break
+                received.extend(block)
+            if bytes(received) != data:
+                raise RemoteModelCacheError(409, "重试分块内容不一致")
+        else:
+            raise RemoteModelCacheError(409, "文件分块偏移不一致，请重新传输")
+        after = os.fstat(descriptor)
+        if not _same_regular_cache_file(path, after):
+            raise OSError("cache path changed while open")
+        return after.st_size
+    except RemoteModelCacheError:
+        raise
+    except OSError as exc:
+        raise RemoteModelCacheError(409, "远程文件缓存路径无效或无法安全写入") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def cached_fetch_digest(
     operation: RemoteOperation,
     *,
     path: Path | None = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Return a stable cache digest and any validation error without changing it."""
     payload = operation.payload or {}
@@ -72,7 +186,12 @@ def cached_fetch_digest(
         return None, "远程产物缓存路径无效"
     descriptor = None
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        ))
         with os.fdopen(descriptor, "rb") as handle:
             descriptor = None
             before = os.fstat(handle.fileno())
@@ -81,8 +200,16 @@ def cached_fetch_digest(
             if before.st_size != expected_size:
                 return None, "远程产物缓存大小校验失败"
             digest = hashlib.sha256()
+            if heartbeat is not None:
+                heartbeat()
+            next_heartbeat = time.monotonic() + MODEL_FINALIZE_HEARTBEAT_SECONDS
             for block in iter(lambda: handle.read(512 * 1024), b""):
                 digest.update(block)
+                if heartbeat is not None and time.monotonic() >= next_heartbeat:
+                    heartbeat()
+                    next_heartbeat = time.monotonic() + MODEL_FINALIZE_HEARTBEAT_SECONDS
+            if heartbeat is not None:
+                heartbeat()
             after = os.fstat(handle.fileno())
         current = path.lstat()
     except OSError:
@@ -90,9 +217,9 @@ def cached_fetch_digest(
     finally:
         if descriptor is not None:
             os.close(descriptor)
-    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    current_identity = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    before_identity = _cache_identity(before)
+    after_identity = _cache_identity(after)
+    current_identity = _cache_identity(current)
     if (
         not stat.S_ISREG(current.st_mode)
         or before_identity != after_identity
@@ -103,6 +230,287 @@ def cached_fetch_digest(
     if expected_sha256 is not None and not secrets.compare_digest(actual_sha256, expected_sha256):
         return None, "远程产物缓存摘要校验失败"
     return actual_sha256, None
+
+
+def model_fetches(db: Session, asset: ModelAsset) -> list[RemoteOperation]:
+    """Return newest first operations that belong to the exact model source."""
+    scope = model_asset_operation_scope(asset.id)
+    return [
+        operation for operation in db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id == scope,
+            RemoteOperation.kind == "fetch_model",
+        ).order_by(RemoteOperation.created_at.desc(), RemoteOperation.id.desc()))
+        if operation_model_asset_id(operation) == asset.id
+        and operation.node_id == asset.execution_node_id
+        and (operation.payload or {}).get("path") == asset.path
+    ]
+
+
+def matching_model_fetch(
+    db: Session,
+    asset: ModelAsset,
+    *,
+    sha256: str | None = None,
+    size: int | None = None,
+) -> RemoteOperation | None:
+    for operation in model_fetches(db, asset):
+        payload = operation.payload or {}
+        if sha256 is not None and payload.get("sha256") != sha256:
+            continue
+        if size is not None and payload.get("size") != size:
+            continue
+        return operation
+    return None
+
+
+def verified_remote_model_cache(
+    db: Session,
+    asset: ModelAsset,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> tuple[Path, str, int]:
+    """Resolve immutable cached bytes, including an older version for reruns."""
+    if asset.source_type != "remote_path":
+        raise RemoteModelCacheError(422, "该模型来源不是远程路径")
+    if expected_sha256 is None and expected_size is None and asset.status != "ready":
+        if asset.status == "preparing":
+            raise RemoteModelCacheError(409, "远程模型正在传输，请稍后重试")
+        raise RemoteModelCacheError(409, asset.error or "远程模型尚未准备完成")
+    sha256 = expected_sha256 if expected_sha256 is not None else asset.sha256
+    size = expected_size if expected_size is not None else asset.size
+    if not isinstance(sha256, str) or len(sha256) != 64 or not isinstance(size, int) or size <= 0:
+        if asset.status == "preparing":
+            raise RemoteModelCacheError(409, "远程模型正在传输，请稍后重试")
+        raise RemoteModelCacheError(409, asset.error or "远程模型尚未准备完成")
+    for operation in model_fetches(db, asset):
+        payload = operation.payload or {}
+        if operation.status != "succeeded" or payload.get("sha256") != sha256 or payload.get("size") != size:
+            continue
+        digest, cache_error = cached_fetch_digest(operation)
+        if cache_error is None and digest is not None and secrets.compare_digest(digest, sha256):
+            return operation_file(operation), digest, size
+    raise RemoteModelCacheError(409, "远程模型的固定缓存已不可用，请重新登记或准备模型")
+
+
+def _mark_model_fetch_failed(
+    db: Session,
+    operation: RemoteOperation,
+    message: str,
+    *,
+    status: str = "failed",
+) -> None:
+    operation.status = status
+    operation.error = message[-2000:]
+    operation.updated_at = utcnow()
+    operation_file(operation, False).unlink(missing_ok=True)
+    asset_id = operation_model_asset_id(operation)
+    asset = db.get(ModelAsset, asset_id) if asset_id else None
+    if asset is not None:
+        newest = matching_model_fetch(db, asset)
+        # A delayed result from an older lease must not overwrite a newer
+        # successful refresh of the same reusable model source.
+        if newest is not None and newest.id == operation.id:
+            asset.status = "failed" if status == "failed" else asset.status
+            asset.error = message[-1000:] if status == "failed" else asset.error
+            asset.updated_at = utcnow()
+
+
+def _regular_file_size(path: Path) -> int:
+    """Return a cache file's logical size without following a symlink."""
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return 0
+    return metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0
+
+
+def _referenced_model_versions(db: Session) -> set[tuple[str, str, int]]:
+    """Return immutable remote-model versions that must remain rerunnable."""
+    references: set[tuple[str, str, int]] = set()
+    for asset_id, sha256, size in db.execute(select(
+        ModelAsset.id, ModelAsset.sha256, ModelAsset.size,
+    ).where(ModelAsset.source_type == "remote_path")):
+        if isinstance(sha256, str) and isinstance(size, int) and not isinstance(size, bool) and size > 0:
+            references.add((asset_id, sha256, size))
+    for asset_id, sha256, size in db.execute(select(
+        ModelTest.model_asset_id, ModelTest.model_sha256, ModelTest.model_size,
+    ).where(ModelTest.model_asset_id.is_not(None))):
+        if (
+            isinstance(asset_id, str)
+            and isinstance(sha256, str)
+            and isinstance(size, int)
+            and not isinstance(size, bool)
+            and size > 0
+        ):
+            references.add((asset_id, sha256, size))
+    return references
+
+
+def _model_fetch_version(operation: RemoteOperation) -> tuple[str, str, int] | None:
+    payload = operation.payload or {}
+    asset_id = operation_model_asset_id(operation)
+    sha256 = payload.get("sha256")
+    size = payload.get("size")
+    if (
+        not asset_id
+        or not isinstance(sha256, str)
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+    ):
+        return None
+    return asset_id, sha256, size
+
+
+def reclaim_unreferenced_model_cache(db: Session) -> int:
+    """Remove only cache bytes that no current asset or history row can use."""
+    references = _referenced_model_versions(db)
+    reclaimed = 0
+    operations = list(db.scalars(select(RemoteOperation).where(
+        RemoteOperation.kind == "fetch_model",
+    ).order_by(RemoteOperation.created_at, RemoteOperation.id)))
+    for operation in operations:
+        if operation.status in ACTIVE_MODEL_FETCH_STATUSES:
+            continue
+        version = _model_fetch_version(operation)
+        if operation.status == "succeeded" and version in references:
+            continue
+        for path in (operation_file(operation), operation_file(operation, False)):
+            size = _regular_file_size(path)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
+            reclaimed += size
+        if operation.status == "succeeded":
+            operation.status = "cancelled"
+            operation.error = "远程模型缓存已按容量策略安全回收"
+            operation.updated_at = utcnow()
+    return reclaimed
+
+
+def remote_model_cache_usage(db: Session) -> tuple[int, int]:
+    """Return quota usage and bytes still needed by all active model fetches."""
+    quota_bytes = 0
+    remaining_bytes = 0
+    for operation in db.scalars(select(RemoteOperation).where(
+        RemoteOperation.kind == "fetch_model",
+    )):
+        complete_size = _regular_file_size(operation_file(operation))
+        partial_size = _regular_file_size(operation_file(operation, False))
+        payload_size = (operation.payload or {}).get("size")
+        if (
+            operation.status in ACTIVE_MODEL_FETCH_STATUSES
+            and isinstance(payload_size, int)
+            and not isinstance(payload_size, bool)
+            and payload_size > 0
+        ):
+            # Reserve the full declared object, not merely the first received
+            # chunk. A stray complete file, if present, is counted separately.
+            quota_bytes += complete_size + max(payload_size, partial_size)
+            remaining_bytes += max(payload_size - partial_size, 0)
+        else:
+            quota_bytes += complete_size + partial_size
+    return quota_bytes, remaining_bytes
+
+
+def ensure_remote_model_cache_capacity(db: Session) -> None:
+    """Reclaim safe candidates and reject transfers that cannot fit."""
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    reclaim_unreferenced_model_cache(db)
+    quota_bytes, remaining_bytes = remote_model_cache_usage(db)
+    if REMOTE_MODEL_CACHE_QUOTA_BYTES and quota_bytes > REMOTE_MODEL_CACHE_QUOTA_BYTES:
+        raise RemoteModelCacheError(507, "远程模型缓存空间不足：本次模型会超过缓存总配额")
+    if REMOTE_MODEL_CACHE_MIN_FREE_BYTES:
+        try:
+            free_bytes = shutil.disk_usage(CACHE_ROOT).free
+        except OSError as exc:
+            raise RemoteModelCacheError(507, "无法读取远程模型缓存磁盘容量") from exc
+        if free_bytes - remaining_bytes < REMOTE_MODEL_CACHE_MIN_FREE_BYTES:
+            raise RemoteModelCacheError(507, "远程模型缓存所在磁盘空间不足，请清理空间后重试")
+
+
+def prepare_remote_model_asset(
+    db: Session,
+    asset: ModelAsset,
+    *,
+    retry: bool = False,
+    refresh: bool = False,
+) -> dict:
+    """Idempotently enqueue transfer of a standalone remote checkpoint."""
+    if asset.source_type != "remote_path":
+        raise HTTPException(422, "该模型来源不是远程路径")
+    operations = model_fetches(db, asset)
+    latest = operations[0] if operations else None
+    if latest and latest.status in ACTIVE_MODEL_FETCH_STATUSES:
+        asset.status = "preparing"
+        asset.error = None
+        asset.updated_at = utcnow()
+        return {
+            "status": "preparing",
+            "operation_id": latest.id,
+            "message": "等待远程 Agent 传输模型",
+        }
+    if latest and latest.status == "succeeded" and not refresh:
+        digest, cache_error = cached_fetch_digest(latest)
+        payload = latest.payload or {}
+        size = payload.get("size")
+        if (
+            cache_error is None and digest is not None
+            and isinstance(size, int) and size > 0
+            and (asset.sha256 is None or secrets.compare_digest(asset.sha256, digest))
+            and (asset.size is None or asset.size == size)
+        ):
+            asset.sha256 = digest
+            asset.size = size
+            asset.status = "ready"
+            asset.error = None
+            asset.updated_at = utcnow()
+            return {"status": "ready", "operation_id": latest.id}
+        refresh = True
+    if latest and latest.status == "failed" and not retry and not refresh:
+        asset.status = "failed"
+        asset.error = latest.error or "远程模型传输失败"
+        asset.updated_at = utcnow()
+        return {
+            "status": "failed",
+            "operation_id": latest.id,
+            "message": asset.error,
+        }
+
+    node = db.get(ComputeNode, asset.execution_node_id)
+    unavailable = remote_model_test_unavailable_reason(node)
+    if unavailable:
+        asset.status = "failed"
+        asset.error = unavailable
+        asset.updated_at = utcnow()
+        raise HTTPException(409, unavailable)
+    assert node is not None
+    from .model_assets import ModelAssetPathError, validate_remote_model_path
+    try:
+        validate_remote_model_path(node, asset.path)
+    except ModelAssetPathError as exc:
+        asset.status = "failed"
+        asset.error = str(exc)
+        asset.updated_at = utcnow()
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+    operation = enqueue(
+        db,
+        node.id,
+        model_asset_operation_scope(asset.id),
+        "fetch_model",
+        {"model_asset_id": asset.id, "path": asset.path},
+    )
+    asset.status = "preparing"
+    asset.error = None
+    asset.updated_at = utcnow()
+    return {
+        "status": "preparing",
+        "operation_id": operation.id,
+        "message": "等待远程 Agent 传输模型",
+    }
 
 
 def run_payload(run: TrainingRun, task: TrainingTask) -> dict:
@@ -304,19 +712,55 @@ def report_artifacts(node_id: str, run_id: str, payload: Manifest, request: Requ
 
 @router.post("/api/compute/nodes/{node_id}/agent/operations/poll")
 def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db)):
+    # Share the node row/write lock with node management and model-source
+    # registration so Token rotation cannot race a pending fetch into running.
+    acquire_node_claim_lock(db, node_id)
     node = authenticated_agent(node_id, request, db)
     if not agent_version_at_least(node.agent_version):
         return {"operation": None, "required_agent_version": REQUIRED_AGENT_VERSION,
                 "message": f"请将远程 Agent 升级到 {REQUIRED_AGENT_VERSION} 或以上版本"}
-    cutoff = utcnow() - timedelta(minutes=5)
+    cutoff = utcnow() - OPERATION_LEASE_TIMEOUT
     operation = db.scalar(select(RemoteOperation).where(
         RemoteOperation.node_id == node_id,
         (RemoteOperation.status == "pending") |
-        ((RemoteOperation.status == "running") & (RemoteOperation.updated_at < cutoff)),
+        ((RemoteOperation.status.in_(["running", "finalizing"])) & (RemoteOperation.updated_at < cutoff)),
     ).order_by(RemoteOperation.created_at).limit(1))
     if not operation:
         return {"operation": None}
     operation_payload = operation.payload
+    if operation.kind == "fetch_model":
+        asset_id = operation_model_asset_id(operation)
+        asset = db.get(ModelAsset, asset_id) if asset_id else None
+        latest = matching_model_fetch(db, asset) if asset is not None else None
+        invalid = (
+            asset is None
+            or asset.source_type != "remote_path"
+            or asset.execution_node_id != node_id
+            or asset.path != (operation.payload or {}).get("path")
+            or latest is None
+            or latest.id != operation.id
+            or asset.status != "preparing"
+        )
+        if invalid:
+            _mark_model_fetch_failed(db, operation, "模型来源已变更，远程传输指令已取消", status="cancelled")
+            db.commit()
+            return {"operation": None}
+        unavailable = remote_model_test_unavailable_reason(node)
+        if unavailable:
+            _mark_model_fetch_failed(db, operation, unavailable)
+            db.commit()
+            return {
+                "operation": None,
+                "required_agent_version": REMOTE_MODEL_TEST_AGENT_VERSION,
+                "message": unavailable,
+            }
+        from .model_assets import ModelAssetPathError, validate_remote_model_path
+        try:
+            validate_remote_model_path(node, asset.path)
+        except ModelAssetPathError as exc:
+            _mark_model_fetch_failed(db, operation, str(exc))
+            db.commit()
+            return {"operation": None, "message": str(exc)}
     if operation.kind == "delete":
         task = db.get(TrainingTask, operation.task_id)
         attempt_scope = (operation.payload or {}).get("scope") == "attempt"
@@ -391,13 +835,17 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
     operation = authorized_operation(db, node_id, operation_id, request, payload.lease)
     if operation.status in {"succeeded", "failed", "cancelled"}:
         return {"status": operation.status}
-    if operation.kind == "fetch" and payload.success:
-        raise HTTPException(409, "产物传输必须通过分块接口完成")
+    if operation.kind in {"fetch", "fetch_model"} and payload.success:
+        raise HTTPException(409, "文件传输必须通过分块接口完成")
     operation.status = "succeeded" if payload.success else "failed"
     operation.error = payload.error if not payload.success else None
     operation.updated_at = utcnow()
     if not payload.success and operation.kind == "fetch":
         operation_file(operation, False).unlink(missing_ok=True)
+    if not payload.success and operation.kind == "fetch_model":
+        _mark_model_fetch_failed(db, operation, payload.error or "远程模型传输失败")
+        db.commit()
+        return {"status": operation.status}
     task = db.get(TrainingTask, operation.task_id)
     attempt_scope = operation.kind == "delete" and (operation.payload or {}).get("scope") == "attempt"
     target_run = db.get(TrainingRun, (operation.payload or {}).get("run_id")) if attempt_scope else None
@@ -529,56 +977,285 @@ class ArtifactChunk(BaseModel):
     data: str = Field(max_length=720000)
     final: bool = False
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    size: int | None = Field(default=None, ge=1, le=MAX_REMOTE_MODEL_BYTES)
+    modified_at: datetime | None = None
+    mtime_ns: int | None = Field(default=None, ge=0)
 
 
 @router.post("/api/compute/nodes/{node_id}/agent/operations/{operation_id}/chunk")
 def upload_chunk(node_id: str, operation_id: str, payload: ArtifactChunk, request: Request, db: Session = Depends(get_db)):
     operation = authorized_operation(db, node_id, operation_id, request, payload.lease)
-    if operation.kind != "fetch" or operation.status not in {"running", "succeeded"}:
+    return _upload_chunk(operation, node_id, payload, db)
+
+
+def _upload_chunk(operation: RemoteOperation, node_id: str, payload: ArtifactChunk, db: Session):
+    if operation.kind not in {"fetch", "fetch_model"} or operation.status not in {
+        "running", "finalizing", "succeeded",
+    }:
         raise HTTPException(409, "远程操作当前不能传输文件")
     if operation.status == "succeeded":
         return {"status": "succeeded", "offset": operation.payload["size"]}
-    task = db.get(TrainingTask, operation.task_id)
-    if not task or task.deleted_at:
-        raise HTTPException(409, "任务已删除，停止传输文件")
+    if operation.status == "finalizing" and not payload.final:
+        raise HTTPException(409, "远程操作正在完成文件校验")
+    model_asset: ModelAsset | None = None
+    if operation.kind == "fetch":
+        task = db.get(TrainingTask, operation.task_id)
+        if not task or task.deleted_at:
+            raise HTTPException(409, "任务已删除，停止传输文件")
+    else:
+        asset_id = operation_model_asset_id(operation)
+        model_asset = db.get(ModelAsset, asset_id) if asset_id else None
+        latest = matching_model_fetch(db, model_asset) if model_asset is not None else None
+        if (
+            model_asset is None
+            or model_asset.source_type != "remote_path"
+            or model_asset.execution_node_id != node_id
+            or model_asset.path != (operation.payload or {}).get("path")
+            or latest is None
+            or latest.id != operation.id
+            or model_asset.status != "preparing"
+        ):
+            raise HTTPException(409, "模型来源已变更，停止传输文件")
+
+    if operation.status == "finalizing":
+        # The status is a cross-worker claim. A duplicate request with the same
+        # lease waits while its owner heartbeats; after a crashed worker misses
+        # the normal lease window, this request may return it to running and
+        # claim finalization again below.
+        if as_utc(operation.updated_at) >= utcnow() - OPERATION_LEASE_TIMEOUT:
+            return {"status": "finalizing", "offset": (operation.payload or {}).get("size", 0)}
+        resumed = db.execute(update(RemoteOperation).where(
+            RemoteOperation.id == operation.id,
+            RemoteOperation.node_id == node_id,
+            RemoteOperation.status == "finalizing",
+            RemoteOperation.lease == payload.lease,
+            RemoteOperation.updated_at == operation.updated_at,
+        ).values(status="running", updated_at=utcnow()).execution_options(synchronize_session=False))
+        if resumed.rowcount != 1:
+            db.rollback()
+            current = db.get(RemoteOperation, operation.id)
+            if current is not None and current.lease == payload.lease:
+                if current.status == "succeeded":
+                    return {"status": "succeeded", "offset": current.payload["size"]}
+                if current.status == "finalizing":
+                    return {"status": "finalizing", "offset": (current.payload or {}).get("size", 0)}
+            raise HTTPException(409, "远程操作已重新分配")
+        db.commit()
+        db.refresh(operation)
     try:
         data = base64.b64decode(payload.data, validate=True)
     except ValueError as exc:
         raise HTTPException(422, "文件分块编码错误") from exc
-    if payload.offset + len(data) > operation.payload["size"]:
-        raise HTTPException(413, "传输文件超出登记大小")
-    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
-    path = operation_file(operation, False)
-    current = path.stat().st_size if path.exists() else 0
-    # Restarting a leased operation starts at zero; retries of other chunks are idempotent.
-    if payload.offset == 0:
-        with path.open("wb") as handle:
-            handle.write(data)
-    elif current == payload.offset:
-        with path.open("ab") as handle:
-            handle.write(data)
-    elif current == payload.offset + len(data):
-        with path.open("rb") as handle:
-            handle.seek(payload.offset)
-            if handle.read(len(data)) != data:
-                raise HTTPException(409, "重试分块内容不一致")
+    if len(data) > MAX_FILE_CHUNK_BYTES:
+        raise HTTPException(413, "文件分块不能超过 512 KiB")
+
+    if operation.kind == "fetch_model":
+        if not data:
+            raise HTTPException(422, "远程模型不能为空")
+        if payload.size is None or payload.modified_at is None or payload.mtime_ns is None:
+            raise HTTPException(422, "远程模型分块缺少稳定文件元数据")
+        if payload.modified_at.tzinfo is None or payload.modified_at.utcoffset() is None:
+            raise HTTPException(422, "远程模型修改时间必须包含时区")
+        metadata = {
+            "size": payload.size,
+            "modified_at": as_utc(payload.modified_at).isoformat(),
+            "mtime_ns": payload.mtime_ns,
+        }
+        registered = operation.payload or {}
+        first_metadata = "size" not in registered
+        if "size" not in registered:
+            operation.payload = {**registered, **metadata}
+        elif any(registered.get(key) != value for key, value in metadata.items()):
+            raise HTTPException(409, "远程模型在传输期间发生变化，请重试")
     else:
-        raise HTTPException(409, "文件分块偏移不一致，请重新传输")
-    operation.updated_at = utcnow()
+        first_metadata = False
+
+    expected_size = (operation.payload or {}).get("size")
+    if not isinstance(expected_size, int) or isinstance(expected_size, bool):
+        raise HTTPException(409, "远程文件缺少有效大小")
+    if operation.kind == "fetch_model" and not 0 < expected_size <= MAX_REMOTE_MODEL_BYTES:
+        raise HTTPException(413, "远程模型大小必须在 1 字节到 8 GiB 之间")
+    if payload.offset + len(data) > expected_size:
+        raise HTTPException(413, "传输文件超出登记大小")
+    if operation.kind == "fetch_model" and (payload.offset + len(data) == expected_size) != payload.final:
+        raise HTTPException(409, "远程模型分块结束标记与文件大小不一致")
+    if first_metadata:
+        # Commit the full-size reservation before accepting bytes. The process
+        # lock makes concurrent first chunks observe every earlier admission;
+        # database state then keeps the reservation durable across restarts.
+        with _MODEL_CACHE_CAPACITY_LOCK:
+            db.flush()
+            try:
+                ensure_remote_model_cache_capacity(db)
+            except RemoteModelCacheError as exc:
+                _mark_model_fetch_failed(db, operation, str(exc))
+                db.commit()
+                raise HTTPException(exc.status_code, str(exc)) from exc
+            db.commit()
+
     if payload.final:
-        if path.stat().st_size != operation.payload["size"] or not payload.sha256:
+        claimed = db.execute(update(RemoteOperation).where(
+            RemoteOperation.id == operation.id,
+            RemoteOperation.node_id == node_id,
+            RemoteOperation.status == "running",
+            RemoteOperation.lease == payload.lease,
+        ).values(status="finalizing", updated_at=utcnow()).execution_options(synchronize_session=False))
+        if claimed.rowcount != 1:
+            db.rollback()
+            current = db.get(RemoteOperation, operation.id)
+            if current is not None and current.lease == payload.lease:
+                if current.status == "succeeded":
+                    return {"status": "succeeded", "offset": current.payload["size"]}
+                if current.status == "finalizing":
+                    return {"status": "finalizing", "offset": (current.payload or {}).get("size", 0)}
+            raise HTTPException(409, "远程操作已重新分配")
+        db.commit()
+        db.refresh(operation)
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = operation_file(operation, False)
+    complete_path = operation_file(operation)
+    if not payload.final:
+        try:
+            written_size = write_cache_chunk(path, offset=payload.offset, data=data)
+        except RemoteModelCacheError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        operation.updated_at = utcnow()
+        db.commit()
+        return {"status": operation.status, "offset": written_size}
+
+    operation_id = operation.id
+
+    def heartbeat_finalization() -> None:
+        heartbeat = db.execute(update(RemoteOperation).where(
+            RemoteOperation.id == operation_id,
+            RemoteOperation.node_id == node_id,
+            RemoteOperation.status == "finalizing",
+            RemoteOperation.lease == payload.lease,
+        ).values(updated_at=utcnow()).execution_options(synchronize_session=False))
+        if heartbeat.rowcount != 1:
+            db.rollback()
+            raise RemoteModelCacheError(409, "远程操作已重新分配")
+        db.commit()
+
+    def release_finalization() -> None:
+        """Make a failed final request retryable without disturbing a new lease."""
+        db.rollback()
+        try:
+            db.execute(update(RemoteOperation).where(
+                RemoteOperation.id == operation_id,
+                RemoteOperation.node_id == node_id,
+                RemoteOperation.status == "finalizing",
+                RemoteOperation.lease == payload.lease,
+            ).values(status="running", updated_at=utcnow()).execution_options(synchronize_session=False))
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    try:
+        part_exists = path.exists() or path.is_symlink()
+        complete_exists = complete_path.exists() or complete_path.is_symlink()
+        recovering_published_file = not part_exists and complete_exists
+        if recovering_published_file:
+            # A process can publish immediately before its database commit is
+            # interrupted. Verify those exact bytes instead of retransmitting.
+            written_size = expected_size
+        else:
+            try:
+                written_size = write_cache_chunk(path, offset=payload.offset, data=data)
+            except RemoteModelCacheError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from exc
+        if written_size != expected_size or not payload.sha256:
             raise HTTPException(409, "传输文件不完整")
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(512 * 1024), b""):
-                digest.update(block)
-        if digest.hexdigest() != payload.sha256:
+
+        digest_path = complete_path if recovering_published_file else path
+        try:
+            digest, cache_error = cached_fetch_digest(
+                operation,
+                path=digest_path,
+                heartbeat=heartbeat_finalization,
+            )
+        except RemoteModelCacheError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        if cache_error or digest is None or not secrets.compare_digest(digest, payload.sha256):
             raise HTTPException(409, "文件校验失败，请重新传输")
-        os.replace(path, operation_file(operation))
-        # Keep the Agent-provided content digest with the durable fetch record.
-        # Model-test history uses it to request the exact checkpoint bytes even
-        # when a later manifest updates the same Artifact row in place.
-        operation.payload = {**operation.payload, "sha256": payload.sha256}
-        operation.status = "succeeded"
-    db.commit()
-    return {"status": operation.status, "offset": payload.offset + len(data)}
+
+        # A test or another worker may have replaced the lease immediately
+        # after the digest callback returned. Renew once more before publish.
+        try:
+            heartbeat_finalization()
+        except RemoteModelCacheError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+        if not recovering_published_file:
+            try:
+                published_identity = _cache_identity(path.lstat())
+                os.replace(path, complete_path)
+                published = complete_path.lstat()
+            except OSError as exc:
+                raise HTTPException(409, "远程文件缓存无法安全发布") from exc
+            if not stat.S_ISREG(published.st_mode) or _cache_identity(published) != published_identity:
+                complete_path.unlink(missing_ok=True)
+                raise HTTPException(409, "远程文件缓存在发布期间发生变化")
+
+        db.rollback()
+        current = db.get(RemoteOperation, operation_id)
+        if (
+            current is None
+            or current.node_id != node_id
+            or current.status != "finalizing"
+            or not current.lease
+            or not secrets.compare_digest(current.lease, payload.lease)
+        ):
+            if current is not None and current.status == "succeeded" and current.lease == payload.lease:
+                return {"status": "succeeded", "offset": current.payload["size"]}
+            raise HTTPException(409, "远程操作已重新分配")
+
+        model_asset = None
+        if current.kind == "fetch_model":
+            asset_id = operation_model_asset_id(current)
+            model_asset = db.get(ModelAsset, asset_id) if asset_id else None
+            latest = matching_model_fetch(db, model_asset) if model_asset is not None else None
+            if (
+                model_asset is None
+                or model_asset.source_type != "remote_path"
+                or model_asset.execution_node_id != node_id
+                or model_asset.path != (current.payload or {}).get("path")
+                or latest is None
+                or latest.id != current.id
+                or model_asset.status != "preparing"
+            ):
+                raise HTTPException(409, "模型来源已变更，停止传输文件")
+
+        final_payload = {**(current.payload or {}), "sha256": payload.sha256}
+        finalized = db.execute(update(RemoteOperation).where(
+            RemoteOperation.id == current.id,
+            RemoteOperation.node_id == node_id,
+            RemoteOperation.status == "finalizing",
+            RemoteOperation.lease == payload.lease,
+        ).values(
+            status="succeeded", error=None, payload=final_payload, updated_at=utcnow(),
+        ).execution_options(synchronize_session=False))
+        if finalized.rowcount != 1:
+            db.rollback()
+            raise HTTPException(409, "远程操作已重新分配")
+        if model_asset is not None:
+            asset_updated = db.execute(update(ModelAsset).where(
+                ModelAsset.id == model_asset.id,
+                ModelAsset.source_type == "remote_path",
+                ModelAsset.execution_node_id == node_id,
+                ModelAsset.path == (current.payload or {}).get("path"),
+                ModelAsset.status == "preparing",
+            ).values(
+                sha256=payload.sha256,
+                size=expected_size,
+                status="ready",
+                error=None,
+                updated_at=utcnow(),
+            ).execution_options(synchronize_session=False))
+            if asset_updated.rowcount != 1:
+                db.rollback()
+                raise HTTPException(409, "模型来源已变更，停止传输文件")
+        db.commit()
+        return {"status": "succeeded", "offset": expected_size}
+    except Exception:
+        release_finalization()
+        raise

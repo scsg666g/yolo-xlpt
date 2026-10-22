@@ -58,7 +58,7 @@ def remote_run(client, factory, tmp_path):
 
 
 def agent_api(client, credential):
-    def api(config, path, method="GET", payload=None):
+    def api(config, path, method="GET", payload=None, extra_headers=None, *, timeout_seconds=20):
         response = client.request(method, path, json=payload, headers=headers(credential))
         if response.status_code >= 400:
             raise HTTPError(path, response.status_code, response.text, {}, None)
@@ -545,9 +545,16 @@ def test_manifest_resume_and_chunked_download(monitoring_client, agent, tmp_path
     prepare_url = f"/api/artifacts/{weight['id']}/prepare"
     assert client.post(prepare_url).json()["status"] == "pending"
     lost = False
-    def unreliable_api(config, path, method="GET", payload=None):
+    def unreliable_api(config, path, method="GET", payload=None, extra_headers=None, *, timeout_seconds=20):
         nonlocal lost
-        response = api(config, path, method, payload)
+        response = api(
+            config,
+            path,
+            method,
+            payload,
+            extra_headers,
+            timeout_seconds=timeout_seconds,
+        )
         if path.endswith("/chunk") and not lost:
             lost = True
             raise OSError("lost ACK after successful write")

@@ -196,14 +196,45 @@ class TaskEvent(Base):
     run: Mapped[TrainingRun | None] = relationship(back_populates="events")
 
 
+class ModelAsset(Base):
+    """A reusable model source registered for the standalone testing centre."""
+    __tablename__ = "model_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_type", "execution_node_id", "path", name="uq_model_asset_source_path",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    source_type: Mapped[str] = mapped_column(String(32), index=True)
+    execution_node_id: Mapped[str] = mapped_column(String(64), index=True)
+    path: Mapped[str] = mapped_column(Text)
+    artifact_id: Mapped[int | None] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(24), default="ready", index=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+    artifact: Mapped[Artifact | None] = relationship(foreign_keys=[artifact_id])
+    model_tests: Mapped[list["ModelTest"]] = relationship(back_populates="model_asset")
+
+
 class ModelTest(Base):
     __tablename__ = "model_tests"
     __table_args__ = (
         Index("ix_model_tests_task_created_id", "task_id", "created_at", "id"),
+        Index("ix_model_tests_created_id", "created_at", "id"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
-    task_id: Mapped[str] = mapped_column(ForeignKey("training_tasks.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[str | None] = mapped_column(
+        ForeignKey("training_tasks.id", ondelete="CASCADE"), nullable=True, index=True,
+    )
     # run_id is the Attempt open in the canvas. source_run_id produced the tested weight.
     run_id: Mapped[str | None] = mapped_column(
         ForeignKey("training_runs.id", ondelete="SET NULL"), nullable=True, index=True,
@@ -214,6 +245,14 @@ class ModelTest(Base):
     artifact_id: Mapped[int | None] = mapped_column(
         ForeignKey("artifacts.id", ondelete="SET NULL"), nullable=True, index=True,
     )
+    model_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_assets.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    model_source_type: Mapped[str] = mapped_column(
+        String(32), default="training_artifact", index=True,
+    )
+    execution_node_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    model_source_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     artifact_name: Mapped[str] = mapped_column(String(255))
     model_name: Mapped[str] = mapped_column(String(255))
     # Content identity is immutable even when the linked Artifact row is
@@ -238,10 +277,11 @@ class ModelTest(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
-    task: Mapped[TrainingTask] = relationship(back_populates="model_tests")
+    task: Mapped[TrainingTask | None] = relationship(back_populates="model_tests")
     run: Mapped[TrainingRun | None] = relationship(foreign_keys=[run_id])
     source_run: Mapped[TrainingRun | None] = relationship(foreign_keys=[source_run_id])
     artifact: Mapped[Artifact | None] = relationship(foreign_keys=[artifact_id])
+    model_asset: Mapped[ModelAsset | None] = relationship(back_populates="model_tests")
     images: Mapped[list["ModelTestImage"]] = relationship(
         back_populates="test", cascade="all, delete-orphan", order_by="ModelTestImage.ordinal",
     )

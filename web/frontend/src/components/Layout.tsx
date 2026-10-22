@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Boxes, Check, Cpu, Database, FolderOpen, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, Settings2, Sun, X } from 'lucide-react'
+import { Activity, Boxes, Check, Cpu, Database, FolderOpen, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import {
@@ -211,6 +211,7 @@ export function Layout() {
         <nav>
           <NavLink to="/" end><LayoutDashboard size={18} />任务中心</NavLink>
           <NavLink to="/compare"><Activity size={18} />实验对比</NavLink>
+          <NavLink to="/model-tests"><ScanEye size={18} />模型测试</NavLink>
           <NavLink to="/compute"><Cpu size={18} />算力资源</NavLink>
           <NavLink to="/datasets"><Database size={18} />数据集管理</NavLink>
         </nav>

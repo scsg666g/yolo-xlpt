@@ -36,13 +36,14 @@ python3 monitor_agent.py --config agent-config.json
   "enable_training": false,
   "allowed_training_roots": [],
   "training_output_roots": [],
+  "model_test_roots": ["pt"],
   "yolo_bin": "yolo"
 }
 ```
 
 ## 启用远程训练
 
-当前脚本为 **Agent 2.0.1**，配套开发平台为 **1.3.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
+当前脚本为 **Agent 2.0.3**，配套开发平台为 **1.4.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -57,6 +58,8 @@ python3 monitor_agent.py --config agent-config.json
 | GPU 进程与训练 Run 关联 | 1.9.0 | Agent 给受管训练进程传递非敏感运行标识，并通过 Linux `/proc` 检查 GPU PID 的父进程链；中心再核验平台实例、节点、Run 和任务。环境不可读、旧进程或链路不完整时保留“无法确认”，不按 PID 猜测 |
 | 同节点按 GPU 并行与多 Run 恢复 | 2.0.0 | 上报 `training.gpu_parallelism=true`，且新中心下发有效 `gpu_assignment`；按稳定 GPU UUID 加宿主机锁，同卡互斥，多卡整组获取；单个 Agent 可管理并恢复多个活动 Run |
 | 旧版平铺 Attempt 精细清理 | 2.0.1 | 单独删除历史 Attempt 001 时只清理任务根级旧产物，保留所有 `attempt-NNN` 子目录；新版标准 Attempt 的删除协议保持兼容 |
+| 独立远程模型检查与传输 | 2.0.2 | 只读取 `model_test_roots` 内非符号链接的普通 `.pt` 文件；分块回传并校验稳定大小、修改时间与 SHA-256 |
+| 大模型最终校验与幂等提交 | 2.0.3 | 最终分块可使用独立长超时；中心仅执行一次完整哈希，并拒绝旧租约发布缓存 |
 
 当前中心在创建、启动、续训、重新训练和领取阶段都会拒绝低于 1.8.0 的 Agent。只需监控的旧 Agent 仍可上报算力，但不应用于新的远程训练。下例假设 Agent 配置目录与项目目录 `yolo` 是兄弟目录，按服务器实际布局调整：
 
@@ -66,6 +69,7 @@ python3 monitor_agent.py --config agent-config.json
   "training_cwd": "../yolo",
   "allowed_training_roots": ["models", "datasets", "runs"],
   "training_output_roots": ["runs"],
+  "model_test_roots": ["pt"],
   "yolo_bin": "yolo",
   "enable_training_trace": true
 }
@@ -78,12 +82,14 @@ Agent 1.8.1 及以上按下表解析路径，不依赖启动终端所在目录�
 | 字段 | 相对路径的基准 |
 | --- | --- |
 | `training_cwd` | `agent-config.json` 所在目录；省略时就是该目录 |
-| `allowed_training_roots`、`training_output_roots`、`training_lock_file` | 解析后的 `training_cwd` |
+| `allowed_training_roots`、`training_output_roots`、`model_test_roots`、`training_lock_file` | 解析后的 `training_cwd` |
 | `yolo_bin` | 单独写 `yolo` 时通过运行环境的 `PATH` 查找；带 `/` 的相对路径基于 `training_cwd` |
 
 `allowed_training_roots` 应仅列模型文件、数据 YAML、输出根目录所在的最小目录；输出根目录须事先存在，运行 Agent 的用户须有相应写权限。训练产物位于 `<输出根目录>/<任务类型>/<任务 ID>/attempt-001`。启动前 Agent 检查模型文件和数据 YAML 是否存在、路径是否落在允许目录内；它不会逐一检查 YAML 引用的全部图片路径是否也在允许目录内。命令通过参数数组执行，不执行任意 Shell。建议用具有训练目录写入权的专用非 root 用户运行 Agent。
 
 `training_output_roots` 明确哪些允许目录可作为训练输出，每一项必须位于 `allowed_training_roots` 内。旧配置未填写时 Agent 会兼容运行，但只能判断允许目录中是否至少有一个可写；每次启动仍会对任务实际输出根目录再做写入检查。
+
+`model_test_roots` 是独立模型测试的专用只读范围，不会自动扩大到 `allowed_training_roots`。未填写时默认为相对 `training_cwd` 的 `pt` 目录；例如项目工作目录为 `/srv/yolo`，实际范围就是 `/srv/yolo/pt`。该目录可暂时不存在，不会影响算力监控或远程训练就绪；选择其中模型时才会返回目录不可用。为了防止通过链接越界，范围目录、模型文件及其父路径都不能包含符号链接。`--check-config` 会输出解析后的模型测试目录，便于核对不同服务器的实际路径。
 
 例如 `runs` 与 `ultralytics/runs` 是项目下的两个独立目录，将后者加入访问目录并不会自动把它加入输出目录。Agent 1.8.1 在 `training.output_roots` 中回传解析后的输出范围，新版开发平台据此提示可用目录并在接受训练前校验路径；最终文件存在性、权限、符号链接和目录边界仍由远程 Agent 检查。1.8.0 未上报该字段时保持兼容。原有任务与 Attempt 的路径快照不会随 Agent 配置自动迁移，应逐一核对；为历史产物保留访问目录，也不代表允许新训练写入该目录或允许绕过共享 owner 删除保护。
 
@@ -95,7 +101,7 @@ workspace 登记以 `node_id` 的稳定哈希作为 owner，不依赖配置文�
 
 Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Batch 的输入张量、网络层统计、损失和采样图片，并增量上传到中台的过程解析接口。平台不会上传完整特征图、模型权重或数据集；采样图片单张最多 512 KiB。采集失败不会中断训练，网络暂时不可用时会在下一次轮询重试。若远程服务器资源紧张，可在配置中设置 `"enable_training_trace": false`，关闭过程采集但保留普通训练、指标和日志回传。替换 Agent 后需重新领取或重新启动训练，已经运行的旧 Attempt 不会补采历史 Batch。
 
-中心从源码配置动态生成参数目录，Agent 2.0.1 与平台 1.3.0 的发布目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
+中心从源码配置动态生成参数目录，Agent 2.0.3 与平台 1.4.0 的发布目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
 
 ### 远程任务与文件操作（Agent 1.3.0）
 
@@ -111,7 +117,9 @@ Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Ba
 
 ### 模型测试历史与 Agent 边界
 
-使用远程权重新建模型图片测试时，中心通过现有产物传输协议准备权重；实际推理、原图和结果持久化都在中心执行。检测完成后，即使远程 Agent 离线，中心保存的历史仍可查看和下载。模型测试历史没有为本轮单独新增 Agent 协议，但当前中心的新远程训练入口统一要求 Agent 1.8.0。
+使用远程训练产物新建模型图片测试时，中心继续通过产物传输协议准备权重。Agent 2.0.2 引入独立的 `fetch_model` 操作，用于读取不属于某个训练任务的指定远程 `.pt` 模型；当前中心要求 Agent 2.0.3。这类路径必须位于该节点上报的 `model_test_roots` 内，不会因为它同时位于训练访问目录就被接受。Agent 使用不跟随符号链接的方式打开普通文件，在每个分块中回传固定大小和修改时间，并在完成时回传 SHA-256；传输期间文件或路径发生变化会立即失败。
+
+远程独立模型测试要求 `enable_training=true`，因为当前 Agent 仅在启用远程训练时轮询受控文件操作。中心还会要求节点在线、Agent 版本不低于 2.0.3，并已上报实际的 `model_test_roots`。只用于算力监控的节点不会因为默认配置就执行文件读取。实际推理、上传原图和结果持久化仍在中心执行。Agent 在普通分块上传时继续使用 20 秒请求超时，只对需要中心完整校验的最终分块使用 `model_transfer_finalize_timeout_seconds`（默认 1800 秒，范围 60～7200）。检测完成后，即使远程 Agent 离线或原始模型后来移动，中心保存的历史仍可查看和下载。
 
 任务移入回收站不会要求 Agent 删除文件，中心模型测试历史也会保留。永久删除远程任务时，Agent 仍须在线清理远程 Attempt 和独立日志；中心保存的模型测试历史属于整套永久删除流程，清理全部成功后才最终删除任务记录。清理失败会保留可重试状态。
 
@@ -145,7 +153,7 @@ Agent 将每个活动任务的启动命令、PID、Linux 进程启动时刻、�
 
 ### 更新 Agent
 
-先确认没有训练运行，然后停止原 Agent，备份脚本和配置，保留 `.training-state/`。升级时保留该节点现有的 `center_url`、`node_id`、`token`、目录和其他私有设置；替换脚本后通过 `--check-config` 核对解析结果。只有原配置确实存在目录不匹配时，才按目标服务器的实际布局调整路径；示例配置中的中文说明可以按需合并，但不是启用 2.0.0 GPU 并行或 2.0.1 旧 Attempt 清理的必填项。不要用开发版、使用版或另一节点的配置覆盖当前节点。
+先确认没有训练运行，然后停止原 Agent，备份脚本和配置，保留 `.training-state/`。升级时保留该节点现有的 `center_url`、`node_id`、`token`、目录和其他私有设置；替换脚本后通过 `--check-config` 核对解析结果。只有原配置确实存在目录不匹配时，才按目标服务器的实际布局调整路径；示例配置中的中文说明可以按需合并，但不是启用 2.0.0 GPU 并行或 2.0.1 旧 Attempt 清理的必填项。Agent 2.0.3 在旧配置中默认使用 `pt` 和 1800 秒最终校验超时；若远程模型存放在其他位置，应只将必要的最小目录加入 `model_test_roots`。不要用开发版、使用版或另一节点的配置覆盖当前节点。
 
 从平台「算力资源」接入窗口下载最新脚本，或从远程可访问的中心地址下载到临时文件：
 
@@ -158,7 +166,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `2.0.1`，核对现有配置和输出目录后，再替换并验证连接：
+确认输出为 `2.0.3`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -229,8 +237,9 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.0.1）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
+| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.0.3）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
 | 旧 Attempt 单独删除提示 Agent 版本过低 | 旧版平铺 Attempt 001 需要 Agent 2.0.1 才能精细清理；替换脚本并重启 Agent，确认页面报告 2.0.1 后重试 |
+| 远程指定模型无法测试 | 确认 Agent 为 2.0.3、`enable_training=true`，并用 `--check-config` 核对模型所在目录已加入 `model_test_roots`；模型必须是该范围内的非空普通 `.pt` 文件，路径不能包含符号链接。若只在最终校验阶段超时，调整 `model_transfer_finalize_timeout_seconds` |
 | 训练输出目录被拒绝 | 比较 `--check-config` 的解析结果与任务输出路径，分别核对访问目录和 `training_output_roots`；两者均通过才能训练，修改本机待复制配置不会自动更新远端进程 |
 | 任务不领取、锁一直被占用 | 检查活动训练进程、中心 GPU 预约、`training_lock_file`、`${XDG_STATE_HOME:-~/.local/state}/yolo-forge-agent/` 下的 GPU / 输出根锁和各 Agent 的 `training_output_roots`；锁文件存在本身不表示锁仍被持有 |
 | 永久删除提示共享 workspace 正在使用 | 查看同一系统用户下其他 1.8.0+ Agent 的节点和输出根配置；停止或调整重叠的存活 Agent 后重试，不要手工删除登记来绕过保护 |
