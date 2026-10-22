@@ -4,6 +4,7 @@ import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider
 import { Activity, AlertCircle, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, ScanEye, SlidersHorizontal, Square, Terminal, Trophy, Workflow, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue, statusLabel } from '../api'
+import { useAppearance } from '../appearance'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { CanvasNode, type PanelNodeData } from './CanvasNode'
 import { CanvasDetailModal, type CanvasDetailKind } from './CanvasDetailModal'
@@ -58,6 +59,7 @@ function chartOption(metrics: MetricPoint[], animate: boolean) {
 function TaskCanvasInner() {
   const { taskId = '' } = useParams()
   const navigate = useNavigate()
+  const { resolvedTheme } = useAppearance()
   const [task, setTask] = useState<TrainingTask | null>(null)
   const [runs, setRuns] = useState<TrainingRun[]>([])
   const [selectedRunId, setSelectedRunId] = useState('')
@@ -490,8 +492,8 @@ function TaskCanvasInner() {
     </header>
     <div className={`canvas-wrap flow-${isCurrentRun ? viewTask.status : 'history'}`}>
       <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeDoubleClick={(_, node) => { if (isCurrentRun && node.id === 'config') setEditingParameters(true); if (isCurrentRun && (node.id === 'dataset' || node.id === 'model')) setEditingResource(node.id); if (node.id === 'logs') setViewingLogs(true); if (node.id === 'trace') setViewingTrace(true); if (node.id === 'inference') { setTestingArtifact(bestWeight || null); setModelTestOpen(true); } if (['runtime', 'status', 'metrics', 'artifacts', 'weights'].includes(node.id)) setDetailKind(node.id as CanvasDetailKind) }} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
-        <Background color="#24313d" gap={24} size={1} />
-        <MiniMap pannable zoomable nodeColor={(node) => node.id === 'status' ? '#70f0bd' : '#344657'} maskColor="rgba(5,9,13,.72)" />
+        <Background color={resolvedTheme === 'light' ? '#c8d8df' : '#24313d'} gap={24} size={1} />
+        <MiniMap pannable zoomable nodeColor={(node) => node.id === 'status' ? (resolvedTheme === 'light' ? '#159a78' : '#70f0bd') : (resolvedTheme === 'light' ? '#b7cad6' : '#344657')} maskColor={resolvedTheme === 'light' ? 'rgba(225,235,242,.72)' : 'rgba(5,9,13,.72)'} />
         <Controls showInteractive={false} />
       </ReactFlow>
       <div className="canvas-legend"><span><i className={currentIsActive && !syncDelayed && !outputWaiting ? 'green live' : 'green'} />{flowLabel}</span><span>{events.length} 条任务事件</span><span>拖拽节点 · 滚轮缩放 · 空白处平移</span></div>

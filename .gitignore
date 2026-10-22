@@ -170,6 +170,7 @@ weights/
 *.safetensors
 *.ts
 !web/frontend/src/api.ts
+!web/frontend/src/appearance.ts
 !web/frontend/src/preferences.ts
 !web/frontend/src/types.ts
 !web/frontend/src/env.d.ts

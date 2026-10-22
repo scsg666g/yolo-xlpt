@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Boxes, Check, Cpu, Database, FolderOpen, LayoutDashboard, Minus, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Settings2, Sun, X } from 'lucide-react'
+import { Activity, Boxes, Check, Cpu, Database, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import {
@@ -12,12 +12,14 @@ import {
   writeStoredCompareRuns,
 } from '../preferences'
 import type { PlatformHealth } from '../types'
+import { resetAppearance, updateAppearance, useAppearance } from '../appearance'
+import { AppearanceSettings } from './AppearanceSettings'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
 
 const settingsSections = [
   { id: 'overview', label: '概览', description: '平台状态与实例信息。', icon: LayoutDashboard },
-  { id: 'appearance', label: '外观', description: '当前浏览器的显示主题。', icon: Sun },
+  { id: 'appearance', label: '外观', description: '为当前浏览器设置配色与阅读偏好。', icon: Sun },
   { id: 'training', label: '实验与训练', description: '实验对比参数。', icon: Activity },
   { id: 'services', label: '服务状态', description: '数据库与后台服务运行状态。', icon: Cpu },
   { id: 'storage', label: '存储与路径', description: '训练输出目录等平台路径。', icon: FolderOpen },
@@ -57,9 +59,7 @@ function dateTimeLabel(value: string | null | undefined) {
 }
 
 export function Layout() {
-  const [theme, setTheme] = useState<'light' | 'dark'>(() =>
-    document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light',
-  )
+  const appearance = useAppearance()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('overview')
   const compareLimit = useCompareLimit()
@@ -69,12 +69,6 @@ export function Layout() {
   const healthController = useRef<AbortController | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement>(null)
   const settingsDialog = useRef<HTMLElement>(null)
-
-  function changeTheme(nextTheme: 'light' | 'dark') {
-    setTheme(nextTheme)
-    document.documentElement.dataset.theme = nextTheme
-    localStorage.setItem('yolo-forge-theme', nextTheme)
-  }
 
   const checkHealth = useCallback(async (showChecking = false) => {
     healthController.current?.abort()
@@ -204,9 +198,10 @@ export function Layout() {
         <div className="theme-picker" aria-label="界面主题">
           <span>界面主题</span>
           <div>
-            <button type="button" className={theme === 'light' ? 'active' : ''} onClick={() => changeTheme('light')} title="明亮主题" aria-pressed={theme === 'light'}><Sun size={14} />明亮</button>
-            <button type="button" className={theme === 'dark' ? 'active' : ''} onClick={() => changeTheme('dark')} title="深色主题" aria-pressed={theme === 'dark'}><Moon size={14} />深色</button>
+            <button type="button" className={appearance.mode === 'light' ? 'active' : ''} onClick={() => updateAppearance({ mode: 'light' })} title="明亮主题" aria-pressed={appearance.mode === 'light'}><Sun size={14} />明亮</button>
+            <button type="button" className={appearance.mode === 'dark' ? 'active' : ''} onClick={() => updateAppearance({ mode: 'dark' })} title="深色主题" aria-pressed={appearance.mode === 'dark'}><Moon size={14} />深色</button>
           </div>
+          {appearance.mode === 'system' && <small className="theme-system-note"><Monitor size={11} />跟随系统 · 当前{appearance.resolvedTheme === 'dark' ? '深色' : '明亮'}</small>}
         </div>
         <nav>
           <NavLink to="/" end><LayoutDashboard size={18} />任务中心</NavLink>
@@ -256,16 +251,7 @@ export function Layout() {
                   </div>
                 </>}
 
-                {settingsSection === 'appearance' && <>
-                  <div className="parameter-section">
-                    <h3>显示模式</h3>
-                    <p>主题保存在当前浏览器中。</p>
-                  </div>
-                  <div className="header-actions settings-theme-actions">
-                    <button type="button" className={`button ${theme === 'light' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'light'} onClick={() => changeTheme('light')}><Sun size={15} />明亮主题</button>
-                    <button type="button" className={`button ${theme === 'dark' ? 'primary' : 'ghost'}`} aria-pressed={theme === 'dark'} onClick={() => changeTheme('dark')}><Moon size={15} />深色主题</button>
-                  </div>
-                </>}
+                {settingsSection === 'appearance' && <AppearanceSettings />}
 
                 {settingsSection === 'training' && <>
                   <div className="parameter-section">
@@ -319,8 +305,13 @@ export function Layout() {
             </div>
           </div>
           <footer>
-            <span style={{ marginRight: 'auto' }}>{health.checkedAt ? `上次检查：${health.checkedAt.toLocaleTimeString('zh-CN')}` : '尚未完成检查'}</span>
-            <button type="button" className="button ghost" disabled={health.phase === 'checking'} onClick={() => void checkHealth(true)}><RefreshCw size={15} className={health.phase === 'checking' ? 'spin' : ''} />重新检查</button>
+            {settingsSection === 'appearance' ? <>
+              <span className="appearance-save-note" role="status">{appearance.storageAvailable ? '即时生效 · 仅保存在当前浏览器' : '即时生效 · 浏览器存储不可用，刷新后可能恢复默认'}</span>
+              <button type="button" className="button ghost" onClick={resetAppearance}><RotateCcw size={15} />恢复默认版</button>
+            </> : <>
+              <span style={{ marginRight: 'auto' }}>{health.checkedAt ? `上次检查：${health.checkedAt.toLocaleTimeString('zh-CN')}` : '尚未完成检查'}</span>
+              <button type="button" className="button ghost" disabled={health.phase === 'checking'} onClick={() => void checkHealth(true)}><RefreshCw size={15} className={health.phase === 'checking' ? 'spin' : ''} />重新检查</button>
+            </>}
             <button type="button" className="button" onClick={closeSettings}>关闭</button>
           </footer>
         </section>

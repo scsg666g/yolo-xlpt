@@ -1,0 +1,163 @@
+/* Personal display preferences; all values are local to this browser. */
+:root { --appearance-density-zoom: 1; --appearance-font-zoom: 1; --appearance-ui-zoom: 1; }
+:root[data-font-size='large'] { --appearance-font-zoom: 1.06; }
+:root[data-density='compact'] { --appearance-density-zoom: .975; }
+:root[data-density='comfortable'] { --appearance-density-zoom: 1.025; }
+/* Keep fixed overlays and the React Flow canvas in their browser coordinate
+   system. This avoids changing pointer math while still scaling the ordinary
+   task, comparison, dataset, and resource pages. */
+body:not(:has(.canvas-page)):not(:has(.modal-backdrop)) {
+  zoom: calc(var(--appearance-font-zoom) * var(--appearance-density-zoom));
+}
+
+:root[data-accent]:not([data-accent='default']) { accent-color: var(--accent); }
+:root[data-accent]:not([data-accent='default']) .sidebar nav a.active,
+:root[data-accent]:not([data-accent='default']) .settings-nav button.active,
+:root[data-accent]:not([data-accent='default']) .theme-picker button.active,
+:root[data-accent]:not([data-accent='default']) .button.primary {
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+  background: var(--accent);
+}
+:root[data-accent]:not([data-accent='default']) .sidebar nav a.active,
+:root[data-accent]:not([data-accent='default']) .settings-nav button.active,
+:root[data-accent]:not([data-accent='default']) .theme-picker button.active,
+:root[data-accent]:not([data-accent='default']) .task-group-icon,
+:root[data-accent]:not([data-accent='default']) .task-group-actions .rename:hover,
+:root[data-accent]:not([data-accent='default']) .task-group-actions .rename:focus-visible,
+:root[data-accent]:not([data-accent='default']) .effects-toggle[aria-pressed='true'],
+:root[data-accent]:not([data-accent='default']) .appearance-mode.selected,
+:root[data-accent]:not([data-accent='default']) .appearance-swatch.selected,
+:root[data-accent]:not([data-accent='default']) .appearance-segmented button[aria-pressed='true'],
+:root[data-accent]:not([data-accent='default']) .dataset-filters button.active,
+:root[data-accent]:not([data-accent='default']) .model-tests-view-tabs button.active,
+:root[data-accent]:not([data-accent='default']) .model-source-tabs button.active,
+:root[data-accent]:not([data-accent='default']) .model-library-task.selected,
+:root[data-accent]:not([data-accent='default']) .model-library-asset.selected,
+:root[data-accent]:not([data-accent='default']) .auto-refresh.active,
+:root[data-accent]:not([data-accent='default']) .compare-run-details-toggle[aria-expanded='true'],
+:root[data-accent]:not([data-accent='default']) .compare-run-detail-tabs button.active,
+:root[data-accent]:not([data-accent='default']) .metric-baseline-button.active,
+:root[data-accent]:not([data-accent='default']) .picker-done,
+:root[data-accent]:not([data-accent='default']) .log-action-button:hover,
+:root[data-accent]:not([data-accent='default']) .log-action-button:focus-visible,
+:root[data-accent]:not([data-accent='default']) .artifact-list a:hover,
+:root[data-accent]:not([data-accent='default']) .artifact-list > div:hover {
+  color: var(--accent-text);
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+}
+:root[data-accent]:not([data-accent='default']) .sidebar nav a.active:hover,
+:root[data-accent]:not([data-accent='default']) .theme-picker button.active:hover {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  box-shadow: none;
+}
+:root[data-accent]:not([data-accent='default']) .button.primary:hover {
+  color: var(--accent-contrast);
+  border-color: var(--accent-border);
+  background: var(--accent);
+  box-shadow: 0 8px 20px var(--accent-soft);
+}
+:root[data-accent]:not([data-accent='default']) :is(
+  .button, .icon-button, .icon-text, .theme-picker button, .sidebar nav a,
+  .settings-nav button, .appearance-mode, .appearance-swatch, .appearance-segmented button,
+  .model-tests-page button, .model-tests-page a, .model-tests-page input, .model-tests-page select,
+  .model-test-modal button, .model-test-modal a, .model-test-modal input, .model-test-modal select,
+  .compare-page button, .compare-page a, .compare-page input, .compare-page select,
+  .compute-page button, .compute-page a, .compute-page input, .compute-page select,
+  .datasets-page button, .datasets-page a, .datasets-page input, .datasets-page select
+):focus-visible {
+  outline-color: var(--accent);
+}
+:root[data-accent]:not([data-accent='default']) .search:focus-within,
+:root[data-accent]:not([data-accent='default']) .toolbar-actions select:focus-visible,
+:root[data-accent]:not([data-accent='default']) .form-grid input:focus-visible,
+:root[data-accent]:not([data-accent='default']) .form-grid select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+:root[data-accent]:not([data-accent='default']) .button:hover:not(.primary):not(.danger),
+:root[data-accent]:not([data-accent='default']) .icon-button:hover,
+:root[data-accent]:not([data-accent='default']) .icon-text:hover {
+  border-color: var(--accent-border);
+  box-shadow: 0 6px 16px var(--accent-soft);
+}
+
+.theme-system-note { display: flex; align-items: center; justify-content: center; gap: 5px; padding-top: 7px; color: var(--muted); font-size: 9px; }
+
+.appearance-settings { display: grid; gap: 20px; }
+.appearance-section { min-width: 0; margin: 0; padding: 15px; border: 1px solid var(--line); border-radius: 9px; background: color-mix(in srgb, var(--panel) 94%, transparent); }
+.appearance-section legend { padding: 0 6px; color: var(--text); font-size: 12px; font-weight: 700; }
+.appearance-section > p { margin: 5px 0 12px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.appearance-section > p:last-child { margin-bottom: 0; }
+.appearance-modes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.appearance-mode { min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--panel-2); cursor: pointer; text-align: left; }
+.appearance-mode:hover { border-color: var(--accent-border); }
+.appearance-mode.selected { border-color: var(--accent-border); box-shadow: inset 0 0 0 1px var(--accent-border); }
+.appearance-mode-image { height: 64px; display: grid; grid-template-columns: 22px 1fr; gap: 5px; padding: 6px; overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: #f2f6f9; }
+.appearance-mode-image.dark { background: #18242f; }
+.appearance-mode-image.system { background: linear-gradient(115deg, #f2f6f9 50%, #18242f 50%); }
+.appearance-mode-image > i { display: block; border-radius: 3px; background: #dbe5eb; }
+.appearance-mode-image.dark > i, .appearance-mode-image.system > i { background: #344653; }
+.appearance-mode-image > span { display: grid; align-content: start; gap: 5px; padding-top: 4px; }
+.appearance-mode-image > span b { width: 85%; height: 5px; display: block; border-radius: 5px; background: #d6e0e6; }
+.appearance-mode-image > span b:first-child { width: 54%; height: 8px; background: var(--accent); }
+.appearance-mode-image.dark > span b, .appearance-mode-image.system > span b { background: #405361; }
+.appearance-mode-image.dark > span b:first-child, .appearance-mode-image.system > span b:first-child { background: var(--accent); }
+.appearance-mode-label { min-width: 0; display: flex; align-items: center; gap: 5px; margin-top: 9px; color: var(--muted); }
+.appearance-mode-label strong { min-width: 0; flex: 1; color: var(--text); font-size: 10px; }
+.appearance-mode.selected .appearance-mode-label { color: var(--accent-text); }
+.appearance-mode > small { display: block; margin-top: 5px; color: var(--muted); font-size: 9px; line-height: 1.4; }
+.appearance-swatches { display: flex; flex-wrap: wrap; gap: 7px; }
+.appearance-swatch { min-height: 35px; display: inline-flex; align-items: center; gap: 7px; padding: 0 10px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--panel-2); cursor: pointer; font-size: 10px; }
+.appearance-swatch > i { width: 14px; height: 14px; flex: 0 0 auto; border: 1px solid color-mix(in srgb, var(--swatch-color, var(--accent)) 65%, white); border-radius: 50%; background: var(--swatch-color, var(--accent)); }
+.appearance-swatch.selected { border-color: var(--accent-border); background: var(--accent-soft); }
+.appearance-custom-color { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 12px; }
+.appearance-color-picker { width: 34px; height: 34px; display: grid; place-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); cursor: pointer; }
+.appearance-color-picker input { width: 40px; height: 40px; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.appearance-hex-label { color: var(--muted); font-size: 10px; }
+.appearance-hex { width: 102px; height: 34px; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--panel); font: 500 10px "DM Mono", monospace; }
+.appearance-hex[aria-invalid='true'] { border-color: #dc717a; box-shadow: 0 0 0 2px rgba(220,113,122,.14); }
+.appearance-section > p.appearance-error { color: #dc717a; }
+.appearance-reading { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.appearance-reading .appearance-section { padding: 12px; }
+.appearance-segmented { display: flex; gap: 3px; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+.appearance-segmented button { min-height: 31px; flex: 1; padding: 0 7px; border: 1px solid transparent; border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; font-size: 9px; }
+.appearance-segmented button:hover { color: var(--text); background: color-mix(in srgb, var(--accent) 8%, var(--panel)); }
+.appearance-segmented button[aria-pressed='true'] { color: var(--accent-text); border-color: var(--accent-border); background: var(--accent-soft); }
+.appearance-reading .appearance-section > p { margin: 8px 0 0; font-size: 9px; }
+.appearance-preview { padding: 14px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.appearance-preview-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.appearance-preview-heading strong { color: var(--text); font-size: 11px; }
+.appearance-preview-heading span { color: var(--muted); font-size: 9px; }
+.appearance-preview-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 13px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.appearance-preview-kicker { color: var(--accent-text); font: 500 8px "DM Mono", monospace; letter-spacing: .1em; }
+.appearance-preview-card h4 { margin: 5px 0 3px; color: var(--text); font-size: 12px; }
+.appearance-preview-card p { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.5; }
+.appearance-preview-statuses { display: flex; align-items: flex-start; gap: 5px; }
+.appearance-preview-controls { display: flex; grid-column: 1 / -1; align-items: center; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+.appearance-preview-controls input { min-width: 0; flex: 1; height: 33px; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: var(--panel-2); font-size: 9px; }
+.appearance-preview-controls .button { min-height: 33px; height: auto; font-size: 10px; }
+.appearance-save-note { margin-right: auto; color: var(--muted); font-size: 9px; }
+
+@media (max-width: 760px) {
+  .appearance-settings { gap: 14px; }
+  .appearance-section { padding: 12px; }
+  .appearance-modes { gap: 6px; }
+  .appearance-mode { padding: 6px; }
+  .appearance-mode-image { height: 46px; }
+  .appearance-mode > small { font-size: 8px; }
+  .appearance-reading { grid-template-columns: minmax(0, 1fr); }
+  .appearance-save-note { width: 100%; flex-basis: 100%; }
+}
+
+@media (max-width: 430px) {
+  .appearance-modes { grid-template-columns: minmax(0, 1fr); }
+  .appearance-mode { display: grid; grid-template-columns: 68px minmax(0, 1fr); column-gap: 9px; align-items: center; }
+  .appearance-mode-image { grid-row: span 2; height: 44px; }
+  .appearance-mode-label { margin-top: 0; }
+  .appearance-mode > small { margin-top: 3px; }
+  .appearance-preview-statuses { grid-column: 1 / -1; }
+  .appearance-preview-card { gap: 8px; }
+}
