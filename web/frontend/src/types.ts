@@ -406,6 +406,14 @@ export interface ModelTest {
     execution_node_name?: string | null
     task_name?: string | null
     sha256?: string | null
+    history_group?: {
+      kind: 'task_group' | 'ungrouped' | 'standalone_model'
+      id: string | null
+      name: string
+      source_type?: ModelAssetSourceType | null
+      execution_node_id?: string | null
+      execution_node_name?: string | null
+    }
   }
   timings: { model_load: number; preprocess: number; inference: number; postprocess: number; total: number } | null
   files: Array<{

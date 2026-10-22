@@ -2,7 +2,7 @@
 
 本仓库的服务模板按两套独立 checkout 配置：开发版使用 `18088`，使用版使用 `18089`。两套服务必须使用不同的 systemd 服务名，不能都安装成 `yolo-platform.service`。模板存在不代表两套服务已在目标机器安装或运行。
 
-安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.4.1**，配套远程 Agent 为 **2.0.3**。
+安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.4.2**，配套远程 Agent 为 **2.0.3**。
 
 仓库同时保存 `yolo-platform-dev.service` 和 `yolo-platform-prod.service`，分别配置两套路径和端口。环境差异放在各实例的 `.env` 中，服务模板也分开维护，减少因开发/使用版配置混用引起的冲突。
 

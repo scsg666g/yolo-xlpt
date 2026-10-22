@@ -21,7 +21,17 @@ import app.model_assets as model_assets
 import app.model_test_storage as storage
 from app.database import get_db
 from app.main import app
-from app.models import Artifact, ModelAsset, ModelTest, ModelTestImage, RemoteOperation, TrainingRun, utcnow
+from app.models import (
+    Artifact,
+    ComputeNode,
+    ModelAsset,
+    ModelTest,
+    ModelTestImage,
+    RemoteOperation,
+    TaskGroup,
+    TrainingRun,
+    utcnow,
+)
 from test_services import make_session, make_task
 
 
@@ -186,6 +196,98 @@ def test_local_model_assets_are_portable_listed_and_restricted(image_test_client
     assert "符号链接" in response.json()["detail"]
 
 
+def test_training_history_group_is_snapshotted_and_refreshed_for_reruns(image_test_client):
+    client, db, artifact, _, _ = image_test_client
+    original_group = TaskGroup(id="group-original", name="烟草初始实验")
+    current_group = TaskGroup(id="group-current", name="烟草新增数据")
+    artifact.task.group_id = original_group.id
+    db.add_all([original_group, current_group])
+    db.commit()
+
+    source = create(client, artifact).json()
+    assert source["model"]["history_group"] == {
+        "kind": "task_group", "id": original_group.id, "name": original_group.name,
+    }
+
+    source_record = db.get(ModelTest, source["id"])
+    source_record.status = "completed"
+    source_record.finished_at = utcnow()
+    artifact.task.group_id = current_group.id
+    db.commit()
+
+    rerun_response = create(client, artifact, rerun_of_test_id=source["id"])
+
+    assert rerun_response.status_code == 201
+    rerun = rerun_response.json()
+    assert rerun["model"]["history_group"] == {
+        "kind": "task_group", "id": current_group.id, "name": current_group.name,
+    }
+    assert rerun["model"]["weight_name"] == source["model"]["weight_name"]
+    assert rerun["model"]["source_path"] == source["model"]["source_path"]
+    db.refresh(source_record)
+    assert source_record.model_snapshot["history_group"]["id"] == original_group.id
+
+
+def test_standalone_history_groups_include_model_source_and_remote_node(
+    image_test_client, tmp_path, monkeypatch,
+):
+    client, db, _, _, _ = image_test_client
+    _, model_root = configure_standalone_models(tmp_path, monkeypatch)
+    local_model = model_root / "local.pt"
+    local_model.write_bytes(b"local-model")
+    local_asset = client.post("/api/model-assets/local", json={"path": str(local_model)}).json()
+    local_test = client.post("/api/model-tests", json={
+        "model_asset_id": local_asset["id"],
+        "files": [{"name": "local.png", "size": len(image_bytes())}],
+    }).json()
+    assert local_test["model"]["history_group"] == {
+        "kind": "standalone_model",
+        "id": "local_path:local",
+        "name": "独立模型 · 本机模型",
+        "source_type": "local_path",
+        "execution_node_id": "local",
+        "execution_node_name": None,
+    }
+
+    node = ComputeNode(id="remote-node", name="远程 GPU 节点")
+    remote_asset = ModelAsset(
+        id="a" * 32,
+        name="remote-best.pt",
+        source_type="remote_path",
+        execution_node_id=node.id,
+        path="/models/remote-best.pt",
+        sha256=hashlib.sha256(b"remote-model").hexdigest(),
+        size=len(b"remote-model"),
+        status="ready",
+    )
+    remote_model = tmp_path / "remote-best.pt"
+    remote_model.write_bytes(b"remote-model")
+    db.add_all([node, remote_asset])
+    db.commit()
+    monkeypatch.setattr(
+        inference,
+        "_verified_model_asset_version",
+        lambda _db, _asset_id, **_kwargs: (
+            remote_model, remote_asset, remote_asset.sha256, remote_asset.size,
+        ),
+    )
+
+    remote_test_response = client.post("/api/model-tests", json={
+        "model_asset_id": remote_asset.id,
+        "files": [{"name": "remote.png", "size": len(image_bytes())}],
+    })
+
+    assert remote_test_response.status_code == 201
+    assert remote_test_response.json()["model"]["history_group"] == {
+        "kind": "standalone_model",
+        "id": "remote_path:remote-node",
+        "name": "独立模型 · 远程 GPU 节点",
+        "source_type": "remote_path",
+        "execution_node_id": "remote-node",
+        "execution_node_name": "远程 GPU 节点",
+    }
+
+
 def test_standalone_model_test_runs_without_training_task_and_has_global_history(
     image_test_client, tmp_path, monkeypatch,
 ):
@@ -316,6 +418,9 @@ def test_completed_test_persists_and_is_listed_after_reopen(image_test_client, m
     assert created["attempt_number"] == 1
     assert created["source_attempt_number"] == 1
     assert created["model"]["weight_name"] == "best.pt"
+    assert created["model"]["history_group"] == {
+        "kind": "ungrouped", "id": None, "name": "未分组",
+    }
     expected_sha256 = hashlib.sha256(b"test-checkpoint").hexdigest()
     assert created["model_sha256"] == expected_sha256
     assert created["model_size"] == len(b"test-checkpoint")

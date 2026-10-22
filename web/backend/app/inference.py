@@ -59,6 +59,7 @@ from .models import (
     ModelTest,
     ModelTestImage,
     RemoteOperation,
+    TaskGroup,
     TrainingRun,
     TrainingTask,
     utcnow,
@@ -154,6 +155,38 @@ def asset_model_summary(db: Session, asset: ModelAsset, *, sha256: str, size: in
         "execution_node_id": asset.execution_node_id,
         "execution_node_name": node.name if node else None,
         "task_name": None,
+    }
+
+
+def _history_group_snapshot(
+    db: Session,
+    *,
+    task: TrainingTask | None = None,
+    asset: ModelAsset | None = None,
+) -> dict:
+    if task is not None:
+        group = db.get(TaskGroup, task.group_id) if task.group_id else None
+        if group is not None:
+            return {"kind": "task_group", "id": group.id, "name": group.name}
+        return {"kind": "ungrouped", "id": None, "name": "未分组"}
+
+    if asset is None:
+        return {"kind": "ungrouped", "id": None, "name": "未分组"}
+
+    node = db.get(ComputeNode, asset.execution_node_id)
+    node_name = node.name if node else None
+    group_name = (
+        "独立模型 · 本机模型"
+        if asset.source_type == "local_path"
+        else f"独立模型 · {node_name or '已登记节点'}"
+    )
+    return {
+        "kind": "standalone_model",
+        "id": f"{asset.source_type}:{asset.execution_node_id}",
+        "name": group_name,
+        "source_type": asset.source_type,
+        "execution_node_id": asset.execution_node_id,
+        "execution_node_name": node_name,
     }
 
 
@@ -1137,6 +1170,7 @@ def _create_test(payload: TestCreate, db: Session):
         model_source_type = asset.source_type
         execution_node_id = asset.execution_node_id
         model_source_path = rerun_source.model_source_path if rerun_source else asset.path
+    snapshot["history_group"] = _history_group_snapshot(db, task=task, asset=asset)
     snapshot.update({"weight_size": model_size, "sha256": model_sha256})
 
     test_id = uuid.uuid4().hex

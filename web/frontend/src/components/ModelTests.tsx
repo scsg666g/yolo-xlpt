@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  AlertCircle, Box, CheckCircle2, Cpu, Download, FileArchive, FolderOpen,
+  AlertCircle, Box, CheckCircle2, ChevronDown, Cpu, Download, FileArchive, FolderOpen,
   HardDrive, History, ImagePlus, Images, Info, LoaderCircle, Play, RefreshCw,
   RotateCcw, ScanEye, Server, SlidersHorizontal, Sparkles, Trash2, Upload, X,
 } from 'lucide-react'
-import { api, formatBytes } from '../api'
+import { api, formatBytes, statusLabel } from '../api'
 import type {
   Artifact, ComputeNode, ModelAsset, ModelTest, ModelTestSummary,
-  TrainingRun, TrainingTask,
+  TaskGroup, TrainingRun, TrainingTask,
 } from '../types'
 import {
   activeModelTestStatuses, modelTestDate, modelTestDetectionLabel, modelTestStatusLabels,
   modelTestWeightName, type SelectedImage, TestWorkspace,
 } from './ModelTestShared'
+import { RegisteredModelLibrary, TrainingTaskLibrary } from './ModelLibrary'
 import '../model-tests.css'
 
 type SourceType = 'local_path' | 'training_artifact' | 'remote_path'
@@ -22,6 +23,15 @@ const sourceLabels: Record<SourceType, string> = {
   local_path: '本机模型',
   training_artifact: '训练产物',
   remote_path: '远程模型',
+}
+
+const collapsedHistoryGroupsKey = 'yolo-model-test-history-collapsed-groups-v1'
+
+function initialCollapsedHistoryGroups() {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(collapsedHistoryGroupsKey) || '[]')
+    return new Set<string>(Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [])
+  } catch { return new Set<string>() }
 }
 
 const assetStatusLabels: Record<ModelAsset['status'], string> = {
@@ -60,6 +70,36 @@ function sourceDescription(test: ModelTestSummary) {
   }
   if (sourceType === 'remote_path') return `远程服务器 · ${test.execution_node_name || '已登记节点'}`
   return '本机服务器 · 模型目录'
+}
+
+function historyGroupFor(
+  test: ModelTestSummary,
+  tasksById: Map<string, TrainingTask>,
+  groupsById: Map<string, TaskGroup>,
+  nodesById: Map<string, ComputeNode>,
+) {
+  const snapshot = test.model.history_group
+  if (test.task_id) {
+    const task = tasksById.get(test.task_id)
+    if (task && !task.group_id) return { key: 'ungrouped:tasks', name: '未分组', order: 1_000_000 }
+    const groupId = task?.group_id
+    const group = groupId ? groupsById.get(groupId) : undefined
+    if (group) return { key: `task_group:${group.id}`, name: group.name, order: group.display_order }
+    if (groupId && snapshot?.kind === 'task_group' && snapshot.id === groupId) {
+      return { key: `task_group:${groupId}`, name: snapshot.name, order: 500_000 }
+    }
+    if (!task && snapshot?.kind === 'task_group' && snapshot.name) {
+      return { key: `task_group:${snapshot.id || snapshot.name}`, name: snapshot.name, order: 500_000 }
+    }
+    return { key: task ? `task_group:${groupId}` : 'ungrouped:missing-task', name: task ? '任务分组不可用' : '已删除或不可用任务', order: 1_000_000 }
+  }
+  if (modelSourceType(test) === 'remote_path') {
+    const nodeId = test.execution_node_id || snapshot?.execution_node_id || null
+    const node = (nodeId ? nodesById.get(nodeId)?.name : null)
+      || test.execution_node_name || snapshot?.execution_node_name || test.model.execution_node_name || '已登记节点'
+    return { key: `standalone_model:remote:${nodeId || node}`, name: `独立模型 · ${node}`, order: 1_000_001 }
+  }
+  return { key: 'standalone_model:local', name: '独立模型 · 本机模型', order: 1_000_001 }
 }
 
 function testHasExactModel(test: ModelTest) {
@@ -105,6 +145,7 @@ export function ModelTests() {
   const [remoteNodeId, setRemoteNodeId] = useState('')
 
   const [tasks, setTasks] = useState<TrainingTask[]>([])
+  const [taskGroups, setTaskGroups] = useState<TaskGroup[]>([])
   const [trainingTaskId, setTrainingTaskId] = useState('')
   const [runs, setRuns] = useState<TrainingRun[]>([])
   const [trainingRunId, setTrainingRunId] = useState('')
@@ -133,6 +174,7 @@ export function ModelTests() {
   const [historyDetails, setHistoryDetails] = useState<Record<string, ModelTest>>({})
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false)
   const [historyImage, setHistoryImage] = useState(0)
+  const [collapsedHistoryGroups, setCollapsedHistoryGroups] = useState<Set<string>>(initialCollapsedHistoryGroups)
   const [deletingId, setDeletingId] = useState<string | null>(null)
   const [reusingId, setReusingId] = useState<string | null>(null)
   const [rerunSource, setRerunSource] = useState<ModelTest | null>(null)
@@ -162,10 +204,25 @@ export function ModelTests() {
   const selectedRun = runs.find((run) => run.id === trainingRunId) || null
   const selectedTask = tasks.find((task) => task.id === trainingTaskId) || null
   const remoteNodes = nodes.filter((node) => node.kind === 'agent' && node.enabled)
-  const relevantAssets = assets.filter((asset) => asset.source_type === sourceType
-    && (sourceType !== 'remote_path' || !remoteNodeId || asset.execution_node_id === remoteNodeId))
+  const tasksById = useMemo(() => new Map(tasks.map((task) => [task.id, task])), [tasks])
+  const groupsById = useMemo(() => new Map(taskGroups.map((group) => [group.id, group])), [taskGroups])
+  const nodesById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes])
+  const groupedHistory = useMemo(() => {
+    const sections = new Map<string, { key: string; name: string; order: number; items: ModelTestSummary[] }>()
+    for (const item of history) {
+      const group = historyGroupFor(item, tasksById, groupsById, nodesById)
+      const section = sections.get(group.key) || { ...group, items: [] }
+      section.items.push(item)
+      sections.set(group.key, section)
+    }
+    return [...sections.values()].sort((left, right) => left.order - right.order || left.name.localeCompare(right.name, 'zh-CN'))
+  }, [groupsById, history, nodesById, tasksById])
   historySourceRef.current = historySource
   historyStatusRef.current = historyStatus
+
+  useEffect(() => {
+    try { window.localStorage.setItem(collapsedHistoryGroupsKey, JSON.stringify([...collapsedHistoryGroups])) } catch { /* Storage is optional. */ }
+  }, [collapsedHistoryGroups])
 
   const refreshAssets = useCallback(async (signal?: AbortSignal) => {
     setAssetsLoading(true)
@@ -212,8 +269,12 @@ export function ModelTests() {
     void api.tasks(abort.signal).then((items) => {
       if (abort.signal.aborted) return
       setTasks(items)
-      setTrainingTaskId((current) => current || items[0]?.id || '')
+      const latest = [...items].sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0]
+      setTrainingTaskId((current) => current && items.some((item) => item.id === current) ? current : latest?.id || '')
     }).catch((reason) => { if (!abort.signal.aborted) setSourceError(reason instanceof Error ? reason.message : '读取训练任务失败') })
+    void api.taskGroups(abort.signal).then((items) => {
+      if (!abort.signal.aborted) setTaskGroups(items)
+    }).catch((reason) => { if (!abort.signal.aborted) setSourceError(reason instanceof Error ? reason.message : '读取任务分组失败') })
     void api.computeNodes(abort.signal).then((items) => {
       if (abort.signal.aborted) return
       setNodes(items)
@@ -807,9 +868,23 @@ export function ModelTests() {
         </section>}
 
         {sourceType === 'training_artifact' && <section className="model-source-form training-artifact-form">
-          <label>训练任务<select value={trainingTaskId} disabled={running} onChange={(event) => { setTrainingTaskId(event.target.value); setTrainingRunId(''); setArtifactId(null); resetCurrentResult() }}><option value="">请选择任务</option>{tasks.map((task) => <option key={task.id} value={task.id}>{task.name}</option>)}</select></label>
-          <label>训练轮次<select value={trainingRunId} disabled={running || !trainingTaskId || trainingSourceLoading} onChange={(event) => { setTrainingRunId(event.target.value); setArtifactId(null); resetCurrentResult() }}><option value="">{trainingSourceLoading ? '正在读取…' : '请选择 Attempt'}</option>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {run.status}</option>)}</select></label>
-          <label>权重文件<select value={artifactId ?? ''} disabled={running || !trainingRunId || trainingSourceLoading} onChange={(event) => { setArtifactId(event.target.value ? Number(event.target.value) : null); resetCurrentResult() }}><option value="">{trainingSourceLoading ? '正在读取…' : artifacts.length ? '请选择权重' : '当前 Attempt 没有 .pt 产物'}</option>{artifacts.map((artifact) => <option key={artifact.id} value={artifact.id}>{artifact.name.split('/').pop()} · {formatBytes(artifact.size)}</option>)}</select></label>
+          <label>模型库 · 训练任务</label>
+          <TrainingTaskLibrary
+            tasks={tasks}
+            groups={taskGroups}
+            nodes={nodes}
+            selectedTaskId={trainingTaskId}
+            disabled={running}
+            onSelect={(task) => {
+              if (task.id === trainingTaskId) return
+              setTrainingTaskId(task.id)
+              setTrainingRunId('')
+              setArtifactId(null)
+              resetCurrentResult()
+            }}
+          />
+          <label>训练轮次<select value={trainingRunId} disabled={running || !trainingTaskId || trainingSourceLoading} onChange={(event) => { setTrainingRunId(event.target.value); setArtifactId(null); resetCurrentResult() }}><option value="">{trainingSourceLoading ? '正在读取…' : '请选择 Attempt'}</option>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {statusLabel(run.status)} · {run.completed_epochs} Epoch</option>)}</select></label>
+          <label>模型权重<select value={artifactId ?? ''} disabled={running || !trainingRunId || trainingSourceLoading} onChange={(event) => { setArtifactId(event.target.value ? Number(event.target.value) : null); resetCurrentResult() }}><option value="">{trainingSourceLoading ? '正在读取…' : artifacts.length ? '请选择权重' : '当前 Attempt 没有 .pt 产物'}</option>{artifacts.map((artifact) => <option key={artifact.id} value={artifact.id}>{artifact.name.split(/[\\/]/).pop()} · {formatBytes(artifact.size)}{artifact.kind ? ` · ${artifact.kind}` : ''}</option>)}</select></label>
           <small><Info size={13} />远程训练产物会在第一次检测前安全传输到中心模型缓存。</small>
         </section>}
 
@@ -817,10 +892,25 @@ export function ModelTests() {
         {sourceNotice && <div className="model-source-notice" role="status"><CheckCircle2 size={15} />{sourceNotice}</div>}
         {renderSelectedModel()}
 
-        {sourceType !== 'training_artifact' && <section className="registered-models">
-          <div><h3>已登记模型</h3><button type="button" className="icon-button" disabled={running || sourceBusy || assetsLoading} title="刷新已登记模型" aria-label="刷新已登记模型" onClick={() => void refreshAssets()}>{assetsLoading ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}</button></div>
-          {relevantAssets.length ? <div>{relevantAssets.map((asset) => <button type="button" key={asset.id} disabled={running || sourceBusy} className={selectedAssetId === asset.id ? 'active' : ''} onClick={() => { setSelectedAssetId(asset.id); setSourceError(''); setSourceNotice(''); resetCurrentResult() }}><span className={`asset-status ${asset.status}`}><i />{assetStatusLabels[asset.status]}</span><strong>{asset.name}</strong><small title={asset.path}>{asset.path}</small></button>)}</div> : <p>{assetsLoading ? '正在读取…' : '还没有已登记模型。输入路径并完成校验后会显示在这里。'}</p>}
-        </section>}
+        {sourceType !== 'training_artifact' && <>
+          <section className="registered-models">
+            <div><h3>模型库 · 已登记模型</h3></div>
+            <RegisteredModelLibrary
+              assets={assets}
+              sourceType={sourceType}
+              nodes={nodes}
+              selectedAssetId={selectedAssetId}
+              disabled={running || sourceBusy}
+              loading={assetsLoading}
+              onRefresh={() => void refreshAssets()}
+              onSelect={(asset) => {
+                setSelectedAssetId(asset.id)
+                if (asset.source_type === 'remote_path' && asset.execution_node_id) setRemoteNodeId(asset.execution_node_id)
+                setSourceError(''); setSourceNotice(''); resetCurrentResult()
+              }}
+            />
+          </section>
+        </>}
       </aside>
 
       <main className="model-test-run-panel">
@@ -864,16 +954,27 @@ export function ModelTests() {
       <div className="model-tests-history-layout">
         <aside className="model-test-history-sidebar">
           {historyLoading && !history.length ? <div className="model-test-history-empty"><LoaderCircle className="spin" size={25} /><span>正在加载全局检测历史…</span></div>
-            : history.length ? <div className="model-test-history-list">{history.map((item) => {
-              const objects = item.files.reduce((sum, file) => sum + (file.detections || 0), 0)
-              const detected = item.files.filter((file) => (file.detections || 0) > 0).length
-              return <button type="button" key={item.id} className={`model-test-history-item${selectedSummary?.id === item.id ? ' selected' : ''}`} onClick={() => { setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError('') }}>
-                <HistoryImagePreview test={item} />
-                <div><span className={`model-test-history-status ${item.status}`}><i />{modelTestStatusLabels[item.status]}</span><time>{modelTestDate(item.created_at)}</time></div>
-                <strong>{modelTestWeightName(item)}<small>{sourceDescription(item)}</small></strong>
-                <p>{item.files.length} 张图片 · {detected} 张命中 · {objects} 个目标</p>
-                <footer><span>Conf {item.confidence.toFixed(2)} · IoU {item.iou.toFixed(2)}</span>{typeof item.storage_bytes === 'number' && <span><HardDrive size={11} />{formatBytes(item.storage_bytes)}</span>}</footer>
-              </button>
+            : history.length ? <div className="model-test-history-list">{groupedHistory.map((section) => {
+              const collapsed = collapsedHistoryGroups.has(section.key)
+              return <section className={`model-test-history-group${collapsed ? ' collapsed' : ''}`} key={section.key}>
+                <header><button type="button" aria-expanded={!collapsed} onClick={() => setCollapsedHistoryGroups((current) => {
+                  const next = new Set(current)
+                  if (next.has(section.key)) next.delete(section.key)
+                  else next.add(section.key)
+                  return next
+                })}><ChevronDown size={14} /><FolderOpen size={15} /><strong>{section.name}</strong><span>{section.items.length}</span></button></header>
+                {!collapsed && <div className="model-test-history-group-items">{section.items.map((item) => {
+                  const objects = item.files.reduce((sum, file) => sum + (file.detections || 0), 0)
+                  const detected = item.files.filter((file) => (file.detections || 0) > 0).length
+                  return <button type="button" key={item.id} className={`model-test-history-item${selectedSummary?.id === item.id ? ' selected' : ''}`} onClick={() => { setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError('') }}>
+                    <HistoryImagePreview test={item} />
+                    <div><span className={`model-test-history-status ${item.status}`}><i />{modelTestStatusLabels[item.status]}</span><time>{modelTestDate(item.created_at)}</time></div>
+                    <strong>{modelTestWeightName(item)}<small>{sourceDescription(item)}</small></strong>
+                    <p>{item.files.length} 张图片 · {detected} 张命中 · {objects} 个目标</p>
+                    <footer><span>Conf {item.confidence.toFixed(2)} · IoU {item.iou.toFixed(2)}</span>{typeof item.storage_bytes === 'number' && <span><HardDrive size={11} />{formatBytes(item.storage_bytes)}</span>}</footer>
+                  </button>
+                })}</div>}
+              </section>
             })}{historyCursor && <button type="button" className="button ghost model-test-history-more" disabled={historyLoading || historyLoadingMore} onClick={() => void loadMoreHistory()}>{historyLoadingMore ? <LoaderCircle className="spin" size={14} /> : <History size={14} />}加载更多</button>}</div>
               : <div className="model-test-history-empty"><History size={30} /><strong>暂无匹配的检测记录</strong><span>新建检测或调整上方筛选条件</span></div>}
         </aside>
