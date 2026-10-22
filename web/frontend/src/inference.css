@@ -96,9 +96,12 @@
 .model-test-history-scope button { height: 27px; padding: 0 9px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 10px; cursor: pointer; }
 .model-test-history-scope button.active { background: color-mix(in srgb, var(--green) 12%, var(--panel-2)); color: var(--green); }
 .model-test-history-list { flex: 1; min-height: 0; overflow-y: auto; padding: 9px; display: flex; flex-direction: column; gap: 7px; }
-.model-test-history-item { width: 100%; display: grid; gap: 7px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); text-align: left; cursor: pointer; }
+.model-test-history-item { width: 100%; display: grid; grid-template-columns: 82px minmax(0, 1fr); gap: 7px 10px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); color: var(--text); text-align: left; cursor: pointer; }
 .model-test-history-item:hover { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
 .model-test-history-item.selected { border-color: var(--green); box-shadow: inset 3px 0 0 var(--green); }
+.model-test-history-preview { grid-row: 1 / span 4; width: 82px; height: 78px; display: grid; place-items: center; overflow: hidden; border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); color: var(--muted); }
+.model-test-history-preview img { width: 100%; height: 100%; object-fit: cover; }
+.model-test-history-preview.placeholder { border-style: dashed; }
 .model-test-history-item > div, .model-test-history-item > footer { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
 .model-test-history-item time { color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
 .model-test-history-item > strong { min-width: 0; display: flex; flex-direction: column; gap: 3px; overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }

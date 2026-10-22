@@ -4,7 +4,7 @@
 
 平台使用 FastAPI 调用服务器上的 `yolo` CLI 执行训练，使用 React Flow 展示训练画布，使用 ECharts 绘制指标曲线。中心平台管理本机训练；其他服务器通过独立 Agent 汇总算力数据，显式启用训练后可从同一界面管理远程任务。训练使用执行服务器自己的环境，输出保存在对应服务器。
 
-本文说明平台的安装与基本使用；页面操作见 [Web 平台说明](web/README.md)，远程接入见 [Agent 说明](web/agent/README.md)，服务维护见 [部署说明](web/deploy/README.md)。架构、代码职责、验证结果和当前改进建议集中记录在 [项目分析](docs/project-analysis.md)。当前平台版本为 **1.4.0**，随仓库提供的远程 Agent 为 **2.0.3**。
+本文说明平台的安装与基本使用；页面操作见 [Web 平台说明](web/README.md)，远程接入见 [Agent 说明](web/agent/README.md)，服务维护见 [部署说明](web/deploy/README.md)。架构、代码职责、验证结果和当前改进建议集中记录在 [项目分析](docs/project-analysis.md)。当前平台版本为 **1.4.1**，随仓库提供的远程 Agent 为 **2.0.3**。
 
 ## 界面预览
 
@@ -307,7 +307,7 @@ python -m pytest -q tests
 
 前端静态检查和构建在 `web/frontend/` 执行 `npm run lint`、`npm run build`。每次发布都应重新运行后端测试、前端 lint、生产构建、三份 Agent 脚本的语法检查和 `--check-config`；不沿用上一版的用例数量作为当前结果。自动化检查不代表真实 GPU/DDP 和跨服务器网络故障已经验收。
 
-修改前端后重新执行 `npm run build`；修改后端后由维护者安排服务重启。后端启动会自动创建算力节点、远程文件操作队列、模型来源和 GPU 预约表，并注册本机；随后校准活动运行的预约。当前平台为 1.4.0，配套 Agent 为 2.0.3；远程训练最低兼容版本仍为 1.8.0，GPU 进程关联需要 1.9.0，独立远程模型测试需要 2.0.3。使用官方 Agent 时，同节点不同 GPU 并行需要 2.0.0 明确上报 `training.gpu_parallelism=true`，并由中心下发有效 GPU 分配。当前未内置登录认证，Agent Token 仅验证对应节点的 Agent 接口；如需开放给其他用户，应在部署网关配置访问认证和 HTTPS。双实例的端口、备份及安装步骤见 [部署说明](web/deploy/README.md)。
+修改前端后重新执行 `npm run build`；修改后端后由维护者安排服务重启。后端启动会自动创建算力节点、远程文件操作队列、模型来源和 GPU 预约表，并注册本机；随后校准活动运行的预约。当前平台为 1.4.1，配套 Agent 为 2.0.3；远程训练最低兼容版本仍为 1.8.0，GPU 进程关联需要 1.9.0，独立远程模型测试需要 2.0.3。使用官方 Agent 时，同节点不同 GPU 并行需要 2.0.0 明确上报 `training.gpu_parallelism=true`，并由中心下发有效 GPU 分配。当前未内置登录认证，Agent Token 仅验证对应节点的 Agent 接口；如需开放给其他用户，应在部署网关配置访问认证和 HTTPS。双实例的端口、备份及安装步骤见 [部署说明](web/deploy/README.md)。
 
 ## 相关文档
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircle, Box, CheckCircle2, Cpu, Download, FileArchive, FolderOpen,
-  HardDrive, History, ImagePlus, Info, LoaderCircle, Play, RefreshCw,
+  HardDrive, History, ImagePlus, Images, Info, LoaderCircle, Play, RefreshCw,
   RotateCcw, ScanEye, Server, SlidersHorizontal, Sparkles, Trash2, Upload, X,
 } from 'lucide-react'
 import { api, formatBytes } from '../api'
@@ -69,6 +69,22 @@ function testHasExactModel(test: ModelTest) {
     && typeof test.model_size === 'number'
     && Number.isSafeInteger(test.model_size)
     && test.model_size >= 0
+}
+
+function HistoryImagePreview({ test }: { test: ModelTestSummary }) {
+  const [failed, setFailed] = useState(false)
+  const index = test.files.findIndex((file) => file.uploaded)
+  if (index < 0 || failed) {
+    return <span className="model-test-history-preview placeholder" aria-hidden="true"><Images size={18} /></span>
+  }
+  return <span className="model-test-history-preview">
+    <img
+      src={`/api/model-tests/${test.id}/images/${index}/original`}
+      alt=""
+      loading="lazy"
+      onError={() => setFailed(true)}
+    />
+  </span>
 }
 
 export function ModelTests() {
@@ -852,6 +868,7 @@ export function ModelTests() {
               const objects = item.files.reduce((sum, file) => sum + (file.detections || 0), 0)
               const detected = item.files.filter((file) => (file.detections || 0) > 0).length
               return <button type="button" key={item.id} className={`model-test-history-item${selectedSummary?.id === item.id ? ' selected' : ''}`} onClick={() => { setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError('') }}>
+                <HistoryImagePreview test={item} />
                 <div><span className={`model-test-history-status ${item.status}`}><i />{modelTestStatusLabels[item.status]}</span><time>{modelTestDate(item.created_at)}</time></div>
                 <strong>{modelTestWeightName(item)}<small>{sourceDescription(item)}</small></strong>
                 <p>{item.files.length} 张图片 · {detected} 张命中 · {objects} 个目标</p>

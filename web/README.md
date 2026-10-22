@@ -2,7 +2,7 @@
 
 独立于 Ultralytics 源码的训练任务控制台。平台通过受控参数调用现有 `yolo` CLI，并读取 `args.yaml`、`results.csv` 和权重文件。平台业务集中在 `web/`，训练行为仍取决于实际执行服务器上的 Ultralytics 版本与依赖环境。
 
-本说明面向页面使用和平台开发；首次安装见 [项目首页](../README.md)，远程配置见 [Agent 说明](agent/README.md)，服务维护见 [部署说明](deploy/README.md)，架构和当前缺陷见 [项目分析](../docs/project-analysis.md)。当前平台版本为 **1.4.0**，配套远程 Agent 为 **2.0.3**。
+本说明面向页面使用和平台开发；首次安装见 [项目首页](../README.md)，远程配置见 [Agent 说明](agent/README.md)，服务维护见 [部署说明](deploy/README.md)，架构和当前缺陷见 [项目分析](../docs/project-analysis.md)。当前平台版本为 **1.4.1**，配套远程 Agent 为 **2.0.3**。
 
 ## 功能
 
