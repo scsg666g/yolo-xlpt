@@ -82,6 +82,10 @@ export const api = {
     signal,
   }),
   modelAssets: (signal?: AbortSignal) => requestWithTimeout<ModelAssetPage>('/api/model-assets', { signal }),
+  removeModelAsset: (id: string, signal?: AbortSignal) => requestWithTimeout<void>(
+    `/api/model-assets/${encodeURIComponent(id)}`, { method: 'DELETE', signal }, 30_000,
+    '移除请求超时，后台可能已完成。请关闭弹窗并刷新模型库确认状态。',
+  ),
   createLocalModelAsset: (path: string, name: string | undefined, signal?: AbortSignal) => requestWithTimeout<ModelAsset>('/api/model-assets/local', {
     method: 'POST', body: JSON.stringify({ path, name: name || undefined }), signal,
   }, 120_000, '校验模型超时，请检查路径后重试'),

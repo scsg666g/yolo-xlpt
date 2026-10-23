@@ -1181,6 +1181,8 @@ def _create_test(payload: TestCreate, db: Session):
         asset = db.get(ModelAsset, payload.model_asset_id)
         if asset is None:
             raise HTTPException(404, "模型来源不存在，请重新选择模型")
+        if asset.deleted_at is not None and rerun_source is None:
+            raise HTTPException(409, "该模型登记已移除，请重新登记或从历史记录按原权重重测")
         if rerun_source:
             if rerun_source.task_id is not None:
                 raise HTTPException(422, "历史检测记录不是独立模型测试")

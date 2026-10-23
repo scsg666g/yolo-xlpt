@@ -372,6 +372,8 @@ export interface ModelAsset {
   error: string | null
   size: number | null
   sha256: string | null
+  history_count?: number
+  removal_blocked_reason?: string | null
   created_at: string
   updated_at: string
 }

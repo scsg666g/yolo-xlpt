@@ -330,7 +330,7 @@ def _referenced_model_versions(db: Session) -> set[tuple[str, str, int]]:
     references: set[tuple[str, str, int]] = set()
     for asset_id, sha256, size in db.execute(select(
         ModelAsset.id, ModelAsset.sha256, ModelAsset.size,
-    ).where(ModelAsset.source_type == "remote_path")):
+    ).where(ModelAsset.source_type == "remote_path", ModelAsset.deleted_at.is_(None))):
         if isinstance(sha256, str) and isinstance(size, int) and not isinstance(size, bool) and size > 0:
             references.add((asset_id, sha256, size))
     for asset_id, sha256, size in db.execute(select(
@@ -439,6 +439,8 @@ def prepare_remote_model_asset(
     refresh: bool = False,
 ) -> dict:
     """Idempotently enqueue transfer of a standalone remote checkpoint."""
+    if asset.deleted_at is not None:
+        raise HTTPException(409, "该模型登记已移除，请重新登记后再准备模型")
     if asset.source_type != "remote_path":
         raise HTTPException(422, "该模型来源不是远程路径")
     operations = model_fetches(db, asset)

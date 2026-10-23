@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Check, ChevronDown, Folder, HardDrive, Search, Server } from 'lucide-react'
+import { Check, ChevronDown, Folder, HardDrive, LoaderCircle, Search, Server, Trash2 } from 'lucide-react'
 import { formatBytes, statusLabel } from '../api'
 import type { ComputeNode, ModelAsset, TaskGroup, TrainingTask } from '../types'
 
@@ -100,11 +100,13 @@ interface RegisteredModelLibraryProps {
   selectedAssetId: string | null
   disabled?: boolean
   loading?: boolean
+  removingAssetId?: string | null
   onRefresh?: () => void
   onSelect: (asset: ModelAsset) => void
+  onRemove: (asset: ModelAsset) => void
 }
 
-export function RegisteredModelLibrary({ assets, sourceType, nodes, selectedAssetId, disabled = false, loading = false, onRefresh, onSelect }: RegisteredModelLibraryProps) {
+export function RegisteredModelLibrary({ assets, sourceType, nodes, selectedAssetId, disabled = false, loading = false, removingAssetId = null, onRefresh, onSelect, onRemove }: RegisteredModelLibraryProps) {
   const [search, setSearch] = useState('')
   const [collapsed, setCollapsed] = useState(() => readCollapsed(collapsedAssetGroupsKey))
   const term = search.trim().toLocaleLowerCase()
@@ -145,12 +147,20 @@ export function RegisteredModelLibrary({ assets, sourceType, nodes, selectedAsse
           <header><button type="button" aria-expanded={!isCollapsed} onClick={() => toggle(section.id)}><ChevronDown size={14} />{sourceType === 'remote_path' ? <Server size={15} /> : <HardDrive size={15} />}<strong>{section.name}</strong><span>{section.matches.length}</span></button></header>
           {!isCollapsed && <div className="model-library-task-list">{section.matches.map((asset) => {
             const selected = asset.id === selectedAssetId
-            return <button type="button" key={asset.id} className={`model-library-asset ${selected ? 'selected' : ''}`} disabled={disabled} aria-pressed={selected} onClick={() => onSelect(asset)}>
-              <span className={`asset-status ${asset.status}`}><i />{asset.status === 'ready' ? '可用' : asset.status === 'preparing' ? '准备中' : '不可用'}</span>
-              <strong>{asset.name}{asset.size !== null && <small>{formatBytes(asset.size)}</small>}</strong>
-              <small className="model-library-asset-path" title={asset.path}>{asset.path}</small>
-              <small className="model-library-asset-version">版本 {asset.sha256 ? `${asset.sha256.slice(0, 12)}…` : '待校验'} · {dateLabel(asset.updated_at)}</small>
-            </button>
+            const removing = removingAssetId === asset.id
+            const blockedReason = asset.removal_blocked_reason === undefined
+              ? asset.status === 'preparing' ? '模型正在准备或传输，完成后可移除登记' : ''
+              : asset.removal_blocked_reason || ''
+            return <div key={asset.id} className={`model-library-asset ${selected ? 'selected' : ''}`}>
+              <button type="button" className="model-library-asset-select" disabled={disabled || removing} aria-pressed={selected} onClick={() => onSelect(asset)}>
+                <span className={`asset-status ${asset.status}`}><i />{asset.status === 'ready' ? '可用' : asset.status === 'preparing' ? '准备中' : '不可用'}</span>
+                <strong>{asset.name}{asset.size !== null && <small>{formatBytes(asset.size)}</small>}</strong>
+                <small className="model-library-asset-path" title={asset.path}>{asset.path}</small>
+                <small className="model-library-asset-version">版本 {asset.sha256 ? `${asset.sha256.slice(0, 12)}…` : '待校验'} · {dateLabel(asset.updated_at)}</small>
+              </button>
+              <button type="button" className="icon-button model-library-asset-remove" title={blockedReason || (disabled ? '请等待当前操作完成后移除登记' : '移除模型登记，保留源文件和测试历史')} disabled={disabled || Boolean(removingAssetId) || Boolean(blockedReason)} aria-label={`移除模型登记：${asset.name}`} aria-describedby={blockedReason ? `model-removal-blocked-${asset.id}` : undefined} onClick={() => onRemove(asset)}>{removing ? <LoaderCircle className="spin" size={14} /> : <Trash2 size={14} />}</button>
+              {blockedReason && <small className="model-library-asset-blocked" id={`model-removal-blocked-${asset.id}`}>{blockedReason}</small>}
+            </div>
           })}</div>}
         </section>
       })}</div>}

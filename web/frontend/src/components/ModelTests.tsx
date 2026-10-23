@@ -137,6 +137,9 @@ export function ModelTests() {
   const [sourceError, setSourceError] = useState('')
   const [sourceNotice, setSourceNotice] = useState('')
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null)
+  const [removalAsset, setRemovalAsset] = useState<ModelAsset | null>(null)
+  const [removingAssetId, setRemovingAssetId] = useState<string | null>(null)
+  const [removalError, setRemovalError] = useState('')
   const [localPath, setLocalPath] = useState('')
   const [localName, setLocalName] = useState('')
   const [remotePath, setRemotePath] = useState('')
@@ -185,6 +188,9 @@ export function ModelTests() {
   const previewUrls = useRef(new Set<string>())
   const runController = useRef<AbortController | null>(null)
   const sourceController = useRef<AbortController | null>(null)
+  const removalController = useRef<AbortController | null>(null)
+  const assetsRefreshVersion = useRef(0)
+  const removalDialog = useRef<HTMLDialogElement>(null)
   const historyController = useRef<AbortController | null>(null)
   const detailController = useRef<AbortController | null>(null)
   const reuseController = useRef<AbortController | null>(null)
@@ -225,19 +231,34 @@ export function ModelTests() {
   }, [collapsedHistoryGroups])
 
   const refreshAssets = useCallback(async (signal?: AbortSignal) => {
+    const version = ++assetsRefreshVersion.current
     setAssetsLoading(true)
     try {
       const page = await api.modelAssets(signal)
-      if (signal?.aborted) return
-      setAssets(page.items)
+      if (signal?.aborted || version !== assetsRefreshVersion.current) return
+      const items = page.items
+      setAssets(items)
       setLocalRoots(page.local_roots?.length ? page.local_roots : page.local_root ? [page.local_root] : [])
-      setSelectedAssetId((current) => current && page.items.some((asset) => asset.id === current) ? current : null)
+      setSelectedAssetId((current) => current && items.some((asset) => asset.id === current) ? current : null)
     } catch (reason) {
-      if (!signal?.aborted) setSourceError(reason instanceof Error ? reason.message : '读取已登记模型失败')
+      if (!signal?.aborted && version === assetsRefreshVersion.current) setSourceError(reason instanceof Error ? reason.message : '读取已登记模型失败')
     } finally {
-      if (!signal?.aborted) setAssetsLoading(false)
+      if (!signal?.aborted && version === assetsRefreshVersion.current) setAssetsLoading(false)
     }
   }, [])
+
+  const assetsNeedRefresh = assets.some((asset) => asset.status === 'preparing' || asset.removal_blocked_reason)
+  useEffect(() => {
+    if (!assetsNeedRefresh || sourceBusy || removingAssetId) return
+    const abort = new AbortController()
+    let timer = 0
+    const poll = async () => {
+      await refreshAssets(abort.signal)
+      if (!abort.signal.aborted) timer = window.setTimeout(() => void poll(), 3000)
+    }
+    timer = window.setTimeout(() => void poll(), 3000)
+    return () => { window.clearTimeout(timer); abort.abort() }
+  }, [assetsNeedRefresh, sourceBusy, removingAssetId, refreshAssets])
 
   const refreshHistory = useCallback(async (signal?: AbortSignal, quiet = false) => {
     const version = ++historyRefreshVersion.current
@@ -392,6 +413,7 @@ export function ModelTests() {
       abandonPending()
       runController.current?.abort()
       sourceController.current?.abort()
+      removalController.current?.abort()
       historyController.current?.abort()
       detailController.current?.abort()
       reuseController.current?.abort()
@@ -423,6 +445,45 @@ export function ModelTests() {
     }
   }, [enlarged])
 
+  useEffect(() => {
+    const dialog = removalDialog.current
+    if (!removalAsset || !dialog) return
+    dialog.showModal()
+    return () => dialog.close()
+  }, [removalAsset])
+
+  async function removeRegisteredModel() {
+    if (!removalAsset || removingAssetId) return
+    const asset = removalAsset
+    const abort = new AbortController()
+    removalController.current = abort
+    assetsRefreshVersion.current += 1
+    setAssetsLoading(false)
+    setRemovingAssetId(asset.id)
+    setRemovalError('')
+    try {
+      await api.removeModelAsset(asset.id, abort.signal)
+      if (abort.signal.aborted) return
+      assetsRefreshVersion.current += 1
+      setAssets((current) => current.filter((item) => item.id !== asset.id))
+      if (selectedAssetId === asset.id || rerunSource?.model_asset_id === asset.id) {
+        setSelectedAssetId(null)
+        resetCurrentResult()
+      }
+      setSourceError('')
+      setSourceNotice(`已移除“${asset.name}”的模型登记；原始权重和测试历史已保留。可重新登记；原模型版本仍可用时，可从历史重测。`)
+      setRemovalAsset(null)
+    } catch (reason) {
+      if (!abort.signal.aborted) {
+        setRemovalError(reason instanceof Error ? reason.message : '移除模型登记失败，请重试')
+        void refreshAssets(abort.signal)
+      }
+    } finally {
+      if (!abort.signal.aborted) setRemovingAssetId(null)
+      if (removalController.current === abort) removalController.current = null
+    }
+  }
+
   function resetCurrentResult() {
     setTest(null)
     setRunError('')
@@ -450,9 +511,14 @@ export function ModelTests() {
     while (current.status !== 'ready') {
       if (Date.now() > deadline) throw new Error('模型准备时间较长，请稍后刷新已登记模型查看状态')
       await sleep(1500, signal)
+      const version = ++assetsRefreshVersion.current
       const page = await api.modelAssets(signal)
-      setAssets(page.items)
-      setLocalRoots(page.local_roots?.length ? page.local_roots : page.local_root ? [page.local_root] : [])
+      if (signal.aborted) throw new DOMException('操作已取消', 'AbortError')
+      if (version === assetsRefreshVersion.current) {
+        setAssets(page.items)
+        setLocalRoots(page.local_roots?.length ? page.local_roots : page.local_root ? [page.local_root] : [])
+        setAssetsLoading(false)
+      }
       const refreshed = page.items.find((asset) => asset.id === current.id)
       if (!refreshed) throw new Error('已登记模型不存在，请重新选择')
       current = refreshed
@@ -475,6 +541,9 @@ export function ModelTests() {
       let asset = sourceType === 'local_path'
         ? await api.createLocalModelAsset(path, name || undefined, abort.signal)
         : await api.createRemoteModelAsset(remoteNodeId, path, name || undefined, abort.signal)
+      if (abort.signal.aborted) return
+      assetsRefreshVersion.current += 1
+      setAssetsLoading(false)
       setAssets((items) => upsertAsset(items, asset)); setSelectedAssetId(asset.id)
       if (asset.status !== 'ready') asset = await waitForAssetReady(asset, abort.signal, asset.status === 'failed')
       setSelectedAssetId(asset.id)
@@ -569,7 +638,7 @@ export function ModelTests() {
   }
 
   async function runModelTest() {
-    if (running || pendingUploadId.current || !files.length) return
+    if (running || removingAssetId || pendingUploadId.current || !files.length) return
     const rerun = rerunSource
     if (rerun && !testHasExactModel(rerun)) { setRunError('该历史记录没有可验证的原模型版本'); return }
     if (!rerun && sourceType === 'training_artifact' && !selectedArtifact) { setRunError('请先选择训练产物'); return }
@@ -666,7 +735,10 @@ export function ModelTests() {
         await refreshHistory(signal, true)
       }
     } finally {
-      if (!signal.aborted) setRunning(false)
+      if (!signal.aborted) {
+        setRunning(false)
+        void refreshAssets(signal)
+      }
       if (runController.current === abort) runController.current = null
     }
   }
@@ -681,6 +753,7 @@ export function ModelTests() {
       pendingUploadId.current = null
       setTest(cancelled); setRunStage(modelTestStatusLabels[cancelled.status])
       await refreshHistory(undefined, true)
+      void refreshAssets()
     } catch (reason) {
       const requestError = reason as Error & { status?: number }
       if (requestError.status === 409) {
@@ -778,7 +851,9 @@ export function ModelTests() {
       releaseImages(images)
       const nextSource = modelSourceType(item)
       setSourceType(nextSource)
-      setSelectedAssetId(item.model_asset_id || null)
+      // Reruns use the immutable history version, including removed registrations.
+      // Do not reinsert a removed model into the library just to display a rerun.
+      setSelectedAssetId(assets.some((asset) => asset.id === item.model_asset_id) ? item.model_asset_id || null : null)
       if (nextSource === 'remote_path' && item.execution_node_id) setRemoteNodeId(item.execution_node_id)
       if (nextSource === 'training_artifact') {
         setTrainingTaskId(item.task_id || '')
@@ -819,6 +894,7 @@ export function ModelTests() {
       ? selectedArtifact?.name.split('/').pop() || '尚未选择权重'
       : selectedAsset?.name || '尚未选择模型'
   const localRoot = localRoots[0] || ''
+  const removalDetails = removalAsset ? assets.find((asset) => asset.id === removalAsset.id) || removalAsset : null
 
   function renderSelectedModel() {
     if (sourceType === 'training_artifact') {
@@ -904,7 +980,9 @@ export function ModelTests() {
               selectedAssetId={selectedAssetId}
               disabled={running || sourceBusy}
               loading={assetsLoading}
+              removingAssetId={removingAssetId}
               onRefresh={() => void refreshAssets()}
+              onRemove={(asset) => { setRemovalError(''); setRemovalAsset(asset) }}
               onSelect={(asset) => {
                 setSelectedAssetId(asset.id)
                 if (asset.source_type === 'remote_path' && asset.execution_node_id) setRemoteNodeId(asset.execution_node_id)
@@ -928,7 +1006,7 @@ export function ModelTests() {
           <input ref={input} hidden disabled={running} type="file" accept=".jpg,.jpeg,.png,.webp,.bmp" multiple onChange={(event) => chooseImages(event.target.files)} />
           <div className="model-test-slider"><label htmlFor="standalone-confidence">置信度 Conf <strong>{confidence.toFixed(2)}</strong></label><input id="standalone-confidence" type="range" min="0.01" max="1" step="0.01" value={confidence} disabled={running} onChange={(event) => setConfidence(Number(event.target.value))} /></div>
           <div className="model-test-slider" title={classification ? '分类模型没有检测框，不使用 IoU' : undefined}><label htmlFor="standalone-iou">NMS IoU <strong>{classification ? '不适用' : iou.toFixed(2)}</strong></label><input id="standalone-iou" type="range" min="0.01" max="1" step="0.01" value={iou} disabled={running || classification} aria-describedby="standalone-parameters-help" onChange={(event) => setIou(Number(event.target.value))} /></div>
-          <button type="button" className="button primary" disabled={running || sourceBusy || hasPendingUpload || !modelReady || !files.length} onClick={() => void runModelTest()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{completed ? '再次测试' : '运行测试'}</button>
+          <button type="button" className="button primary" disabled={running || sourceBusy || Boolean(removingAssetId) || hasPendingUpload || !modelReady || !files.length} onClick={() => void runModelTest()}>{running ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{completed ? '再次测试' : '运行测试'}</button>
         </div>
         <p id="standalone-parameters-help" className="model-test-help">最多 10 张 · 单张 20 MB / 2000 万像素 · 总大小 100 MB · 可拖入 JPG、PNG、WEBP、BMP。{classification ? '分类结果按置信度筛选 Top-5；分类模型没有检测框，IoU 不适用。' : '任务类型在加载模型后自动识别；置信度筛选预测结果，IoU 仅对检测、分割、姿态和 OBB 框类任务生效。'}</p>
         {runError && <div className="model-test-error" role="alert">{runError}</div>}
@@ -1005,6 +1083,22 @@ export function ModelTests() {
       </div>
     </section>}
 
+    {removalDetails && <dialog ref={removalDialog} className="model-asset-remove-dialog" aria-labelledby="model-asset-remove-title" aria-describedby="model-asset-remove-description" onCancel={(event) => { event.preventDefault(); if (!removingAssetId) setRemovalAsset(null) }}>
+      <header><div><Trash2 size={20} /><h2 id="model-asset-remove-title">移除模型登记</h2></div><button type="button" className="icon-button" aria-label="关闭移除确认" disabled={Boolean(removingAssetId)} onClick={() => setRemovalAsset(null)}><X size={19} /></button></header>
+      <div className="model-asset-remove-body">
+        <p id="model-asset-remove-description">该模型将从模型库中移除。原始 .pt 权重、训练任务和已保存的测试历史都会保留。</p>
+        <dl>
+          <div><dt>模型名称</dt><dd>{removalDetails.name}</dd></div>
+          <div><dt>所属服务器</dt><dd>{removalDetails.source_type === 'local_path' ? '本机 · 中心服务器' : `远程 · ${nodesById.get(removalDetails.execution_node_id || '')?.name || removalDetails.execution_node_name || '已登记节点'}`}</dd></div>
+          <div><dt>源文件路径</dt><dd className="model-asset-remove-path">{removalDetails.path}</dd></div>
+          <div><dt>关联测试历史</dt><dd>{typeof removalDetails.history_count === 'number' ? `${removalDetails.history_count} 条（保留）` : '已有历史均保留'}</dd></div>
+        </dl>
+        <p className="model-asset-remove-hint">以后可重新登记同一路径；已有历史仍可查看和下载。原模型版本仍可用时，也可以从历史重测。</p>
+        {removalDetails.removal_blocked_reason && <div className="model-test-parameter-notice" role="status"><Info size={15} />{removalDetails.removal_blocked_reason}</div>}
+        {removalError && <div className="model-test-error" role="alert">{removalError}</div>}
+      </div>
+      <footer><button type="button" className="button ghost" autoFocus disabled={Boolean(removingAssetId)} onClick={() => setRemovalAsset(null)}>取消</button><button type="button" className="button danger" disabled={Boolean(removingAssetId || removalDetails.removal_blocked_reason)} onClick={() => void removeRegisteredModel()}>{removingAssetId ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{removingAssetId ? '正在移除…' : '确认移除登记'}</button></footer>
+    </dialog>}
     {enlarged && <div ref={lightbox} className="model-test-lightbox" role="dialog" aria-modal="true" aria-label={`放大查看${enlarged.title}`} tabIndex={-1} onClick={() => setEnlarged(null)}><button type="button" className="icon-button" aria-label="关闭图片放大" onClick={() => setEnlarged(null)}><X size={24} /></button><img src={enlarged.url} alt={enlarged.title} onClick={(event) => event.stopPropagation()} /><span>{enlarged.title} · Esc 关闭</span></div>}
   </div>
 }

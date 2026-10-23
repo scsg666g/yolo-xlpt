@@ -48,13 +48,14 @@ _MODEL_TEST_COLUMNS = (
 
 _MODEL_ASSET_COLUMNS = {
     "id", "name", "source_type", "execution_node_id", "path", "artifact_id",
-    "sha256", "size", "status", "error", "created_at", "updated_at",
+    "sha256", "size", "status", "error", "created_at", "updated_at", "deleted_at",
 }
 _MODEL_ASSET_INDEXES = {
     "ix_model_assets_source_type",
     "ix_model_assets_execution_node_id",
     "ix_model_assets_artifact_id",
     "ix_model_assets_status",
+    "ix_model_assets_deleted_at",
 }
 _MODEL_ASSET_UNIQUE_COLUMNS = ("source_type", "execution_node_id", "path")
 _MODEL_ASSET_UNIQUE_INDEX = "uq_model_asset_source_path_idx"
@@ -103,6 +104,7 @@ def _create_model_assets_table(connection, *, add_unique_index: bool = False) ->
             size INTEGER,
             status VARCHAR(24) NOT NULL DEFAULT 'ready',
             error TEXT,
+            deleted_at DATETIME,
             created_at DATETIME NOT NULL,
             updated_at DATETIME NOT NULL,
             CONSTRAINT uq_model_asset_source_path UNIQUE (source_type, execution_node_id, path),
@@ -114,6 +116,7 @@ def _create_model_assets_table(connection, *, add_unique_index: bool = False) ->
         ("ix_model_assets_execution_node_id", "execution_node_id"),
         ("ix_model_assets_artifact_id", "artifact_id"),
         ("ix_model_assets_status", "status"),
+        ("ix_model_assets_deleted_at", "deleted_at"),
     ):
         connection.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON model_assets ({column})"))
     if add_unique_index:
@@ -323,10 +326,13 @@ def migrate_database() -> Path | None:
     backup = _backup_sqlite_database(database)
 
     if model_assets_need_repair:
-        if model_assets_table_exists and missing_model_asset_columns:
-            missing = ", ".join(sorted(missing_model_asset_columns))
+        unsupported_missing = missing_model_asset_columns - {"deleted_at"}
+        if model_assets_table_exists and unsupported_missing:
+            missing = ", ".join(sorted(unsupported_missing))
             raise RuntimeError(f"model_assets 缺少必需字段：{missing}；已保留迁移前备份 {backup}")
         with engine.begin() as connection:
+            if model_assets_table_exists and "deleted_at" in missing_model_asset_columns:
+                connection.execute(text("ALTER TABLE model_assets ADD COLUMN deleted_at DATETIME"))
             _create_model_assets_table(
                 connection,
                 add_unique_index=model_assets_table_exists and not model_asset_unique_present,

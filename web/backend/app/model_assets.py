@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -19,7 +19,7 @@ from .config import MODEL_TEST_ROOTS, PROJECT_ROOT
 from .compute_nodes import remote_model_test_unavailable_reason
 from .database import get_db
 from .gpu_reservations import acquire_node_claim_lock
-from .models import ComputeNode, ModelAsset, utcnow
+from .models import ComputeNode, ModelAsset, ModelTest, RemoteOperation, utcnow
 
 
 router = APIRouter(prefix="/api/model-assets", tags=["model-assets"])
@@ -249,7 +249,31 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat()
 
 
-def asset_public(asset: ModelAsset, *, node_name: str | None = None) -> dict:
+def asset_removal_metadata(db: Session, asset_ids: list[str]) -> dict[str, dict]:
+    """Batch history counts and authoritative busy reasons without N+1 queries."""
+    from .inference import ACTIVE_STATUSES
+    from .remote_operations import ACTIVE_MODEL_FETCH_STATUSES, model_asset_operation_scope
+
+    metadata = {asset_id: {"history_count": 0, "removal_blocked_reason": None} for asset_id in asset_ids}
+    if not asset_ids:
+        return metadata
+    for asset_id, status, count in db.execute(select(
+        ModelTest.model_asset_id, ModelTest.status, func.count(),
+    ).where(ModelTest.model_asset_id.in_(asset_ids)).group_by(ModelTest.model_asset_id, ModelTest.status)):
+        metadata[asset_id]["history_count"] += count
+        if status in ACTIVE_STATUSES:
+            metadata[asset_id]["removal_blocked_reason"] = "该模型有尚未结束的测试，请完成或取消测试后再移除登记"
+    scope_assets = {model_asset_operation_scope(asset_id): asset_id for asset_id in asset_ids}
+    for scope in db.scalars(select(RemoteOperation.task_id).where(
+        RemoteOperation.task_id.in_(scope_assets),
+        RemoteOperation.kind == "fetch_model",
+        RemoteOperation.status.in_(ACTIVE_MODEL_FETCH_STATUSES),
+    )):
+        metadata[scope_assets[scope]]["removal_blocked_reason"] = "模型正在准备或传输，请等待完成后再移除登记"
+    return metadata
+
+
+def asset_public(asset: ModelAsset, *, node_name: str | None = None, removal: dict | None = None) -> dict:
     return {
         "id": asset.id,
         "name": asset.name,
@@ -264,6 +288,7 @@ def asset_public(asset: ModelAsset, *, node_name: str | None = None) -> dict:
         "sha256": asset.sha256,
         "created_at": _iso(asset.created_at),
         "updated_at": _iso(asset.updated_at),
+        **(removal or {}),
     }
 
 
@@ -314,7 +339,7 @@ def list_model_assets(
     source_type: str | None = Query(default=None, max_length=32),
     db: Session = Depends(get_db),
 ):
-    query = select(ModelAsset)
+    query = select(ModelAsset).where(ModelAsset.deleted_at.is_(None))
     if source_type:
         query = query.where(ModelAsset.source_type == source_type)
     assets = list(db.scalars(query.order_by(ModelAsset.updated_at.desc(), ModelAsset.id.desc())).all())
@@ -325,8 +350,9 @@ def list_model_assets(
         ).all()
     } if node_ids else {}
     roots = model_test_root_labels()
+    removal = asset_removal_metadata(db, [asset.id for asset in assets])
     return {
-        "items": [asset_public(asset, node_name=nodes.get(asset.execution_node_id)) for asset in assets],
+        "items": [asset_public(asset, node_name=nodes.get(asset.execution_node_id), removal=removal[asset.id]) for asset in assets],
         "local_root": roots[0],
         "local_roots": roots,
     }
@@ -340,6 +366,9 @@ def register_local_model_asset(payload: LocalModelAssetCreate, db: Session = Dep
     except ModelAssetPathError as exc:
         raise HTTPException(exc.status_code, str(exc)) from exc
     stored_path = portable_local_model_path(path)
+    # Serialize restoring a registration with removal, without holding a write
+    # lock during potentially expensive checkpoint hashing.
+    acquire_node_claim_lock(db, LOCAL_NODE_ID)
     asset = db.scalar(select(ModelAsset).where(
         ModelAsset.source_type == LOCAL_SOURCE_TYPE,
         ModelAsset.execution_node_id == LOCAL_NODE_ID,
@@ -360,6 +389,7 @@ def register_local_model_asset(payload: LocalModelAssetCreate, db: Session = Dep
     asset.size = size
     asset.status = "ready"
     asset.error = None
+    asset.deleted_at = None
     asset.updated_at = utcnow()
     try:
         db.commit()
@@ -378,11 +408,12 @@ def register_local_model_asset(payload: LocalModelAssetCreate, db: Session = Dep
         asset.size = size
         asset.status = "ready"
         asset.error = None
+        asset.deleted_at = None
         asset.updated_at = utcnow()
         db.commit()
     db.refresh(asset)
     node = db.get(ComputeNode, LOCAL_NODE_ID)
-    return asset_public(asset, node_name=node.name if node else "本机服务器")
+    return asset_public(asset, node_name=node.name if node else "本机服务器", removal=asset_removal_metadata(db, [asset.id])[asset.id])
 
 
 @router.post("/remote", status_code=201)
@@ -421,7 +452,8 @@ def register_remote_model_asset(payload: RemoteModelAssetCreate, db: Session = D
         # Registering the same remote path means "read its current bytes".
         # Preserve older successful operation caches for already-created tests,
         # while preparing a fresh immutable version for new tests.
-        force_refresh = asset.status in {"ready", "failed"}
+        force_refresh = asset.deleted_at is not None or asset.status in {"ready", "failed"}
+        asset.deleted_at = None
         if payload.name is not None:
             asset.name = payload.name
         asset.updated_at = utcnow()
@@ -439,7 +471,7 @@ def register_remote_model_asset(payload: RemoteModelAssetCreate, db: Session = D
         db.rollback()
         raise HTTPException(409, "该远程模型已被其他请求登记，请刷新后重试") from None
     db.refresh(asset)
-    return asset_public(asset, node_name=node.name)
+    return asset_public(asset, node_name=node.name, removal=asset_removal_metadata(db, [asset.id])[asset.id])
 
 
 @router.post("/{asset_id}/prepare")
@@ -451,13 +483,17 @@ def prepare_model_asset(
     asset = db.get(ModelAsset, asset_id)
     if asset is None:
         raise HTTPException(404, "模型来源不存在")
+    if asset.deleted_at is not None:
+        raise HTTPException(409, "该模型登记已移除，请重新登记后再准备模型")
     if asset.source_type != REMOTE_SOURCE_TYPE:
         node = db.get(ComputeNode, asset.execution_node_id)
-        return asset_public(asset, node_name=node.name if node else None)
+        return asset_public(asset, node_name=node.name if node else None, removal=asset_removal_metadata(db, [asset.id])[asset.id])
     acquire_node_claim_lock(db, asset.execution_node_id)
     asset = db.get(ModelAsset, asset_id, populate_existing=True)
     if asset is None:
         raise HTTPException(404, "模型来源不存在")
+    if asset.deleted_at is not None:
+        raise HTTPException(409, "该模型登记已移除，请重新登记后再准备模型")
     from .remote_operations import prepare_remote_model_asset
     try:
         prepare_remote_model_asset(db, asset, retry=retry)
@@ -469,4 +505,29 @@ def prepare_model_asset(
     db.commit()
     db.refresh(asset)
     node = db.get(ComputeNode, asset.execution_node_id)
-    return asset_public(asset, node_name=node.name if node else None)
+    return asset_public(asset, node_name=node.name if node else None, removal=asset_removal_metadata(db, [asset.id])[asset.id])
+
+
+@router.delete("/{asset_id}", status_code=204)
+def remove_model_asset(asset_id: str, db: Session = Depends(get_db)):
+    """Hide a registration, keeping source bytes and immutable test histories."""
+    from .inference import model_test_lifecycle
+
+    # Use the same lock order as test launch/task mutations: lifecycle first,
+    # then database. The node lock also serializes Agent polling and restores.
+    with model_test_lifecycle():
+        asset = db.get(ModelAsset, asset_id)
+        if asset is None:
+            raise HTTPException(404, "模型来源不存在")
+        acquire_node_claim_lock(db, asset.execution_node_id)
+        asset = db.get(ModelAsset, asset_id, populate_existing=True)
+        if asset is None:
+            raise HTTPException(404, "模型来源不存在")
+        if asset.deleted_at is not None:
+            return
+        reason = asset_removal_metadata(db, [asset.id])[asset.id]["removal_blocked_reason"]
+        if reason:
+            raise HTTPException(409, reason)
+        asset.deleted_at = utcnow()
+        asset.updated_at = asset.deleted_at
+        db.commit()
