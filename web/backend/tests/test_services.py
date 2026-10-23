@@ -441,10 +441,8 @@ def test_scheduler_reconciles_artifacts_for_previously_interrupted_run(tmp_path,
         assert artifact.path == str(checkpoint.resolve())
 
 
-@pytest.mark.parametrize("completed_epochs,expected_status", [(3, "interrupted"), (20, "completed")])
-def test_adopted_process_exit_uses_recorded_epochs_without_faking_exit_code(
-    tmp_path, completed_epochs, expected_status,
-):
+@pytest.mark.parametrize("completed_epochs", [3, 20])
+def test_adopted_process_exit_requires_completion_evidence_without_faking_exit_code(tmp_path, completed_epochs):
     session = make_session(tmp_path)
     task = make_task("task-adopted-exit", status="running", completed_epochs=completed_epochs)
     run = TrainingRun(
@@ -460,11 +458,10 @@ def test_adopted_process_exit_uses_recorded_epochs_without_faking_exit_code(
 
     scheduler._poll_processes(session)
 
-    assert run.status == expected_status
+    assert run.status == "interrupted"
     assert run.exit_code is None
     assert run.pid is None
-    if expected_status == "interrupted":
-        assert "无法取得原进程退出码" in run.error_message
+    assert "无法取得原进程退出码" in run.error_message
     session.close()
 
 

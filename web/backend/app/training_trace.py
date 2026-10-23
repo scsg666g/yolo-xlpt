@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -215,28 +218,133 @@ class TraceCollector:
                 self._disable(exc)
 
 
-def run(command: list[str], trace_dir: Path, maximum: int, interval: int) -> None:
+def _training_directory(values: dict[str, Any], trace_dir: Path, model: Any = None) -> Path:
+    trainer = getattr(model, "trainer", None)
+    if getattr(trainer, "save_dir", None):
+        return Path(trainer.save_dir)
+    if values.get("save_dir"):
+        return Path(values["save_dir"])
+    if values.get("project") and values.get("name"):
+        return Path(values["project"]) / str(values["name"])
+    return trace_dir.parent
+
+
+def _completed_epochs(directory: Path) -> int:
+    try:
+        with (directory / "results.csv").open(newline="", encoding="utf-8-sig") as handle:
+            epochs = [int(float(value)) for row in csv.DictReader(handle) for key, value in row.items()
+                      if key and key.strip() == "epoch" and value is not None]
+        return max(epochs, default=0)
+    except (OSError, ValueError, TypeError):
+        # epoch starts at zero before the first completed batch, so it cannot
+        # establish a completed epoch when setup or validation raises.
+        return 0
+
+
+def _failure_exit_code(error: BaseException) -> int:
+    if isinstance(error, KeyboardInterrupt):
+        return 130
+    if isinstance(error, SystemExit) and isinstance(error.code, int):
+        # SystemExit(0) before train returns is not a completed training call.
+        return (error.code & 255) or 1
+    return 1
+
+
+def _write_training_result(directory: Path, model: Any, values: dict[str, Any], error: BaseException | None) -> None:
+    """Publish completion only after the whole train call, including final validation."""
+    if not TraceCollector._is_primary_rank():
+        return
+    trainer = getattr(model, "trainer", None)
+    completed = _completed_epochs(directory)
+    args = getattr(trainer, "args", None)
+    # Resume can restore epochs from the checkpoint, overriding the command.
+    expected = int(getattr(args, "epochs", None) or values.get("epochs") or 0)
+    stopper = getattr(trainer, "stopper", None)
+    best_epoch = getattr(stopper, "best_epoch", None)
+    patience = getattr(args, "patience", values.get("patience"))
+    reason = "exception" if error is not None else ("epochs_completed" if completed >= expected > 0 else "training_completed")
+    if (error is None and 0 < completed < expected and best_epoch is not None and patience
+            and completed - int(best_epoch) >= int(patience)):
+        reason = "early_stopping"
+    metrics: dict[str, float] = {}
+    for key, value in (getattr(model, "metrics", None).results_dict
+                       if getattr(getattr(model, "metrics", None), "results_dict", None) else {}).items():
+        try:
+            number = float(value)
+            if math.isfinite(number):
+                metrics[str(key)] = number
+        except (ValueError, TypeError, OverflowError, RuntimeError):
+            continue
+    payload = {
+        "schema_version": 1,
+        "run_id": os.getenv("YOLO_FORGE_RUN_ID", ""),
+        "task_id": os.getenv("YOLO_FORGE_TASK_ID", ""),
+        "status": "failed" if error is not None else "completed",
+        "exit_code": _failure_exit_code(error) if error is not None else 0,
+        "reason": reason,
+        "completed_epochs": completed,
+        "expected_epochs": expected,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "error_message": f"{type(error).__name__}: {error}" if error is not None else None,
+        "final_metrics": metrics,
+    }
+    if best_epoch is not None and int(best_epoch) > 0:
+        payload["best_epoch"] = int(best_epoch)
+    if patience is not None:
+        payload["patience"] = int(patience)
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / f"training-result.json.{os.getpid()}.tmp"
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(directory / "training-result.json")
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run(command: list[str], trace_dir: Path, maximum: int, interval: int, collect_trace: bool = True) -> None:
     # The runner is launched with the Ultralytics checkout as cwd, but an absolute
     # script path is used by the platform. Make the checkout importable explicitly.
     sys.path.insert(0, str(Path.cwd()))
-    from ultralytics import YOLO
-
     values: dict[str, Any] = {}
-    for item in command[3:]:
-        if "=" not in item:
-            continue
-        key, raw = item.split("=", 1)
-        values[key] = _value(raw)
-    model_path = str(values.pop("model"))
-    task_type = str(values.pop("task", command[1]))
-    values.pop("mode", None)
-    collector = TraceCollector(trace_dir, maximum=maximum, interval=interval)
-    model = YOLO(model_path, task=task_type)
-    model.add_callback("on_train_start", collector.on_train_start)
-    model.add_callback("on_train_batch_start", collector.on_train_batch_start)
-    model.add_callback("on_train_batch_end", collector.on_train_batch_end)
-    model.add_callback("on_train_end", collector.on_train_end)
-    model.train(**values)
+    model = None
+    try:
+        for item in command[3:]:
+            if "=" not in item:
+                continue
+            key, raw = item.split("=", 1)
+            values[key] = _value(raw)
+        from ultralytics import YOLO
+
+        model_path = str(values.pop("model"))
+        task_type = str(values.pop("task", command[1]))
+        values.pop("mode", None)
+        if collect_trace:
+            collector = TraceCollector(trace_dir, maximum=maximum, interval=interval)
+        model = YOLO(model_path, task=task_type)
+        if collect_trace:
+            model.add_callback("on_train_start", collector.on_train_start)
+            model.add_callback("on_train_batch_start", collector.on_train_batch_start)
+            model.add_callback("on_train_batch_end", collector.on_train_batch_end)
+            model.add_callback("on_train_end", collector.on_train_end)
+        model.train(**values)
+    except BaseException as exc:
+        try:
+            _write_training_result(_training_directory(values, trace_dir, model), model, values, exc)
+        except Exception as write_error:
+            print(f"[training-result] cannot save failure record: {write_error}", file=sys.stderr, flush=True)
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            raise SystemExit(_failure_exit_code(exc)) from exc
+        raise
+    else:
+        try:
+            _write_training_result(_training_directory(values, trace_dir, model), model, values, None)
+        except Exception as write_error:
+            # Result persistence is observability; a full disk must not replace
+            # the actual successful process exit with a new training failure.
+            print(f"[training-result] cannot save completion record: {write_error}", file=sys.stderr, flush=True)
 
 
 def main() -> int:
@@ -245,8 +353,9 @@ def main() -> int:
     parser.add_argument("--maximum", type=int, default=24)
     parser.add_argument("--interval", type=int, default=10)
     parser.add_argument("--command-json", required=True)
+    parser.add_argument("--disable-trace", "--no-trace", dest="no_trace", action="store_true")
     args, _ = parser.parse_known_args()
-    run(json.loads(args.command_json), args.trace_dir, args.maximum, args.interval)
+    run(json.loads(args.command_json), args.trace_dir, args.maximum, args.interval, collect_trace=not args.no_trace)
     return 0
 
 

@@ -1,7 +1,8 @@
 import { useMemo } from 'react'
 import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
 import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, ScanEye, Terminal, Trophy, X } from 'lucide-react'
-import { formatBytes, statusLabel } from '../api'
+import { formatBytes } from '../api'
+import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { LineChartView } from './LineChart'
@@ -91,7 +92,7 @@ function RuntimeDetails({ task, run }: Pick<Props, 'task' | 'run'>) {
       <div className="canvas-detail-grid">
         <DetailField label="设备" value={`GPU ${task.device}`} />
         <DetailField label="进程 PID" value={task.pid} />
-        <DetailField label="运行状态" value={statusLabel(task.status)} />
+        <DetailField label="运行状态" value={trainingStatusLabel(task)} />
         <DetailField label="退出代码" value={task.exit_code} />
         <DetailField label="进程启动时间" value={formatDate(run?.process_started_at)} />
         <DetailField label="进程运行时长" value={formatDuration(runDuration(run))} />
@@ -116,16 +117,20 @@ function RuntimeDetails({ task, run }: Pick<Props, 'task' | 'run'>) {
 
 function StatusDetails({ task, run, events }: Pick<Props, 'task' | 'run' | 'events'>) {
   const metricEntries = Object.entries(task.latest_metrics || {})
+  const finalMetricEntries = task.status === 'completed' ? Object.entries(task.completion_info?.final_metrics || {}) : []
+  const completionNote = earlyStoppingExplanation(task)
+  const epochProgress = trainingEpochProgress(task)
   return <div className="canvas-detail-sections">
     <div className="run-summary-strip">
-      <div><span>当前状态</span><strong className={`detail-status ${task.status}`}>{statusLabel(task.status)}</strong></div>
+      <div><span>当前状态</span><strong className={`detail-status ${task.status}`}>{trainingStatusLabel(task)}</strong></div>
       <div><span>运行批次</span><strong>{run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '未创建'}</strong></div>
       <div><span>启动方式</span><strong>{run ? launchModeLabel[run.launch_mode] : '—'}</strong></div>
-      <div><span>训练进度</span><strong>{Math.round(task.progress)}%</strong></div>
+      <div><span>轮数进度</span><strong>{Math.round(epochProgress)}%</strong></div>
     </div>
     <section className="canvas-detail-section">
-      <div className="detail-progress-heading"><h3>Epoch {task.completed_epochs} / {task.epochs}</h3><span>{task.progress.toFixed(2)}%</span></div>
-      <div className="detail-progress"><i style={{ width: `${task.progress}%` }} /></div>
+      <div className="detail-progress-heading"><h3>实际训练 Epoch {task.completed_epochs} / {trainingEpochTarget(task)}</h3><span>{epochProgress.toFixed(2)}%</span></div>
+      <div className="detail-progress"><i style={{ width: `${epochProgress}%` }} /></div>
+      {completionNote && <p className="training-completion-note">{completionNote}</p>}
     </section>
     {task.error_message && <div className="canvas-detail-error"><strong>本次运行错误</strong><pre>{task.error_message}</pre></div>}
     <section className="canvas-detail-section">
@@ -138,9 +143,13 @@ function StatusDetails({ task, run, events }: Pick<Props, 'task' | 'run' | 'even
       </div>
     </section>
     <section className="canvas-detail-section">
-      <h3>最新指标</h3>
+      <h3>最新 Epoch 指标 <span>Epoch {task.completed_epochs}</span></h3>
       {metricEntries.length ? <div className="metric-value-grid">{metricEntries.map(([key, value]) => <div key={key}><span title={key}>{key}</span><strong>{displayValue(value)}</strong></div>)}</div> : <div className="canvas-detail-empty">暂无指标数据</div>}
     </section>
+    {finalMetricEntries.length > 0 && <section className="canvas-detail-section">
+      <h3>训练结束验证指标</h3>
+      <div className="metric-value-grid">{finalMetricEntries.map(([key, value]) => <div key={key}><span title={key}>{key}</span><strong>{displayValue(value)}</strong></div>)}</div>
+    </section>}
     <section className="canvas-detail-section">
       <h3>任务事件 <span>{events.length}</span></h3>
       {events.length ? <div className="event-timeline">{events.map((event) => <article key={event.id}><i className={event.level} /><div><strong>{event.message}</strong><span>{event.event_type} · {formatDate(event.created_at)}</span></div></article>)}</div> : <div className="canvas-detail-empty">本次运行暂无事件记录</div>}
@@ -197,7 +206,7 @@ function WeightsDetails({ artifacts, effectiveBestWeight, task, run, onTest, tes
     { name: 'last.pt', label: '最新模型', description: '最后一个 Epoch 保存的检查点，保留训练状态，通常用于中断后继续训练。', icon: History },
   ]
   return <div className="canvas-detail-sections">
-    <div className="weight-detail-summary"><div><span>运行批次</span><strong>{run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '—'}</strong></div><div><span>训练状态</span><strong>{statusLabel(task.status)}</strong></div><div><span>可用权重</span><strong>{weights.length + (inheritedBestWeight ? 1 : 0)}</strong></div><div><span>输出目录</span><strong title={task.run_dir || ''}>{task.run_dir?.split('/').slice(-3).join('/') || '等待创建'}</strong></div></div>
+    <div className="weight-detail-summary"><div><span>运行批次</span><strong>{run ? `Attempt ${String(run.attempt_number).padStart(3, '0')}` : '—'}</strong></div><div><span>训练状态</span><strong>{trainingStatusLabel(task)}</strong></div><div><span>可用权重</span><strong>{weights.length + (inheritedBestWeight ? 1 : 0)}</strong></div><div><span>输出目录</span><strong title={task.run_dir || ''}>{task.run_dir?.split('/').slice(-3).join('/') || '等待创建'}</strong></div></div>
     <div className="weight-card-grid">{knownWeights.map(({ name, label, description, icon: Icon }) => {
       const currentArtifact = weights.find((item) => item.name.split('/').pop() === name)
       const inherited = name === 'best.pt' && !currentArtifact && effectiveBestWeight?.inherited

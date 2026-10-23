@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Copy, Cpu, Folder, FolderInput, FolderPlus, GitCompareArrows, GripVertical, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
+import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { DeletionJob, TaskDeletionPreview, TaskGroup, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { CreateTaskModal } from './CreateTaskModal'
@@ -770,13 +771,16 @@ export function Dashboard() {
   }
 
   function renderTaskCard(task: TrainingTask) {
+    const completionNote = earlyStoppingExplanation(task)
+    const epochProgress = trainingEpochProgress(task)
     return <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { const source = tasks.find((item) => item.id === draggingId); if (source?.group_id !== task.group_id) return; event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
-      <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整组内顺序" aria-label="按住拖动调整组内顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`}>{statusIcon(task.status)}{statusLabel(task.status)}</span></div>
+      <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整组内顺序" aria-label="按住拖动调整组内顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`} title={completionNote || undefined}>{statusIcon(task.status)}{trainingStatusLabel(task)}</span></div>
       <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" disabled={taskActionIds.has(task.id)} title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
       <p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p>
-      <div className="progress-heading"><span>Epoch {task.completed_epochs} / {task.epochs}</span><strong>{Math.round(task.progress)}%</strong></div>
-      <div className="progress"><i style={{ width: `${task.progress}%` }} /></div>
-      <div className="metric-strip"><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>{task.device === 'cpu' ? 'CPU' : `GPU ${task.device}`}</strong></div></div>
+      <div className="progress-heading"><span>Epoch {task.completed_epochs} / {trainingEpochTarget(task)}</span><strong title="实际完成轮数占目标轮数的比例">轮数进度 {Math.round(epochProgress)}%</strong></div>
+      <div className="progress"><i style={{ width: `${epochProgress}%` }} /></div>
+      {completionNote && <p className="training-completion-note">{completionNote}</p>}
+      <div className="metric-strip" title={`最新 Epoch ${task.completed_epochs} 指标`}><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>{task.device === 'cpu' ? 'CPU' : `GPU ${task.device}`}</strong></div></div>
       {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
       <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
         {task.status === 'draft' && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="启动训练" aria-label={`启动训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.start(task.id))}><Zap size={15} /></button>}

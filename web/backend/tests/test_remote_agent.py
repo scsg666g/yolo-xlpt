@@ -999,6 +999,12 @@ def test_recovery_stops_only_identity_verified_process(agent, training, monkeypa
 @pytest.mark.parametrize(("scenario", "expected"), [
     ("all_epochs", "completed"),
     ("early_stopping", "completed"),
+    ("trace_oom", "completed"),
+    ("epochs_only", "interrupted"),
+    ("early_marker_only", "interrupted"),
+    ("validation_error", "interrupted"),
+    ("error_after_save", "interrupted"),
+    ("wrong_path", "interrupted"),
     ("uncertain", "interrupted"),
 ])
 def test_recovery_classifies_process_that_exited_before_agent_restart(
@@ -1010,15 +1016,27 @@ def test_recovery_classifies_process_that_exited_before_agent_restart(
     weights.mkdir(parents=True)
     log = Path(task["log_path"])
     log.parent.mkdir(parents=True)
-    if scenario == "all_epochs":
+    (weights / "best.pt").write_bytes(b"best")
+    (weights / "last.pt").write_bytes(b"last")
+    full_epochs = scenario in {"all_epochs", "epochs_only"}
+    if full_epochs:
         (run_dir / "results.csv").write_text("epoch,time,score\n1,1,0.1\n2,2,0.2\n3,3,0.3\n")
-        log.write_text("training output\n")
     else:
         (run_dir / "results.csv").write_text("epoch,time,score\n1,1,0.1\n")
-        (weights / "best.pt").write_bytes(b"best")
-        (weights / "last.pt").write_bytes(b"last")
-        marker = "EarlyStopping: Training stopped early\n" if scenario == "early_stopping" else "training vanished\n"
-        log.write_text(marker + "".join(f"final validation line {index}\n" for index in range(200)))
+    prefix = "EarlyStopping: Training stopped early as no improvement observed in last 2 epochs. Best results observed at epoch 1.\n"
+    if scenario == "trace_oom":
+        prefix = "Traceback (most recent call last):\nCUDA out of memory\nTrace collection disabled; training continues\n" + prefix
+    text = prefix if not full_epochs else "training output\n"
+    if scenario not in {"epochs_only", "early_marker_only", "uncertain"}:
+        text += f"{3 if full_epochs else 1} epochs completed in 1.0 hours.\n"
+        text += "".join(f"final validation line {index}\n" for index in range(200))
+        if scenario == "validation_error":
+            text += "Traceback (most recent call last):\nRuntimeError: CUDA out of memory\n"
+        else:
+            text += f"Results saved to {run_dir if scenario != 'wrong_path' else run_dir.parent / 'attempt-000'}\n"
+            if scenario == "error_after_save":
+                text += "Traceback (most recent call last):\nRuntimeError: final model cleanup failed\n"
+    log.write_text(text)
     updates = []
 
     def api(_config, path, method="GET", payload=None, extra_headers=None):
@@ -1034,10 +1052,126 @@ def test_recovery_classifies_process_that_exited_before_agent_restart(
     lock = agent.acquire_training_lock(config)
     agent.recover_remote_task(config, state, threading.Event(), training_lock=lock)
     assert updates[-1]["status"] == expected
-    assert updates[-1]["completed_epochs"] == (3 if scenario == "all_epochs" else 1)
-    assert updates[-1]["progress"] == (100 if expected == "completed" else pytest.approx(100 / 3))
+    assert updates[-1]["completed_epochs"] == (3 if full_epochs else 1)
+    assert updates[-1]["exit_code"] is None
+    assert updates[-1]["progress"] == (100 if expected == "completed" else pytest.approx(min(99.99, (3 if full_epochs else 1) * 100 / 3)))
+    if expected == "completed":
+        assert updates[-1]["completion_info"]["source"] == "legacy_log"
     if expected == "interrupted":
         assert "无法取得原进程退出码" in updates[-1]["error_message"]
+
+
+def test_remote_training_outcome_runner_is_used_when_trace_is_disabled(agent, training):
+    config, task = training
+    config["enable_training_trace"] = False
+    command = ["yolo", "segment", "train", "model=model.pt", "epochs=3"]
+    wrapped = agent.prepare_trace_command(config, task, command)
+    assert wrapped[1].endswith("training_trace_runner.py")
+    assert "--run-dir" in wrapped and task["run_dir"] in wrapped
+    assert "--trace-enabled" not in wrapped
+
+
+def test_remote_legacy_resume_summary_counts_only_new_epochs(agent, training):
+    _config, task = training
+    task["parameters"]["epochs"] = 100
+    run_dir = Path(task["run_dir"])
+    weights = run_dir / "weights"
+    weights.mkdir(parents=True)
+    for name in ("best.pt", "last.pt"):
+        (weights / name).write_bytes(b"checkpoint")
+    (run_dir / "results.csv").write_text("epoch,time,score\n55,1,0.8\n56,2,0.81\n")
+    log = Path(task["log_path"])
+    log.parent.mkdir(parents=True)
+    log.write_text(f"2 epochs completed in 0.5 hours.\nValidating best.pt\nResults saved to {run_dir}\n")
+    assert agent.recovered_natural_exit(task, 56, []) == ("completed", None, None)
+
+
+@pytest.mark.parametrize("rank", ["-1", "1"])
+@pytest.mark.parametrize("scenario", ["early_stopping", "all_epochs", "validation_failure", "no_patience", "resume_epochs", "keyboard_interrupt", "system_exit_zero", "system_exit_none", "system_exit_two", "system_exit_wraparound"])
+def test_remote_runner_persists_actual_result_after_train_returns(agent, training, tmp_path, scenario, rank):
+    _config, task = training
+    if scenario == "early_stopping":
+        task["parameters"]["epochs"] = 5
+    run_dir = Path(task["run_dir"])
+    fake = tmp_path / "fake-ultralytics"
+    fake.mkdir()
+    (fake / "ultralytics.py").write_text('''
+import os
+from pathlib import Path
+from types import SimpleNamespace
+class YOLO:
+    def __init__(self, model, task):
+        self.trainer = SimpleNamespace(epochs=5 if os.getenv("SCENARIO") == "early_stopping" else 3, stopper=SimpleNamespace(best_epoch=1, patience=float("inf") if os.getenv("SCENARIO") == "no_patience" else 2))
+        if os.getenv("SCENARIO") == "resume_epochs":
+            self.trainer.args = SimpleNamespace(epochs=8)
+            self.trainer.stopper = SimpleNamespace(best_epoch=0, patience=2)
+        self.metrics = SimpleNamespace(results_dict={"metrics/mAP50(B)": 0.818})
+    def train(self, **values):
+        root = Path(values["project"]) / values["name"]
+        root.mkdir(parents=True, exist_ok=True)
+        assert not (root / "training-result.json").exists()
+        (root / "results.csv").write_text("epoch,time,score\\n1,1,0.1\\n" + ("2,2,0.2\\n3,3,0.3\\n" if os.getenv("SCENARIO") in {"all_epochs", "early_stopping", "no_patience"} else ""))
+        if os.getenv("SCENARIO") == "validation_failure":
+            print("EarlyStopping: Training stopped early", flush=True)
+            raise RuntimeError("final validation failed")
+        if os.getenv("SCENARIO") == "keyboard_interrupt":
+            raise KeyboardInterrupt()
+        if os.getenv("SCENARIO").startswith("system_exit_"):
+            raise SystemExit({"system_exit_zero": 0, "system_exit_none": None, "system_exit_two": 2, "system_exit_wraparound": 256}[os.getenv("SCENARIO")])
+''')
+    runner = tmp_path / "training-runner.py"
+    runner.write_text(agent.REMOTE_TRACE_RUNNER)
+    command = ["yolo", "detect", "train", "model=fake.pt", f"epochs={task['parameters']['epochs']}",
+               f"project={run_dir.parent}", f"name={run_dir.name}"]
+    result = subprocess.run([sys.executable, str(runner), "--trace-dir", str(run_dir / "training-trace"),
+                             "--run-dir", str(run_dir), "--command-json", json.dumps(command)],
+                            env={**os.environ, "PYTHONPATH": str(fake), "YOLO_FORGE_RUN_ID": task["run_id"],
+                                 "YOLO_FORGE_TASK_ID": task["task_id"], "SCENARIO": scenario, "RANK": rank},
+                            text=True, capture_output=True, timeout=10)
+    failure = scenario not in {"early_stopping", "all_epochs", "no_patience", "resume_epochs"}
+    expected_code = 130 if scenario == "keyboard_interrupt" else 2 if scenario == "system_exit_two" else 1 if failure else 0
+    assert result.returncode == expected_code
+    if rank == "1":
+        assert not (run_dir / "training-result.json").exists()
+        return
+    record = json.loads((run_dir / "training-result.json").read_text())
+    assert record["schema_version"] == 1
+    assert record["run_id"] == task["run_id"] and record["task_id"] == task["task_id"]
+    assert record["exit_code"] == result.returncode
+    expected_status = "failed" if failure else "completed"
+    assert record["status"] == expected_status
+    assert record["reason"] == ("exception" if failure else
+                                 "early_stopping" if scenario == "early_stopping" else
+                                 "training_completed" if scenario == "resume_epochs" else "epochs_completed")
+    assert record["expected_epochs"] == (8 if scenario == "resume_epochs" else task["parameters"]["epochs"])
+    assert not list(run_dir.glob("*.tmp"))
+    status, error, code = agent.recovered_natural_exit(task, record["completed_epochs"], [])
+    assert status == expected_status and code == result.returncode
+    assert bool(error) == failure
+    if scenario == "validation_failure":
+        assert "final validation failed" in error
+    info = agent.training_completion_info(task, record["completed_epochs"], [])
+    assert info["source"] == "training_result"
+    assert info["final_metrics"]["metrics/mAP50(B)"] == 0.818
+
+
+@pytest.mark.parametrize("invalid", ["run_id", "task_id", "expected_epochs", "finished_at", "status_code", "best_epoch", "patience", "schema_version", "future_finished_at"])
+def test_remote_recovery_rejects_foreign_or_invalid_result_records(agent, training, invalid):
+    _config, task = training
+    run_dir = Path(task["run_dir"])
+    run_dir.mkdir(parents=True)
+    record = {"schema_version": 1, "run_id": task["run_id"], "task_id": task["task_id"],
+              "status": "completed", "exit_code": 0, "reason": "epochs_completed", "completed_epochs": 3,
+              "expected_epochs": 3, "finished_at": datetime.now(timezone.utc).isoformat()}
+    if invalid == "status_code":
+        record["exit_code"] = 1
+    elif invalid == "future_finished_at":
+        record["finished_at"] = "2999-01-01T00:00:00+00:00"
+    else:
+        record[invalid] = {"run_id": "f" * 32, "task_id": "other-task", "expected_epochs": 0,
+                           "finished_at": "bad timestamp", "best_epoch": None, "patience": -1, "schema_version": True}[invalid]
+    (run_dir / "training-result.json").write_text(json.dumps(record))
+    assert agent.recovered_natural_exit(task, 3, [])[0] == "interrupted"
 
 
 def test_recovered_weight_stat_race_degrades_to_interrupted(agent, training, monkeypatch):

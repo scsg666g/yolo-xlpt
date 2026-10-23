@@ -1059,6 +1059,75 @@ def test_remote_stop_does_not_invent_user_request(monitoring_client, reason, exp
         assert db.get(TrainingRun, run_id).error_message == expected
 
 
+@pytest.mark.parametrize("with_info", [False, True])
+def test_remote_completion_preserves_unknown_exit_code_and_early_stop_details(monitoring_client, with_info):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        task = TrainingTask(id="early-stop", name="smoke", task_type="detect", execution_node_id=node_id,
+                            model_path="/remote/model.pt", data_path="/remote/data.yaml", epochs=100,
+                            config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run.status = "running"
+        run.error_message = "stale recovery error"
+        run_id = run.id
+        db.commit()
+    info = {"source": "legacy_log", "reason": "early_stopping", "completed_epochs": 56,
+            "expected_epochs": 100, "best_epoch": 21, "patience": 35,
+            "final_metrics": {"metrics/mAP50(B)": 0.818}}
+    payload = {"status": "completed", "completed_epochs": 56, "progress": 56,
+               "latest_metrics": {"metrics/mAP50(B)": 0.8016}, "exit_code": None}
+    if with_info:
+        payload["completion_info"] = info
+    url = f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update"
+    response = client.post(url, headers=headers(credential), json=payload)
+    assert response.status_code == 200, response.text
+    with factory() as db:
+        task, run = db.get(TrainingTask, "early-stop"), db.get(TrainingRun, run_id)
+        assert task.status == run.status == "completed"
+        assert run.exit_code is task.exit_code is None
+        assert run.error_message is task.error_message is None
+        assert run.completed_epochs == 56 and run.progress == 100
+        assert run.completion_info == task.completion_info == (info if with_info else {})
+        assert run.latest_metrics == {"metrics/mAP50(B)": 0.8016}
+        event = db.scalar(select(TaskEvent).where(TaskEvent.run_id == run_id, TaskEvent.event_type == "completed"))
+        assert event.payload["completion_info"] == (info if with_info else {})
+    assert client.get("/api/tasks/early-stop").json()["completion_info"] == (info if with_info else {})
+    # A delayed heartbeat must not roll a completed Attempt back to running.
+    assert client.post(url, headers=headers(credential), json={"status": "running"}).json()["status"] == "completed"
+
+
+@pytest.mark.parametrize("changes", [
+    {"exit_code": 1},
+    {"completion_info": {"source": "training_result", "reason": "exception", "completed_epochs": 56, "expected_epochs": 100}},
+    {"completion_info": {"source": "unknown", "reason": "early_stopping", "completed_epochs": 56, "expected_epochs": 100}},
+    {"completion_info": {"source": "legacy_log", "reason": "early_stopping", "completed_epochs": True, "expected_epochs": 100}},
+    {"completion_info": {"source": "legacy_log", "reason": "early_stopping", "completed_epochs": 56, "expected_epochs": 100, "best_epoch": 57}},
+])
+def test_remote_completion_rejects_inconsistent_or_invalid_details(monitoring_client, changes):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    with factory() as db:
+        task = TrainingTask(id="invalid-result", name="smoke", task_type="detect", execution_node_id=node_id,
+                            model_path="/remote/model.pt", data_path="/remote/data.yaml",
+                            config={"remote_output_root": "/remote/runs"})
+        db.add(task)
+        db.flush()
+        run = create_training_run(db, task, "fresh")
+        run.status = "running"
+        run_id = run.id
+        db.commit()
+    response = client.post(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/update",
+                           headers=headers(credential), json={"status": "completed", **changes})
+    assert response.status_code == 422
+    with factory() as db:
+        assert db.get(TrainingRun, run_id).status == "running"
+
+
 def test_active_remote_run_blocks_node_disabling_and_token_rotation(monitoring_client):
     client, factory = monitoring_client
     credential = create(client)

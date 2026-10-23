@@ -176,6 +176,7 @@ class RemoteRunUpdate(BaseModel):
     log_tail: list[str] = Field(default_factory=list, max_length=200)
     exit_code: int | None = None
     error_message: str | None = Field(default=None, max_length=4000)
+    completion_info: dict[str, Any] = Field(default_factory=dict, max_length=8)
     stop_reason: str | None = Field(default=None, pattern=r"^(platform_stop|agent_shutdown)$")
     run_dir: str | None = Field(default=None, max_length=2000)
     command: list[str] = Field(default_factory=list, max_length=256)
@@ -191,6 +192,38 @@ class RemoteRunUpdate(BaseModel):
     @classmethod
     def clean_logs(cls, value: list[str]) -> list[str]:
         return [line[:4000] for line in value]
+
+    @field_validator("completion_info")
+    @classmethod
+    def clean_completion_info(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not value:
+            return value
+        allowed = {"source", "reason", "completed_epochs", "expected_epochs", "best_epoch",
+                   "patience", "finished_at", "final_metrics"}
+        if value.keys() - allowed or value.get("source") not in {"training_result", "legacy_log", "process_exit"}:
+            raise ValueError("训练结束记录来源无效")
+        if value.get("reason") not in {"early_stopping", "epochs_completed", "training_completed", "exception"}:
+            raise ValueError("训练结束原因无效")
+        for key, minimum in (("completed_epochs", 0), ("expected_epochs", 1), ("best_epoch", 1), ("patience", 0)):
+            if key not in value and key in {"best_epoch", "patience"}:
+                continue
+            number = value.get(key)
+            if type(number) is not int or not minimum <= number <= 10**9:
+                raise ValueError("训练结束记录的轮数无效")
+        if value.get("best_epoch", 0) > value["completed_epochs"]:
+            raise ValueError("最佳轮数不能超过实际完成轮数")
+        if "finished_at" in value:
+            timestamp = value["finished_at"]
+            if not isinstance(timestamp, str) or len(timestamp) > 64 or datetime.fromisoformat(timestamp.replace("Z", "+00:00")).tzinfo is None:
+                raise ValueError("训练结束时间无效")
+        if "final_metrics" in value:
+            metrics = value["final_metrics"]
+            if not isinstance(metrics, dict) or len(metrics) > 128 or any(
+                not isinstance(key, str) or len(key) > 200 or type(number) not in {int, float} or not math.isfinite(number)
+                for key, number in metrics.items()
+            ):
+                raise ValueError("最终验证指标无效")
+        return value
 
 
 def remote_trace_root(run_id: str) -> Path:
@@ -888,6 +921,10 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
         return {"status": prior_status, "stop_requested": bool(run.stop_requested)}
     if payload.status not in {"starting", "running", "stopping", *terminal}:
         raise HTTPException(422, "非法状态")
+    if payload.status == "completed" and (
+        payload.exit_code not in {None, 0} or payload.completion_info.get("reason") == "exception"
+    ):
+        raise HTTPException(422, "异常退出的训练不能标记为已完成")
     effective_status = "stopping" if run.stop_requested and payload.status in {"starting", "running"} else payload.status
     run.status = effective_status
     run.pid = payload.pid if payload.status in {"starting", "running", "stopping"} else None
@@ -917,9 +954,13 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
             continue
     if effective_status in terminal:
         run.finished_at = utcnow()
+        run.completion_info = payload.completion_info
+        if run.completion_info:
+            run.completed_epochs = max(run.completed_epochs, run.completion_info["completed_epochs"])
         if effective_status == "completed":
             run.progress = 100
-            run.exit_code = payload.exit_code if payload.exit_code is not None else 0
+            run.exit_code = payload.exit_code
+            run.error_message = None
         if effective_status == "stopped" and not run.error_message:
             if payload.stop_reason == "agent_shutdown":
                 run.error_message = "Agent 退出，训练进程已停止"
@@ -930,7 +971,8 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
         add_event(db, task.id, effective_status, run.error_message or f"远程训练{effective_status}",
                   "error" if effective_status == "failed" else "info",
                   payload={"exit_code": run.exit_code, "stop_reason": payload.stop_reason,
-                           "stop_requested": bool(run.stop_requested)}, run_id=run.id)
+                           "stop_requested": bool(run.stop_requested),
+                           "completion_info": run.completion_info}, run_id=run.id)
         release_gpu_reservations(db, run.id)
     elif effective_status != prior_status:
         add_event(db, task.id, effective_status, f"远程训练状态：{effective_status}", run_id=run.id)

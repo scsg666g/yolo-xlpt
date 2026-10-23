@@ -183,6 +183,7 @@ class TaskRead(BaseModel):
     pid: int | None
     exit_code: int | None
     error_message: str | None
+    completion_info: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any]
     latest_metrics: dict[str, Any]
     canvas_layout: dict[str, Any]
@@ -220,6 +221,7 @@ class RunRead(BaseModel):
     latest_metrics: dict[str, Any]
     exit_code: int | None
     error_message: str | None
+    completion_info: dict[str, Any] = Field(default_factory=dict)
     queued_at: datetime | None
     started_at: datetime | None
     finished_at: datetime | None

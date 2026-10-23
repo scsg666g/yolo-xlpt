@@ -9,6 +9,15 @@ export type TaskStatus =
   | 'failed'
   | 'interrupted'
 
+export interface TrainingCompletionInfo {
+  reason?: 'early_stopping' | 'epochs_completed' | 'training_completed' | 'exception'
+  source?: string
+  best_epoch?: number
+  patience?: number
+  expected_epochs?: number
+  final_metrics?: Record<string, number | string | null>
+}
+
 export interface PlatformHealth {
   status: 'ok' | 'degraded'
   instance: string
@@ -54,6 +63,7 @@ export interface TrainingTask {
   pid: number | null
   exit_code: number | null
   error_message: string | null
+  completion_info?: TrainingCompletionInfo | null
   config: Record<string, unknown>
   latest_metrics: Record<string, number | string | null>
   canvas_layout: { nodes?: Array<{ id: string; position: { x: number; y: number } }>; viewport?: { x: number; y: number; zoom: number } }
@@ -145,6 +155,7 @@ export interface TrainingRun {
   latest_metrics: Record<string, number | string | null>
   exit_code: number | null
   error_message: string | null
+  completion_info?: TrainingCompletionInfo | null
   queued_at: string | null
   started_at: string | null
   finished_at: string | null

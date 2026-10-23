@@ -24,13 +24,13 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -44,7 +44,8 @@ _YOLO_VERSION_CACHE: dict[tuple[str, int | None], str | None] = {}
 
 
 REMOTE_TRACE_RUNNER = r'''#!/usr/bin/env python3
-import argparse, json, os, sys, time
+import argparse, csv, json, math, os, sys, time
+from datetime import datetime, timezone
 from pathlib import Path
 
 def stats(value):
@@ -132,10 +133,58 @@ class Collector:
             try: self.write()
             except Exception: pass
 
+def publish_result(run_dir, model, values, error=None):
+    if os.getenv("RANK", "-1") not in {"-1", "0"}: return
+    def integer(value):
+        try: return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError): return 0
+    trainer = getattr(model, "trainer", None)
+    expected = integer(getattr(getattr(trainer, "args", None), "epochs", None) or getattr(trainer, "epochs", None) or values.get("epochs"))
+    completed = 0
+    try:
+        with (run_dir / "results.csv").open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                raw = next((value for key, value in row.items() if key and key.strip() == "epoch"), "0")
+                completed = max(completed, int(float(raw or 0)))
+    except (OSError, ValueError, TypeError, csv.Error): pass
+    stopper = getattr(trainer, "stopper", None)
+    best = integer(getattr(stopper, "best_epoch", 0))
+    patience = integer(getattr(stopper, "patience", 0))
+    reason = "exception" if error is not None else "epochs_completed" if expected and completed >= expected else "training_completed"
+    if error is None and completed < expected and best > 0 and patience > 0 and completed - best >= patience:
+        reason = "early_stopping"
+    metrics = getattr(getattr(model, "metrics", None), "results_dict", {}) or {}
+    final_metrics = {}
+    for key, value in metrics.items():
+        try:
+            value = float(value)
+            if math.isfinite(value): final_metrics[str(key)] = value
+        except (ValueError, TypeError): pass
+    exit_code = ((int(error.code) % 256 or 1) if isinstance(error, SystemExit) and isinstance(error.code, int)
+                 else 130 if isinstance(error, KeyboardInterrupt) else 1 if error is not None else 0)
+    payload = {"schema_version": 1, "run_id": os.getenv("YOLO_FORGE_RUN_ID"),
+               "task_id": os.getenv("YOLO_FORGE_TASK_ID"), "status": "failed" if error is not None else "completed",
+               "exit_code": exit_code, "reason": reason, "completed_epochs": completed,
+               "expected_epochs": expected, "finished_at": datetime.now(timezone.utc).isoformat(),
+               "error_message": (type(error).__name__ + ": " + str(error))[:4000] if error is not None else None,
+               "final_metrics": final_metrics}
+    if best > 0: payload["best_epoch"] = best
+    if patience > 0: payload["patience"] = patience
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        temporary = run_dir / (".training-result.%s.tmp" % os.getpid())
+        try:
+            with temporary.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+                handle.flush(); os.fsync(handle.fileno())
+            temporary.replace(run_dir / "training-result.json")
+        finally: temporary.unlink(missing_ok=True)
+    except OSError as exc:
+        print("[YOLO Forge] 无法保存训练结束记录: %s" % exc, file=sys.stderr, flush=True)
+
 def main():
-    parser = argparse.ArgumentParser(); parser.add_argument("--trace-dir", required=True); parser.add_argument("--maximum", type=int, default=24); parser.add_argument("--interval", type=int, default=10); parser.add_argument("--command-json", required=True)
+    parser = argparse.ArgumentParser(); parser.add_argument("--trace-dir", required=True); parser.add_argument("--run-dir", required=True); parser.add_argument("--trace-enabled", action="store_true"); parser.add_argument("--maximum", type=int, default=24); parser.add_argument("--interval", type=int, default=10); parser.add_argument("--command-json", required=True)
     args, _ = parser.parse_known_args()
-    from ultralytics import YOLO
     command = json.loads(args.command_json); values = {}
     for item in command[3:]:
         if "=" in item:
@@ -144,10 +193,22 @@ def main():
                 from ultralytics.cfg import smart_value; value = smart_value(value)
             except Exception: pass
             values[key] = value
-    model = YOLO(str(values.pop("model")), task=str(values.pop("task", command[1])))
-    values.pop("mode", None); collector = Collector(args.trace_dir, args.maximum, args.interval)
-    model.add_callback("on_train_start", collector.start); model.add_callback("on_train_batch_start", collector.batch_start); model.add_callback("on_train_batch_end", collector.batch_end); model.add_callback("on_train_end", collector.end)
-    model.train(**values)
+    model = None
+    try:
+        from ultralytics import YOLO
+        model = YOLO(str(values.pop("model")), task=str(values.pop("task", command[1])))
+        values.pop("mode", None)
+        if args.trace_enabled:
+            collector = Collector(args.trace_dir, args.maximum, args.interval)
+            model.add_callback("on_train_start", collector.start); model.add_callback("on_train_batch_start", collector.batch_start); model.add_callback("on_train_batch_end", collector.batch_end); model.add_callback("on_train_end", collector.end)
+        model.train(**values)
+    except BaseException as exc:
+        publish_result(Path(args.run_dir), model, values, exc)
+        if isinstance(exc, KeyboardInterrupt): raise SystemExit(130) from exc
+        if isinstance(exc, SystemExit) and (exc.code is None or isinstance(exc.code, int)):
+            raise SystemExit((int(exc.code or 0) % 256) or 1) from exc
+        raise
+    publish_result(Path(args.run_dir), model, values)
 if __name__ == "__main__": main()
 '''
 
@@ -1195,6 +1256,10 @@ def training_process_environment(config: dict, task: dict) -> dict[str, str]:
         "YOLO_FORGE_RUN_ID": task.get("run_id"),
         "YOLO_FORGE_TASK_ID": task.get("task_id"),
     }
+    # Result identity is also required with older centers that lack attribution.
+    if (re.fullmatch(r"[0-9a-f]{32}", markers["YOLO_FORGE_RUN_ID"] or "")
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", markers["YOLO_FORGE_TASK_ID"] or "")):
+        environment.update({key: str(markers[key]) for key in ("YOLO_FORGE_RUN_ID", "YOLO_FORGE_TASK_ID")})
     if (re.fullmatch(r"[0-9a-f]{32}", markers["YOLO_FORGE_INSTANCE_ID"] or "")
             and re.fullmatch(r"[0-9a-f]{32}", markers["YOLO_FORGE_RUN_ID"] or "")
             and re.fullmatch(r"[A-Za-z0-9_-]{1,160}", markers["YOLO_FORGE_TASK_ID"] or "")
@@ -1971,8 +2036,8 @@ def retry_pending_finals(config: dict) -> bool:
 
 
 def prepare_trace_command(config: dict, task: dict, command: list[str]) -> list[str]:
-    """Wrap remote detect training with the bundled real-batch collector."""
-    if not config.get("enable_training_trace", False) or task.get("task_type") != "detect":
+    """Persist the real training outcome, with optional detection trace collection."""
+    if len(command) < 3 or command[1] not in {"detect", "segment", "classify", "pose", "obb"} or command[2] != "train":
         return command
     trace_dir = Path(task["run_dir"]) / "training-trace"
     state_dir = Path(config["training_state_dir"])
@@ -1993,7 +2058,8 @@ def prepare_trace_command(config: dict, task: dict, command: list[str]) -> list[
     python_bin = str(Path(yolo_bin).parent / "python") if "/" in yolo_bin else sys.executable
     if not Path(python_bin).is_file():
         python_bin = sys.executable
-    return [python_bin, str(runner), "--trace-dir", str(trace_dir),
+    trace_flags = ["--trace-enabled"] if config.get("enable_training_trace", False) and task.get("task_type") == "detect" else []
+    return [python_bin, str(runner), "--trace-dir", str(trace_dir), "--run-dir", str(task["run_dir"]), *trace_flags,
             "--maximum", str(TRACE_MAXIMUM), "--interval", str(TRACE_INTERVAL),
             "--command-json", json.dumps(command, ensure_ascii=False), *command]
 
@@ -2097,26 +2163,122 @@ def _recovery_identity(state: dict) -> dict | None:
     return matches[0] if matches else None
 
 
-def recovered_natural_exit(task: dict, completed: int, log_lines: list[str]) -> tuple[str, str | None, int | None]:
-    """Classify an orphaned process exit using durable completion evidence."""
+def read_training_result(task: dict) -> dict | None:
+    """Accept only the terminal record belonging to this exact Run."""
+    path = Path(task["run_dir"]) / "training-result.json"
+    try:
+        if path.is_symlink() or path.stat().st_size > 256 * 1024:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] != 1
+                or payload.get("run_id") != task.get("run_id")
+                or payload.get("task_id") != task.get("task_id")
+                or payload.get("status") not in {"completed", "failed"}
+                or type(payload.get("exit_code")) is not int
+                or type(payload.get("completed_epochs")) is not int
+                or payload["completed_epochs"] < 0
+                or type(payload.get("expected_epochs")) is not int
+                or payload["expected_epochs"] <= 0
+                or payload.get("reason") not in {"early_stopping", "epochs_completed", "training_completed", "exception"}):
+            return None
+        finished = datetime.fromisoformat(payload["finished_at"].replace("Z", "+00:00"))
+        if finished.tzinfo is None or finished > datetime.now(timezone.utc) + timedelta(seconds=10):
+            return None
+        for key in ("best_epoch", "patience"):
+            if key in payload and (type(payload[key]) is not int or payload[key] <= 0):
+                return None
+        if payload.get("best_epoch", 0) > payload["completed_epochs"]:
+            return None
+        if payload.get("error_message") is not None and not isinstance(payload["error_message"], str):
+            return None
+        if task.get("started_at"):
+            started = datetime.fromisoformat(str(task["started_at"]).replace("Z", "+00:00"))
+            started = started.replace(tzinfo=timezone.utc) if started.tzinfo is None else started
+            if finished < started or path.stat().st_mtime < started.timestamp() - 1:
+                return None
+        if ((payload["status"] == "completed") != (payload["exit_code"] == 0)
+                or (payload["status"] == "failed") != (payload["reason"] == "exception")):
+            return None
+        return payload
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _record_completion_info(record: dict) -> dict:
+    info = {"source": "training_result", "reason": record["reason"],
+            "completed_epochs": record["completed_epochs"], "expected_epochs": record["expected_epochs"],
+            "finished_at": record["finished_at"]}
+    for key in ("best_epoch", "patience"):
+        if type(record.get(key)) is int and record[key] > 0:
+            info[key] = record[key]
+    final_metrics = record.get("final_metrics")
+    if isinstance(final_metrics, dict):
+        info["final_metrics"] = {str(key)[:200]: value for key, value in final_metrics.items()
+                                 if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value)}
+    return info
+
+
+def _legacy_completion_info(task: dict, completed: int, log_lines: list[str]) -> dict:
+    """Require final validation/save evidence, rather than an early-stop announcement."""
     try:
         expected = max(1, int(task.get("parameters", {}).get("epochs") or 1))
     except (TypeError, ValueError):
         expected = 1
-    if completed >= expected:
-        return "completed", None, 0
-    weights = Path(task["run_dir"]) / "weights"
+    run_dir = Path(task["run_dir"])
+    weights = run_dir / "weights"
     best = weights / "best.pt"
     last = weights / "last.pt"
-    text = (recent_log_text(Path(task["log_path"])) or "\n".join(log_lines)).lower()
-    completion_markers = ("results saved to", "training complete", "epochs completed in", "earlystopping:")
+    text = recent_log_text(Path(task["log_path"])) or "\n".join(log_lines)
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).replace("\r", "\n")
+    summaries = list(re.finditer(r"(?im)^\s*(\d+)\s+epochs? completed in\b", text))
+    if not summaries or completed <= 0:
+        return {}
+    summary = summaries[-1]
+    suffix = text[summary.end():]
+    # A failure during final validation must dominate the earlier early-stop notice.
+    if re.search(r"(?im)Traceback \(most recent call last\):|^\s*(?:[\w.]*Error|[\w.]*Exception):|CUDA error:|CUDA out of memory|^\s*Killed\s*$", suffix):
+        return {}
+    saves = list(re.finditer(r"(?im)^\s*Results saved to\s+([^\n]+)", suffix))
+    if not saves:
+        return {}
     try:
-        weights_complete = (best.is_file() and best.stat().st_size > 0 and
-                            last.is_file() and last.stat().st_size > 0)
-    except OSError:
-        weights_complete = False
-    if weights_complete and any(marker in text for marker in completion_markers):
-        return "completed", None, 0
+        saved_path = Path(saves[-1].group(1).strip().strip("'\""))
+        actual_completed, _, rows = read_remote_progress(run_dir)
+        first_epoch = min((row["epoch"] for row in rows), default=0)
+        summary_epochs = int(summary.group(1))
+        if (saved_path.resolve() != run_dir.resolve() or actual_completed != completed
+                or summary_epochs not in {completed, completed - first_epoch + 1}
+                or not best.is_file() or best.stat().st_size <= 0
+                or not last.is_file() or last.stat().st_size <= 0):
+            return {}
+    except (OSError, ValueError):
+        return {}
+    early = list(re.finditer(r"(?im)EarlyStopping:.*?(?:\n[^\n]*){0,3}", text[:summary.start()]))
+    info = {"source": "legacy_log", "reason": "early_stopping" if early and completed < expected else
+            "epochs_completed" if completed >= expected else "training_completed",
+            "completed_epochs": completed, "expected_epochs": expected}
+    if early:
+        notice = early[-1].group(0)
+        for key, pattern in (("best_epoch", r"best results observed at epoch\s+(\d+)"),
+                             ("patience", r"(?:last\s+(\d+)\s+epochs|patience\s*=\s*(\d+))")):
+            match = re.search(pattern, notice, re.I)
+            if match:
+                info[key] = int(next(group for group in match.groups() if group is not None))
+    return info
+
+
+def training_completion_info(task: dict, completed: int, log_lines: list[str]) -> dict:
+    record = read_training_result(task)
+    return _record_completion_info(record) if record else _legacy_completion_info(task, completed, log_lines)
+
+
+def recovered_natural_exit(task: dict, completed: int, log_lines: list[str]) -> tuple[str, str | None, int | None]:
+    """Recover the durable outcome without inventing an orphan's OS exit code."""
+    record = read_training_result(task)
+    if record:
+        return record["status"], str(record.get("error_message") or "")[:4000] or None, record["exit_code"]
+    if _legacy_completion_info(task, completed, log_lines):
+        return "completed", None, None
     return ("interrupted",
             "Agent 重启后接管的训练进程已结束，但无法取得原进程退出码；已保留产物供核对",
             None)
@@ -2205,6 +2367,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 status, error, exit_code = recovered_natural_exit(task, completed, log_lines)
             path = _save_terminal_for_retry(config, task, {
                 "status": status, "error_message": error, "exit_code": exit_code,
+                "completion_info": {} if requested_stop else training_completion_info(task, completed, log_lines),
                 "stop_reason": "platform_stop" if requested_stop else None,
                 "completed_epochs": completed,
                 "progress": (100 if status == "completed" else
@@ -2268,6 +2431,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             status, error, exit_code = recovered_natural_exit(task, completed, log_lines)
         path = _save_terminal_for_retry(config, task, {
             "status": status, "error_message": error, "exit_code": exit_code,
+            "completion_info": {} if requested_stop else training_completion_info(task, completed, log_lines),
             "stop_reason": stop_reason, "completed_epochs": completed,
             "progress": 100 if status == "completed" else min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
             "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in sent_epochs],
@@ -2399,7 +2563,18 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
         log_lines = recent_log_lines(Path(task["log_path"]))
         final_status = "stopped" if requested_stop else "completed" if exit_code == 0 else "failed"
         error = None if final_status != "failed" else f"训练进程异常退出，退出码 {exit_code}"
+        completion_info = {} if requested_stop else training_completion_info(task, completed, log_lines)
+        record = read_training_result(task)
+        if final_status == "failed" and record and record.get("status") == "failed" and record.get("error_message"):
+            error = str(record["error_message"])[:4000]
+        if final_status == "failed" and (not record or record.get("status") != "failed"):
+            completion_info = {"source": "process_exit", "reason": "exception", "completed_epochs": completed,
+                               "expected_epochs": int(task["parameters"]["epochs"])}
+        if not completion_info and final_status == "completed":
+            completion_info = {"source": "process_exit", "reason": "epochs_completed" if completed >= int(task["parameters"]["epochs"]) else "training_completed",
+                               "completed_epochs": completed, "expected_epochs": int(task["parameters"]["epochs"])}
         final_payload = {"_claim_lease": lease, "status": final_status, "completed_epochs": completed,
+                         "completion_info": completion_info,
                          "progress": 100 if final_status == "completed" else min(99.99, completed / max(1, int(task['parameters']['epochs'])) * 100),
                          "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in last_metrics],
                          "log_tail": log_lines, "exit_code": exit_code, "command": command,

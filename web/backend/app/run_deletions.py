@@ -424,5 +424,6 @@ def delete_attempt_records(db: Session, task_id: str, run_id: str) -> TrainingTa
         task.pid = task.exit_code = None
         task.error_message = None
         task.latest_metrics = {}
+        task.completion_info = {}
         task.queued_at = task.started_at = task.finished_at = None
     return task

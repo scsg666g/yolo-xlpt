@@ -49,6 +49,7 @@ from .gpu_reservations import (
 )
 from .models import Artifact, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .parameter_catalog import training_parameter_keys
+from .training_outcome import classify_training_exit
 
 
 logger = logging.getLogger("yolo-platform.training-scheduler")
@@ -180,6 +181,7 @@ def mirror_run_to_task(task: TrainingTask, run: TrainingRun) -> None:
     task.pid = run.pid
     task.exit_code = run.exit_code
     task.error_message = run.error_message
+    task.completion_info = dict(run.completion_info or {})
     task.latest_metrics = dict(run.latest_metrics or {})
     task.queued_at = run.queued_at
     task.started_at = run.started_at
@@ -278,6 +280,7 @@ def backfill_training_runs() -> int:
                     latest_metrics=dict(task.latest_metrics or {}),
                     exit_code=task.exit_code,
                     error_message=task.error_message,
+                    completion_info=dict(task.completion_info or {}),
                     queued_at=task.queued_at,
                     started_at=task.started_at,
                     finished_at=task.finished_at,
@@ -638,8 +641,12 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
                 pass
         latest, latest_epoch = values, max(latest_epoch, epoch)
     if rows:
-        epochs = int((run.parameter_snapshot or {}).get("epochs") or task.epochs)
-        progress = min(100.0, round(latest_epoch / max(epochs, 1) * 100, 2))
+        epochs = int(
+            (run.completion_info or {}).get("expected_epochs")
+            or (run.parameter_snapshot or {}).get("epochs")
+            or task.epochs
+        )
+        progress = 100.0 if run.status == "completed" else min(100.0, round(latest_epoch / max(epochs, 1) * 100, 2))
         changed = (run.completed_epochs != latest_epoch or run.progress != progress or run.latest_metrics != latest)
         if run.completed_epochs != latest_epoch:
             run.completed_epochs = latest_epoch
@@ -910,6 +917,43 @@ class TrainingScheduler:
                 return pid
         return None
 
+    @staticmethod
+    def _finalize_run(
+        task: TrainingTask, run: TrainingRun, *, actual_exit_code: int | None = None,
+        interrupted_message: str = "平台接管的训练进程已退出，无法取得原进程退出码",
+        only_verified: bool = False,
+    ) -> tuple[str, str] | None:
+        outcome = classify_training_exit(
+            run.run_dir, run.log_path, run.id, task.id,
+            int((run.parameter_snapshot or {}).get("epochs") or task.epochs),
+            run.completed_epochs, run.process_started_at or run.started_at,
+            actual_exit_code=actual_exit_code,
+        )
+        if only_verified and outcome["status"] == "interrupted":
+            return None
+        run.status = outcome["status"]
+        run.exit_code = outcome["exit_code"]
+        run.pid = None
+        run.completion_info = outcome["completion_info"] or {}
+        run.finished_at = utcnow()
+        if run.completion_info.get("finished_at"):
+            run.finished_at = datetime.fromisoformat(run.completion_info["finished_at"].replace("Z", "+00:00"))
+        run.completed_epochs = max(run.completed_epochs, run.completion_info.get("completed_epochs", 0))
+        run.error_message = outcome["error_message"]
+        if run.status == "completed":
+            run.progress = 100.0
+            message = "训练已完成 · 提前停止" if run.completion_info.get("reason") == "early_stopping" else "训练已完成"
+            return message, "info"
+        if run.status == "interrupted":
+            run.error_message = interrupted_message
+            return run.error_message, "warning"
+        if actual_exit_code is not None and actual_exit_code != 0:
+            detail = failure_detail(run.log_path)
+            run.error_message = f"训练进程异常退出，退出码 {actual_exit_code}"
+            if detail or outcome["error_message"]:
+                run.error_message += f"：{(detail or outcome['error_message'])[-500:]}"
+        return run.error_message or "训练异常结束", "error"
+
     def _recover_processes(self) -> None:
         with self.session_factory() as db:
             release_terminal_gpu_reservations(db)
@@ -918,20 +962,28 @@ class TrainingScheduler:
                 TrainingRun.execution_node_id.is_(None),
                 (
                     TrainingRun.status.in_(["starting", "running", "stopping"])
-                    | ((TrainingRun.status == "interrupted") & (TrainingRun.error_message == "平台服务重启后未发现受管训练进程"))
+                    | ((TrainingRun.status == "interrupted") & TrainingRun.error_message.in_([
+                        "平台服务重启后未发现受管训练进程",
+                        "平台接管的训练进程已退出，无法取得原进程退出码",
+                    ]))
                 ),
             )).all()
             for run in candidates:
                 task = db.get(TrainingTask, run.task_id)
+                previous_status = run.status
+                historical = previous_status == "interrupted"
+                if not task or (historical and (task.deleted_at or run.stop_requested)):
+                    continue
                 # A training process can finish writing checkpoints while the platform is
                 # restarting. Reconcile the run directory before deciding whether the
                 # process can be reattached so completed checkpoints do not remain
                 # invisible after the run is marked interrupted.
-                if task:
-                    sync_artifacts(db, task, run)
+                sync_artifacts(db, task, run)
                 pid = self._find_run_process(run)
-                if pid and task and run.process_started_at:
-                    previous_status = run.status
+                if pid and task.current_run_id != run.id:
+                    # Reconciliation of an old Attempt must not replace the current one.
+                    continue
+                if pid and run.process_started_at:
                     run.status = "stopping" if previous_status == "stopping" else "running"
                     run.pid = pid
                     run.error_message = None
@@ -969,23 +1021,32 @@ class TrainingScheduler:
                         except ProcessLookupError:
                             pass
                     continue
-                if run.status == "interrupted":
-                    continue
+                sync_metrics(db, task, run)
                 stopped_during_start = run.status == "stopping" and run.stop_requested
-                run.status = "stopped" if stopped_during_start else "interrupted"
-                run.pid = None
-                run.finished_at = utcnow() if stopped_during_start else run.finished_at
-                run.error_message = (
-                    "平台已取消本机训练启动，训练进程尚未启动"
-                    if stopped_during_start else "平台服务重启后未发现受管训练进程"
-                )
-                release_gpu_reservations(db, run.id)
-                if task:
-                    mirror_run_to_task(task, run)
-                    add_event(
-                        db, task.id, run.status, run.error_message,
-                        "info" if stopped_during_start else "warning", run_id=run.id,
+                if stopped_during_start:
+                    run.status = "stopped"
+                    run.pid = None
+                    run.finished_at = utcnow()
+                    run.completion_info = {}
+                    run.error_message = "平台停止请求已确认，训练进程已退出或尚未启动"
+                    message, level = run.error_message, "info"
+                else:
+                    result = self._finalize_run(
+                        task, run, interrupted_message="平台服务重启后未发现受管训练进程",
+                        only_verified=historical,
                     )
+                    if result is None:
+                        # No new evidence: leave the historical terminal state untouched.
+                        continue
+                    message, level = result
+                release_gpu_reservations(db, run.id)
+                if task.current_run_id == run.id:
+                    mirror_run_to_task(task, run)
+                add_event(
+                    db, task.id, "reconciled" if historical else run.status, message, level,
+                    payload={"previous_status": previous_status, "status": run.status,
+                             "exit_code": run.exit_code, "completion_info": run.completion_info}, run_id=run.id,
+                )
             db.commit()
 
     def start(self) -> None:
@@ -1041,7 +1102,7 @@ class TrainingScheduler:
                 command.append(f"{key}={value}")
         for key, value in (config.get("custom_args") or {}).items():
             command.append(f"{key}={value}")
-        if task.task_type == "detect" and not run.execution_node_id:
+        if not run.execution_node_id:
             trace_dir = Path(run.run_dir or RUNS_ROOT / task.task_type / task.id / f"attempt-{run.attempt_number:03d}") / "training-trace"
             trace_dir.mkdir(parents=True, exist_ok=True)
             python_bin = YOLO_BIN.parent / "python"
@@ -1050,6 +1111,7 @@ class TrainingScheduler:
             return [
                 str(python_bin), str(Path(__file__).with_name("training_trace.py")),
                 "--trace-dir", str(trace_dir), "--maximum", "24", "--interval", "10",
+                *([] if task.task_type == "detect" else ["--disable-trace"]),
                 "--command-json", json.dumps(command, ensure_ascii=False),
                 *command,
             ]
@@ -1361,31 +1423,23 @@ class TrainingScheduler:
                     sync_artifacts(db, task, run)
                     self._last_artifact_scan[run_id] = now
                 continue
-            run.exit_code = None if managed.adopted else code
             run.pid = None
             run.finished_at = utcnow()
             if run.status == "stopping" or (run.status == "stopped" and run.stop_requested):
                 run.status = "stopped"
+                run.exit_code = None if managed.adopted else code
+                run.completion_info = {}
                 message, level = "训练已停止", "info"
-            elif managed.adopted and run.completed_epochs < int((run.parameter_snapshot or {}).get("epochs") or task.epochs):
-                run.status = "interrupted"
-                run.error_message = "平台接管的训练进程已退出，无法取得原进程退出码"
-                message, level = run.error_message, "warning"
-            elif code == 0:
-                run.status = "completed"
-                run.progress = 100.0
-                message, level = "训练已完成", "info"
             else:
-                run.status = "failed"
-                detail = failure_detail(run.log_path)
-                run.error_message = f"训练进程异常退出，退出码 {code}"
-                if detail:
-                    run.error_message += f"：{detail[-500:]}"
-                message, level = run.error_message, "error"
-            mirror_run_to_task(task, run)
+                message, level = self._finalize_run(
+                    task, run, actual_exit_code=None if managed.adopted else code,
+                )
+            if task.current_run_id == run.id:
+                mirror_run_to_task(task, run)
             sync_artifacts(db, task, run)
             self._last_artifact_scan.pop(run_id, None)
-            add_event(db, task.id, run.status, message, level, run_id=run.id)
+            add_event(db, task.id, run.status, message, level,
+                      payload={"exit_code": run.exit_code, "completion_info": run.completion_info}, run_id=run.id)
             release_gpu_reservations(db, run.id)
             with self._process_lock:
                 if self.processes.get(task_id) is managed:
