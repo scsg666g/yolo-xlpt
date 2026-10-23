@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 import shutil
@@ -18,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from .config import (
     DATA_ROOT,
@@ -53,6 +54,7 @@ from .run_deletions import (
     delete_attempt_records,
     is_attempt_payload,
     remote_attempt_layout,
+    remote_attempt_path_candidates,
     remote_output_root_for_run,
     validate_attempt_deletion,
 )
@@ -63,6 +65,9 @@ CACHE_ROOT = DATA_ROOT / "remote-artifacts"
 ACTIVE = {"queued", "starting", "running", "stopping"}
 LEGACY_FLAT_DELETE_AGENT_VERSION = "2.0.1"
 LEGACY_FLAT_DELETE_AGENT_VERSION_PARTS = (2, 0, 1)
+TASK_DELETE_AGENT_VERSION = "2.0.4"
+TASK_DELETE_AGENT_VERSION_PARTS = (2, 0, 4)
+DELETE_RECEIPT_VERSION = 1
 MODEL_ASSET_OPERATION_PREFIX = "model-asset:"
 MAX_REMOTE_MODEL_BYTES = 8 * 1024**3
 MAX_FILE_CHUNK_BYTES = 512 * 1024
@@ -70,6 +75,43 @@ ACTIVE_MODEL_FETCH_STATUSES = {"pending", "running", "finalizing"}
 _MODEL_CACHE_CAPACITY_LOCK = threading.Lock()
 OPERATION_LEASE_TIMEOUT = timedelta(minutes=5)
 MODEL_FINALIZE_HEARTBEAT_SECONDS = 30
+CENTER_CLEANUP_LEASE_TIMEOUT = timedelta(minutes=5)
+CENTER_CLEANUP_HEARTBEAT_SECONDS = 30
+
+
+def _delete_plan_run(run: dict) -> dict:
+    """Return the stable subset covered by a remote deletion receipt."""
+    return {
+        key: run.get(key)
+        for key in (
+            "task_id", "task_type", "run_id", "attempt_number", "run_dir",
+            "log_path", "output_root", "layout",
+        )
+    }
+
+
+def deletion_plan_digest(runs: list[dict]) -> str:
+    document = {
+        "version": DELETE_RECEIPT_VERSION,
+        "scope": "task",
+        "runs": [_delete_plan_run(run) for run in runs],
+    }
+    encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def deletion_plan_targets(runs: list[dict]) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+    for run in runs:
+        run_id = run.get("run_id")
+        if not isinstance(run_id, str) or not run_id or len(run_id) > 160 or run_id in seen:
+            raise ValueError("远程删除计划包含无效或重复的 Attempt 标识")
+        seen.add(run_id)
+        targets.append(f"{run_id}:output")
+        if run.get("log_path"):
+            targets.append(f"{run_id}:log")
+    return targets
 
 
 class RemoteModelCacheError(RuntimeError):
@@ -518,13 +560,15 @@ def prepare_remote_model_asset(
 def run_payload(run: TrainingRun, task: TrainingTask) -> dict:
     output_root = remote_output_root_for_run(task, run)
     layout = None
+    run_dir = run.run_dir
     if output_root:
         try:
-            layout = remote_attempt_layout(task, run)[0]
+            layout, _, validated_run_dir = remote_attempt_layout(task, run)
+            run_dir = str(validated_run_dir)
         except ValueError:
             pass
     return {"task_id": task.id, "task_type": task.task_type, "run_id": run.id,
-            "attempt_number": run.attempt_number, "run_dir": run.run_dir, "log_path": run.log_path,
+            "attempt_number": run.attempt_number, "run_dir": run_dir, "log_path": run.log_path,
             "output_root": output_root, **({"layout": layout} if layout else {})}
 
 
@@ -565,21 +609,194 @@ def queue_scan(db: Session, task: TrainingTask, run: TrainingRun) -> None:
     enqueue(db, run.execution_node_id, task.id, "scan", run_payload(run, task))
 
 
-def queue_delete(db: Session, task: TrainingTask) -> None:
-    existing = db.scalar(select(RemoteOperation).where(
-        RemoteOperation.task_id == task.id, RemoteOperation.kind == "delete",
-        RemoteOperation.status.in_(["pending", "running"])))
-    if existing:
-        return
-    # Freeze the exact set of Attempts; a pending deletion cannot be restored or launched.
-    runs = [run_payload(run, task) for run in task.runs if run.execution_node_id]
-    enqueue(db, task.execution_node_id, task.id, "delete", {
-        "runs": runs,
-        "protected_paths": live_protected_paths(db, task.execution_node_id, task.id),
-    })
+def _remote_path_overlaps(first: str, second: str) -> bool:
+    left, right = PurePosixPath(first), PurePosixPath(second)
+    return left == right or left in right.parents or right in left.parents
+
+
+def _protected_remote_model_assets(
+    db: Session,
+    node_id: str,
+    deleting_task_id: str,
+) -> list[tuple[ModelAsset, bool]]:
+    """Return live sources and removed sources retained by external test history."""
+    protected: list[tuple[ModelAsset, bool]] = []
+    assets = db.scalars(select(ModelAsset).where(
+        ModelAsset.execution_node_id == node_id,
+        ModelAsset.source_type == "remote_path",
+    )).all()
+    for asset in assets:
+        retained_by_history = asset.deleted_at is not None and db.scalar(select(ModelTest.id).where(
+            ModelTest.model_asset_id == asset.id,
+            (ModelTest.task_id.is_(None)) | (ModelTest.task_id != deleting_task_id),
+        ).limit(1)) is not None
+        if asset.deleted_at is None or retained_by_history:
+            protected.append((asset, retained_by_history))
+    return protected
+
+
+def build_remote_task_delete_plan(
+    db: Session,
+    task: TrainingTask,
+    *,
+    acquire_lock: bool = True,
+) -> dict:
+    """Validate and freeze the complete remote portion of a whole-task deletion."""
+    task_id, node_id = task.id, task.execution_node_id
+    if not node_id:
+        raise ValueError("本机任务不能进入远程删除队列")
+    if acquire_lock:
+        acquire_node_claim_lock(db, node_id)
+        task = db.get(TrainingTask, task_id)
+        if task is None or task.execution_node_id != node_id:
+            raise ValueError("远程任务归属已变更，请刷新后重试")
+    node = db.get(ComputeNode, node_id)
+    if not node:
+        raise ValueError("远程服务器不存在，无法验证删除计划")
+    if task.status in ACTIVE:
+        raise ValueError("运行中或排队中的任务不能永久删除")
+
+    plans: list[dict] = []
+    output_evidence = bool(task.run_dir or task.log_path or task.current_run_id)
+    artifacts = list(db.scalars(select(Artifact).where(Artifact.task_id == task.id)))
+    output_evidence = output_evidence or any(artifact.path for artifact in artifacts)
+    for run in sorted(task.runs, key=lambda item: (item.attempt_number, item.id)):
+        if run.status in ACTIVE:
+            raise ValueError(f"Attempt {run.attempt_number:03d} 仍在运行或排队，不能永久删除")
+        if run.execution_node_id not in {None, node_id}:
+            raise ValueError(
+                f"Attempt {run.attempt_number:03d} 属于其他远程服务器，已拒绝清理"
+            )
+        output_evidence = output_evidence or bool(
+            run.run_dir or run.log_path or run.checkpoint_path
+            or any(artifact.run_id == run.id and artifact.path for artifact in artifacts)
+        )
+        try:
+            layout, output_root, validated_run_dir = remote_attempt_layout(task, run)
+        except ValueError as exc:
+            raise ValueError(f"Attempt {run.attempt_number:03d} 无法形成安全删除计划：{exc}") from exc
+        payload = run_payload(run, task)
+        payload.update({
+            "output_root": str(output_root),
+            "run_dir": str(validated_run_dir),
+            "layout": layout,
+        })
+        plans.append(payload)
+
+    if not plans and output_evidence:
+        raise ValueError("任务存在训练目录、日志或产物记录，但没有可验证的远程 Attempt，已拒绝清理")
+    if plans and not agent_version_at_least(node.agent_version, TASK_DELETE_AGENT_VERSION_PARTS):
+        raise ValueError(f"整任务永久删除需要远程 Agent {TASK_DELETE_AGENT_VERSION} 或以上版本")
+    if task.current_run_id and all(run.id != task.current_run_id for run in task.runs):
+        raise ValueError("当前 Attempt 记录不存在，已拒绝清理")
+
+    protected = live_protected_paths(db, node_id, task.id)
+    target_paths: list[str] = []
+    for run, plan in zip(sorted(task.runs, key=lambda item: (item.attempt_number, item.id)), plans):
+        target_paths.extend(str(path) for path in remote_attempt_path_candidates(
+            task,
+            run,
+            [artifact.path for artifact in artifacts if artifact.run_id == run.id],
+        ))
+        if plan.get("layout") == LEGACY_FLAT_LAYOUT:
+            target_paths.append(plan["run_dir"])
+    for target in target_paths:
+        for asset, retained_by_history in _protected_remote_model_assets(db, node_id, task.id):
+            if asset.path and _remote_path_overlaps(target, asset.path):
+                if retained_by_history:
+                    raise ValueError(
+                        f"已移除的模型登记「{asset.name}」仍有模型测试历史引用；"
+                        "请先删除相关历史记录后再永久删除任务"
+                    )
+                raise ValueError(f"训练产物仍被模型来源「{asset.name}」登记，请先移除该模型来源")
+        if any(_remote_path_overlaps(target, path) for path in protected):
+            raise ValueError("待清理远程目录仍被模型、数据集或其他任务引用，已拒绝永久删除")
+
+    targets = deletion_plan_targets(plans)
+    test_ids = sorted(db.scalars(select(ModelTest.id).where(ModelTest.task_id == task.id)).all())
+    return {
+        "scope": "task",
+        "phase": "stopping_tests",
+        "task_name": task.name,
+        "node_name": node.name,
+        "test_ids": test_ids,
+        "runs": plans,
+        "protected_paths": protected,
+        "receipt_required": True,
+        "receipt_version": DELETE_RECEIPT_VERSION,
+        "plan_digest": deletion_plan_digest(plans),
+        "plan_targets": targets,
+    }
+
+
+def queue_delete(db: Session, task: TrainingTask) -> RemoteOperation:
+    task_id, node_id = task.id, task.execution_node_id
+    if not node_id:
+        raise ValueError("本机任务不能进入远程删除队列")
+    acquire_node_claim_lock(db, node_id)
+    task = db.get(TrainingTask, task_id)
+    if task is None or task.execution_node_id != node_id:
+        raise ValueError("远程任务归属已变更，请刷新后重试")
+    operations = list(db.scalars(select(RemoteOperation).where(
+        RemoteOperation.task_id == task.id,
+        RemoteOperation.kind == "delete",
+    ).order_by(RemoteOperation.created_at.desc())))
+    existing = next((operation for operation in operations if (operation.payload or {}).get("scope") != "attempt"), None)
+    if existing and existing.status in {"pending", "running", "finalizing", "center_cleaning"}:
+        existing_payload = existing.payload or {}
+        modern = (
+            existing_payload.get("scope") == "task"
+            and existing_payload.get("receipt_required") is True
+            and existing_payload.get("receipt_version") == DELETE_RECEIPT_VERSION
+        )
+        if modern:
+            return existing
+        existing.status = "cancelled"
+        existing.error = "旧版删除指令缺少验证回执要求，已由新协议替换"
+        existing.updated_at = utcnow()
+    if existing and (existing.payload or {}).get("remote_verified"):
+        payload = dict(existing.payload or {})
+        payload["phase"] = "center_cleanup"
+        existing.payload = payload
+        existing.status = "finalizing"
+        existing.error = None
+        existing.updated_at = utcnow()
+        task.deleted_at = task.deleted_at or utcnow()
+        task.deleted_reason = "remote_delete_pending"
+        add_event(db, task.id, "remote_delete_center_retry", "远程文件已确认清理，正在重试平台关联数据清理")
+        return existing
+    active = active_remote_delete(db, node_id)
+    if active and active.task_id != task.id:
+        raise ValueError("该远程服务器正在清理其他任务文件，请稍后重试")
+
+    payload = build_remote_task_delete_plan(db, task, acquire_lock=False)
+    status = "pending"
+    if not payload["runs"]:
+        receipt = {
+            "version": DELETE_RECEIPT_VERSION,
+            "plan_digest": payload["plan_digest"],
+            "targets": [],
+            "removed": [],
+            "already_absent": [],
+            "verified_absent": True,
+        }
+        payload.update({
+            "phase": "center_cleanup",
+            "remote_verified": True,
+            "receipt": receipt,
+        })
+        status = "finalizing"
+    operation = enqueue(db, node_id, task.id, "delete", payload)
+    operation.status = status
     task.deleted_at = task.deleted_at or utcnow()
     task.deleted_reason = "remote_delete_pending"
-    add_event(db, task.id, "remote_delete_queued", "等待远程 Agent 清理该任务文件；确认后删除记录")
+    message = (
+        "任务尚未产生远程训练文件，正在清理平台关联数据"
+        if status == "finalizing"
+        else "等待远程 Agent 清理该任务文件；确认后删除记录"
+    )
+    add_event(db, task.id, "remote_delete_queued", message)
+    return operation
 
 
 def queue_attempt_delete(db: Session, task: TrainingTask, run: TrainingRun) -> RemoteOperation:
@@ -627,11 +844,11 @@ def live_protected_paths(
     protected: set[str] = set()
     tasks = db.scalars(select(TrainingTask).where(TrainingTask.execution_node_id == node_id))
     for task in tasks:
-        if task.id == deleting_task_id and deleting_run_id is None:
-            continue
         # Task resources are shared by all its Attempts and must never be
         # removed by an Attempt-scoped operation.
         protected.update(path for path in (task.model_path, task.data_path) if path)
+        if task.id == deleting_task_id and deleting_run_id is None:
+            continue
         for run in task.runs:
             if task.id == deleting_task_id and deleting_run_id and run.id == deleting_run_id:
                 continue
@@ -639,6 +856,18 @@ def live_protected_paths(
             protected.update(
                 artifact.path for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id))
             )
+    protected.update(
+        asset.path for asset, _retained in _protected_remote_model_assets(
+            db, node_id, deleting_task_id,
+        ) if asset.path
+    )
+    protected.update(
+        test.model_source_path for test in db.scalars(select(ModelTest).where(
+            ModelTest.execution_node_id == node_id,
+            ModelTest.status.in_(["uploading", "queued", "running", "cancel_requested"]),
+            (ModelTest.task_id.is_(None)) | (ModelTest.task_id != deleting_task_id),
+        )) if test.model_source_path
+    )
     return sorted(protected)
 
 
@@ -652,7 +881,7 @@ def active_remote_delete(db: Session, node_id: str) -> RemoteOperation | None:
     return db.scalar(select(RemoteOperation).where(
         RemoteOperation.node_id == node_id,
         RemoteOperation.kind == "delete",
-        RemoteOperation.status.in_(["pending", "running"]),
+        RemoteOperation.status.in_(["pending", "running", "finalizing", "center_cleaning"]),
     ).order_by(RemoteOperation.created_at).limit(1))
 
 
@@ -730,6 +959,22 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
     if not operation:
         return {"operation": None}
     operation_payload = operation.payload
+    task_delete = (
+        operation.kind == "delete"
+        and (operation.payload or {}).get("scope") == "task"
+    )
+    if task_delete and (operation.payload or {}).get("remote_verified"):
+        return {"operation": None, "message": "远程文件已确认清理，正在清理平台关联数据"}
+    if task_delete and not agent_version_at_least(node.agent_version, TASK_DELETE_AGENT_VERSION_PARTS):
+        task = db.get(TrainingTask, operation.task_id)
+        message = f"整任务永久删除需要远程 Agent {TASK_DELETE_AGENT_VERSION} 或以上版本"
+        _mark_task_delete_failed(db, operation, task, message)
+        db.commit()
+        return {
+            "operation": None,
+            "required_agent_version": TASK_DELETE_AGENT_VERSION,
+            "message": message,
+        }
     if operation.kind == "fetch_model":
         asset_id = operation_model_asset_id(operation)
         asset = db.get(ModelAsset, asset_id) if asset_id else None
@@ -766,6 +1011,7 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
     if operation.kind == "delete":
         task = db.get(TrainingTask, operation.task_id)
         attempt_scope = (operation.payload or {}).get("scope") == "attempt"
+        task_scope = (operation.payload or {}).get("scope") == "task"
         target_run = db.get(TrainingRun, (operation.payload or {}).get("run_id")) if attempt_scope else None
         invalid_attempt = (
             attempt_scope and (
@@ -778,20 +1024,24 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
         invalid_task = (
             not attempt_scope and (
                 not task or task.execution_node_id != node_id or task.status in ACTIVE
-                or task.deleted_reason != "remote_delete_pending"
+                or task.deleted_reason != "remote_delete_pending" or not task_scope
             )
         )
         if invalid_attempt or invalid_task:
+            message = "任务状态或删除协议已变更，删除指令已取消"
             cancelled = db.execute(update(RemoteOperation).where(
                 RemoteOperation.id == operation.id,
                 RemoteOperation.status == operation.status,
                 RemoteOperation.updated_at == operation.updated_at,
-            ).values(status="cancelled", error="任务状态已变更，删除指令已取消", updated_at=utcnow()))
+            ).values(status="cancelled", error=message, updated_at=utcnow()))
             if cancelled.rowcount != 1:
                 db.rollback()
                 return {"operation": None}
+            if invalid_task and task is not None:
+                task.deleted_reason = "remote_delete_failed"
+                add_event(db, task.id, "remote_delete_failed", message, "error")
             db.commit()
-            return {"operation": None}
+            return {"operation": None, "message": message}
         # A node can be offline for a long time after deletion was queued. Refresh
         # references immediately before dispatch so newly-created tasks are safe.
         operation_payload = {
@@ -813,6 +1063,30 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
         return {"operation": None}
     db.commit()
     db.refresh(operation)
+    if task_delete:
+        try:
+            from .inference import cancel_task_tests
+            cancel_task_tests(operation.task_id, purge=True, bind=db.get_bind())
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc) or type(exc).__name__
+            message = f"停止模型检测失败：{detail}"[-2000:]
+            db.expire_all()
+            current = db.get(RemoteOperation, operation.id)
+            task = db.get(TrainingTask, operation.task_id)
+            if current is not None and current.status == "running" and current.lease == lease:
+                _mark_task_delete_failed(db, current, task, message)
+                db.commit()
+            return {"operation": None, "message": message}
+        db.expire_all()
+        operation = db.get(RemoteOperation, operation.id)
+        if operation is None or operation.status != "running" or operation.lease != lease:
+            return {"operation": None}
+        dispatched_payload = dict(operation.payload or {})
+        dispatched_payload["phase"] = "remote_cleanup"
+        operation.payload = dispatched_payload
+        operation.updated_at = utcnow()
+        db.commit()
+        db.refresh(operation)
     return {"operation": {"id": operation.id, "kind": operation.kind, "lease": lease, "payload": operation.payload}}
 
 
@@ -826,10 +1100,329 @@ def authorized_operation(db: Session, node_id: str, operation_id: str, request: 
     return operation
 
 
+class DeleteReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int
+    plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    targets: list[str] = Field(max_length=4096)
+    removed: list[str] = Field(max_length=4096)
+    already_absent: list[str] = Field(max_length=4096)
+    verified_absent: bool
+
+
 class OperationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     lease: str = Field(pattern=r"^[0-9a-f]{32}$")
     success: bool
     error: str | None = Field(default=None, max_length=2000)
+    receipt: DeleteReceipt | None = None
+
+
+def _verified_delete_receipt(operation: RemoteOperation, receipt: DeleteReceipt | None) -> dict:
+    expected = operation.payload or {}
+    if receipt is None:
+        raise ValueError("远程 Agent 未返回删除验证回执")
+    value = receipt.model_dump()
+    if value["version"] != DELETE_RECEIPT_VERSION or value["version"] != expected.get("receipt_version"):
+        raise ValueError("远程删除验证回执版本不匹配")
+    if not value["verified_absent"]:
+        raise ValueError("远程 Agent 未确认全部目标已经清理")
+    expected_digest = expected.get("plan_digest")
+    if value["plan_digest"] != expected_digest:
+        raise ValueError("远程删除验证回执与冻结计划不匹配")
+    targets = value["targets"]
+    removed = value["removed"]
+    absent = value["already_absent"]
+    if (
+        len(targets) != len(set(targets))
+        or len(removed) != len(set(removed))
+        or len(absent) != len(set(absent))
+        or set(removed) & set(absent)
+        or set(targets) != set(expected.get("plan_targets") or [])
+        or set(removed) | set(absent) != set(targets)
+    ):
+        raise ValueError("远程删除验证回执没有完整覆盖冻结计划")
+    return value
+
+
+def _mark_task_delete_failed(
+    db: Session,
+    operation: RemoteOperation,
+    task: TrainingTask | None,
+    message: str,
+) -> None:
+    operation.status = "failed"
+    operation.error = message[-2000:]
+    operation.updated_at = utcnow()
+    if task is not None:
+        task.deleted_reason = "remote_delete_failed"
+        add_event(db, task.id, "remote_delete_failed", operation.error, "error")
+
+
+def _remove_center_path(path: Path) -> bool:
+    """Remove one center-owned path and prove it is absent afterward."""
+    present = path.is_symlink() or path.exists()
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.exists():
+        shutil.rmtree(path)
+    if path.is_symlink() or path.exists():
+        raise RuntimeError(f"中心清理后路径仍然存在：{path}")
+    return present
+
+
+def _remove_center_cache_file(path: Path) -> bool:
+    """Delete only a regular cache file (or its link), never an unexpected directory."""
+    if not path.is_symlink() and not path.exists():
+        return False
+    if not path.is_symlink() and not path.is_file():
+        raise RuntimeError(f"远程产物缓存路径不是普通文件：{path}")
+    path.unlink(missing_ok=True)
+    if path.is_symlink() or path.exists():
+        raise RuntimeError(f"远程产物缓存清理后仍然存在：{path}")
+    return True
+
+
+def _owns_center_cleanup(operation: RemoteOperation | None, claim_token: str) -> bool:
+    token = (operation.payload or {}).get("center_claim_token") if operation is not None else None
+    return (
+        operation is not None
+        and operation.status == "center_cleaning"
+        and isinstance(token, str)
+        and secrets.compare_digest(token, claim_token)
+    )
+
+
+def _heartbeat_center_cleanup(session_factory, operation_id: str, claim_token: str) -> bool:
+    """Renew a center-cleanup claim only while this exact worker still owns it."""
+    with session_factory() as db:
+        operation = db.get(RemoteOperation, operation_id)
+        if not _owns_center_cleanup(operation, claim_token):
+            return False
+        previous_update = operation.updated_at
+        changed = db.execute(update(RemoteOperation).where(
+            RemoteOperation.id == operation_id,
+            RemoteOperation.status == "center_cleaning",
+            RemoteOperation.updated_at == previous_update,
+        ).values(updated_at=utcnow()))
+        if changed.rowcount != 1:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+
+
+def _center_cleanup_heartbeat_loop(
+    session_factory,
+    operation_id: str,
+    claim_token: str,
+    stop: threading.Event,
+    claim_lost: threading.Event,
+) -> None:
+    while not stop.wait(CENTER_CLEANUP_HEARTBEAT_SECONDS):
+        try:
+            if not _heartbeat_center_cleanup(session_factory, operation_id, claim_token):
+                claim_lost.set()
+                return
+        except Exception:
+            # A transient database error must not terminate filesystem cleanup.
+            # The final compare-and-swap still prevents a stale worker from
+            # committing success or failure after another worker reclaims it.
+            continue
+
+
+def process_remote_delete_center(session_factory) -> bool:
+    """Claim and idempotently finish one Agent-verified task deletion."""
+    operation_id: str | None = None
+    task_id: str | None = None
+    payload: dict = {}
+    claim_token: str | None = None
+    heartbeat_stop: threading.Event | None = None
+    heartbeat_lost: threading.Event | None = None
+    heartbeat_thread: threading.Thread | None = None
+    try:
+        with session_factory() as db:
+            candidates = list(db.scalars(select(RemoteOperation).where(
+                RemoteOperation.kind == "delete",
+                RemoteOperation.status.in_(["finalizing", "center_cleaning"]),
+            ).order_by(RemoteOperation.updated_at, RemoteOperation.created_at)))
+            operation = next((candidate for candidate in candidates if (
+                (candidate.payload or {}).get("scope") == "task"
+                and (candidate.payload or {}).get("remote_verified") is True
+                and (
+                    candidate.status == "finalizing"
+                    or as_utc(candidate.updated_at) < utcnow() - CENTER_CLEANUP_LEASE_TIMEOUT
+                )
+            )), None)
+            if operation is None:
+                return False
+            claim_token = secrets.token_hex(16)
+            claimed_at = utcnow()
+            claimed_payload = dict(operation.payload or {})
+            claimed_payload.update({
+                "phase": "center_cleanup",
+                "center_claim_token": claim_token,
+                "center_claimed_at": claimed_at.isoformat(),
+            })
+            claimed = db.execute(update(RemoteOperation).where(
+                RemoteOperation.id == operation.id,
+                RemoteOperation.status == operation.status,
+                RemoteOperation.updated_at == operation.updated_at,
+            ).values(
+                status="center_cleaning",
+                payload=claimed_payload,
+                error=None,
+                updated_at=claimed_at,
+            ))
+            if claimed.rowcount != 1:
+                db.rollback()
+                return False
+            operation_id, task_id, payload = operation.id, operation.task_id, claimed_payload
+            db.commit()
+
+            task = db.get(TrainingTask, task_id)
+            current_test_ids = (
+                list(db.scalars(select(ModelTest.id).where(ModelTest.task_id == task_id)))
+                if task is not None else []
+            )
+            test_ids = sorted(set(payload.get("test_ids") or []) | set(current_test_ids))
+            run_ids = {
+                run.get("run_id") for run in payload.get("runs") or []
+                if isinstance(run, dict) and isinstance(run.get("run_id"), str)
+            }
+            if task is not None:
+                run_ids.update(run.id for run in task.runs)
+            related_operation_ids = list(db.scalars(select(RemoteOperation.id).where(
+                RemoteOperation.task_id == task_id,
+            )))
+
+        heartbeat_stop = threading.Event()
+        heartbeat_lost = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=_center_cleanup_heartbeat_loop,
+            args=(session_factory, operation_id, claim_token, heartbeat_stop, heartbeat_lost),
+            name=f"remote-center-cleanup-{operation_id[:8]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
+
+        from .task_deletions import cleanup_task_test_files
+        cleanup_task_test_files(task_id, test_ids, delete_history=delete_task_history)
+        if heartbeat_lost.is_set():
+            raise RuntimeError("中心清理租约已失效，已停止提交清理结果")
+        removed_trace_count = 0
+        for run_id in run_ids:
+            removed_trace_count += int(_remove_center_path(remote_trace_root(run_id)))
+        removed_cache_count = 0
+        cache_target_count = 0
+        for related_id in related_operation_ids:
+            for complete in (True, False):
+                cache_path = CACHE_ROOT / (related_id + (".bin" if complete else ".part"))
+                cache_target_count += 1
+                removed_cache_count += int(_remove_center_cache_file(cache_path))
+
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=5)
+        heartbeat_thread = None
+        if heartbeat_lost.is_set() or not _heartbeat_center_cleanup(
+            session_factory, operation_id, claim_token,
+        ):
+            raise RuntimeError("中心清理租约已失效，已停止提交清理结果")
+
+        with session_factory() as db:
+            operation = db.get(RemoteOperation, operation_id)
+            task = db.get(TrainingTask, task_id)
+            if operation is None:
+                return True
+            if not _owns_center_cleanup(operation, claim_token):
+                return True
+            if not (operation.payload or {}).get("remote_verified"):
+                raise RuntimeError("远程验证状态已丢失，已拒绝删除任务记录")
+            previous_update = operation.updated_at
+            completed_payload = dict(operation.payload or {})
+            completed_payload.pop("center_claim_token", None)
+            completed_payload.update({
+                "phase": "complete",
+                "center_cleanup": {
+                    "started_at": completed_payload.pop("center_claimed_at", None),
+                    "completed_at": utcnow().isoformat(),
+                    "test_count": len(test_ids),
+                    "run_count": len(run_ids),
+                    "trace_target_count": len(run_ids),
+                    "removed_trace_count": removed_trace_count,
+                    "cache_target_count": cache_target_count,
+                    "removed_cache_count": removed_cache_count,
+                },
+            })
+            completed = db.execute(update(RemoteOperation).where(
+                RemoteOperation.id == operation_id,
+                RemoteOperation.status == "center_cleaning",
+                RemoteOperation.updated_at == previous_update,
+            ).values(
+                payload=completed_payload,
+                status="succeeded",
+                error=None,
+                updated_at=utcnow(),
+            ))
+            if completed.rowcount != 1:
+                db.rollback()
+                return True
+            for other in db.scalars(select(RemoteOperation).where(
+                RemoteOperation.task_id == task_id,
+                RemoteOperation.id != operation_id,
+                RemoteOperation.status.in_(["pending", "running", "finalizing", "center_cleaning"]),
+            )):
+                other.status = "cancelled"
+                other.error = "任务永久删除已完成"
+                other.updated_at = utcnow()
+            if task is not None:
+                db.delete(task)
+            db.commit()
+        return True
+    except Exception as exc:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=5)
+            heartbeat_thread = None
+        if operation_id is None:
+            raise
+        detail = f"中心关联数据清理失败：{type(exc).__name__}: {exc}"[-2000:]
+        try:
+            with session_factory() as db:
+                operation = db.get(RemoteOperation, operation_id)
+                task = db.get(TrainingTask, task_id) if task_id else None
+                if claim_token is not None and _owns_center_cleanup(operation, claim_token):
+                    previous_update = operation.updated_at
+                    failed_payload = dict(operation.payload or payload)
+                    failed_payload.pop("center_claim_token", None)
+                    failed_payload.pop("center_claimed_at", None)
+                    failed_payload.update({"phase": "center_cleanup_failed", "remote_verified": True})
+                    failed = db.execute(update(RemoteOperation).where(
+                        RemoteOperation.id == operation_id,
+                        RemoteOperation.status == "center_cleaning",
+                        RemoteOperation.updated_at == previous_update,
+                    ).values(
+                        payload=failed_payload,
+                        status="failed",
+                        error=detail,
+                        updated_at=utcnow(),
+                    ))
+                    if failed.rowcount != 1:
+                        db.rollback()
+                        return True
+                    if task is not None:
+                        task.deleted_reason = "remote_delete_failed"
+                        add_event(db, task.id, "remote_delete_failed", detail, "error")
+                    db.commit()
+        except Exception:
+            pass
+        return True
+    finally:
+        if heartbeat_stop is not None:
+            heartbeat_stop.set()
+        if heartbeat_thread is not None:
+            heartbeat_thread.join(timeout=5)
 
 
 @router.post("/api/compute/nodes/{node_id}/agent/operations/{operation_id}/result")
@@ -837,8 +1430,52 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
     operation = authorized_operation(db, node_id, operation_id, request, payload.lease)
     if operation.status in {"succeeded", "failed", "cancelled"}:
         return {"status": operation.status}
+    task_scope = operation.kind == "delete" and (operation.payload or {}).get("scope") == "task"
+    if task_scope and (operation.payload or {}).get("remote_verified"):
+        return {"status": operation.status}
     if operation.kind in {"fetch", "fetch_model"} and payload.success:
         raise HTTPException(409, "文件传输必须通过分块接口完成")
+    task = db.get(TrainingTask, operation.task_id)
+    if task_scope:
+        if (
+            task is None or task.execution_node_id != node_id or task.status in ACTIVE
+            or task.deleted_reason != "remote_delete_pending"
+        ):
+            raise HTTPException(409, "任务当前不能永久删除")
+        if not payload.success:
+            _mark_task_delete_failed(
+                db,
+                operation,
+                task,
+                "远程文件清理失败：" + (payload.error or "未知错误"),
+            )
+            db.commit()
+            return {"status": operation.status}
+        try:
+            receipt = _verified_delete_receipt(operation, payload.receipt)
+        except ValueError as exc:
+            _mark_task_delete_failed(db, operation, task, f"远程删除回执验证失败：{exc}")
+            db.commit()
+            return {"status": operation.status}
+        verified_payload = dict(operation.payload or {})
+        verified_payload.update({
+            "phase": "center_cleanup",
+            "remote_verified": True,
+            "receipt": receipt,
+            "remote_verified_at": utcnow().isoformat(),
+        })
+        operation.payload = verified_payload
+        operation.status = "finalizing"
+        operation.error = None
+        operation.updated_at = utcnow()
+        db.commit()
+
+        factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+        process_remote_delete_center(factory)
+        db.expire_all()
+        current = db.get(RemoteOperation, operation_id)
+        return {"status": current.status if current is not None else "succeeded"}
+
     operation.status = "succeeded" if payload.success else "failed"
     operation.error = payload.error if not payload.success else None
     operation.updated_at = utcnow()
@@ -848,7 +1485,6 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
         _mark_model_fetch_failed(db, operation, payload.error or "远程模型传输失败")
         db.commit()
         return {"status": operation.status}
-    task = db.get(TrainingTask, operation.task_id)
     attempt_scope = operation.kind == "delete" and (operation.payload or {}).get("scope") == "attempt"
     target_run = db.get(TrainingRun, (operation.payload or {}).get("run_id")) if attempt_scope else None
     if attempt_scope:
@@ -895,39 +1531,9 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
                 add_event(db, task.id, "run_delete_failed", operation.error, "error")
             db.commit()
             return {"status": operation.status}
-        if task.status in ACTIVE or task.deleted_reason != "remote_delete_pending":
-            raise HTTPException(409, "任务当前不能永久删除")
-        if payload.success:
-            related_operations = list(db.scalars(select(RemoteOperation).where(
-                RemoteOperation.task_id == task.id,
-            )))
-            try:
-                # The Agent ACK covers remote files only. Center-owned history,
-                # traces and fetched checkpoints must be gone before the task row.
-                delete_task_history(task.id)
-                for historical in task.runs:
-                    trace_root = remote_trace_root(historical.id)
-                    if trace_root.exists() or trace_root.is_symlink():
-                        shutil.rmtree(trace_root)
-                for other in related_operations:
-                    for path in (operation_file(other), operation_file(other, False)):
-                        path.unlink(missing_ok=True)
-            except Exception as exc:
-                detail = f"{type(exc).__name__}: {exc}"[-1600:]
-                operation.status = "failed"
-                operation.error = f"中心关联数据清理失败：{detail}"
-                task.deleted_reason = "remote_delete_failed"
-                task.error_message = operation.error + "；远程文件已确认清理，可重试永久删除"
-                add_event(db, task.id, "remote_delete_failed", task.error_message, "error")
-            else:
-                for other in related_operations:
-                    if other.id != operation.id:
-                        other.status = "cancelled"
-                db.delete(task)
-        else:
-            task.deleted_reason = "remote_delete_failed"
-            task.error_message = "远程文件清理失败：" + (payload.error or "未知错误")
-            add_event(db, task.id, "remote_delete_failed", task.error_message, "error")
+        # Whole-task deletion uses the receipt-gated branch above. A legacy
+        # instruction must be retried so it can be rebuilt under the new plan.
+        _mark_task_delete_failed(db, operation, task, "旧版整任务删除指令缺少验证计划，请重试永久删除")
     db.commit()
     return {"status": operation.status}
 

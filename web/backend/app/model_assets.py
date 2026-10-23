@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 from .config import MODEL_TEST_ROOTS, PROJECT_ROOT
 from .compute_nodes import remote_model_test_unavailable_reason
 from .database import get_db
+from .dataset_uploads import managed_dataset_mutation
+from .deletion_jobs import reject_local_task_cleanup
 from .gpu_reservations import acquire_node_claim_lock
 from .models import ComputeNode, ModelAsset, ModelTest, RemoteOperation, utcnow
 
@@ -360,6 +362,14 @@ def list_model_assets(
 
 @router.post("/local", status_code=201)
 def register_local_model_asset(payload: LocalModelAssetCreate, db: Session = Depends(get_db)):
+    # Keep reference registration serialized with the full local deletion
+    # transaction, including the filesystem verification performed by workers.
+    with managed_dataset_mutation():
+        reject_local_task_cleanup(db)
+        return _register_local_model_asset(payload, db)
+
+
+def _register_local_model_asset(payload: LocalModelAssetCreate, db: Session):
     try:
         path = resolve_local_model_path(payload.path)
         sha256, size = digest_stable_regular_file(path)
@@ -422,6 +432,9 @@ def register_remote_model_asset(payload: RemoteModelAssetCreate, db: Session = D
     # polling. Otherwise a concurrent request could enqueue work immediately
     # after node management had concluded that no transfer was active.
     acquire_node_claim_lock(db, payload.execution_node_id)
+    from .remote_operations import active_remote_delete
+    if active_remote_delete(db, payload.execution_node_id):
+        raise HTTPException(409, "该远程服务器正在清理训练文件，请等待完成后再登记模型")
     node = db.get(ComputeNode, payload.execution_node_id)
     unavailable = remote_model_test_unavailable_reason(node)
     if unavailable:

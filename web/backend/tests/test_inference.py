@@ -19,6 +19,8 @@ import app.inference as inference
 import app.main as main_module
 import app.model_assets as model_assets
 import app.model_test_storage as storage
+import app.services as services_module
+from app.local_deletions import LocalDeletionWorker
 from app.database import get_db
 from app.main import app
 from app.models import (
@@ -52,8 +54,11 @@ def image_test_client(tmp_path, monkeypatch):
         factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
         test_worker = inference.InferenceWorker(session_factory=factory, interval=0.01)
         monkeypatch.setattr(inference, "worker", test_worker)
-        run_dir = tmp_path / "run"
-        run_dir.mkdir()
+        monkeypatch.setattr(services_module, "RUNS_ROOT", tmp_path / "runs")
+        monkeypatch.setattr(services_module, "RUNTIME_ROOT", tmp_path / "runtime")
+        monkeypatch.setattr(services_module, "LOG_ROOT", tmp_path / "logs")
+        run_dir = tmp_path / "runs" / "detect" / "task-test" / "attempt-001"
+        run_dir.mkdir(parents=True)
         model = run_dir / "best.pt"
         model.write_bytes(b"test-checkpoint")
         task = make_task(status="completed")
@@ -1223,7 +1228,7 @@ def test_task_delete_serializes_model_test_create_and_start(
         assert len(check_db.scalars(select(ModelTest)).all()) == 1
 
 
-def test_permanent_delete_upload_timeout_does_not_enqueue_file_cleanup(
+def test_permanent_delete_upload_timeout_keeps_durable_retryable_job(
     image_test_client, monkeypatch,
 ):
     client, _, artifact, factory, test_worker = image_test_client
@@ -1234,14 +1239,19 @@ def test_permanent_delete_upload_timeout_does_not_enqueue_file_cleanup(
     monkeypatch.setattr(test_worker, "wait_for_uploads", lambda *_args, **_kwargs: False)
 
     try:
-        with factory() as delete_db, pytest.raises(HTTPException) as error:
-            main_module.permanently_delete_task(task_id, delete_db)
-        assert error.value.status_code == 409
+        with factory() as delete_db:
+            response = main_module.permanently_delete_task(task_id, delete_db)
+        assert response.status_code == 202
+        deletion_worker = LocalDeletionWorker(session_factory=factory)
+        assert deletion_worker.process_once()
         with factory() as check_db:
             task = check_db.get(inference.TrainingTask, task_id)
             assert task.deleted_at is not None
-            assert task.deleted_reason == "soft_delete"
-            assert check_db.scalar(select(RemoteOperation.id)) is None
+            assert task.deleted_reason == "local_delete_failed"
+            operation = check_db.scalar(select(RemoteOperation))
+            assert operation.status == "failed"
+            assert "上传" in operation.error
+            assert Path(artifact.path).is_file()
     finally:
         with test_worker._state_changed:
             test_worker.uploading.discard((test_id, 0))
@@ -1295,6 +1305,8 @@ def test_permanent_delete_sweeps_stale_work_for_terminal_record(image_test_clien
         response = main_module.permanently_delete_task(artifact.task_id, delete_db)
 
     assert response.status_code == 202
+    assert work.exists()
+    assert LocalDeletionWorker(session_factory=factory).process_once()
     assert not work.exists()
     with factory() as check_db:
         operation = check_db.scalar(select(RemoteOperation).where(
@@ -1302,6 +1314,7 @@ def test_permanent_delete_sweeps_stale_work_for_terminal_record(image_test_clien
         ))
         assert operation is not None
         assert operation.kind == "local_delete"
+        assert operation.status == "succeeded"
 
 
 @pytest.mark.parametrize("confidence", [-0.1, 0, 1.01, "nan"])

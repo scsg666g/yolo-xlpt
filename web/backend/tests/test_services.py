@@ -20,7 +20,7 @@ from app.database import get_db
 from app.main import app
 import app.main as main_module
 from app.local_deletions import LocalDeletionWorker
-from app.models import Artifact, GpuReservation, MetricPoint, TaskEvent, TrainingRun, TrainingTask, utcnow
+from app.models import Artifact, GpuReservation, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.schemas import TaskConfigUpdate, TaskCreate, TaskRead
 from app.services import (
     TrainingScheduler,
@@ -1560,6 +1560,7 @@ def test_local_history_cleanup_failure_keeps_task_retryable(tmp_path: Path, monk
     monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "model-test-history")
     session = make_session(tmp_path)
     task = make_task("task-history-retry", status="completed")
+    task.error_message = "原训练错误"
     session.add(task)
     session.commit()
     history_file = model_test_storage.test_history_root(task.id, "e" * 32) / "detections.json"
@@ -1582,7 +1583,14 @@ def test_local_history_cleanup_failure_keeps_task_retryable(tmp_path: Path, monk
         retained = session.get(TrainingTask, task.id)
         assert retained is not None
         assert retained.deleted_reason == "local_delete_failed"
-        assert "PermissionError" in retained.error_message
+        assert retained.error_message == "原训练错误"
+        failed_operation = session.scalar(select(RemoteOperation).where(
+            RemoteOperation.task_id == task.id,
+            RemoteOperation.kind == "local_delete",
+            RemoteOperation.status == "failed",
+        ))
+        assert failed_operation is not None
+        assert "PermissionError" in failed_operation.error
         assert history_file.is_file()
 
         monkeypatch.setattr(

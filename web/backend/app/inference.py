@@ -1051,13 +1051,17 @@ class InferenceWorker:
                             if record and record.status not in ACTIVE_STATUSES:
                                 record.storage_bytes = _settle_test_storage(record_task_id, record_id)
                         cleanup_db.commit()
-                except Exception:
+                except Exception as exc:
                     logger.warning("model_test_cancel_storage_finalize_failed task_id=%s", task_id, exc_info=True)
+                    if purge:
+                        raise RuntimeError("模型测试存储结算失败，请重试清理") from exc
             for test_id in all_test_ids:
                 try:
                     delete_test_work(test_id)
-                except (OSError, ValueError):
+                except (OSError, ValueError) as exc:
                     logger.warning("model_test_cancel_work_cleanup_failed test_id=%s", test_id)
+                    if purge:
+                        raise RuntimeError(f"模型测试临时文件清理失败：{test_id}") from exc
         finally:
             with self._state_changed:
                 self._cancelled_ids.difference_update(

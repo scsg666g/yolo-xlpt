@@ -31,7 +31,7 @@ from .compute_nodes import (
     router as compute_nodes_router,
 )
 from .database import Base, SessionLocal, engine, get_db, migrate_database
-from .gpu_reservations import release_gpu_reservations
+from .gpu_reservations import acquire_node_claim_lock, release_gpu_reservations
 from .dataset_uploads import (
     cleanup_managed_dataset_workdirs,
     managed_dataset_mutation,
@@ -78,6 +78,7 @@ from .services import (
     validate_input_path,
 )
 from .run_deletions import active_attempt_delete_operation, attempt_deletion_state
+from .deletion_jobs import deletion_preview, list_deletion_jobs, reject_local_task_cleanup
 
 logger = logging.getLogger("yolo-platform.requests")
 _task_snapshot = ""
@@ -121,8 +122,8 @@ async def lifespan(_: FastAPI):
     backfill_training_runs()
     migrate_training_logs()
     scheduler.start()
-    local_deletion_worker.start()
     inference_worker.start()
+    local_deletion_worker.start()
     _task_snapshot = await asyncio.to_thread(load_task_snapshot)
     snapshot_task = asyncio.create_task(task_snapshot_pump(), name="task-snapshot-pump")
     try:
@@ -469,6 +470,9 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
     guard = nullcontext() if node else managed_dataset_mutation()
     with guard:
         if node:
+            acquire_node_claim_lock(db, node.id)
+            db.refresh(node)
+            reject_unavailable_remote_training(node, 422)
             model_path, data_path = payload.model_path.strip(), payload.data_path.strip()
             output_root = (payload.remote_output_root or "").strip()
             if not Path(model_path).is_absolute() or not Path(data_path).is_absolute() or not Path(output_root).is_absolute():
@@ -477,6 +481,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
                 raise HTTPException(422, "路径不能包含空字符")
             reject_active_remote_delete(db, node.id)
         else:
+            reject_local_task_cleanup(db)
             try:
                 model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
                 data_path = str(validate_dataset_config(payload.data_path))
@@ -776,7 +781,10 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     with guard:
         if not source.execution_node_id:
             db.refresh(source)
+            reject_local_task_cleanup(db)
         else:
+            acquire_node_claim_lock(db, source.execution_node_id)
+            db.refresh(source)
             reject_active_remote_delete(db, source.execution_node_id)
         # Reserve the source position and shift every visible task after it.
         # This keeps the clone immediately before its source for all clients,
@@ -865,23 +873,32 @@ def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
             raise HTTPException(409, "运行中或排队中的任务不能永久删除")
         if active_attempt_delete_operation(db, task.id):
             raise HTTPException(409, "该任务已有 Attempt 文件清理正在进行，请等待完成后再删除任务")
-        if not task.deleted_at:
-            # This is a recoverable checkpoint. If cancellation is interrupted,
-            # the task remains in the recycle bin and no file deletion is queued.
-            task.deleted_at = utcnow()
-            task.deleted_reason = "soft_delete"
-        stage_task_test_cancellation(task.id, db, purge=True)
-        db.commit()
-        # Always sweep terminal records too: an earlier crash may have left a
-        # pinned model copy even when no active database row remains.
-        cancel_task_tests(task.id, purge=True, bind=db.get_bind())
-        if task.execution_node_id:
-            queue_delete(db, task)
-            db.commit()
-            return JSONResponse(status_code=202, content={"status": "pending", "message": "等待远程 Agent 清理文件；确认后删除任务记录"})
-        queue_local_delete(db, task)
-        db.commit()
-        return JSONResponse(status_code=202, content={"status": "pending", "message": "已提交本机文件清理；可在回收站查看进度"})
+        guard = nullcontext() if task.execution_node_id else managed_dataset_mutation()
+        with guard:
+            try:
+                # Queue first: remote serialization may restart a read-only
+                # transaction. Intent and cancellation markers commit together.
+                operation = queue_delete(db, task) if task.execution_node_id else queue_local_delete(db, task)
+                stage_task_test_cancellation(task.id, db, purge=True)
+                db.commit()
+            except ValueError as exc:
+                db.rollback()
+                raise HTTPException(409, str(exc)) from exc
+        return JSONResponse(status_code=202, content={
+            "status": operation.status,
+            "operation_id": operation.id,
+            "message": "已提交文件清理；可在回收站查看进度和清理结果",
+        })
+
+
+@app.get("/api/task-deletions")
+def task_deletion_jobs(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)):
+    return list_deletion_jobs(db, limit=limit)
+
+
+@app.get("/api/tasks/{task_id}/deletion-preview")
+def task_deletion_preview(task_id: str, db: Session = Depends(get_db)):
+    return deletion_preview(db, get_task_or_404(db, task_id, include_deleted=True))
 
 
 @app.patch("/api/tasks/{task_id}/layout", response_model=TaskRead)
@@ -942,6 +959,10 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
     guard = nullcontext() if task.execution_node_id else managed_dataset_mutation()
     with guard:
         if not task.execution_node_id:
+            db.refresh(task)
+            reject_local_task_cleanup(db)
+        else:
+            acquire_node_claim_lock(db, task.execution_node_id)
             db.refresh(task)
         if task.status in {"queued", "starting", "running", "stopping"}:
             raise HTTPException(409, "任务正在运行或排队，不能更换模型或数据集")

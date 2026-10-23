@@ -30,7 +30,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.3"
+VERSION = "2.0.4"
+DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
@@ -1452,6 +1453,40 @@ def operation_paths(
     return run_dir, log
 
 
+def _delete_plan_run(run: dict) -> dict:
+    return {
+        key: run.get(key)
+        for key in (
+            "task_id", "task_type", "run_id", "attempt_number", "run_dir",
+            "log_path", "output_root", "layout",
+        )
+    }
+
+
+def deletion_plan_digest(runs: list[dict]) -> str:
+    document = {
+        "version": DELETE_RECEIPT_VERSION,
+        "scope": "task",
+        "runs": [_delete_plan_run(run) for run in runs],
+    }
+    encoded = json.dumps(document, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def deletion_plan_targets(runs: list[dict]) -> list[str]:
+    targets = []
+    seen = set()
+    for run in runs:
+        run_id = run.get("run_id")
+        if not isinstance(run_id, str) or not run_id or len(run_id) > 160 or run_id in seen:
+            raise ValueError("远程删除计划包含无效或重复的 Attempt 标识")
+        seen.add(run_id)
+        targets.append(f"{run_id}:output")
+        if run.get("log_path"):
+            targets.append(f"{run_id}:log")
+    return targets
+
+
 def report_manifest(config: dict, payload: dict) -> None:
     paths = operation_paths(config, payload)
     assert paths is not None
@@ -1474,10 +1509,21 @@ def report_manifest(config: dict, payload: dict) -> None:
     api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/runs/{payload['run_id']}/artifacts", "POST", {"items": items})
 
 
-def delete_remote_files(config: dict, payload: dict) -> None:
+def delete_remote_files(config: dict, payload: dict) -> dict | None:
     # Serialize deletion with every training process using this workspace. This
     # also prevents a second Agent from claiming new work during validation.
-    requested_roots = [Path(run["output_root"]).resolve() for run in payload["runs"]]
+    runs = payload["runs"]
+    receipt_required = payload.get("receipt_required") is True
+    expected_targets = deletion_plan_targets(runs) if receipt_required else []
+    expected_digest = deletion_plan_digest(runs) if receipt_required else None
+    if receipt_required and (
+        payload.get("scope") != "task"
+        or payload.get("receipt_version") != DELETE_RECEIPT_VERSION
+        or payload.get("plan_digest") != expected_digest
+        or payload.get("plan_targets") != expected_targets
+    ):
+        raise ValueError("远程删除计划摘要或回执要求无效")
+    requested_roots = [Path(run["output_root"]).resolve() for run in runs]
     training_lock = acquire_training_lock(config, requested_roots)
     if training_lock is None:
         raise ValueError("训练工作区正在使用，已拒绝远程删除；请等待训练结束后重试")
@@ -1487,7 +1533,7 @@ def delete_remote_files(config: dict, payload: dict) -> None:
         plans = [
             (*operation_paths(config, run, allow_missing_root=True, allow_legacy_flat=True),
              run.get("layout", "canonical"))
-            for run in payload["runs"]
+            for run in runs
         ]
         target_roots = _normalized_output_roots(requested_roots)
         if workspace_delete_conflicts(config, target_roots):
@@ -1498,7 +1544,7 @@ def delete_remote_files(config: dict, payload: dict) -> None:
         protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
         protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
         deletion_targets = []
-        for run_dir, log, layout in plans:
+        for run, (run_dir, log, layout) in zip(runs, plans):
             if (run_dir.exists() and not run_dir.is_dir()) or (log and log.exists() and not log.is_file()):
                 raise ValueError("Attempt 或日志的文件类型不正确，已拒绝清理")
             if layout == "legacy_flat":
@@ -1520,8 +1566,13 @@ def delete_remote_files(config: dict, payload: dict) -> None:
             for path in protected:
                 if log and path == log:
                     raise ValueError("任务目录包含仍被引用的模型、数据或训练程序，已拒绝清理")
-            deletion_targets.append((run_dir, log, layout, owned))
-        for run_dir, log, layout, owned in deletion_targets:
+            deletion_targets.append((run, run_dir, log, layout, owned))
+        removed_targets = []
+        absent_targets = []
+        for run, run_dir, log, layout, owned in deletion_targets:
+            output_key = f"{run['run_id']}:output"
+            output_existed = bool(owned) if layout == "legacy_flat" else (run_dir.exists() or run_dir.is_symlink())
+            log_existed = bool(log and (log.exists() or log.is_symlink()))
             for target in owned:
                 if target.is_symlink() or target.is_file():
                     target.unlink(missing_ok=True)
@@ -1531,6 +1582,21 @@ def delete_remote_files(config: dict, payload: dict) -> None:
                     shutil.rmtree(target)
             if log:
                 log.unlink(missing_ok=True)
+            if layout == "legacy_flat":
+                remaining_owned = [
+                    child for child in run_dir.iterdir()
+                    if not re.fullmatch(r"attempt-\d{3,}", child.name)
+                ] if run_dir.is_dir() else []
+                if remaining_owned:
+                    raise OSError("旧版 Attempt 文件未完全清理")
+            elif run_dir.exists() or run_dir.is_symlink():
+                raise OSError("Attempt 目录未完全清理")
+            if log and (log.exists() or log.is_symlink()):
+                raise OSError("Attempt 日志未完全清理")
+            (removed_targets if output_existed else absent_targets).append(output_key)
+            if log:
+                log_key = f"{run['run_id']}:log"
+                (removed_targets if log_existed else absent_targets).append(log_key)
             cleanup_parents = {run_dir.parent, log.parent if log else run_dir.parent}
             if layout == "legacy_flat":
                 # Remove the old task container only when it is now empty.  A
@@ -1541,6 +1607,19 @@ def delete_remote_files(config: dict, payload: dict) -> None:
                     parent.rmdir()  # remove empty task directory only
                 except OSError:
                     pass
+        if receipt_required:
+            covered = removed_targets + absent_targets
+            if len(covered) != len(set(covered)) or set(covered) != set(expected_targets):
+                raise OSError("远程删除结果未完整覆盖冻结计划")
+            return {
+                "version": DELETE_RECEIPT_VERSION,
+                "plan_digest": expected_digest,
+                "targets": expected_targets,
+                "removed": removed_targets,
+                "already_absent": absent_targets,
+                "verified_absent": True,
+            }
+        return None
     finally:
         release_training_lock(training_lock)
 
@@ -1706,7 +1785,9 @@ def execute_operation(config: dict, operation: dict, stop: threading.Event) -> N
     try:
         payload = operation["payload"]
         if operation["kind"] == "delete":
-            delete_remote_files(config, payload)
+            receipt = delete_remote_files(config, payload)
+            if receipt is not None:
+                result["receipt"] = receipt
         elif operation["kind"] == "scan":
             report_manifest(config, payload)
         elif operation["kind"] == "fetch":

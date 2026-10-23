@@ -10,9 +10,11 @@ from urllib.error import HTTPError
 import pytest
 from sqlalchemy import event, select
 
+import app.inference as inference
 import app.model_test_storage as model_test_storage
 import app.remote_operations as operations
-from app.models import Artifact, ComputeNode, MetricPoint, ModelTest, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
+import app.task_deletions as task_deletions
+from app.models import Artifact, ComputeNode, MetricPoint, ModelAsset, ModelTest, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.parameter_catalog import training_parameter_keys
 from app.run_deletions import validate_attempt_deletion
 from app.services import create_training_run
@@ -29,7 +31,7 @@ def remote_run(client, factory, tmp_path):
     data.write_text("train: images/train\n")
     with factory() as db:
         node = db.get(ComputeNode, credential["node"]["id"])
-        node.agent_version = "1.8.0"
+        node.agent_version = "2.0.4"
         node.last_seen_at = utcnow()
         node.snapshot = {"sampled_at": utcnow().isoformat(),
                          "training": {"enabled": True, "ready": True, "supported_parameters": []}}
@@ -77,6 +79,26 @@ def execute_through(client, credential, config, agent, operation_id):
         if work["id"] == operation_id:
             return work
     raise AssertionError(f"remote operation was not claimed: {operation_id}")
+
+
+def verified_delete_result(work, *, removed=None, already_absent=None):
+    payload = work["payload"]
+    targets = list(payload["plan_targets"])
+    if removed is None and already_absent is None:
+        removed = targets
+        already_absent = []
+    return {
+        "lease": work["lease"],
+        "success": True,
+        "receipt": {
+            "version": payload["receipt_version"],
+            "plan_digest": payload["plan_digest"],
+            "targets": targets,
+            "removed": removed or [],
+            "already_absent": already_absent or [],
+            "verified_absent": True,
+        },
+    }
 
 
 def test_old_agent_cannot_claim_remote_file_operations(monitoring_client, tmp_path):
@@ -160,6 +182,9 @@ def test_remote_delete_keeps_task_retryable_when_center_cleanup_fails(
     history_file = model_test_storage.test_history_root(task_id, "d" * 32) / "detections.json"
     history_file.parent.mkdir(parents=True)
     history_file.write_text("{}", encoding="utf-8")
+    with factory() as db:
+        db.get(TrainingTask, task_id).error_message = "early stopping after epoch 3"
+        db.commit()
 
     assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
     work = claim(client, credential)
@@ -169,28 +194,370 @@ def test_remote_delete_keeps_task_retryable_when_center_cleanup_fails(
         raise PermissionError("history is read-only")
 
     monkeypatch.setattr(operations, "delete_task_history", cleanup_failure)
-    result = client.post(endpoint, json={"lease": work["lease"], "success": True}, headers=headers(credential))
+    result = client.post(endpoint, json=verified_delete_result(work), headers=headers(credential))
     assert result.status_code == 200
     assert result.json()["status"] == "failed"
     with factory() as db:
         task = db.get(TrainingTask, task_id)
         assert task is not None
         assert task.deleted_reason == "remote_delete_failed"
-        assert "中心关联数据清理失败" in task.error_message
+        operation = db.get(RemoteOperation, work["id"])
+        assert operation is not None and operation.payload["remote_verified"] is True
+        assert "中心关联数据清理失败" in operation.error
+        assert task.error_message == "early stopping after epoch 3"
     assert history_file.is_file()
 
     monkeypatch.setattr(operations, "delete_task_history", model_test_storage.delete_task_history)
     assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
-    retry = claim(client, credential)
-    retry_endpoint = f"/api/compute/nodes/{credential['node']['id']}/agent/operations/{retry['id']}/result"
-    retried = client.post(
-        retry_endpoint, json={"lease": retry["lease"], "success": True}, headers=headers(credential),
-    )
-    assert retried.status_code == 200
-    assert retried.json()["status"] == "succeeded"
+    assert operations.process_remote_delete_center(factory)
     with factory() as db:
         assert db.get(TrainingTask, task_id) is None
     assert not model_test_storage.task_history_root(task_id).exists()
+
+
+def test_stale_remote_center_cleanup_cannot_finalize_a_new_claim(
+    monitoring_client, tmp_path, monkeypatch,
+):
+    _client, factory = monitoring_client
+    credential, _config, payload = remote_run(_client, factory, tmp_path)
+    task_id = payload["task_id"]
+    operation_id = "center-stale-success"
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(operations, "remote_trace_root", lambda run_id: tmp_path / "traces" / run_id)
+    with factory() as db:
+        task = db.get(TrainingTask, task_id)
+        task.deleted_at = utcnow()
+        task.deleted_reason = "remote_delete_pending"
+        db.add(RemoteOperation(
+            id=operation_id,
+            node_id=credential["node"]["id"],
+            task_id=task_id,
+            kind="delete",
+            status="finalizing",
+            payload={
+                "scope": "task",
+                "remote_verified": True,
+                "test_ids": [],
+                "runs": [payload],
+                "receipt": {"verified_absent": True},
+            },
+        ))
+        db.commit()
+
+    def replace_claim(_task_id, _test_ids, *, delete_history):
+        with factory() as db:
+            operation = db.get(RemoteOperation, operation_id)
+            updated = dict(operation.payload)
+            updated["center_claim_token"] = "f" * 32
+            operation.payload = updated
+            operation.updated_at = utcnow()
+            db.commit()
+        return []
+
+    monkeypatch.setattr(task_deletions, "cleanup_task_test_files", replace_claim)
+    assert operations.process_remote_delete_center(factory)
+    with factory() as db:
+        operation = db.get(RemoteOperation, operation_id)
+        assert operation.status == "center_cleaning"
+        assert operation.payload["center_claim_token"] == "f" * 32
+        assert db.get(TrainingTask, task_id) is not None
+
+
+def test_stale_remote_center_cleanup_cannot_overwrite_newer_success(
+    monitoring_client, tmp_path, monkeypatch,
+):
+    _client, factory = monitoring_client
+    credential, _config, payload = remote_run(_client, factory, tmp_path)
+    task_id = payload["task_id"]
+    operation_id = "center-stale-error"
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(operations, "remote_trace_root", lambda run_id: tmp_path / "traces" / run_id)
+    with factory() as db:
+        task = db.get(TrainingTask, task_id)
+        task.deleted_at = utcnow()
+        task.deleted_reason = "remote_delete_pending"
+        db.add(RemoteOperation(
+            id=operation_id,
+            node_id=credential["node"]["id"],
+            task_id=task_id,
+            kind="delete",
+            status="finalizing",
+            payload={
+                "scope": "task",
+                "remote_verified": True,
+                "test_ids": [],
+                "runs": [payload],
+                "receipt": {"verified_absent": True},
+            },
+        ))
+        db.commit()
+
+    def finish_elsewhere(_task_id, _test_ids, *, delete_history):
+        with factory() as db:
+            operation = db.get(RemoteOperation, operation_id)
+            updated = dict(operation.payload)
+            updated.pop("center_claim_token", None)
+            updated["phase"] = "complete"
+            operation.payload = updated
+            operation.status = "succeeded"
+            operation.error = None
+            operation.updated_at = utcnow()
+            db.commit()
+        raise PermissionError("stale worker failed after another worker completed")
+
+    monkeypatch.setattr(task_deletions, "cleanup_task_test_files", finish_elsewhere)
+    assert operations.process_remote_delete_center(factory)
+    with factory() as db:
+        operation = db.get(RemoteOperation, operation_id)
+        assert operation.status == "succeeded"
+        assert operation.error is None
+        assert db.get(TrainingTask, task_id).deleted_reason == "remote_delete_pending"
+
+
+def test_remote_center_cleanup_rejects_unexpected_cache_directory(
+    monitoring_client, tmp_path, monkeypatch,
+):
+    _client, factory = monitoring_client
+    credential, _config, payload = remote_run(_client, factory, tmp_path)
+    task_id = payload["task_id"]
+    operation_id = "center-cache-directory"
+    cache_root = tmp_path / "cache"
+    unexpected = cache_root / f"{operation_id}.bin"
+    unexpected.mkdir(parents=True)
+    monkeypatch.setattr(operations, "CACHE_ROOT", cache_root)
+    monkeypatch.setattr(operations, "remote_trace_root", lambda run_id: tmp_path / "traces" / run_id)
+    with factory() as db:
+        task = db.get(TrainingTask, task_id)
+        task.deleted_at = utcnow()
+        task.deleted_reason = "remote_delete_pending"
+        db.add(RemoteOperation(
+            id=operation_id,
+            node_id=credential["node"]["id"],
+            task_id=task_id,
+            kind="delete",
+            status="finalizing",
+            payload={
+                "scope": "task",
+                "remote_verified": True,
+                "test_ids": [],
+                "runs": [payload],
+                "receipt": {"verified_absent": True},
+            },
+        ))
+        db.commit()
+
+    assert operations.process_remote_delete_center(factory)
+    assert unexpected.is_dir()
+    with factory() as db:
+        operation = db.get(RemoteOperation, operation_id)
+        assert operation.status == "failed"
+        assert "缓存路径不是普通文件" in operation.error
+        assert db.get(TrainingTask, task_id).deleted_reason == "remote_delete_failed"
+
+
+def test_remote_whole_task_plan_inherits_legacy_run_node_and_rejects_foreign_node(
+    monitoring_client, tmp_path,
+):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    with factory() as db:
+        task = db.get(TrainingTask, payload["task_id"])
+        run = db.get(TrainingRun, payload["run_id"])
+        run.execution_node_id = None
+        db.flush()
+        plan = operations.build_remote_task_delete_plan(db, task, acquire_lock=False)
+        assert [item["run_id"] for item in plan["runs"]] == [run.id]
+
+        run.execution_node_id = "another-node"
+        db.flush()
+        with pytest.raises(ValueError, match="属于其他远程服务器"):
+            operations.build_remote_task_delete_plan(db, task, acquire_lock=False)
+
+
+def test_remote_task_with_output_evidence_but_no_attempt_is_not_deletable(
+    monitoring_client, tmp_path,
+):
+    client, factory = monitoring_client
+    credential = create(client)
+    with factory() as db:
+        node = db.get(ComputeNode, credential["node"]["id"])
+        node.agent_version = "2.0.4"
+        task = TrainingTask(
+            id="remote-missing-attempt",
+            name="Missing attempt",
+            task_type="detect",
+            execution_node_id=node.id,
+            model_path="/remote/model.pt",
+            data_path="/remote/data.yaml",
+            run_dir="/remote/runs/detect/remote-missing-attempt/attempt-001",
+            status="stopped",
+        )
+        db.add(task)
+        db.flush()
+        with pytest.raises(ValueError, match="没有可验证的远程 Attempt"):
+            operations.build_remote_task_delete_plan(db, task, acquire_lock=False)
+
+
+def test_never_run_remote_task_cleans_locally_without_supported_agent(
+    monitoring_client, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential = create(client)
+    task_id = "remote-never-run"
+    monkeypatch.setattr(operations, "CACHE_ROOT", tmp_path / "cache")
+    monkeypatch.setattr(model_test_storage, "HISTORY_ROOT", tmp_path / "history")
+    with factory() as db:
+        node = db.get(ComputeNode, credential["node"]["id"])
+        node.agent_version = "1.0.0"
+        node.last_seen_at = utcnow() - timedelta(days=1)
+        task = TrainingTask(
+            id=task_id,
+            name="Never run",
+            task_type="detect",
+            execution_node_id=node.id,
+            model_path="/remote/model.pt",
+            data_path="/remote/data.yaml",
+            status="idle",
+        )
+        db.add(task)
+        db.commit()
+        task = db.get(TrainingTask, task_id)
+        operation = operations.queue_delete(db, task)
+        assert operation.status == "finalizing"
+        assert operation.payload["runs"] == []
+        assert operation.payload["remote_verified"] is True
+        db.commit()
+
+    assert operations.process_remote_delete_center(factory)
+    with factory() as db:
+        assert db.get(TrainingTask, task_id) is None
+        operation = db.scalar(select(RemoteOperation).where(RemoteOperation.task_id == task_id))
+        assert operation.status == "succeeded"
+
+
+def test_remote_delete_replaces_legacy_pending_operation(
+    monitoring_client, tmp_path,
+):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    legacy_id = "legacy-whole-delete"
+    with factory() as db:
+        db.add(RemoteOperation(
+            id=legacy_id,
+            node_id=credential["node"]["id"],
+            task_id=payload["task_id"],
+            kind="delete",
+            status="pending",
+            payload={},
+        ))
+        db.commit()
+
+    response = client.delete(f"/api/tasks/{payload['task_id']}/permanent")
+    assert response.status_code == 202
+    assert response.json()["operation_id"] != legacy_id
+    with factory() as db:
+        legacy = db.get(RemoteOperation, legacy_id)
+        replacement = db.get(RemoteOperation, response.json()["operation_id"])
+        assert legacy.status == "cancelled"
+        assert replacement.payload["receipt_required"] is True
+        assert replacement.payload["receipt_version"] == operations.DELETE_RECEIPT_VERSION
+
+
+def test_tampered_remote_delete_receipt_cannot_remove_task(
+    monitoring_client, tmp_path,
+):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    task_id = payload["task_id"]
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+    work = claim(client, credential)
+    result = verified_delete_result(work)
+    result["receipt"]["removed"] = result["receipt"]["removed"][:-1]
+    endpoint = f"/api/compute/nodes/{credential['node']['id']}/agent/operations/{work['id']}/result"
+    response = client.post(endpoint, json=result, headers=headers(credential))
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    with factory() as db:
+        assert db.get(TrainingTask, task_id) is not None
+        operation = db.get(RemoteOperation, work["id"])
+        assert "回执没有完整覆盖" in operation.error
+
+
+def test_remote_delete_does_not_dispatch_when_test_cancellation_fails(
+    monitoring_client, tmp_path, monkeypatch,
+):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    task_id = payload["task_id"]
+    with factory() as db:
+        db.get(TrainingTask, task_id).error_message = "original training failure"
+        db.commit()
+    assert client.delete(f"/api/tasks/{task_id}/permanent").status_code == 202
+
+    def cancellation_failure(*_args, **_kwargs):
+        raise RuntimeError("test worker did not stop")
+
+    monkeypatch.setattr(inference, "cancel_task_tests", cancellation_failure)
+    polled = client.post(
+        f"/api/compute/nodes/{credential['node']['id']}/agent/operations/poll",
+        json={},
+        headers=headers(credential),
+    )
+    assert polled.status_code == 200
+    assert polled.json()["operation"] is None
+    assert "停止模型检测失败" in polled.json()["message"]
+    with factory() as db:
+        operation = db.scalar(select(RemoteOperation).where(
+            RemoteOperation.task_id == task_id,
+            RemoteOperation.kind == "delete",
+        ))
+        task = db.get(TrainingTask, task_id)
+        assert operation.status == "failed"
+        assert task.deleted_reason == "remote_delete_failed"
+        assert task.error_message == "original training failure"
+
+
+def test_remote_model_asset_references_control_whole_task_deletion(
+    monitoring_client, tmp_path,
+):
+    client, factory = monitoring_client
+    credential, _config, payload = remote_run(client, factory, tmp_path)
+    model_path = str(Path(payload["run_dir"]) / "weights" / "last.pt")
+    with factory() as db:
+        task = db.get(TrainingTask, payload["task_id"])
+        asset = ModelAsset(
+            id="remote-delete-asset",
+            name="Registered best model",
+            source_type="remote_path",
+            execution_node_id=credential["node"]["id"],
+            path=model_path,
+            status="ready",
+        )
+        db.add(asset)
+        db.flush()
+        with pytest.raises(ValueError, match="仍被模型来源"):
+            operations.build_remote_task_delete_plan(db, task, acquire_lock=False)
+
+        asset.deleted_at = utcnow()
+        db.flush()
+        assert operations.build_remote_task_delete_plan(db, task, acquire_lock=False)["runs"]
+
+        db.add(ModelTest(
+            id="history-retains-asset",
+            task_id=None,
+            model_asset_id=asset.id,
+            model_source_type="remote_path",
+            execution_node_id=credential["node"]["id"],
+            model_source_path=model_path,
+            artifact_name="last.pt",
+            model_name="last.pt",
+            confidence=0.25,
+            iou=0.7,
+            status="completed",
+        ))
+        db.flush()
+        with pytest.raises(ValueError, match="仍有模型测试历史引用"):
+            operations.build_remote_task_delete_plan(db, task, acquire_lock=False)
 
 
 def test_remote_attempt_delete_retries_and_preserves_history_and_other_attempt(
@@ -702,7 +1069,11 @@ def test_remote_delete_rejects_missing_or_unmounted_output_root(monitoring_clien
     with factory() as db:
         task = db.get(TrainingTask, task_id)
         assert task is not None and task.deleted_reason == "remote_delete_failed"
-        assert "输出根目录不存在" in (task.error_message or "")
+        operation = db.scalar(select(RemoteOperation).where(
+            RemoteOperation.task_id == task_id,
+            RemoteOperation.kind == "delete",
+        ).order_by(RemoteOperation.created_at.desc()))
+        assert operation is not None and "输出根目录不存在" in (operation.error or "")
 
     # A missing or unmounted root cannot prove that remote data was cleaned.
     # Scan/fetch also reject it, and a root outside the current server's

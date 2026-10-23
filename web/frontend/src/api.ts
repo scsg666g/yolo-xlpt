@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -137,6 +137,10 @@ export const api = {
   assignTaskGroup: (id: string, group_id: string | null) => request<TrainingTask>(`/api/tasks/${id}/group`, { method: 'PATCH', body: JSON.stringify({ group_id }) }),
   reorderTasks: (task_ids: string[]) => request<void>('/api/tasks/order', { method: 'PATCH', body: JSON.stringify({ task_ids }) }),
   deletedTasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks?deleted_only=true', { signal }).then((tasks) => tasks.filter((task) => task.deleted_at)),
+  taskDeletionJobs: (signal?: AbortSignal) => requestWithTimeout<DeletionJob[]>('/api/task-deletions?limit=50', { signal }),
+  taskDeletionPreview: (id: string, signal?: AbortSignal) => requestWithTimeout<TaskDeletionPreview>(
+    `/api/tasks/${encodeURIComponent(id)}/deletion-preview`, { signal }, 15_000, '删除范围读取超时，请重试',
+  ),
   task: (id: string, signal?: AbortSignal) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}`, { signal }),
   create: (payload: TaskCreatePayload) => request<TrainingTask>('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }),
   start: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/start`, { method: 'POST' }),
@@ -151,7 +155,7 @@ export const api = {
   remove: (id: string) => requestWithTimeout<void>(`/api/tasks/${id}/trash`, { method: 'POST' }, 30_000, deletionTimeout),
   restore: (id: string) => requestWithTimeout<TrainingTask>(`/api/tasks/${id}/restore`, { method: 'POST' }, 30_000,
     '恢复请求超时，后台可能已经受理。请刷新任务列表和回收站确认状态。'),
-  permanentRemove: (id: string) => requestWithTimeout<{ status: string; message: string } | undefined>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }, 30_000, deletionTimeout),
+  permanentRemove: (id: string) => requestWithTimeout<{ status: string; operation_id: string; message: string }>(`/api/tasks/${id}/permanent`, { method: 'DELETE' }, 30_000, deletionTimeout),
   prepareArtifact: (id: number, retry = false, signal?: AbortSignal) => requestWithTimeout<{ status: string; message?: string }>(`/api/artifacts/${id}/prepare?retry=${retry}`, { method: 'POST', signal }),
   saveLayout: (id: string, layout: TrainingTask['canvas_layout'], signal?: AbortSignal) =>
     requestWithTimeout<TrainingTask>(`/api/tasks/${id}/layout`, { method: 'PATCH', body: JSON.stringify({ layout }), signal }, 15_000,

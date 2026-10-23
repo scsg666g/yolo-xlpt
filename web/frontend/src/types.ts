@@ -68,6 +68,54 @@ export interface TrainingTask {
   deleted_reason: string | null
 }
 
+export type DeletionJobStatus = 'pending' | 'running' | 'finalizing' | 'failed' | 'cancelled' | 'succeeded'
+
+export type DeletionJobPhase =
+  | 'stopping_tests'
+  | 'validating'
+  | 'queued'
+  | 'waiting_agent'
+  | 'agent_upgrade_required'
+  | 'deleting_files'
+  | 'verifying'
+  | 'center_cleanup'
+  | 'completed'
+  | 'failed'
+
+export interface DeletionJob {
+  id: string
+  task_id: string
+  task_name: string
+  executor: 'local' | 'remote'
+  node_id: string | null
+  node_name: string | null
+  node_status: 'online' | 'offline' | 'pending' | 'disabled' | null
+  last_seen_at: string | null
+  agent_version: string | null
+  required_agent_version: string | null
+  status: DeletionJobStatus
+  phase: DeletionJobPhase
+  message: string
+  error: string | null
+  retryable: boolean
+  updated_at: string
+  created_at: string
+  receipt: Record<string, unknown> | null
+}
+
+export interface TaskDeletionPreview {
+  task_id: string
+  task_name: string
+  executor: 'local' | 'remote'
+  node_name: string | null
+  attempt_count: number
+  test_count: number
+  can_delete: boolean
+  blocking_reason: string | null
+  delete_items: string[]
+  keep_items: string[]
+}
+
 export interface TaskGroup {
   id: string
   name: string
