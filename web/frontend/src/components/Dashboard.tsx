@@ -13,7 +13,6 @@ import { AttemptDeletionHistory } from './AttemptDeletionHistory'
 const statusIcon = (status: string) => status === 'completed' ? <CheckCircle2 size={15} /> : status === 'failed' || status === 'interrupted' ? <AlertTriangle size={15} /> : status === 'running' ? <Zap size={15} /> : <Clock3 size={15} />
 const activeStatuses = ['queued', 'starting', 'running', 'stopping']
 const activeDeletionStatuses = new Set<DeletionJob['status']>(['pending', 'running', 'finalizing'])
-const collapsedGroupsKey = 'yolo-task-groups-collapsed-v1'
 const ungroupedKey = '__ungrouped__'
 
 const deletionPhaseLabels: Record<DeletionJob['phase'], string> = {
@@ -99,13 +98,6 @@ function deletionReceiptValue(value: unknown): string {
   return JSON.stringify(localizeDeletionReceipt(value), null, 2)
 }
 
-function initialCollapsedGroups(): Set<string> {
-  try {
-    const value = JSON.parse(window.localStorage.getItem(collapsedGroupsKey) || '[]')
-    return new Set(Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [])
-  } catch { return new Set() }
-}
-
 function taskMetric(task: TrainingTask, keys: string[]): { key: string; value: number } | null {
   for (const key of keys) {
     const raw = task.latest_metrics[key]
@@ -171,7 +163,7 @@ export function Dashboard() {
   const [renameTarget, setRenameTarget] = useState<TrainingTask | null>(null)
   const [groupEditor, setGroupEditor] = useState<GroupEditorState | null>(null)
   const [moveTarget, setMoveTarget] = useState<TrainingTask | null>(null)
-  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(initialCollapsedGroups)
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set())
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
@@ -413,11 +405,10 @@ export function Dashboard() {
   const selectedDeletionJob = deleteTarget ? latestDeletionJobs.get(deleteTarget.id) || null : null
 
   function toggleGroup(key: string) {
-    setCollapsedGroups((current) => {
+    setExpandedGroups((current) => {
       const next = new Set(current)
       if (next.has(key)) next.delete(key)
       else next.add(key)
-      window.localStorage.setItem(collapsedGroupsKey, JSON.stringify([...next]))
       return next
     })
   }
@@ -438,10 +429,9 @@ export function Dashboard() {
   function removeGroup(group: TaskGroup) {
     setGroups((current) => current.filter((item) => item.id !== group.id))
     setTasks((current) => current.map((task) => task.group_id === group.id ? { ...task, group_id: null } : task))
-    setCollapsedGroups((current) => {
+    setExpandedGroups((current) => {
       const next = new Set(current)
       next.delete(group.id)
-      window.localStorage.setItem(collapsedGroupsKey, JSON.stringify([...next]))
       return next
     })
     setOperationNotice(`分组“${group.name}”已删除，组内任务已移到未分组`)
@@ -822,7 +812,7 @@ export function Dashboard() {
       {loading ? <div className="empty">正在加载任务…</div> : loadError && !tasks.length ? <div className="empty">暂时无法获取任务列表，请重新加载。</div> : filtered.length === 0 && (search.trim() || filter !== 'all') ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>请调整搜索关键词或状态筛选。</span></div> : tasks.length === 0 && groups.length === 0 ? <div className="empty"><Cpu size={28} /><strong>还没有训练任务</strong><span>可以先建立模型分组，再创建第一次训练。</span></div> :
         <div className="task-group-list">{groupedTasks.map((view) => {
           const isForcedOpen = Boolean(search.trim()) || filter !== 'all'
-          const isCollapsed = collapsedGroups.has(view.key) && !isForcedOpen
+          const isCollapsed = !expandedGroups.has(view.key) && !isForcedOpen
           const activeCount = view.allTasks.filter((task) => activeStatuses.includes(task.status)).length
           const completedCount = view.allTasks.filter((task) => task.status === 'completed').length
           const attentionCount = view.allTasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
