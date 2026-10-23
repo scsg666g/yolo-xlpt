@@ -161,6 +161,8 @@ class TrainingCapability(BaseModel):
 
 class AgentReport(BaseModel):
     agent_version: str = Field(default="1.0.0", max_length=40)
+    boot_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    report_seq: int | None = Field(default=None, ge=1)
     compute: ComputeReport
     training: TrainingCapability | None = None
 
@@ -304,13 +306,14 @@ def node_or_404(db: Session, node_id: str) -> ComputeNode:
     return node
 
 
-def has_active_model_fetch(db: Session, node_id: str, *, include_pending: bool = True) -> bool:
+def has_active_file_transfer(db: Session, node_id: str, *, include_pending: bool = True) -> bool:
+    """Return whether rotating node credentials would interrupt a file transfer."""
     statuses = ["running", "finalizing"]
     if include_pending:
         statuses.append("pending")
     return db.scalar(select(RemoteOperation.id).where(
         RemoteOperation.node_id == node_id,
-        RemoteOperation.kind == "fetch_model",
+        RemoteOperation.kind.in_(["fetch_model", "fetch_log"]),
         RemoteOperation.status.in_(statuses),
     ).limit(1)) is not None
 
@@ -638,8 +641,8 @@ def update_node(node_id: str, payload: NodeSettings, db: Session = Depends(get_d
         TrainingRun.status.in_(["starting", "running", "stopping"]),
     ).limit(1)):
         raise HTTPException(409, "该服务器正在执行训练，请先停止并等待状态上报后再禁用")
-    if not payload.enabled and has_active_model_fetch(db, node_id):
-        raise HTTPException(409, "该服务器正在传输测试模型，请等待传输结束后再禁用")
+    if not payload.enabled and has_active_file_transfer(db, node_id):
+        raise HTTPException(409, "该服务器正在传输远程文件，请等待传输结束后再禁用")
     for key, value in payload.model_dump().items():
         setattr(node, key, value)
     db.commit()
@@ -658,8 +661,8 @@ def rotate_token(node_id: str, db: Session = Depends(get_db)):
         TrainingRun.status.in_(["starting", "running", "stopping"]),
     ).limit(1)):
         raise HTTPException(409, "该服务器正在执行训练，请等待完成后再更换 Token")
-    if has_active_model_fetch(db, node_id, include_pending=False):
-        raise HTTPException(409, "该服务器正在传输测试模型，请等待传输结束后再更换 Token")
+    if has_active_file_transfer(db, node_id, include_pending=False):
+        raise HTTPException(409, "该服务器正在传输远程文件，请等待传输结束后再更换 Token")
     token = issue_token(node)
     # Old observations do not establish the connection of the replacement Agent.
     node.last_seen_at = None
@@ -674,8 +677,8 @@ def delete_node(node_id: str, db: Session = Depends(get_db)):
     node = node_or_404(db, node_id)
     if node.kind == "local":
         raise HTTPException(409, "不能移除本机服务器")
-    if has_active_model_fetch(db, node_id):
-        raise HTTPException(409, "该服务器仍有测试模型等待或正在传输，请等待完成后再移除")
+    if has_active_file_transfer(db, node_id):
+        raise HTTPException(409, "该服务器仍有远程文件等待或正在传输，请等待完成后再移除")
     if db.scalar(select(TrainingTask.id).where(TrainingTask.execution_node_id == node_id).limit(1)):
         raise HTTPException(409, "该服务器仍有关联任务，请先处理任务后再移除服务器")
     db.delete(node)
@@ -694,13 +697,33 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
         payload = AgentReport.model_validate_json(body)
     except ValidationError as exc:
         raise HTTPException(422, "采样数据格式错误：" + "; ".join(error["msg"] for error in exc.errors(include_input=False))) from exc
-    previous = (node.snapshot or {}).get("sampled_at")
-    if previous and payload.compute.sampled_at < datetime.fromisoformat(previous):
-        raise HTTPException(409, "采样数据早于上次采样，已忽略")
+    received_at = utcnow()
+    previous_snapshot = node.snapshot or {}
+    previous = previous_snapshot.get("sampled_at")
+    ordered_report = payload.boot_id is not None and payload.report_seq is not None
+    stale_order = (
+        ordered_report
+        and previous_snapshot.get("agent_boot_id") == payload.boot_id
+        and isinstance(previous_snapshot.get("agent_report_seq"), int)
+        and payload.report_seq <= previous_snapshot["agent_report_seq"]
+    )
+    stale_legacy_time = (
+        not ordered_report
+        and previous
+        and as_utc(payload.compute.sampled_at) < as_utc(datetime.fromisoformat(previous))
+    )
+    if stale_order or stale_legacy_time:
+        # A wall-clock rollback must not make a live Agent appear offline. Keep
+        # the newer hardware snapshot while recording this authenticated receipt.
+        node.last_seen_at = received_at
+        db.commit()
+        return {"status": "stale", "report_interval_seconds": node.report_interval_seconds}
     node.snapshot = {**payload.compute.model_dump(mode="json"),
-                     **({"training": payload.training.model_dump(mode="json")} if payload.training else {})}
+                     **({"training": payload.training.model_dump(mode="json")} if payload.training else {}),
+                     **({"agent_boot_id": payload.boot_id, "agent_report_seq": payload.report_seq}
+                        if ordered_report else {})}
     node.agent_version = payload.agent_version
-    node.last_seen_at = utcnow()
+    node.last_seen_at = received_at
     db.commit()
     return {"status": "ok", "report_interval_seconds": node.report_interval_seconds}
 

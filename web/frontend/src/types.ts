@@ -113,6 +113,12 @@ export interface DeletionJob {
   receipt: Record<string, unknown> | null
 }
 
+export interface AttemptDeletionJob extends DeletionJob {
+  scope: 'attempt'
+  run_id: string
+  attempt_number: number
+}
+
 export interface TaskDeletionPreview {
   task_id: string
   task_name: string
@@ -336,6 +342,7 @@ export interface Resources {
   gpus: GpuInfo[]
   models: ResourceFile[]
   datasets: ResourceFile[]
+  classification_datasets: ResourceFile[]
 }
 
 export interface DatasetUploadResult {

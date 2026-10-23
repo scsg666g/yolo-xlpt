@@ -126,7 +126,7 @@ def test_remove_and_create_are_serialized(image_test_client, tmp_path, monkeypat
     asset, _ = local_asset(client, tmp_path, monkeypatch)
     entered, release, second_started = threading.Event(), threading.Event(), threading.Event()
     hook_module = assets if first == "remove" else inference
-    hook_name = "asset_removal_metadata" if first == "remove" else "_verified_model_asset_version"
+    hook_name = "asset_removal_metadata" if first == "remove" else "_available_model_asset_version"
     original = getattr(hook_module, hook_name)
 
     def paused(*args, **kwargs):

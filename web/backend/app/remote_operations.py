@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -25,6 +26,7 @@ from .config import (
     DATA_ROOT,
     REMOTE_MODEL_CACHE_MIN_FREE_BYTES,
     REMOTE_MODEL_CACHE_QUOTA_BYTES,
+    nonnegative_int_env,
 )
 from .compute_nodes import (
     REQUIRED_AGENT_VERSION,
@@ -77,6 +79,8 @@ OPERATION_LEASE_TIMEOUT = timedelta(minutes=5)
 MODEL_FINALIZE_HEARTBEAT_SECONDS = 30
 CENTER_CLEANUP_LEASE_TIMEOUT = timedelta(minutes=5)
 CENTER_CLEANUP_HEARTBEAT_SECONDS = 30
+REMOTE_LOG_CACHE_QUOTA_BYTES = nonnegative_int_env("PLATFORM_REMOTE_LOG_CACHE_QUOTA_BYTES", 2 * 1024**3)
+REMOTE_LOG_MIN_FREE_BYTES = nonnegative_int_env("PLATFORM_REMOTE_LOG_MIN_FREE_BYTES", 2 * 1024**3)
 
 
 def _delete_plan_run(run: dict) -> dict:
@@ -131,6 +135,31 @@ def operation_model_asset_id(operation: RemoteOperation) -> str | None:
 
 def operation_file(operation: RemoteOperation, complete: bool = True) -> Path:
     return CACHE_ROOT / (operation.id + (".bin" if complete else ".part"))
+
+
+def validate_log_fetch(db: Session, operation: RemoteOperation) -> None:
+    task = db.get(TrainingTask, operation.task_id)
+    run = db.get(TrainingRun, (operation.payload or {}).get("run_id"))
+    if (not task or task.deleted_at or not run or run.task_id != task.id
+            or (run.execution_node_id or task.execution_node_id) != operation.node_id
+            or run.log_path != operation.payload.get("log_path")
+            or attempt_delete_operation(db, run, active_only=True)):
+        raise HTTPException(409, "训练日志来源已变更或正在清理，停止传输")
+
+
+def reserve_log_cache(db: Session) -> None:
+    """Reserve complete snapshot sizes before accepting their first chunks."""
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    used = outstanding = 0
+    for operation in db.scalars(select(RemoteOperation).where(RemoteOperation.kind == "fetch_log")):
+        stored = sum(_regular_file_size(path) for path in (operation_file(operation), operation_file(operation, False)))
+        reserved = max(stored, int((operation.payload or {}).get("size") or 0)) if operation.status in {"pending", "running", "finalizing"} else stored
+        used += reserved
+        outstanding += max(0, reserved - stored)
+    if REMOTE_LOG_CACHE_QUOTA_BYTES and used > REMOTE_LOG_CACHE_QUOTA_BYTES:
+        raise HTTPException(507, "远程日志缓存已达到容量限制，请清理不再需要的训练记录或调整日志缓存配额")
+    if REMOTE_LOG_MIN_FREE_BYTES and shutil.disk_usage(CACHE_ROOT).free - outstanding < REMOTE_LOG_MIN_FREE_BYTES:
+        raise HTTPException(507, "平台磁盘余量不足，不能接收完整日志")
 
 
 def _cache_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
@@ -959,6 +988,19 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
     if not operation:
         return {"operation": None}
     operation_payload = operation.payload
+    if operation.kind == "fetch_log":
+        try:
+            validate_log_fetch(db, operation)
+            if not agent_version_at_least(node.agent_version, (2, 0, 6)):
+                raise HTTPException(409, "远程完整日志下载需要 Agent 2.0.6 或以上版本")
+        except HTTPException as exc:
+            operation.status, operation.error = "failed", str(exc.detail)
+            operation_file(operation, False).unlink(missing_ok=True)
+            db.commit()
+            return {"operation": None, "message": str(exc.detail)}
+        # A fresh lease takes a fresh bounded snapshot; stale chunks cannot mix.
+        operation_payload = {key: value for key, value in operation.payload.items()
+                             if key not in {"size", "modified_at", "mtime_ns", "sha256"}}
     task_delete = (
         operation.kind == "delete"
         and (operation.payload or {}).get("scope") == "task"
@@ -1061,6 +1103,11 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
     if claimed.rowcount != 1:
         db.rollback()
         return {"operation": None}
+    if operation.kind == "fetch_log":
+        # Only the worker that owns the new lease may remove a previous
+        # partial snapshot. The row remains locked until this reset is durable.
+        for path in (operation_file(operation), operation_file(operation, False)):
+            path.unlink(missing_ok=True)
     db.commit()
     db.refresh(operation)
     if task_delete:
@@ -1433,7 +1480,7 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
     task_scope = operation.kind == "delete" and (operation.payload or {}).get("scope") == "task"
     if task_scope and (operation.payload or {}).get("remote_verified"):
         return {"status": operation.status}
-    if operation.kind in {"fetch", "fetch_model"} and payload.success:
+    if operation.kind in {"fetch", "fetch_model", "fetch_log"} and payload.success:
         raise HTTPException(409, "文件传输必须通过分块接口完成")
     task = db.get(TrainingTask, operation.task_id)
     if task_scope:
@@ -1479,7 +1526,7 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
     operation.status = "succeeded" if payload.success else "failed"
     operation.error = payload.error if not payload.success else None
     operation.updated_at = utcnow()
-    if not payload.success and operation.kind == "fetch":
+    if not payload.success and operation.kind in {"fetch", "fetch_log"}:
         operation_file(operation, False).unlink(missing_ok=True)
     if not payload.success and operation.kind == "fetch_model":
         _mark_model_fetch_failed(db, operation, payload.error or "远程模型传输失败")
@@ -1585,7 +1632,7 @@ class ArtifactChunk(BaseModel):
     data: str = Field(max_length=720000)
     final: bool = False
     sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    size: int | None = Field(default=None, ge=1, le=MAX_REMOTE_MODEL_BYTES)
+    size: int | None = Field(default=None, ge=0)
     modified_at: datetime | None = None
     mtime_ns: int | None = Field(default=None, ge=0)
 
@@ -1597,7 +1644,16 @@ def upload_chunk(node_id: str, operation_id: str, payload: ArtifactChunk, reques
 
 
 def _upload_chunk(operation: RemoteOperation, node_id: str, payload: ArtifactChunk, db: Session):
-    if operation.kind not in {"fetch", "fetch_model"} or operation.status not in {
+    if operation.kind == "fetch_log" and "size" not in (operation.payload or {}):
+        operation_id = operation.id
+        # All nodes reserve against the same cache. A DB lock, rather than a
+        # process-only mutex, serializes reservations across API workers too.
+        acquire_node_claim_lock(db, "local")
+        db.expire_all()
+        operation = db.get(RemoteOperation, operation_id)
+        if operation is None or operation.lease != payload.lease or operation.node_id != node_id:
+            raise HTTPException(409, "远程日志传输租约已失效")
+    if operation.kind not in {"fetch", "fetch_model", "fetch_log"} or operation.status not in {
         "running", "finalizing", "succeeded",
     }:
         raise HTTPException(409, "远程操作当前不能传输文件")
@@ -1606,7 +1662,9 @@ def _upload_chunk(operation: RemoteOperation, node_id: str, payload: ArtifactChu
     if operation.status == "finalizing" and not payload.final:
         raise HTTPException(409, "远程操作正在完成文件校验")
     model_asset: ModelAsset | None = None
-    if operation.kind == "fetch":
+    if operation.kind == "fetch_log":
+        validate_log_fetch(db, operation)
+    elif operation.kind == "fetch":
         task = db.get(TrainingTask, operation.task_id)
         if not task or task.deleted_at:
             raise HTTPException(409, "任务已删除，停止传输文件")
@@ -1657,11 +1715,11 @@ def _upload_chunk(operation: RemoteOperation, node_id: str, payload: ArtifactChu
     if len(data) > MAX_FILE_CHUNK_BYTES:
         raise HTTPException(413, "文件分块不能超过 512 KiB")
 
-    if operation.kind == "fetch_model":
-        if not data:
+    if operation.kind in {"fetch_model", "fetch_log"}:
+        if not data and operation.kind == "fetch_model":
             raise HTTPException(422, "远程模型不能为空")
         if payload.size is None or payload.modified_at is None or payload.mtime_ns is None:
-            raise HTTPException(422, "远程模型分块缺少稳定文件元数据")
+            raise HTTPException(422, "远程文件分块缺少稳定文件元数据")
         if payload.modified_at.tzinfo is None or payload.modified_at.utcoffset() is None:
             raise HTTPException(422, "远程模型修改时间必须包含时区")
         metadata = {
@@ -1683,18 +1741,29 @@ def _upload_chunk(operation: RemoteOperation, node_id: str, payload: ArtifactChu
         raise HTTPException(409, "远程文件缺少有效大小")
     if operation.kind == "fetch_model" and not 0 < expected_size <= MAX_REMOTE_MODEL_BYTES:
         raise HTTPException(413, "远程模型大小必须在 1 字节到 8 GiB 之间")
+    if operation.kind == "fetch_log":
+        maximum = int(operation.payload.get("max_bytes") or 0)
+        if maximum and expected_size > maximum:
+            raise HTTPException(413, "日志超过下载大小限制")
     if payload.offset + len(data) > expected_size:
         raise HTTPException(413, "传输文件超出登记大小")
-    if operation.kind == "fetch_model" and (payload.offset + len(data) == expected_size) != payload.final:
+    if operation.kind in {"fetch_model", "fetch_log"} and (payload.offset + len(data) == expected_size) != payload.final:
         raise HTTPException(409, "远程模型分块结束标记与文件大小不一致")
     if first_metadata:
         # Commit the full-size reservation before accepting bytes. The process
         # lock makes concurrent first chunks observe every earlier admission;
         # database state then keeps the reservation durable across restarts.
-        with _MODEL_CACHE_CAPACITY_LOCK:
+        with (nullcontext() if operation.kind == "fetch_log" else _MODEL_CACHE_CAPACITY_LOCK):
             db.flush()
             try:
-                ensure_remote_model_cache_capacity(db)
+                if operation.kind == "fetch_log":
+                    reserve_log_cache(db)
+                else:
+                    ensure_remote_model_cache_capacity(db)
+            except HTTPException as exc:
+                operation.status, operation.error = "failed", str(exc.detail)
+                db.commit()
+                raise
             except RemoteModelCacheError as exc:
                 _mark_model_fetch_failed(db, operation, str(exc))
                 db.commit()
@@ -1818,6 +1887,8 @@ def _upload_chunk(operation: RemoteOperation, node_id: str, payload: ArtifactChu
             raise HTTPException(409, "远程操作已重新分配")
 
         model_asset = None
+        if current.kind == "fetch_log":
+            validate_log_fetch(db, current)
         if current.kind == "fetch_model":
             asset_id = operation_model_asset_id(current)
             model_asset = db.get(ModelAsset, asset_id) if asset_id else None

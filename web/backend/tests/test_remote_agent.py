@@ -112,6 +112,24 @@ def test_remote_trace_runner_rewrite_is_atomic_and_keeps_complete_file(agent, tr
     assert not list(runner.parent.glob("*.tmp"))
 
 
+def test_classification_training_requires_dataset_directory(agent, training):
+    config, task = training
+    root = Path(config["training_cwd"])
+    dataset = root / "classification"
+    (dataset / "train" / "cat").mkdir(parents=True)
+    (dataset / "val" / "cat").mkdir(parents=True)
+    task.update(task_type="classify", data_path=str(dataset))
+    task["run_dir"] = str(root / "runs/classify/task-id/attempt-001")
+
+    command = agent.build_training_command(config, task)
+
+    assert f"data={dataset}" in command
+    shutil.rmtree(task["run_dir"])
+    task["data_path"] = str(root / "data.yaml")
+    with pytest.raises(ValueError, match="不是目录"):
+        agent.build_training_command(config, task)
+
+
 def test_gpu_assignment_validates_inventory_and_maps_devices(agent, training, monkeypatch):
     config, task = training
     task["parameters"]["device"] = "0,2"
@@ -710,6 +728,85 @@ def test_fetch_training_artifact_uses_long_timeout_only_for_final_chunk(
     assert [chunk["offset"] for chunk in chunks] == [0, 512 * 1024]
     assert chunks[-1]["sha256"] == hashlib.sha256(content).hexdigest()
     assert timeouts == [20, 432]
+
+
+def test_fetch_remote_log_keeps_open_size_while_training_appends(agent, training, monkeypatch):
+    config, task = training
+    run_dir = Path(task["run_dir"])
+    run_dir.mkdir(parents=True)
+    log = Path(task["log_path"])
+    log.parent.mkdir(parents=True)
+    original = b"epoch line\n" * 60000
+    log.write_bytes(original)
+    operation = {
+        "id": "1" * 32, "kind": "fetch_log", "lease": "2" * 32,
+        "payload": {**task, "output_root": task["parameters"]["remote_output_root"],
+                    "max_bytes": len(original) * 2},
+    }
+    chunks = []
+
+    def submit(_config, _endpoint, chunk, _stop):
+        chunks.append(dict(chunk))
+        if len(chunks) == 1:
+            with log.open("ab") as handle:
+                handle.write(b"appended after snapshot\n")
+        return {"status": "succeeded" if chunk["final"] else "running"}
+
+    monkeypatch.setattr(agent, "submit_operation_chunk", submit)
+    agent.fetch_remote_log(config, operation, threading.Event(), "/operation")
+
+    assert b"".join(base64.b64decode(chunk["data"]) for chunk in chunks) == original
+    assert chunks[-1]["size"] == len(original)
+    assert chunks[-1]["sha256"] == hashlib.sha256(original).hexdigest()
+    assert len({(chunk["modified_at"], chunk["mtime_ns"]) for chunk in chunks}) == 1
+
+
+def test_fetch_remote_log_rejects_truncation_after_snapshot(agent, training, monkeypatch):
+    config, task = training
+    Path(task["run_dir"]).mkdir(parents=True)
+    log = Path(task["log_path"])
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b"x" * (600 * 1024))
+    operation = {
+        "id": "1" * 32, "kind": "fetch_log", "lease": "2" * 32,
+        "payload": {**task, "output_root": task["parameters"]["remote_output_root"]},
+    }
+
+    def truncate(_config, _endpoint, chunk, _stop):
+        log.write_bytes(b"short")
+        return {"status": "running"}
+
+    monkeypatch.setattr(agent, "submit_operation_chunk", truncate)
+    with pytest.raises(ValueError, match="截断"):
+        agent.fetch_remote_log(config, operation, threading.Event(), "/operation")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"), reason="requires POSIX FIFOs")
+def test_fetch_remote_log_rejects_fifo_without_blocking(agent, training):
+    config, task = training
+    Path(task["run_dir"]).mkdir(parents=True)
+    log = Path(task["log_path"])
+    log.parent.mkdir(parents=True)
+    os.mkfifo(log)
+    operation = {
+        "id": "1" * 32, "kind": "fetch_log", "lease": "2" * 32,
+        "payload": {**task, "output_root": task["parameters"]["remote_output_root"]},
+    }
+    outcome = {}
+
+    def fetch():
+        try:
+            agent.fetch_remote_log(config, operation, threading.Event(), "/operation")
+        except Exception as exc:  # Capture the worker-thread result for the assertion below.
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=fetch, daemon=True)
+    thread.start()
+    thread.join(timeout=0.5)
+
+    assert not thread.is_alive(), "opening a FIFO must not block the Agent operation thread"
+    assert isinstance(outcome.get("error"), ValueError)
+    assert "不是普通文件" in str(outcome["error"])
 
 
 def test_standalone_remote_model_rejects_training_roots_links_and_non_pt(

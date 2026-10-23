@@ -3,6 +3,7 @@ import { Box, Database, FileCheck2, FolderSearch, LoaderCircle, X } from 'lucide
 import { api, formatBytes } from '../api'
 import type { ResourceFile, Resources, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
+import { remoteTrainingDataPathError } from '../trainingDataPaths'
 
 interface Props {
   task: TrainingTask | null
@@ -56,18 +57,22 @@ export function EditResourceModal({ task, mode, onClose, onSave }: Props) {
   }, [task?.id, mode])
 
   const files = useMemo(() => {
-    const source = mode === 'dataset' ? resources?.datasets : resources?.models
+    const source = mode === 'dataset'
+      ? (task?.task_type === 'classify' ? resources?.classification_datasets : resources?.datasets)
+      : resources?.models
     return (source || []).filter((file) => `${file.name} ${file.path}`.toLowerCase().includes(search.toLowerCase()))
-  }, [resources, mode, search])
+  }, [resources, mode, search, task?.task_type])
 
   if (!task || !mode) return null
   const isDataset = mode === 'dataset'
+  const isClassificationDataset = isDataset && task.task_type === 'classify'
   const locked = ['queued', 'starting', 'running', 'stopping'].includes(task.status)
+  const pathError = task.execution_node_id && isDataset ? remoteTrainingDataPathError(task.task_type, path) : null
   const currentMissing = !task.execution_node_id && !files.some((file) => file.path === path) && path === (isDataset ? task.data_path : task.model_path)
 
   async function save(event: React.FormEvent) {
     event.preventDefault()
-    if (!task || !mode || !normalizedPath || !dirty) return
+    if (!task || !mode || !normalizedPath || !dirty || pathError) return
     setSaving(true); setError('')
     try {
       await onSave(mode, normalizedPath)
@@ -85,16 +90,17 @@ export function EditResourceModal({ task, mode, onClose, onSave }: Props) {
       <div className="modal-body">
         {locked && <div className="alert warning">任务正在运行或排队，请停止任务后再更换资源。</div>}
         {currentMissing && <div className="alert error">当前路径已经失效，请从下方选择服务器中存在的文件。</div>}
+        {pathError && <div className="alert error">{pathError}</div>}
         {error && <div className="alert error">{error}</div>}
-        <label className="resource-path-label">当前选择<input value={path} onChange={(event) => setPath(event.target.value)} placeholder={isDataset ? '数据集 YAML 的绝对路径' : '模型权重的绝对路径'} /></label>
-        {task.execution_node_id && <div className="node-info">填写执行服务器上的绝对路径；Agent 将在启动训练前检查文件和允许目录。</div>}
+        <label className="resource-path-label">当前选择<input value={path} onChange={(event) => setPath(event.target.value)} placeholder={isClassificationDataset ? '分类数据集目录的绝对路径' : isDataset ? '数据集 YAML 的绝对路径' : '模型权重的绝对路径'} /></label>
+        {task.execution_node_id && <div className="node-info">填写执行服务器上的绝对路径；{isClassificationDataset ? '分类任务需要包含 train/val 的目录。' : ''}Agent 将在启动训练前检查路径和允许目录。</div>}
         {!task.execution_node_id && <><div className="resource-toolbar"><div><FolderSearch size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索名称或路径" /></div><span>发现 {files.length} 个可用文件</span></div>
         <div className="resource-list">
           {files.map((file) => <button type="button" key={file.path} className={path === file.path ? 'selected' : ''} onClick={() => selectFile(file)}><span className="resource-file-icon">{isDataset ? <Database size={16} /> : <Box size={16} />}</span><span><strong>{file.name}</strong><small>{file.path}</small></span><em>{formatBytes(file.size)}</em>{path === file.path && <FileCheck2 className="selected-check" size={16} />}</button>)}
           {!files.length && <div className="resource-empty">没有找到匹配的文件</div>}
         </div></>}
       </div>
-      <footer><div className="resource-footer-note"><span>{task.execution_node_id ? '远程 Agent 将验证路径及权限' : '仅允许选择平台批准目录中的文件'}</span>{dirty && <strong>有未保存的修改</strong>}</div><button type="button" className="button ghost" disabled={saving} onClick={requestClose}>取消</button><button className="button primary" disabled={saving || locked || !normalizedPath || !dirty}>{saving && <LoaderCircle size={16} className="spin" />}{saving ? '保存中' : `保存${isDataset ? '数据集' : '模型'}`}</button></footer>
+      <footer><div className="resource-footer-note"><span>{task.execution_node_id ? '远程 Agent 将验证路径及权限' : '仅允许选择平台批准目录中的文件'}</span>{dirty && <strong>有未保存的修改</strong>}</div><button type="button" className="button ghost" disabled={saving} onClick={requestClose}>取消</button><button className="button primary" disabled={saving || locked || Boolean(pathError) || !normalizedPath || !dirty}>{saving && <LoaderCircle size={16} className="spin" />}{saving ? '保存中' : `保存${isDataset ? '数据集' : '模型'}`}</button></footer>
     </form>
   </div>
 }

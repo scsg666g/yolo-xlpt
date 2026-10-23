@@ -26,7 +26,7 @@ from starlette.requests import ClientDisconnect
 
 from .config import DATA_ROOT, DATASET_ROOTS
 from .database import get_db
-from .models import TrainingTask
+from .models import TrainingRun, TrainingTask
 
 router = APIRouter(prefix="/api/datasets/uploads", tags=["dataset uploads"])
 management_router = APIRouter(prefix="/api/datasets/managed", tags=["managed datasets"])
@@ -112,11 +112,105 @@ def canonical_path(raw: str | Path) -> Path:
         return Path(os.path.abspath(os.path.expanduser(str(raw))))
 
 
+def _paths_intersect(first: Path, second: Path) -> bool:
+    left, right = canonical_path(first), canonical_path(second)
+    return left == right or left in right.parents or right in left.parents
+
+
+def _resolve_dataset_entry(raw: str, base: Path) -> Path | None:
+    value = raw.strip()
+    if not value or "://" in value or "\x00" in value:
+        return None
+    candidate = Path(value).expanduser()
+    return canonical_path(candidate if candidate.is_absolute() else base / candidate)
+
+
+def _manifest_references_directory(manifest: Path, target_directory: Path) -> bool:
+    try:
+        with manifest.open("r", encoding="utf-8-sig") as stream:
+            for line in stream:
+                value = line.strip()
+                if not value or value.startswith("#"):
+                    continue
+                entry = _resolve_dataset_entry(value, manifest.parent)
+                if entry is not None and _paths_intersect(entry, target_directory):
+                    return True
+    except (OSError, UnicodeError):
+        return False
+    return False
+
+
+def _dataset_config_references_directory(config_path: Path, target_directory: Path) -> bool:
+    config_path = canonical_path(config_path)
+    target_directory = canonical_path(target_directory)
+    if _paths_intersect(config_path, target_directory):
+        return True
+    if config_path.suffix.lower() not in {".yaml", ".yml"} or not config_path.is_file():
+        return False
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    root_value = payload.get("path")
+    root = _resolve_dataset_entry(str(root_value), config_path.parent) if root_value else canonical_path(config_path.parent)
+    if root is None:
+        return False
+    # A YAML rooted inside the managed dataset necessarily consumes that
+    # dataset. A root above it is only a reference when one of the split paths
+    # actually intersects the managed directory.
+    if root == target_directory or target_directory in root.parents:
+        return True
+    for key in ("train", "val", "test"):
+        raw_entries = payload.get(key)
+        entries = raw_entries if isinstance(raw_entries, list) else [raw_entries]
+        for raw_entry in entries:
+            if not isinstance(raw_entry, str):
+                continue
+            entry = _resolve_dataset_entry(raw_entry, root)
+            if entry is None:
+                continue
+            if _paths_intersect(entry, target_directory):
+                return True
+            if entry.suffix.lower() == ".txt" and entry.is_file():
+                if _manifest_references_directory(entry, target_directory):
+                    return True
+    return False
+
+
 def dataset_references(db: Session, config_path: str,
                        local_tasks: list[TrainingTask] | None = None) -> list[TrainingTask]:
     target = canonical_path(config_path)
-    return [task for task in (local_tasks if local_tasks is not None else local_tasks_by_reference_priority(db))
-            if canonical_path(task.data_path) == target]
+    target_directory = target.parent
+    tasks = local_tasks if local_tasks is not None else local_tasks_by_reference_priority(db)
+    task_ids = [task.id for task in tasks]
+    historical: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
+    if task_ids:
+        for run in db.scalars(select(TrainingRun).where(TrainingRun.task_id.in_(task_ids))):
+            if run.data_path:
+                historical[run.task_id].append(run.data_path)
+
+    reference_cache: dict[str, bool] = {}
+    references: list[TrainingTask] = []
+    for task in tasks:
+        paths = [task.data_path, *historical.get(task.id, [])]
+        referenced = False
+        for raw_path in dict.fromkeys(path for path in paths if path):
+            candidate = canonical_path(raw_path)
+            cache_key = str(candidate)
+            if cache_key not in reference_cache:
+                reference_cache[cache_key] = (
+                    candidate == target
+                    or _dataset_config_references_directory(candidate, target_directory)
+                )
+            if reference_cache[cache_key]:
+                referenced = True
+                break
+        if referenced:
+            references.append(task)
+    return references
 
 
 @management_router.get("")

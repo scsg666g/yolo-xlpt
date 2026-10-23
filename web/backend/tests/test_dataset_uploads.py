@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 import app.dataset_uploads as uploads
 import app.services as services
 from app.database import Base, get_db
-from app.models import TrainingTask, utcnow
+from app.models import TrainingRun, TrainingTask, utcnow
 
 
 @pytest.fixture
@@ -515,6 +515,91 @@ def test_managed_dataset_reference_matches_equivalent_symlink_path(environment):
 
     listed = client.get("/api/datasets/managed").json()[0]
     assert listed["references"][0]["id"] == "symlink-reference"
+    assert client.delete("/api/datasets/managed/%E4%B8%AD%E6%96%87%20%E8%AE%AD%E7%BB%83%E9%9B%86").status_code == 409
+
+
+def test_managed_dataset_reference_in_historical_run_remains_protected(environment):
+    client, root = environment
+    upload_id = stage(client, dataset_files())
+    result = complete(client, upload_id, ["person", "hat"]).json()
+    unrelated = root.parent / "new-data.yaml"
+    unrelated.write_text("train: images/train\n", encoding="utf-8")
+    local_session = client.app.state.session_factory
+    with local_session() as db:
+        task = TrainingTask(
+            id="historical-reference",
+            name="历史轮次引用",
+            task_type="detect",
+            model_path="/models/yolo.pt",
+            data_path=str(unrelated),
+        )
+        db.add(task)
+        db.flush()
+        db.add(TrainingRun(
+            id="historical-reference-run",
+            task_id=task.id,
+            attempt_number=1,
+            status="completed",
+            model_path=task.model_path,
+            data_path=result["resource"]["path"],
+        ))
+        db.commit()
+
+    listed = client.get("/api/datasets/managed").json()[0]
+    assert [reference["id"] for reference in listed["references"]] == [task.id]
+    assert client.delete("/api/datasets/managed/%E4%B8%AD%E6%96%87%20%E8%AE%AD%E7%BB%83%E9%9B%86").status_code == 409
+
+
+def test_managed_dataset_detects_external_yaml_and_manifest_references_without_sibling_false_positive(environment):
+    client, root = environment
+    upload_id = stage(client, dataset_files())
+    assert complete(client, upload_id, ["person", "hat"]).status_code == 200
+    target = root / "中文 训练集"
+    sibling = root / "sibling"
+    (sibling / "images" / "train").mkdir(parents=True)
+    configs = root.parent / "external-configs"
+    configs.mkdir()
+    rooted = configs / "rooted.yaml"
+    rooted.write_text(
+        yaml.safe_dump({"path": str(target), "train": "images/train", "val": "images/val"}),
+        encoding="utf-8",
+    )
+    split = configs / "split.yaml"
+    split.write_text(
+        yaml.safe_dump({"path": str(root), "train": "中文 训练集/images/train", "val": "sibling/images/train"}),
+        encoding="utf-8",
+    )
+    manifest = configs / "train.txt"
+    manifest.write_text(str(target / "images" / "train" / "样本.png") + "\n", encoding="utf-8")
+    listed = configs / "listed.yaml"
+    listed.write_text(yaml.safe_dump({"train": "train.txt"}), encoding="utf-8")
+    unrelated = configs / "unrelated.yaml"
+    unrelated.write_text(
+        yaml.safe_dump({"path": str(root), "train": "sibling/images/train"}),
+        encoding="utf-8",
+    )
+
+    local_session = client.app.state.session_factory
+    with local_session() as db:
+        for task_id, data_path in (
+            ("rooted-reference", rooted),
+            ("split-reference", split),
+            ("manifest-reference", listed),
+            ("sibling-reference", unrelated),
+        ):
+            db.add(TrainingTask(
+                id=task_id,
+                name=task_id,
+                task_type="detect",
+                model_path="/models/yolo.pt",
+                data_path=str(data_path),
+            ))
+        db.commit()
+
+    references = client.get("/api/datasets/managed").json()[0]["references"]
+    assert {reference["id"] for reference in references} == {
+        "rooted-reference", "split-reference", "manifest-reference",
+    }
     assert client.delete("/api/datasets/managed/%E4%B8%AD%E6%96%87%20%E8%AE%AD%E7%BB%83%E9%9B%86").status_code == 409
 
 

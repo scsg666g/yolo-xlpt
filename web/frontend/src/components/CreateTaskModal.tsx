@@ -4,6 +4,7 @@ import { api } from '../api'
 import type { ComputeNode, DatasetUploadResult, Resources, TaskCreatePayload, TaskGroup, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { remoteOutputPathError, remoteOutputRoots } from '../remoteOutputPaths'
+import { remoteTrainingDataPathError, trainingDataLabel } from '../trainingDataPaths'
 import { UploadDatasetModal } from './UploadDatasetModal'
 import { analyzeImportedParameters, definitionsFromCatalog, importDefinitions, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
 
@@ -20,6 +21,10 @@ const initial: TaskCreatePayload = {
   execution_node_id: null, remote_output_root: '',
   imgsz: 640, device: '0', workers: 8, optimizer: 'auto', patience: 50, lr0: null,
   pretrained: true, cache: false, amp: true, close_mosaic: 10, advanced: {},
+}
+
+function availableDatasets(resources: Resources | null, taskType: string) {
+  return taskType === 'classify' ? resources?.classification_datasets || [] : resources?.datasets || []
 }
 
 export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
@@ -58,7 +63,7 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
       setForm((value) => ({
         ...value,
         model_path: value.model_path || data.models[0]?.path || '',
-        data_path: value.data_path || data.datasets[0]?.path || '',
+        data_path: value.data_path || availableDatasets(data, value.task_type)[0]?.path || '',
         device: data.gpus.length > 1 ? data.gpus.map((gpu) => gpu.index).join(',') : String(data.gpus[0]?.index ?? 'cpu'),
       }))
     }).catch((reason) => setError(reason.message))
@@ -85,7 +90,7 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
   if (!open) return null
 
   if (uploading) return <UploadDatasetModal onClose={() => setUploading(false)} onUploaded={(result) => {
-    setResources((current) => current ? { ...current, datasets: [...current.datasets.filter((file) => file.path !== result.resource.path), result.resource] } : { gpus: [], models: [], datasets: [result.resource] })
+    setResources((current) => current ? { ...current, datasets: [...current.datasets.filter((file) => file.path !== result.resource.path), result.resource] } : { gpus: [], models: [], datasets: [result.resource], classification_datasets: [] })
     setForm((current) => ({ ...current, data_path: result.resource.path }))
     setUploaded(result); setError(''); setUploading(false)
   }} />
@@ -115,8 +120,10 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
   const jsonParameters = { task: form.task_type, mode: 'train', name: form.name, model: form.model_path, data: form.data_path, epochs: form.epochs, batch: form.batch, imgsz: form.imgsz, device: form.device, workers: form.workers, optimizer: form.optimizer, patience: form.patience, lr0: form.lr0, pretrained: form.pretrained, cache: form.cache, amp: form.amp, close_mosaic: form.close_mosaic, ...form.advanced }
   const isRemote = Boolean(form.execution_node_id)
   const executionNode = nodes.find((node) => node.id === form.execution_node_id)
+  const datasetOptions = availableDatasets(resources, form.task_type)
   const outputRoots = remoteOutputRoots(executionNode)
   const outputPathError = isRemote ? remoteOutputPathError(form.remote_output_root || '', outputRoots) : null
+  const dataPathError = isRemote ? remoteTrainingDataPathError(form.task_type, form.data_path) : null
   const remoteTrainingUnavailableReason = isRemote
     ? executionNode?.training_unavailable_reason || (!executionNode ? '正在读取远程服务器状态' : null)
     : null
@@ -131,15 +138,24 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
     setForm((current) => ({
       ...current, execution_node_id: id,
       model_path: id ? '' : (resources?.models[0]?.path || ''),
-      data_path: id ? '' : (resources?.datasets[0]?.path || ''),
+      data_path: id ? '' : (availableDatasets(resources, current.task_type)[0]?.path || ''),
       device: id ? '0' : String(resources?.gpus[0]?.index ?? 'cpu'),
       remote_output_root: output,
     }))
   }
 
+  function selectTaskType(taskType: string) {
+    setUploaded(null)
+    setForm((current) => ({
+      ...current,
+      task_type: taskType,
+      data_path: current.execution_node_id ? '' : (availableDatasets(resources, taskType)[0]?.path || ''),
+    }))
+  }
+
   async function submit(event: React.FormEvent) {
     event.preventDefault()
-    if (outputPathError) { setError(outputPathError); return }
+    if (outputPathError || dataPathError) { setError(outputPathError || dataPathError || ''); return }
     setSubmitting(true)
     setError('')
     try {
@@ -165,15 +181,15 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
             <label className="span-2">任务名称<input data-modal-initial-focus required value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：反光背心 YOLO26x 试验 02" /></label>
             <label className="span-2">训练分组<select value={form.group_id || ''} onChange={(e) => update('group_id', e.target.value || null)}><option value="">未分组</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select><small>将同一模型的多轮实验放在同一分组中，便于折叠和对比。</small></label>
             <label className="span-2">执行服务器<select value={form.execution_node_id || ''} onChange={(e) => selectExecutionNode(e.target.value || null)}><option value="">本机（中台服务器）</option>{nodes.filter((node) => node.kind === 'agent' && node.enabled).map((node) => <option key={node.id} value={node.id}>{node.name} · {node.address || node.hostname || node.status}</option>)}</select><small>{isRemote ? `远程 Agent：${remoteTrainingUnavailableReason || '训练已就绪'}` : '使用中台服务器本机资源与路径'}</small></label>
-            <label>任务类型<select value={form.task_type} onChange={(e) => update('task_type', e.target.value)}><option value="detect">目标检测</option><option value="segment">实例分割</option><option value="classify">图像分类</option><option value="pose">姿态估计</option><option value="obb">旋转框</option></select></label>
+            <label>任务类型<select value={form.task_type} onChange={(e) => selectTaskType(e.target.value)}><option value="detect">目标检测</option><option value="segment">实例分割</option><option value="classify">图像分类</option><option value="pose">姿态估计</option><option value="obb">旋转框</option></select></label>
             <label>GPU 设备{isRemote ? <input value={form.device} onChange={(e) => update('device', e.target.value)} placeholder="例如 0 或 0,1；也可填 cpu" /> : <select value={form.device} onChange={(e) => update('device', e.target.value)}>{resources?.gpus.map((gpu) => <option key={gpu.index} value={gpu.index}>{gpu.index} · {gpu.name}</option>)}{(resources?.gpus.length || 0) > 1 && <option value={resources!.gpus.map((gpu) => gpu.index).join(',')}>全部 GPU（DDP）</option>}<option value="cpu">CPU</option></select>}</label>
-            {isRemote ? <><label className="span-2">远程基础模型绝对路径<input required value={form.model_path} onChange={(e) => update('model_path', e.target.value)} placeholder="填写远程服务器上的模型文件绝对路径" /></label><label className="span-2">远程数据集 YAML 绝对路径<input required value={form.data_path} onChange={(e) => update('data_path', e.target.value)} placeholder="填写远程服务器上的 data.yaml 绝对路径" /></label><label className="span-2">远程训练输出根目录
+            {isRemote ? <><label className="span-2">远程基础模型绝对路径<input required value={form.model_path} onChange={(e) => update('model_path', e.target.value)} placeholder="填写远程服务器上的模型文件绝对路径" /></label><label className="span-2">远程{trainingDataLabel(form.task_type)}绝对路径<input required value={form.data_path} aria-invalid={Boolean(dataPathError)} onChange={(e) => update('data_path', e.target.value)} placeholder={form.task_type === 'classify' ? '填写包含 train/val 的远程分类数据集目录' : '填写远程服务器上的 data.yaml 绝对路径'} />{dataPathError && <span className="alert error" role="alert" style={{ marginBottom: 0 }}>{dataPathError}</span>}</label><label className="span-2">远程训练输出根目录
               <input required list="remote-training-output-roots" value={form.remote_output_root} aria-invalid={Boolean(outputPathError)} aria-describedby="remote-output-help" onChange={(e) => { if (form.execution_node_id) outputDrafts.current[form.execution_node_id] = e.target.value; update('remote_output_root', e.target.value) }} placeholder={outputRoots.length ? '选择允许目录，也可填写已存在的子目录' : '填写远程 Agent 允许写入训练结果的绝对路径'} />
               <datalist id="remote-training-output-roots">{outputRoots.map((root) => <option key={root} value={root} />)}</datalist>
               <small id="remote-output-help">{outputRoots.length ? '可选择以下 Agent 允许目录，或填写其中已存在的子目录。如需新目录，请先在远程服务器创建。最终以远程 Agent 的文件检查为准。' : '此 Agent 尚未上报允许目录，请按远程配置手动填写已存在的目录；升级 Agent 后可直接选择目录。'}</small>
               {outputRoots.map((root) => <code key={root} style={{ overflowWrap: 'anywhere' }}>{root}</code>)}
               {outputPathError && <span className="alert error" role="alert" style={{ marginBottom: 0 }}>{outputPathError}</span>}
-            </label><div className="alert warning span-2" role="note" style={{ gridColumn: 'span 2', marginBottom: 0 }}><strong>路径必须存在于远程服务器“{executionNode?.name || '当前所选服务器'}”上。</strong><br />请填写该服务器上的模型、YAML 和输出目录路径；不能直接使用中心平台资源列表中的本机路径。数据不会自动复制。</div></> : <><label className="span-2">基础模型<select required value={form.model_path} onChange={(e) => update('model_path', e.target.value)}><option value="">请选择模型</option>{resources?.models.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label><div className="dataset-field"><div className="dataset-field-heading"><label htmlFor="task-dataset">数据集配置</label><button type="button" className="button ghost compact" disabled={form.task_type !== 'detect'} onClick={() => setUploading(true)} title={form.task_type === 'detect' ? '上传本地数据集文件夹' : '文件夹上传目前支持目标检测，请选择已有数据集配置'}><Upload size={14} />上传数据集</button></div><label><select id="task-dataset" required value={form.data_path} onChange={(e) => { update('data_path', e.target.value); setUploaded(null) }}><option value="">请选择数据集 YAML</option>{resources?.datasets.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>{form.task_type !== 'detect' && <small className="upload-help">文件夹上传目前支持目标检测，其他任务请使用已有数据集配置。</small>}</div></>}
+            </label><div className="alert warning span-2" role="note" style={{ gridColumn: 'span 2', marginBottom: 0 }}><strong>路径必须存在于远程服务器“{executionNode?.name || '当前所选服务器'}”上。</strong><br />请填写该服务器上的模型、{form.task_type === 'classify' ? '分类数据集目录' : 'YAML'}和输出目录路径；不能直接使用中心平台资源列表中的本机路径。数据不会自动复制。</div></> : <><label className="span-2">基础模型<select required value={form.model_path} onChange={(e) => update('model_path', e.target.value)}><option value="">请选择模型</option>{resources?.models.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label><div className="dataset-field"><div className="dataset-field-heading"><label htmlFor="task-dataset">{form.task_type === 'classify' ? '分类数据集目录' : '数据集配置'}</label><button type="button" className="button ghost compact" disabled={form.task_type !== 'detect'} onClick={() => setUploading(true)} title={form.task_type === 'detect' ? '上传本地数据集文件夹' : '文件夹上传目前支持目标检测，请选择已有数据集配置'}><Upload size={14} />上传数据集</button></div><label><select id="task-dataset" required value={form.data_path} onChange={(e) => { update('data_path', e.target.value); setUploaded(null) }}><option value="">{form.task_type === 'classify' ? '请选择分类数据集目录' : '请选择数据集 YAML'}</option>{datasetOptions.map((file) => <option key={file.path} value={file.path}>{file.name} · {file.path}</option>)}</select></label>{form.task_type !== 'detect' && <small className="upload-help">{form.task_type === 'classify' ? '分类训练使用包含 train/val 和类别子目录的数据集目录。' : '文件夹上传目前支持目标检测，请使用已有数据集 YAML。'}</small>}</div></>}
             {uploaded && <div className="alert dataset-upload-success span-2" role="status" style={{ gridColumn: 'span 2', marginBottom: 0 }}><strong>已上传并选中：{uploaded.name}</strong><p>训练 {uploaded.stats.train_images} 张 · 验证 {uploaded.stats.val_images} 张 · {uploaded.stats.classes} 个类别</p><p>path: {uploaded.directory}</p>{uploaded.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
             <label>训练轮数<input type="number" min="1" value={form.epochs} onChange={(e) => update('epochs', Number(e.target.value))} /></label>
             <label>批大小<input type="number" min="1" value={form.batch} onChange={(e) => update('batch', Number(e.target.value))} /></label>

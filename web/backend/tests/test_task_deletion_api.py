@@ -8,8 +8,9 @@ from sqlalchemy import select
 import app.model_test_storage as storage
 import app.services as services
 from app.database import get_db
+from app.deletion_jobs import list_attempt_deletion_jobs
 from app.main import app
-from app.models import ComputeNode, ModelTest, RemoteOperation, TrainingTask, utcnow
+from app.models import ComputeNode, ModelTest, RemoteOperation, TrainingRun, TrainingTask, utcnow
 from test_services import make_session, make_task
 
 
@@ -144,3 +145,89 @@ def test_history_limit_cannot_hide_latest_failure_of_trashed_task(deletion_clien
     current = next(job for job in jobs if job["task_id"] == task.id)
     assert current["error"] == "文件暂不可写"
     assert task.error_message == "原来的训练中断原因"
+
+
+def test_attempt_deletion_list_keeps_active_and_failed_jobs_outside_history_limit(deletion_client):
+    _, db, task = deletion_client
+    run = TrainingRun(
+        id="attempt-list-run", task=task, attempt_number=3, status="completed",
+        model_path=task.model_path, data_path=task.data_path,
+    )
+    db.add(run)
+    db.flush()
+    db.add_all([
+        RemoteOperation(
+            id="attempt-failed", node_id="__local__", task_id=task.id,
+            kind="local_delete", status="failed", error="disk busy",
+            payload={"scope": "attempt", "run_id": run.id, "attempt_number": 3},
+            updated_at=utcnow() - timedelta(days=3),
+        ),
+        RemoteOperation(
+            id="attempt-active", node_id="__local__", task_id="missing-active-task",
+            kind="local_delete", status="running",
+            payload={"scope": "attempt", "run_id": "missing-active-run", "attempt_number": 2},
+            updated_at=utcnow() - timedelta(days=2),
+        ),
+        *[
+            RemoteOperation(
+                id=f"attempt-history-{index}", node_id="__local__", task_id=f"history-task-{index}",
+                kind="local_delete", status="succeeded",
+                payload={"scope": "attempt", "run_id": f"history-run-{index}", "attempt_number": index + 1},
+                updated_at=utcnow() - timedelta(hours=index),
+            )
+            for index in range(3)
+        ],
+        RemoteOperation(
+            id="whole-task-history", node_id="__local__", task_id=task.id,
+            kind="local_delete", status="failed", payload={"scope": "task"},
+        ),
+    ])
+    db.commit()
+
+    jobs = list_attempt_deletion_jobs(db, limit=1)
+    assert {job["id"] for job in jobs} == {
+        "attempt-failed", "attempt-active", "attempt-history-0",
+    }
+    failed = next(job for job in jobs if job["id"] == "attempt-failed")
+    assert failed["scope"] == "attempt"
+    assert failed["run_id"] == run.id
+    assert failed["attempt_number"] == 3
+    assert failed["retryable"] is True
+
+
+@pytest.mark.parametrize(
+    ("layout", "agent_version", "required_version", "upgrade_required"),
+    [
+        ("canonical", "1.8.0", "1.8.0", False),
+        ("legacy_flat", "1.8.0", "2.0.1", True),
+    ],
+)
+def test_attempt_deletion_list_uses_attempt_agent_requirement(
+    deletion_client, layout, agent_version, required_version, upgrade_required,
+):
+    _, db, task = deletion_client
+    node = ComputeNode(
+        id=f"attempt-node-{layout}", name="Attempt node", kind="agent", enabled=True,
+        agent_version=agent_version, report_interval_seconds=5, last_seen_at=utcnow(), snapshot={},
+    )
+    task.execution_node_id = node.id
+    run = TrainingRun(
+        id=f"attempt-run-{layout}", task=task, attempt_number=1, status="completed",
+        execution_node_id=node.id, model_path=task.model_path, data_path=task.data_path,
+    )
+    operation = RemoteOperation(
+        id=f"attempt-operation-{layout}", node_id=node.id, task_id=task.id,
+        kind="delete", status="pending",
+        payload={
+            "scope": "attempt", "run_id": run.id, "attempt_number": 1,
+            "runs": [{"layout": layout}],
+        },
+    )
+    db.add_all([node, run, operation])
+    db.commit()
+
+    job = next(item for item in list_attempt_deletion_jobs(db) if item["id"] == operation.id)
+    assert job["required_agent_version"] == required_version
+    assert (job["phase"] == "agent_upgrade_required") is upgrade_required
+    if not upgrade_required:
+        assert "完整任务清理" not in job["message"]

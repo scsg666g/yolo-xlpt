@@ -8,6 +8,7 @@ import { useModalFocus } from '../useModalFocus'
 import { CreateTaskModal } from './CreateTaskModal'
 import { RenameTaskModal } from './RenameTaskModal'
 import { MoveTaskGroupModal, TaskGroupModal } from './TaskGroupModals'
+import { AttemptDeletionHistory } from './AttemptDeletionHistory'
 
 const statusIcon = (status: string) => status === 'completed' ? <CheckCircle2 size={15} /> : status === 'failed' || status === 'interrupted' ? <AlertTriangle size={15} /> : status === 'running' ? <Zap size={15} /> : <Clock3 size={15} />
 const activeStatuses = ['queued', 'starting', 'running', 'stopping']
@@ -799,7 +800,7 @@ export function Dashboard() {
   return <div className="page dashboard-page">
     <header className="page-header">
       <div><span className="eyebrow">TRAINING OPERATIONS</span><h1>训练任务中心</h1><p>创建、调度并观察每一次模型实验。</p></div>
-      <div className="header-actions"><button type="button" className="button ghost" onClick={openTrash}><Trash2 size={16} />回收站</button><button type="button" className="button ghost" disabled={syncing} onClick={() => void syncHistoricalRuns()}><RefreshCw size={16} className={syncing ? 'spin' : ''} />{syncing ? '同步中…' : '同步历史任务'}</button><button type="button" className="button ghost" onClick={() => setGroupEditor({ group: null })}><FolderPlus size={16} />新建分组</button><button type="button" className="button primary" onClick={() => setCreating(true)}><Plus size={17} />新建训练任务</button></div>
+      <div className="header-actions"><AttemptDeletionHistory /><button type="button" className="button ghost" onClick={openTrash}><Trash2 size={16} />回收站</button><button type="button" className="button ghost" disabled={syncing} onClick={() => void syncHistoricalRuns()}><RefreshCw size={16} className={syncing ? 'spin' : ''} />{syncing ? '同步中…' : '同步历史任务'}</button><button type="button" className="button ghost" onClick={() => setGroupEditor({ group: null })}><FolderPlus size={16} />新建分组</button><button type="button" className="button primary" onClick={() => setCreating(true)}><Plus size={17} />新建训练任务</button></div>
     </header>
 
     <section className="stat-row">

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -30,17 +31,21 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.5"
+VERSION = "2.0.6"
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
 TRACE_INTERVAL = 10
 MODEL_TRANSFER_FINALIZE_TIMEOUT_SECONDS = 1800
+LOG_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 LOGGER = logging.getLogger("yolo-monitor-agent")
 CONFIRM_RETRY_DELAYS = (1, 2, 4, 8)
 ACTIVE_STATE_VERSION = 1
 WORKSPACE_REGISTRY_VERSION = 2
 _YOLO_VERSION_CACHE: dict[tuple[str, int | None], str | None] = {}
+REPORT_BOOT_ID = uuid.uuid4().hex
+_REPORT_SEQUENCE = 0
+_REPORT_SEQUENCE_LOCK = threading.Lock()
 
 
 REMOTE_TRACE_RUNNER = r'''#!/usr/bin/env python3
@@ -393,6 +398,13 @@ def training_capability(config: dict) -> dict:
                 "model_test_roots": list(config.get("model_test_roots", []))}
 
 
+def next_report_sequence() -> int:
+    global _REPORT_SEQUENCE
+    with _REPORT_SEQUENCE_LOCK:
+        _REPORT_SEQUENCE += 1
+        return _REPORT_SEQUENCE
+
+
 def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
     memory: dict[str, int] = {}
     try:
@@ -409,6 +421,8 @@ def collect(binary: str = "nvidia-smi", config: dict | None = None) -> dict:
     gpus, message = collect_gpus(binary, config)
     payload = {
         "agent_version": VERSION,
+        "boot_id": REPORT_BOOT_ID,
+        "report_seq": next_report_sequence(),
         "compute": {
             "available": bool(gpus), "provider": "NVIDIA" if gpus else None,
             "message": message, "sampled_at": datetime.now(timezone.utc).isoformat(),
@@ -1394,11 +1408,31 @@ def scalar_parameter(value) -> str:
     raise ValueError("不支持的参数类型")
 
 
+def training_data_path(task_type: str, raw: str, roots: list[str]) -> Path:
+    """Validate the different data contract used by classification training."""
+    if task_type == "classify":
+        dataset = within_allowed(raw, roots, file_required=False, label="分类数据集目录")
+        train = dataset / "train"
+        if not train.is_dir():
+            raise ValueError(f"远程分类数据集缺少 train 目录：{train}")
+        try:
+            has_class = any(child.is_dir() and not child.name.startswith(".") for child in train.iterdir())
+        except OSError as exc:
+            raise ValueError(f"远程分类数据集无法读取：{dataset}") from exc
+        if not has_class:
+            raise ValueError(f"远程分类数据集 train 目录中没有类别子目录：{train}")
+        return dataset
+    dataset = within_allowed(raw, roots, label="数据集 YAML 文件")
+    if dataset.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError(f"非分类任务的数据集必须是 YAML 文件：{dataset}")
+    return dataset
+
+
 def build_training_command(config: dict, task: dict) -> list[str]:
     params = task["parameters"]
     roots = config["allowed_training_roots"]
     model = within_allowed(task["model_path"], roots, label="基础模型文件")
-    dataset = within_allowed(task["data_path"], roots, label="数据集 YAML 文件")
+    dataset = training_data_path(task["task_type"], task["data_path"], roots)
     run_dir = Path(task["run_dir"]).resolve()
     output_root = within_allowed(params["remote_output_root"], roots, file_required=False,
                                  label="训练输出根目录")
@@ -1844,6 +1878,75 @@ def fetch_remote_model(config: dict, operation: dict, stop: threading.Event, end
         # The lease will expire; a restarted Agent can safely retry from byte 0.
 
 
+def fetch_remote_log(config: dict, operation: dict, stop: threading.Event, endpoint: str) -> None:
+    """Stream the bytes present when a managed log is opened, allowing later appends."""
+    payload = operation["payload"]
+    _run_dir, path = operation_paths(config, payload)
+    if path is None:
+        raise ValueError("远程训练日志路径缺失")
+    maximum = payload.get("max_bytes", LOG_SNAPSHOT_MAX_BYTES)
+    if type(maximum) is not int or maximum < 0:
+        raise ValueError("远程日志下载大小限制无效")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"远程训练日志无法打开：{path}") from exc
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("远程训练日志不是普通文件")
+        snapshot_size = opened.st_size
+        if maximum and snapshot_size > maximum:
+            raise ValueError(f"远程训练日志超过下载大小限制：{snapshot_size} > {maximum}")
+        identity = (opened.st_dev, opened.st_ino, opened.st_mode)
+
+        def verify_snapshot() -> None:
+            current = os.fstat(handle.fileno())
+            if ((current.st_dev, current.st_ino, current.st_mode) != identity
+                    or not stat.S_ISREG(current.st_mode) or current.st_size < snapshot_size):
+                raise ValueError("远程训练日志在传输期间被截断或替换，请重试")
+            try:
+                current_path = os.stat(path, follow_symlinks=False)
+                if (path.resolve(strict=True) != path or path.is_symlink()
+                        or (current_path.st_dev, current_path.st_ino, current_path.st_mode) != identity):
+                    raise ValueError("远程训练日志在传输期间被替换，请重试")
+            except OSError as exc:
+                raise ValueError("远程训练日志在传输期间被替换，请重试") from exc
+
+        verify_snapshot()
+        metadata = {
+            "size": snapshot_size,
+            "modified_at": datetime.fromtimestamp(opened.st_mtime, timezone.utc).isoformat(),
+            "mtime_ns": opened.st_mtime_ns,
+        }
+        digest, offset = hashlib.sha256(), 0
+        while not stop.is_set():
+            remaining = snapshot_size - offset
+            data = handle.read(min(512 * 1024, remaining)) if remaining else b""
+            if remaining and not data:
+                raise ValueError("远程训练日志在传输期间被截断，请重试")
+            digest.update(data)
+            final = offset + len(data) == snapshot_size
+            verify_snapshot()
+            chunk = {
+                "lease": operation["lease"], "offset": offset,
+                "data": base64.b64encode(data).decode("ascii"), "final": final,
+                "sha256": digest.hexdigest() if final else None,
+                **metadata,
+            }
+            response = submit_operation_chunk(config, endpoint, chunk, stop)
+            if response is None or response.get("status") == "succeeded":
+                return
+            offset += len(data)
+        # The lease will expire; a restarted Agent can safely take a fresh snapshot.
+
+
 def execute_operation(config: dict, operation: dict, stop: threading.Event) -> None:
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/operations/{operation['id']}"
     result = {"lease": operation["lease"], "success": True}
@@ -1895,6 +1998,9 @@ def execute_operation(config: dict, operation: dict, stop: threading.Event) -> N
                 return  # lease expires and a restarted Agent can retry from zero
         elif operation["kind"] == "fetch_model":
             fetch_remote_model(config, operation, stop, endpoint)
+            return
+        elif operation["kind"] == "fetch_log":
+            fetch_remote_log(config, operation, stop, endpoint)
             return
         else:
             raise ValueError("未知远程操作")

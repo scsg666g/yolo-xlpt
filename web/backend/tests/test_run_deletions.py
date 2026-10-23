@@ -1,13 +1,18 @@
 import hashlib
+import shutil
+from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+import app.local_deletions as local_deletions
 import app.run_deletions as run_deletions
 from app.database import Base
 from app.local_deletions import LocalDeletionWorker, queue_local_run_delete
-from app.models import Artifact, MetricPoint, ModelTest, RemoteOperation, TaskEvent, TrainingRun, TrainingTask
+from app.models import Artifact, MetricPoint, ModelAsset, ModelTest, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from app.services import create_training_run
 
 
@@ -283,3 +288,212 @@ def test_local_attempt_delete_preserves_path_referenced_by_other_task(tmp_path, 
             raise AssertionError("an Attempt referenced by another task must not be deleted")
 
     assert weight.read_bytes() == b"shared model"
+
+
+def _isolated_attempt(tmp_path, monkeypatch, suffix="protected"):
+    roots = {
+        "runs": tmp_path / "runs",
+        "runtime": tmp_path / "runtime",
+        "logs": tmp_path / "logs",
+        "ultralytics": tmp_path / "ultralytics",
+    }
+    for root in roots.values():
+        root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(run_deletions, "RUNS_ROOT", roots["runs"])
+    monkeypatch.setattr(run_deletions, "RUNTIME_ROOT", roots["runtime"])
+    monkeypatch.setattr(run_deletions, "LOG_ROOT", roots["logs"])
+    monkeypatch.setattr(run_deletions, "ULTRALYTICS_ROOT", roots["ultralytics"])
+    monkeypatch.setattr(local_deletions, "managed_dataset_mutation", nullcontext)
+    factory = session_factory(tmp_path)
+    task_id = f"task-{suffix}"
+    run_id = f"run-{suffix}"
+    run_dir = roots["runs"] / "detect" / task_id / "attempt-001"
+    weight = run_dir / "weights" / "best.pt"
+    weight.parent.mkdir(parents=True)
+    weight.write_bytes(b"weight")
+    runtime = roots["runtime"] / task_id / "attempt-001"
+    runtime.mkdir(parents=True)
+    with factory() as db:
+        task = TrainingTask(
+            id=task_id, name=suffix, task_type="detect", status="completed",
+            model_path="base.pt", data_path="data.yaml", config={},
+        )
+        run = TrainingRun(
+            id=run_id, task=task, attempt_number=1, status="completed",
+            model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir),
+        )
+        task.current_run_id = run.id
+        task.run_dir = str(run_dir)
+        db.add_all([task, run])
+        db.flush()
+        artifact = Artifact(
+            task_id=task.id, run_id=run.id, kind="weight", name="weights/best.pt",
+            path=str(weight), size=weight.stat().st_size,
+        )
+        db.add(artifact)
+        db.commit()
+    return factory, roots, task_id, run_id, weight
+
+
+def test_local_attempt_delete_rejects_registered_model_asset(tmp_path, monkeypatch):
+    factory, _, task_id, run_id, weight = _isolated_attempt(tmp_path, monkeypatch, "asset")
+    with factory() as db:
+        task, run = db.get(TrainingTask, task_id), db.get(TrainingRun, run_id)
+        db.add(ModelAsset(
+            id="asset-protected", name="正在使用的模型", source_type="training_artifact",
+            execution_node_id="local", path=str(weight), status="ready",
+        ))
+        db.flush()
+        with pytest.raises(ValueError, match="模型来源"):
+            queue_local_run_delete(db, task, run)
+    assert weight.exists()
+
+
+def test_local_attempt_delete_rejects_removed_asset_retained_by_external_history(tmp_path, monkeypatch):
+    factory, _, task_id, run_id, weight = _isolated_attempt(tmp_path, monkeypatch, "history")
+    with factory() as db:
+        task, run = db.get(TrainingTask, task_id), db.get(TrainingRun, run_id)
+        asset = ModelAsset(
+            id="asset-history", name="历史模型", source_type="training_artifact",
+            execution_node_id="local", path=str(weight), status="removed", deleted_at=utcnow(),
+        )
+        db.add(asset)
+        db.flush()
+        db.add(ModelTest(
+            id="b" * 32, task_id=None, model_asset_id=asset.id,
+            model_source_type="registered_model", model_source_path=str(weight),
+            artifact_name="best.pt", model_name="best.pt", confidence=0.25, iou=0.7,
+            status="completed",
+        ))
+        db.flush()
+        with pytest.raises(ValueError, match="历史引用"):
+            queue_local_run_delete(db, task, run)
+    assert weight.exists()
+
+
+def test_local_attempt_delete_rejects_external_active_model_test(tmp_path, monkeypatch):
+    factory, _, task_id, run_id, weight = _isolated_attempt(tmp_path, monkeypatch, "active-test")
+    with factory() as db:
+        task, run = db.get(TrainingTask, task_id), db.get(TrainingRun, run_id)
+        db.add(ModelTest(
+            id="c" * 32, task_id=None, execution_node_id="local",
+            model_source_type="registered_model", model_source_path=str(weight),
+            artifact_name="best.pt", model_name="best.pt", confidence=0.25, iou=0.7,
+            status="running",
+        ))
+        db.flush()
+        with pytest.raises(ValueError, match="其他模型检测"):
+            queue_local_run_delete(db, task, run)
+    assert weight.exists()
+
+
+def test_local_attempt_delete_allows_removed_unreferenced_asset(tmp_path, monkeypatch):
+    factory, _, task_id, run_id, weight = _isolated_attempt(tmp_path, monkeypatch, "removed-asset")
+    with factory() as db:
+        task, run = db.get(TrainingTask, task_id), db.get(TrainingRun, run_id)
+        db.add(ModelAsset(
+            id="asset-removed", name="已移除模型", source_type="training_artifact",
+            execution_node_id="local", path=str(weight), status="removed", deleted_at=utcnow(),
+        ))
+        db.flush()
+        operation = queue_local_run_delete(db, task, run)
+        assert operation.payload["plan"]["run_id"] == run.id
+
+
+def test_attempt_files_are_deleted_without_holding_sqlite_writer_lock(tmp_path, monkeypatch):
+    factory, _, task_id, run_id, _ = _isolated_attempt(tmp_path, monkeypatch, "writer-lock")
+    with factory() as db:
+        operation = queue_local_run_delete(db, db.get(TrainingTask, task_id), db.get(TrainingRun, run_id))
+        db.commit()
+
+    execute = local_deletions.execute_local_attempt_plan
+
+    def execute_while_writing(plan):
+        with factory() as other:
+            other.add(TrainingTask(
+                id="parallel-write", name="Parallel write", task_type="detect",
+                status="draft", model_path="base.pt", data_path="data.yaml", config={},
+            ))
+            other.commit()
+        return execute(plan)
+
+    monkeypatch.setattr(local_deletions, "execute_local_attempt_plan", execute_while_writing)
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        assert db.get(TrainingTask, "parallel-write") is not None
+        assert db.get(RemoteOperation, operation.id).status == "succeeded"
+
+
+def test_stale_attempt_cleanup_resumes_after_partial_file_removal(tmp_path, monkeypatch):
+    factory, roots, task_id, run_id, _ = _isolated_attempt(tmp_path, monkeypatch, "stale-partial")
+    with factory() as db:
+        operation = queue_local_run_delete(db, db.get(TrainingTask, task_id), db.get(TrainingRun, run_id))
+        db.commit()
+        runtime_target = Path(operation.payload["plan"]["runtime_target"])
+        shutil.rmtree(runtime_target)
+        operation.status = "running"
+        operation.lease = "stale-lease"
+        operation.updated_at = utcnow() - timedelta(hours=1)
+        db.commit()
+
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        completed = db.get(RemoteOperation, operation.id)
+        assert completed.status == "succeeded"
+        assert str(runtime_target) in completed.payload["receipt"]["already_missing_targets"]
+        assert db.get(TrainingRun, run_id) is None
+    assert not (roots["runs"] / "detect" / task_id / "attempt-001").exists()
+
+
+def test_legacy_attempt_plan_rejects_new_root_entry_after_queue(tmp_path, monkeypatch):
+    factory, roots, task_id, run_id, weight = _isolated_attempt(tmp_path, monkeypatch, "legacy-freeze")
+    task_root = roots["runs"] / "detect" / task_id
+    canonical = task_root / "attempt-001"
+    legacy_weight = task_root / "weights" / "best.pt"
+    legacy_weight.parent.mkdir(parents=True, exist_ok=True)
+    legacy_weight.write_bytes(weight.read_bytes())
+    shutil.rmtree(canonical)
+    with factory() as db:
+        task, run = db.get(TrainingTask, task_id), db.get(TrainingRun, run_id)
+        run.run_dir = task.run_dir = str(task_root)
+        artifact = db.scalar(select(Artifact).where(Artifact.run_id == run.id))
+        artifact.path = str(legacy_weight)
+        db.commit()
+        operation = queue_local_run_delete(db, task, run)
+        db.commit()
+    unexpected = task_root / "created-after-queue.txt"
+    unexpected.write_text("keep", encoding="utf-8")
+
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        assert db.get(RemoteOperation, operation.id).status == "failed"
+        assert db.get(TrainingRun, run_id) is not None
+    assert unexpected.read_text(encoding="utf-8") == "keep"
+    assert legacy_weight.exists()
+
+
+def test_attempt_cleanup_finishes_database_records_from_saved_receipt(tmp_path, monkeypatch):
+    factory, _, task_id, run_id, _ = _isolated_attempt(tmp_path, monkeypatch, "saved-receipt")
+    with factory() as db:
+        operation = queue_local_run_delete(db, db.get(TrainingTask, task_id), db.get(TrainingRun, run_id))
+        db.commit()
+        plan = operation.payload["plan"]
+    receipt = run_deletions.execute_local_attempt_plan(plan)
+    receipt.update({
+        "plan_version": plan["version"], "task_id": task_id, "run_id": run_id,
+        "attempt_number": plan["attempt_number"], "completed_at": utcnow().isoformat(),
+    })
+    with factory() as db:
+        operation = db.get(RemoteOperation, operation.id)
+        operation.status = "running"
+        operation.lease = "expired-receipt-lease"
+        operation.updated_at = utcnow() - timedelta(hours=1)
+        operation.payload = {**operation.payload, "phase": "recording", "receipt": receipt}
+        db.commit()
+
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        completed = db.get(RemoteOperation, operation.id)
+        assert completed.status == "succeeded"
+        assert completed.payload["receipt"] == receipt
+        assert db.get(TrainingRun, run_id) is None

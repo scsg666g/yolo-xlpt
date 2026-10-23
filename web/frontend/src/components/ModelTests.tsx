@@ -10,8 +10,9 @@ import type {
   TaskGroup, TrainingRun, TrainingTask,
 } from '../types'
 import {
-  activeModelTestStatuses, modelTestDate, modelTestParameterText, modelTestResultLabel, modelTestStatusLabels,
-  modelTestTaskLabel, modelTestTaskType, modelTestWeightName, type SelectedImage, TestWorkspace,
+  activeModelTestStatuses, createModelTestRequestId, createOrRecoverModelTest, modelTestDate, modelTestParameterText,
+  modelTestRequestMayHaveReachedServer, modelTestResultLabel, modelTestStatusLabels, modelTestTaskLabel, modelTestTaskType, modelTestWeightName,
+  startOrRecoverModelTest, type SelectedImage, TestWorkspace, uploadPendingModelTestImages,
 } from './ModelTestShared'
 import { RegisteredModelLibrary, TrainingTaskLibrary } from './ModelLibrary'
 import '../model-tests.css'
@@ -662,30 +663,35 @@ export function ModelTests() {
         asset = await waitForAssetReady(asset, signal, asset.status === 'failed')
       }
       setRunStage('正在创建测试记录…')
-      const created = rerun?.artifact_id
-        ? await api.createModelTest(
-          rerun.artifact_id, confidence, iou, files, signal, rerun.run_id || undefined, rerun.id,
-        )
-        : rerun?.model_asset_id
-          ? await api.createStandaloneModelTest(
-            rerun.model_asset_id, confidence, iou, files, signal, rerun.id,
+      const requestId = createModelTestRequestId()
+      createdId = requestId
+      pendingUploadId.current = requestId
+      const created = await createOrRecoverModelTest(requestId, files, signal, () => (
+        rerun?.artifact_id
+          ? api.createModelTest(
+            rerun.artifact_id, confidence, iou, files, requestId, signal, rerun.run_id || undefined, rerun.id,
           )
-          : sourceType === 'training_artifact' && selectedArtifact
-            ? await api.createModelTest(selectedArtifact.id, confidence, iou, files, signal, trainingRunId || undefined)
-            : await api.createStandaloneModelTest(asset!.id, confidence, iou, files, signal)
-      createdId = created.id
+          : rerun?.model_asset_id
+            ? api.createStandaloneModelTest(
+              rerun.model_asset_id, confidence, iou, files, requestId, signal, rerun.id,
+            )
+            : sourceType === 'training_artifact' && selectedArtifact
+              ? api.createModelTest(selectedArtifact.id, confidence, iou, files, requestId, signal, trainingRunId || undefined)
+              : api.createStandaloneModelTest(asset!.id, confidence, iou, files, requestId, signal)
+      ))
       lastKnown = created
-      pendingUploadId.current = created.id
       setTest(created); setRunStage(modelTestStatusLabels[created.status])
       await refreshHistory(signal, true)
-      for (let index = 0; index < files.length; index++) {
-        setRunStage(`正在上传 ${index + 1}/${files.length}：${files[index].name}`)
-        await api.uploadModelTestImage(created.id, index, files[index], signal)
-      }
-      setRunStage('正在提交测试…')
-      let current = await api.startModelTest(created.id, signal)
+      let current = await uploadPendingModelTestImages(created, files, signal, (index, file) => {
+        setRunStage(`正在上传 ${index + 1}/${files.length}：${file.name}`)
+      })
       lastKnown = current
-      pendingUploadId.current = null
+      if (current.status === 'uploading') {
+        setRunStage('正在提交测试…')
+        current = await startOrRecoverModelTest(current, files, signal)
+        lastKnown = current
+      }
+      if (current.status !== 'uploading') pendingUploadId.current = null
       await refreshHistory(signal, true)
       const deadline = Date.now() + 15 * 60_000
       while (true) {
@@ -696,19 +702,23 @@ export function ModelTests() {
         if (current.status === 'completed') break
         if (Date.now() > deadline) throw new Error('等待测试超时，任务会继续运行，请稍后在历史记录中查看')
         await sleep(1500, signal)
-        current = await api.modelTest(created.id, signal)
+        current = await api.modelTest(requestId, signal)
       }
       await refreshHistory(signal, true)
     } catch (reason) {
       if (!signal.aborted) {
         const message = reason instanceof Error ? reason.message : '模型测试请求失败'
-        if (createdId) {
+        const uncertainCreate = createdId !== null && lastKnown === null && modelTestRequestMayHaveReachedServer(reason)
+        if (createdId && (lastKnown !== null || uncertainCreate)) {
           try {
             lastKnown = await api.modelTest(createdId, signal)
             setTest(lastKnown)
           } catch {
             // Keep the last confirmed server state when the status request also fails.
           }
+        }
+        if (createdId && lastKnown === null && !uncertainCreate && pendingUploadId.current === createdId) {
+          pendingUploadId.current = null
         }
         if (lastKnown?.status === 'failed') {
           setRunStage(modelTestStatusLabels.failed)
@@ -767,6 +777,11 @@ export function ModelTests() {
         } catch (statusReason) {
           setRunError(statusReason instanceof Error ? statusReason.message : '读取测试状态失败，请刷新历史记录确认')
         }
+      } else if (requestError.status === 404) {
+        pendingUploadId.current = null
+        setTest(null); setRunStage('')
+        setRunError('服务器暂未找到本次测试记录，已解除本页占用；请刷新历史记录确认后再重试')
+        await refreshHistory(undefined, true)
       } else {
         setRunError(requestError.message || '取消上传失败，请到历史记录确认状态')
       }

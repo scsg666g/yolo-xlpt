@@ -2,7 +2,7 @@
 
 本仓库的服务模板按两套独立 checkout 配置：开发版使用 `18088`，使用版使用 `18089`。两套服务必须使用不同的 systemd 服务名，不能都安装成 `yolo-platform.service`。模板存在不代表两套服务已在目标机器安装或运行。
 
-安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.4.8**，配套远程 Agent 为 **2.0.5**。
+安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.4.9**，配套远程 Agent 为 **2.0.6**。
 
 仓库同时保存 `yolo-platform-dev.service` 和 `yolo-platform-prod.service`，分别配置两套路径和端口。环境差异放在各实例的 `.env` 中，服务模板也分开维护，减少因开发/使用版配置混用引起的冲突。
 
@@ -146,3 +146,9 @@ curl --fail http://127.0.0.1:18088/api/health
 - 本机 `PLATFORM_MODEL_TEST_ROOTS` 与远程 `model_test_roots` 只能放可信 `.pt`；PyTorch / Ultralytics 加载权重时可能执行其中携带的代码，路径和摘要校验不能安全地加载恶意权重。
 - 节点有等待或进行中的模型传输时不能禁用或移除，进行中的传输也会阻止 Token 轮换。传输进入终态后可以移除节点；中心的模型缓存和历史不会随节点删除，已固定的 `ready` 版本可继续测试，但要抓取新版本必须重新接入并登记新的节点来源。
 - 两套平台连接同一训练服务器时，为每套平台创建独立节点、Token 和 Agent 配置，并统一使用当前 Agent 2.0.3 及同一专用系统账户。新中心下发有效 `gpu_assignment` 后，同一账户下的 Agent 才会通过权限为 `0700` 的用户私有状态目录共享 GPU UUID 锁，并以共享方式持有 workspace 与层级输出根锁；同卡互斥由 UUID 锁保证，不同 GPU Run 可以共享配置输出根。旧中心或没有 GPU 分配的任务仍走传统独占锁路径，混合部署必须保留能够覆盖这些旧协议任务的 `training_lock_file` 或等效互斥范围。不同账户无法共享这些宿主机锁和永久删除 owner 保护。训练子进程继承锁，Agent 意外退出后也会保持到训练结束；删除操作独占重叠输出范围，共享输出根存在其他存活 owner 时也会拒绝永久删除。这些锁不限制中心本机调度器或平台外进程。两个 Agent 还应各自核对 `model_test_roots` 和 `model_transfer_finalize_timeout_seconds`，不要为了方便而扩大到整个项目或共享文件系统根。
+
+### 1.4.9 升级说明
+
+更新平台前后端，重新构建前端并由维护者安排服务重启。完整远程日志下载与分类训练适配需要同步部署 Agent 2.0.6；只替换分发脚本和说明，保留各节点 `agent-config.json`、Token、实际目录和 `.training-state/`。现有训练和远程清理协议保持兼容。
+
+单份日志大小、日志缓存配额和磁盘余量分别由 `PLATFORM_LOG_DOWNLOAD_MAX_BYTES`、`PLATFORM_REMOTE_LOG_CACHE_QUOTA_BYTES`、`PLATFORM_REMOTE_LOG_MIN_FREE_BYTES` 配置，默认 256 MiB / 2 GiB / 2 GiB；均为非负字节数，`0` 关闭对应限制。

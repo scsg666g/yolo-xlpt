@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Check, Clipboard, Download, Search, Terminal, X } from 'lucide-react'
 import type { TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
+import { FullLogDownload } from './FullLogDownload'
 
 interface Props {
   task: TrainingTask | null
   lines: string[]
+  runId?: string | null
   open: boolean
   onClose: () => void
 }
@@ -18,7 +20,7 @@ function lineClass(line: string): string {
   return ''
 }
 
-export function LogViewerModal({ task, lines, open, onClose }: Props) {
+export function LogViewerModal({ task, lines, runId, open, onClose }: Props) {
   const [search, setSearch] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
   const [copied, setCopied] = useState(false)
@@ -69,7 +71,7 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
-    anchor.download = `${task.name.replace(/[\\/:*?"<>|]+/g, '_') || 'training'}-training.log`
+    anchor.download = `${task.name.replace(/[\\/:*?"<>|]+/g, '_') || 'training'}-recent.log`
     anchor.style.display = 'none'
     document.body.appendChild(anchor)
     anchor.click()
@@ -87,8 +89,9 @@ export function LogViewerModal({ task, lines, open, onClose }: Props) {
       <div className="log-tool-row">
         <div className="log-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索日志内容" />{search && <span>{visibleLines.length} 条匹配</span>}</div>
         <label className="auto-scroll"><input type="checkbox" checked={autoScroll} onChange={(event) => setAutoScroll(event.target.checked)} />自动滚动</label>
-        <button className="log-action-button" title="复制当前日志内容" aria-label="复制当前日志内容" onClick={copyLogs}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? '已复制' : '复制全部'}</button>
-        <button className="log-action-button" title="下载当前日志文件" aria-label="下载当前日志文件" onClick={downloadLogs}><Download size={15} />下载日志</button>
+        <button className="log-action-button" title="复制当前日志片段" aria-label="复制当前日志片段" onClick={copyLogs}>{copied ? <Check size={15} /> : <Clipboard size={15} />}{copied ? '已复制' : '复制片段'}</button>
+        <button className="log-action-button" title="导出当前显示的最近日志，不含早期内容" aria-label="导出当前日志片段" onClick={downloadLogs}><Download size={15} />导出片段</button>
+        <FullLogDownload taskId={task.id} runId={runId || task.current_run_id} />
         {actionMessage && <span className="log-action-message" role="status">{actionMessage}</span>}
       </div>
       <div className="terminal-window">

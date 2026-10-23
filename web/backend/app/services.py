@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import platform
 import re
@@ -48,6 +49,7 @@ from .gpu_reservations import (
     resolve_gpu_assignments,
 )
 from .models import Artifact, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
+from .log_files import tail_log
 from .parameter_catalog import training_parameter_keys
 from .training_outcome import classify_training_exit
 
@@ -137,11 +139,11 @@ class ManagedTrainingProcess:
 
 
 def failure_detail(log_path: str | None) -> str:
-    if not log_path or not Path(log_path).exists():
+    if not log_path:
         return ""
     lines = [
         ANSI_ESCAPE.sub("", line).strip()
-        for line in Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in tail_log(log_path, 2000)
         if line.strip()
     ]
     root_markers = ("Error:", "RuntimeError:", "ValueError:", "FileNotFoundError:", "OutOfMemoryError:")
@@ -268,6 +270,7 @@ def backfill_training_runs() -> int:
                     attempt_number=1,
                     launch_mode="fresh",
                     status=task.status,
+                    execution_node_id=task.execution_node_id,
                     pid=task.pid,
                     process_started_at=task.started_at,
                     parameter_snapshot=parameter_snapshot(task),
@@ -405,6 +408,8 @@ def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
 def validate_dataset_config(raw: str) -> Path:
     """Validate the dataset YAML and resolve train/val entries before queuing a run."""
     path = validate_input_path(raw, DATASET_ROOTS, "数据集配置")
+    if not path.is_file() or path.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError(f"非分类任务的数据集必须是 YAML 文件：{path}")
     try:
         config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
@@ -433,6 +438,46 @@ def validate_dataset_config(raw: str) -> Path:
     return path
 
 
+def validate_classification_dataset(raw: str) -> Path:
+    """Validate an Ultralytics classification dataset directory without mutating it."""
+    path = validate_input_path(raw, DATASET_ROOTS, "分类数据集目录")
+    if not path.is_dir():
+        raise ValueError(f"分类数据集必须是目录，不能是 YAML 文件：{path}")
+    train = path / "train"
+    if not train.is_dir():
+        raise ValueError(f"分类数据集缺少 train 目录：{train}")
+    try:
+        has_class = any(child.is_dir() and not child.name.startswith(".") for child in train.iterdir())
+    except OSError as exc:
+        raise ValueError(f"分类数据集无法读取：{path}（{exc}）") from exc
+    if not has_class:
+        raise ValueError(f"分类数据集 train 目录中没有类别子目录：{train}")
+    return path
+
+
+def validate_training_data_path(task_type: str, raw: str) -> Path:
+    """Validate the task-specific Ultralytics data input."""
+    if task_type == "classify":
+        return validate_classification_dataset(raw)
+    return validate_dataset_config(raw)
+
+
+def validate_remote_training_data_path(task_type: str, raw: str) -> str:
+    """Validate task-specific remote path syntax before the Agent checks the filesystem."""
+    value = raw.strip()
+    path = Path(value)
+    if not value or not path.is_absolute() or any(ord(character) < 32 for character in value):
+        kind = "分类数据集目录" if task_type == "classify" else "数据集 YAML"
+        raise ValueError(f"远程{kind}必须是不含控制字符的绝对路径")
+    suffix = path.suffix.lower()
+    if task_type == "classify":
+        if suffix in {".yaml", ".yml"}:
+            raise ValueError("图像分类任务需要远程数据集目录，不能使用 YAML 文件")
+    elif suffix not in {".yaml", ".yml"}:
+        raise ValueError("非分类任务需要远程 .yaml 或 .yml 数据集配置")
+    return value
+
+
 def prepare_dataset_config(raw: str, destination: Path) -> Path:
     """Write a run-local dataset YAML with an absolute root for Ultralytics."""
     source = validate_dataset_config(raw)
@@ -445,6 +490,13 @@ def prepare_dataset_config(raw: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
     return destination
+
+
+def prepare_training_data_path(task_type: str, raw: str, destination: Path) -> Path:
+    """Return a validated directory for classification or a run-local YAML otherwise."""
+    if task_type == "classify":
+        return validate_classification_dataset(raw)
+    return prepare_dataset_config(raw, destination)
 
 
 def discover_files(roots: list[Path], suffixes: set[str]) -> list[dict[str, Any]]:
@@ -470,6 +522,35 @@ def discover_files(roots: list[Path], suffixes: set[str]) -> list[dict[str, Any]
                 name = path.parent.name if path.name in {"data.yaml", "data.yml"} and root in DATASET_ROOTS else path.name
                 files.append({"name": name, "path": str(path), "size": stat.st_size, "root": str(root)})
     return sorted(files, key=lambda item: item["name"].lower())
+
+
+def discover_classification_datasets(roots: list[Path]) -> list[dict[str, Any]]:
+    """List dataset roots that contain a train split with at least one class directory."""
+    datasets: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for directory, child_directories, _filenames in os.walk(root, topdown=True, followlinks=False):
+            child_directories[:] = [name for name in child_directories if not name.startswith(".")]
+            parent = Path(directory)
+            if "train" not in child_directories:
+                continue
+            train = parent / "train"
+            try:
+                if parent.is_symlink() or not any(
+                    child.is_dir() and not child.name.startswith(".") for child in train.iterdir()
+                ):
+                    continue
+                resolved = parent.resolve()
+            except OSError:
+                continue
+            if resolved in seen or not path_is_within(resolved, roots):
+                continue
+            seen.add(resolved)
+            datasets.append({"name": parent.name, "path": str(resolved), "size": 0, "root": str(root)})
+            child_directories.clear()
+    return sorted(datasets, key=lambda item: item["name"].lower())
 
 
 def _nullable_number(value: str, integer: bool = False) -> int | float | None:
@@ -631,7 +712,12 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
         except ValueError:
             continue
         values = {key.strip(): parse_number(value) for key, value in row.items() if key and key.strip() not in {"epoch", "time"}}
-        elapsed = float(row.get("time") or 0)
+        try:
+            elapsed = float(row.get("time") or 0)
+            if not math.isfinite(elapsed) or elapsed < 0:
+                elapsed = 0.0
+        except (TypeError, ValueError):
+            elapsed = 0.0
         if epoch not in existing:
             try:
                 with db.begin_nested():
@@ -1225,7 +1311,9 @@ class TrainingScheduler:
         try:
             runtime_dir.mkdir(parents=True, exist_ok=True)
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            dataset_path = prepare_dataset_config(run.data_path, runtime_dir / "dataset.yaml")
+            dataset_path = prepare_training_data_path(
+                task.task_type, run.data_path, runtime_dir / "dataset.yaml",
+            )
         except (OSError, ValueError, yaml.YAMLError) as exc:
             self._fail_before_launch(db, run.id, str(exc), f"数据集配置校验失败：{exc}")
             return

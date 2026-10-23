@@ -26,10 +26,14 @@ from .services import (
 ACTIVE_RUN_STATUSES = {"queued", "starting", "running", "stopping"}
 ACTIVE_TEST_STATUSES = {"uploading", "preparing", "queued", "running", "cancel_requested"}
 RUN_DELETE_KINDS = {"local_delete", "delete"}
+ACTIVE_DELETE_STATUSES = {"pending", "running", "finalizing", "center_cleaning"}
 CANONICAL_LAYOUT = "canonical"
 IMPORTED_LAYOUT = "imported"
 LEGACY_FLAT_LAYOUT = "legacy_flat"
 ATTEMPT_DIRECTORY_PATTERN = re.compile(r"attempt-\d{3,}")
+TASK_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+TASK_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+ATTEMPT_PLAN_VERSION = 1
 
 
 def is_attempt_payload(payload: dict | None, run_id: str) -> bool:
@@ -44,7 +48,7 @@ def attempt_delete_operation(db: Session, run: TrainingRun, *, active_only: bool
         RemoteOperation.kind.in_(RUN_DELETE_KINDS),
     ).order_by(RemoteOperation.created_at.desc())
     if active_only:
-        query = query.where(RemoteOperation.status.in_({"pending", "running"}))
+        query = query.where(RemoteOperation.status.in_(ACTIVE_DELETE_STATUSES))
     for operation in db.scalars(query):
         if is_attempt_payload(operation.payload, run.id):
             return operation
@@ -56,7 +60,7 @@ def active_attempt_delete_operation(db: Session, task_id: str):
     return db.scalar(select(RemoteOperation).where(
         RemoteOperation.task_id == task_id,
         RemoteOperation.kind.in_(RUN_DELETE_KINDS),
-        RemoteOperation.status.in_({"pending", "running"}),
+        RemoteOperation.status.in_(ACTIVE_DELETE_STATUSES),
         RemoteOperation.payload["scope"].as_string() == "attempt",
     ).order_by(RemoteOperation.created_at.desc()))
 
@@ -70,8 +74,8 @@ def attempt_deletion_state(db: Session, run: TrainingRun) -> tuple[str | None, s
         return "succeeded", None, operation
     if status == "failed":
         return "failed", operation.error, operation
-    if status in {"pending", "running"}:
-        return status, operation.error, operation
+    if status in ACTIVE_DELETE_STATUSES:
+        return ("pending" if status == "pending" else "running"), operation.error, operation
     return None, operation.error, operation
 
 
@@ -101,24 +105,36 @@ def local_attempt_layout(task: TrainingTask, run: TrainingRun) -> tuple[str, Pat
 
 def attempt_path_candidates(task: TrainingTask, run: TrainingRun) -> list[Path]:
     """Return only paths owned by this run on the local platform."""
-    layout, run_dir = local_attempt_layout(task, run)
+    _, _, output_targets, log_target, runtime_target = _local_attempt_components(task, run)
+    paths = list(output_targets)
+    if log_target is not None:
+        paths.append(log_target)
+    paths.append(runtime_target)
+    return list(dict.fromkeys(paths))
 
+
+def _local_attempt_components(
+    task: TrainingTask,
+    run: TrainingRun,
+) -> tuple[str, Path, list[Path], Path | None, Path]:
+    layout, run_dir = local_attempt_layout(task, run)
     if layout == LEGACY_FLAT_LAYOUT:
-        # Delete only root-level legacy output.  Preserve every Attempt-shaped
+        # Delete only root-level legacy output. Preserve every Attempt-shaped
         # child even when an old database lacks the corresponding run row.
-        paths = [
+        output_targets = [
             _deletion_path(child)
             for child in run_dir.iterdir()
             if not ATTEMPT_DIRECTORY_PATTERN.fullmatch(child.name)
         ] if run_dir.is_dir() else []
     else:
-        paths = [run_dir]
+        output_targets = [run_dir]
+    runtime_target = _deletion_path(RUNTIME_ROOT / task.id / f"attempt-{run.attempt_number:03d}")
+    log_target: Path | None = None
     if run.log_path:
         log_path = _deletion_path(Path(run.log_path))
-        runtime_dir = _deletion_path(RUNTIME_ROOT / task.id / f"attempt-{run.attempt_number:03d}")
         allowed_logs = {
             _deletion_path(run_dir / "platform.log"),
-            _deletion_path(runtime_dir / "platform.log"),
+            _deletion_path(runtime_target / "platform.log"),
         }
         log_root = _deletion_path(LOG_ROOT)
         is_platform_log = (
@@ -130,17 +146,8 @@ def attempt_path_candidates(task: TrainingTask, run: TrainingRun) -> list[Path]:
         )
         if log_path not in allowed_logs and not is_platform_log:
             raise ValueError("Attempt 日志路径与该任务/轮次不匹配，已拒绝清理")
-        paths.append(log_path)
-    # Runtime metadata is always created below the configured platform root.
-    paths.append(RUNTIME_ROOT / task.id / f"attempt-{run.attempt_number:03d}")
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for path in paths:
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
+        log_target = log_path
+    return layout, run_dir, output_targets, log_target, runtime_target
 
 
 def remote_output_root_for_run(task: TrainingTask, run: TrainingRun) -> str | None:
@@ -287,7 +294,7 @@ def validate_attempt_deletion(
     task_operations = db.scalars(select(RemoteOperation).where(
         RemoteOperation.task_id == task.id,
         RemoteOperation.kind.in_(RUN_DELETE_KINDS),
-        RemoteOperation.status.in_({"pending", "running"}),
+        RemoteOperation.status.in_(ACTIVE_DELETE_STATUSES),
     ))
     if any(not is_attempt_payload(operation.payload, run.id) for operation in task_operations):
         raise ValueError("任务整体文件正在清理，不能单独删除 Attempt")
@@ -309,6 +316,16 @@ def validate_attempt_deletion(
     convert_path = PurePosixPath if remote else Path
     overlaps = _remote_overlaps if remote else _overlaps
     protected_paths = [convert_path(path) for path in (task.model_path, task.data_path) if path]
+    if not remote:
+        # Import lazily because whole-task deletion shares the constants above.
+        from .task_deletions import validate_local_model_references
+
+        validate_local_model_references(
+            db,
+            task.id,
+            [str(path) for path in target_paths],
+            include_task_active_tests=True,
+        )
     related_runs = db.scalars(select(TrainingRun).where(
         TrainingRun.task_id == task.id, TrainingRun.id != run.id,
     )).all()
@@ -364,6 +381,201 @@ def validate_attempt_deletion(
     )
     if any(overlaps(target, protected) for target in target_paths for protected in protected_paths):
         raise ValueError("该 Attempt 路径仍被其他任务或资源引用，不能安全删除")
+
+
+def build_local_attempt_delete_plan(
+    db: Session,
+    task: TrainingTask,
+    run: TrainingRun,
+    *,
+    ignore_operation_id: str | None = None,
+) -> dict:
+    """Validate ownership/references and freeze one local Attempt's targets."""
+    if task.execution_node_id or run.execution_node_id:
+        raise ValueError("远程 Attempt 不能进入本机删除队列")
+    validate_attempt_deletion(
+        db,
+        task,
+        run,
+        ignore_operation_id=ignore_operation_id,
+    )
+    layout, run_dir, output_targets, log_target, runtime_target = _local_attempt_components(task, run)
+    targets = list(dict.fromkeys([
+        *output_targets,
+        *([log_target] if log_target is not None else []),
+        runtime_target,
+    ]))
+    roots = [RUNS_ROOT, ULTRALYTICS_ROOT / "runs", RUNTIME_ROOT, LOG_ROOT]
+    for target in targets:
+        _validate_deletion_target(target, roots)
+    return {
+        "version": ATTEMPT_PLAN_VERSION,
+        "task_id": task.id,
+        "task_type": task.task_type,
+        "source": task.source,
+        "run_id": run.id,
+        "attempt_number": run.attempt_number,
+        "layout": layout,
+        "run_dir": str(run_dir),
+        "output_targets": sorted(str(path) for path in output_targets),
+        "log_target": str(log_target) if log_target is not None else None,
+        "runtime_target": str(runtime_target),
+        "targets": sorted(str(path) for path in targets),
+    }
+
+
+def _validate_frozen_attempt_plan(
+    plan: dict,
+    task: TrainingTask | None = None,
+    run: TrainingRun | None = None,
+) -> list[Path]:
+    """Validate an immutable plan while allowing already removed targets."""
+    if plan.get("version") != ATTEMPT_PLAN_VERSION:
+        raise ValueError("本机 Attempt 删除计划版本无效")
+    task_id, task_type = plan.get("task_id"), plan.get("task_type")
+    run_id, attempt_number = plan.get("run_id"), plan.get("attempt_number")
+    if not isinstance(task_id, str) or not TASK_IDENTIFIER_PATTERN.fullmatch(task_id):
+        raise ValueError("本机 Attempt 删除计划的任务标识无效")
+    if not isinstance(task_type, str) or not TASK_TYPE_PATTERN.fullmatch(task_type):
+        raise ValueError("本机 Attempt 删除计划的任务类型无效")
+    if not isinstance(run_id, str) or not run_id or type(attempt_number) is not int or attempt_number < 1:
+        raise ValueError("本机 Attempt 删除计划的轮次标识无效")
+    if task is not None and (
+        task.id != task_id or task.task_type != task_type or task.source != plan.get("source")
+    ):
+        raise ValueError("本机 Attempt 删除计划与任务记录不匹配")
+    if run is not None and (
+        run.id != run_id or run.task_id != task_id or run.attempt_number != attempt_number
+    ):
+        raise ValueError("本机 Attempt 删除计划与轮次记录不匹配")
+
+    run_dir_value = plan.get("run_dir")
+    if not isinstance(run_dir_value, str) or not run_dir_value:
+        raise ValueError("本机 Attempt 删除计划缺少训练目录")
+    run_dir = _deletion_path(Path(run_dir_value))
+    canonical_task_root = _deletion_path(RUNS_ROOT / task_type / task_id)
+    canonical_run_dir = canonical_task_root / f"attempt-{attempt_number:03d}"
+    layout = plan.get("layout")
+    if layout == CANONICAL_LAYOUT:
+        if run_dir != canonical_run_dir:
+            raise ValueError("本机 Attempt 删除计划的标准目录已变更")
+    elif layout == LEGACY_FLAT_LAYOUT:
+        if plan.get("source") != "platform" or attempt_number != 1 or run_dir != canonical_task_root:
+            raise ValueError("本机 Attempt 删除计划的旧版目录无法验证")
+    elif layout == IMPORTED_LAYOUT:
+        legacy_root = _deletion_path(ULTRALYTICS_ROOT / "runs")
+        try:
+            relative = run_dir.relative_to(legacy_root)
+        except ValueError as exc:
+            raise ValueError("本机 Attempt 删除计划的导入目录超出允许范围") from exc
+        expected_id = "legacy-" + hashlib.sha1(str(run_dir.resolve(strict=False)).encode()).hexdigest()[:12]
+        if plan.get("source") != "imported" or len(relative.parts) < 2 or relative.parts[0] != task_type or expected_id != task_id:
+            raise ValueError("本机 Attempt 删除计划的导入目录归属无法验证")
+    else:
+        raise ValueError("本机 Attempt 删除计划包含未知目录布局")
+    if task is not None and run is not None:
+        current_layout, current_run_dir = local_attempt_layout(task, run)
+        if current_layout != layout or current_run_dir != run_dir:
+            raise ValueError("Attempt 训练目录在排队后发生变化，请重新提交删除")
+
+    output_values = plan.get("output_targets")
+    if not isinstance(output_values, list) or any(not isinstance(value, str) for value in output_values):
+        raise ValueError("本机 Attempt 删除计划缺少产物清单")
+    output_targets = [_deletion_path(Path(value)) for value in output_values]
+    if len(set(output_targets)) != len(output_targets):
+        raise ValueError("本机 Attempt 删除计划包含重复产物")
+    if layout in {CANONICAL_LAYOUT, IMPORTED_LAYOUT}:
+        if output_targets != [run_dir]:
+            raise ValueError("本机 Attempt 删除计划的训练目录不完整")
+    else:
+        if any(
+            target.parent != run_dir or ATTEMPT_DIRECTORY_PATTERN.fullmatch(target.name)
+            for target in output_targets
+        ):
+            raise ValueError("本机 Attempt 删除计划的旧版产物超出允许范围")
+        current_targets = {
+            _deletion_path(child)
+            for child in run_dir.iterdir()
+            if not ATTEMPT_DIRECTORY_PATTERN.fullmatch(child.name)
+        } if run_dir.is_dir() else set()
+        unexpected = current_targets - set(output_targets)
+        if unexpected:
+            raise ValueError("Attempt 排队后出现新的旧版产物，已拒绝扩大删除范围")
+
+    runtime_value = plan.get("runtime_target")
+    if not isinstance(runtime_value, str):
+        raise ValueError("本机 Attempt 删除计划缺少运行时目录")
+    runtime_target = _deletion_path(Path(runtime_value))
+    expected_runtime = _deletion_path(RUNTIME_ROOT / task_id / f"attempt-{attempt_number:03d}")
+    if runtime_target != expected_runtime:
+        raise ValueError("本机 Attempt 删除计划的运行时目录已变更")
+
+    log_value = plan.get("log_target")
+    log_target = _deletion_path(Path(log_value)) if isinstance(log_value, str) and log_value else None
+    if log_value is not None and log_target is None:
+        raise ValueError("本机 Attempt 删除计划包含无效日志路径")
+    if log_target is not None:
+        platform_match = re.fullmatch(
+            rf"\d{{8}}_{re.escape(task_id)}_attempt-{attempt_number:03d}\.log",
+            log_target.name,
+        )
+        allowed_logs = {
+            _deletion_path(run_dir / "platform.log"),
+            _deletion_path(runtime_target / "platform.log"),
+        }
+        if log_target not in allowed_logs and not (
+            log_target.parent == _deletion_path(LOG_ROOT) and platform_match is not None
+        ):
+            raise ValueError("本机 Attempt 删除计划的日志路径超出允许范围")
+
+    expected_targets = sorted(str(path) for path in dict.fromkeys([
+        *output_targets,
+        *([log_target] if log_target is not None else []),
+        runtime_target,
+    ]))
+    if plan.get("targets") != expected_targets:
+        raise ValueError("本机 Attempt 删除计划的目标清单不完整")
+    roots = [RUNS_ROOT, ULTRALYTICS_ROOT / "runs", RUNTIME_ROOT, LOG_ROOT]
+    targets = [_deletion_path(Path(value)) for value in expected_targets]
+    for target in targets:
+        _validate_deletion_target(target, roots)
+    return targets
+
+
+def verify_local_attempt_plan_absent(plan: dict) -> int:
+    """Verify a prior cleanup receipt against the frozen target list."""
+    targets = _validate_frozen_attempt_plan(plan)
+    remaining = [str(target) for target in targets if target.exists() or target.is_symlink()]
+    if remaining:
+        raise RuntimeError("已记录的 Attempt 删除回执与文件系统不一致：" + "、".join(remaining))
+    return len(targets)
+
+
+def execute_local_attempt_plan(plan: dict) -> dict:
+    """Apply a frozen Attempt plan outside a database write transaction."""
+    targets = _validate_frozen_attempt_plan(plan)
+    roots = [RUNS_ROOT, ULTRALYTICS_ROOT / "runs", RUNTIME_ROOT, LOG_ROOT]
+    deleted: list[str] = []
+    already_missing: list[str] = []
+    for target in sorted(targets, key=lambda path: len(str(path)), reverse=True):
+        if not target.exists() and not target.is_symlink():
+            already_missing.append(str(target))
+            continue
+        removed = _safe_delete_directory(target, roots)
+        if removed is not None:
+            deleted.append(str(removed))
+    remaining = [str(target) for target in targets if target.exists() or target.is_symlink()]
+    if remaining:
+        raise RuntimeError("Attempt 文件清理后仍有目标存在：" + "、".join(remaining))
+    if plan.get("layout") == LEGACY_FLAT_LAYOUT:
+        # Re-run validation so a file created during cleanup is reported and
+        # left untouched instead of silently widening the frozen plan.
+        _validate_frozen_attempt_plan(plan)
+    return {
+        "deleted_targets": sorted(deleted),
+        "already_missing_targets": sorted(already_missing),
+        "verified_target_count": len(targets),
+    }
 
 
 def delete_attempt_files(task: TrainingTask, run: TrainingRun) -> list[str]:

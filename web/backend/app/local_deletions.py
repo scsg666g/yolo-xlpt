@@ -16,10 +16,13 @@ from .gpu_reservations import acquire_node_claim_lock
 from .model_test_storage import delete_task_history
 from .models import ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utcnow
 from .run_deletions import (
-    delete_attempt_files,
+    _validate_frozen_attempt_plan,
+    build_local_attempt_delete_plan,
     delete_attempt_records,
+    execute_local_attempt_plan,
     is_attempt_payload,
     validate_attempt_deletion,
+    verify_local_attempt_plan_absent,
 )
 from .services import add_event
 from .task_deletions import (
@@ -85,7 +88,8 @@ def queue_local_delete(db, task: TrainingTask) -> RemoteOperation:
 
 def queue_local_run_delete(db, task: TrainingTask, run: TrainingRun) -> RemoteOperation:
     """Queue cleanup for one local Attempt without moving the task to trash."""
-    validate_attempt_deletion(db, task, run)
+    plan = build_local_attempt_delete_plan(db, task, run)
+    node = db.get(ComputeNode, LOCAL_COMPUTE_NODE_ID)
     operation = RemoteOperation(
         id=uuid.uuid4().hex,
         node_id=LOCAL_NODE_ID,
@@ -96,8 +100,11 @@ def queue_local_run_delete(db, task: TrainingTask, run: TrainingRun) -> RemoteOp
             "scope": "attempt",
             "run_id": run.id,
             "attempt_number": run.attempt_number,
-            "run_dir": run.run_dir,
-            "log_path": run.log_path,
+            "task_name": task.name,
+            "node_name": node.name if node else "本机服务器",
+            "phase": "queued",
+            "plan": plan,
+            "receipt": None,
         },
     )
     db.add(operation)
@@ -279,6 +286,8 @@ class LocalDeletionWorker:
         if not isinstance(run_id, str) or not run_id:
             raise ValueError("待清理 Attempt 标识无效")
         with managed_dataset_mutation():
+            # Freeze/revalidate ownership in a short transaction. The shared
+            # filesystem mutation lock remains held after this commit.
             with self.session_factory() as db:
                 acquire_node_claim_lock(db, LOCAL_COMPUTE_NODE_ID)
                 operation = self._leased_operation(db, operation_id, lease)
@@ -288,28 +297,91 @@ class LocalDeletionWorker:
                     raise ValueError("待清理任务记录不存在")
                 if not run or run.task_id != task.id:
                     raise ValueError("待清理 Attempt 记录不存在")
-                validate_attempt_deletion(db, task, run, ignore_operation_id=operation.id)
-                operation.payload = _phase_payload(operation.payload, "deleting_files")
+                frozen_plan = (operation.payload or {}).get("plan")
+                if isinstance(frozen_plan, dict):
+                    validate_attempt_deletion(db, task, run, ignore_operation_id=operation.id)
+                    _validate_frozen_attempt_plan(frozen_plan, task, run)
+                else:
+                    # Compatibility for pending jobs created before plans were
+                    # introduced. Freeze them before touching the filesystem.
+                    frozen_plan = build_local_attempt_delete_plan(
+                        db,
+                        task,
+                        run,
+                        ignore_operation_id=operation.id,
+                    )
+                receipt = (operation.payload or {}).get("receipt")
+                operation.payload = _phase_payload(
+                    operation.payload,
+                    "recording" if isinstance(receipt, dict) else "deleting_files",
+                    plan=frozen_plan,
+                )
                 operation.updated_at = utcnow()
-                db.flush()
-                deleted = delete_attempt_files(task, run)
+                db.commit()
+
+            if isinstance(receipt, dict):
+                verified_count = verify_local_attempt_plan_absent(frozen_plan)
+                if (
+                    receipt.get("run_id") != run_id
+                    or receipt.get("plan_version") != frozen_plan.get("version")
+                    or receipt.get("verified_target_count") != verified_count
+                ):
+                    raise RuntimeError("已保存的 Attempt 删除回执与冻结计划不匹配")
+            else:
+                if not self._heartbeat(operation_id, lease, "deleting_files"):
+                    raise RuntimeError("本机删除任务租约已失效，停止继续清理")
+                with self._lease_keepalive(operation_id, lease):
+                    receipt = execute_local_attempt_plan(frozen_plan)
+                receipt.update({
+                    "plan_version": frozen_plan["version"],
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "attempt_number": frozen_plan["attempt_number"],
+                    "completed_at": utcnow().isoformat(),
+                })
+                # Persist the physical-cleanup receipt independently. If the
+                # final DB transaction fails, a reclaimed worker can verify the
+                # same frozen plan and finish without guessing from missing files.
+                with self.session_factory() as db:
+                    operation = self._leased_operation(db, operation_id, lease)
+                    operation.payload = _phase_payload(
+                        operation.payload,
+                        "recording",
+                        plan=frozen_plan,
+                        receipt=receipt,
+                    )
+                    operation.updated_at = utcnow()
+                    db.commit()
+
+            # Finalize run-owned rows under a fresh, short node transaction.
+            with self.session_factory() as db:
+                acquire_node_claim_lock(db, LOCAL_COMPUTE_NODE_ID)
+                operation = self._leased_operation(db, operation_id, lease)
+                stored_plan = (operation.payload or {}).get("plan")
+                stored_receipt = (operation.payload or {}).get("receipt")
+                if stored_plan != frozen_plan or stored_receipt != receipt:
+                    raise RuntimeError("Attempt 删除计划或回执在收尾前发生变化")
+                task = db.get(TrainingTask, task_id)
+                run = db.get(TrainingRun, run_id)
+                if not task:
+                    raise ValueError("待清理任务记录不存在")
+                if not run or run.task_id != task.id:
+                    raise ValueError("待清理 Attempt 记录不存在")
+                _validate_frozen_attempt_plan(frozen_plan, task, run)
                 delete_attempt_records(db, task.id, run.id)
                 operation.status = "succeeded"
                 operation.error = None
                 operation.payload = _phase_payload(
                     operation.payload,
                     "complete",
-                    receipt={
-                        "deleted_targets": sorted(deleted),
-                        "completed_at": utcnow().isoformat(),
-                    },
+                    receipt=receipt,
                 )
                 operation.updated_at = utcnow()
                 add_event(
                     db,
                     task.id,
                     "run_deleted",
-                    f"Attempt {payload.get('attempt_number', '')} 已删除",
+                    f"Attempt {frozen_plan.get('attempt_number', '')} 已删除",
                 )
                 db.commit()
 

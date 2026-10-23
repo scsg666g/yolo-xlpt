@@ -34,6 +34,7 @@ from .model_assets import (
     ModelAssetPathError,
     copy_stable_regular_file,
     digest_stable_regular_file,
+    local_asset_file,
     verify_local_asset,
 )
 from .model_test_storage import (
@@ -64,7 +65,7 @@ from .models import (
     TrainingTask,
     utcnow,
 )
-from .remote_operations import cached_fetch_digest, matching_fetch, operation_file
+from .remote_operations import cached_fetch_digest, matching_fetch, model_fetches, operation_file
 from .run_deletions import attempt_delete_operation
 from .services import failure_detail, path_is_within, training_environment
 
@@ -94,6 +95,7 @@ class ImageSpec(BaseModel):
 class TestCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     artifact_id: int | None = Field(default=None, gt=0)
     model_asset_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     run_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
@@ -258,6 +260,39 @@ def _remote_weight_for_version(
     raise HTTPException(409, "原远程权重的精确版本已不在中心缓存，无法按原权重重测")
 
 
+def _available_remote_weight_for_version(
+    db: Session,
+    artifact: Artifact,
+    run: TrainingRun,
+    sha256: str,
+    size: int,
+) -> Path:
+    """Find a plausible historical cache using metadata only; start verifies bytes."""
+    operations = db.scalars(select(RemoteOperation).where(
+        RemoteOperation.task_id == artifact.task_id,
+        RemoteOperation.kind == "fetch",
+        RemoteOperation.status == "succeeded",
+    ).order_by(RemoteOperation.created_at.desc()))
+    for operation in operations:
+        payload = operation.payload or {}
+        cached_sha256 = payload.get("sha256")
+        if (
+            payload.get("artifact_id") != artifact.id
+            or payload.get("run_id") != run.id
+            or payload.get("size") != size
+            or (cached_sha256 is not None and cached_sha256 != sha256)
+        ):
+            continue
+        path = operation_file(operation)
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
+                continue
+        except OSError:
+            continue
+        return path
+    raise HTTPException(409, "原远程权重的精确版本已不在中心缓存，无法按原权重重测")
+
+
 def _weight_source(
     db: Session,
     artifact_id: int | None,
@@ -327,6 +362,95 @@ def _verified_weight_version(
         if operation and operation.status == "succeeded":
             operation.payload = {**(operation.payload or {}), "sha256": actual_sha256}
     return path, artifact, run, actual_sha256, actual_size
+
+
+def _available_weight_version(
+    db: Session,
+    artifact_id: int | None,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> tuple[Path, Artifact, TrainingRun, str | None, int]:
+    """Resolve usable source bytes without hashing a current model on create."""
+    artifact, _, run = _weight_context(db, artifact_id)
+    if run.execution_node_id and expected_sha256 is not None and expected_size is not None:
+        path = _available_remote_weight_for_version(
+            db, artifact, run, expected_sha256, expected_size,
+        )
+        advertised_sha256 = expected_sha256
+    else:
+        path, artifact, run, advertised_sha256 = _weight_source(db, artifact_id)
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError
+        actual_size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(404, "模型权重文件不存在，请刷新后重试") from exc
+    if expected_size is not None and actual_size != expected_size:
+        raise HTTPException(409, "原模型权重版本已变化，无法按原权重重测")
+    if run.execution_node_id and expected_size is None and actual_size != artifact.size:
+        raise HTTPException(409, "远程权重缓存大小与产物登记不一致，请重新准备模型")
+    return path, artifact, run, expected_sha256 or advertised_sha256, actual_size
+
+
+def _available_model_asset_version(
+    db: Session,
+    model_asset_id: str | None,
+    *,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> tuple[Path, ModelAsset, str, int]:
+    """Resolve a ready standalone source and validate its cheap file metadata."""
+    asset = db.get(ModelAsset, model_asset_id) if model_asset_id else None
+    if asset is None:
+        raise HTTPException(404, "模型来源不存在，请重新选择模型")
+    if expected_sha256 is None and expected_size is None and asset.status != "ready":
+        if asset.source_type == "remote_path" and asset.status == "preparing":
+            raise HTTPException(409, "远程模型正在传输，请稍后重试")
+        raise HTTPException(409, asset.error or "模型尚未准备完成，请重新校验模型来源")
+    sha256 = expected_sha256 if expected_sha256 is not None else asset.sha256
+    size = expected_size if expected_size is not None else asset.size
+    if (
+        not isinstance(sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+    ):
+        raise HTTPException(409, "模型尚未准备完成，请重新校验模型来源")
+
+    if asset.source_type == "local_path":
+        try:
+            path = local_asset_file(asset)
+        except ModelAssetPathError as exc:
+            raise HTTPException(exc.status_code, str(exc)) from exc
+    elif asset.source_type == "remote_path":
+        path = None
+        for operation in model_fetches(db, asset):
+            payload = operation.payload or {}
+            if (
+                operation.status == "succeeded"
+                and payload.get("sha256") == sha256
+                and payload.get("size") == size
+            ):
+                candidate = operation_file(operation)
+                if candidate.is_file() and not candidate.is_symlink():
+                    path = candidate
+                    break
+        if path is None:
+            raise HTTPException(409, "远程模型的固定缓存已不可用，请重新登记或准备模型")
+    else:
+        raise HTTPException(422, "当前模型来源类型不支持独立测试")
+
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise OSError
+        actual_size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(404, "模型文件不存在，请重新校验模型来源") from exc
+    if actual_size != size:
+        raise HTTPException(409, "原模型权重版本已变化，无法按原权重重测")
+    return path, asset, sha256, size
 
 
 def _verified_model_asset_version(
@@ -1119,10 +1243,43 @@ def create_test(payload: TestCreate, db: Session = Depends(get_db)):
         return _create_test(payload, db)
 
 
+def _matching_create_request(record: ModelTest, payload: TestCreate) -> bool:
+    """Accept a retried create only when it describes the original request."""
+    images = sorted(record.images, key=lambda item: item.ordinal)
+    requested_files = [(item.name, item.size) for item in payload.files]
+    recorded_files = [(item.original_name, item.declared_size) for item in images]
+    requested_run_id = payload.run_id
+    if payload.artifact_id is not None and requested_run_id is None:
+        requested_run_id = record.source_run_id
+    return (
+        record.artifact_id == payload.artifact_id
+        and record.model_asset_id == payload.model_asset_id
+        and record.run_id == requested_run_id
+        and record.rerun_of_test_id == payload.rerun_of_test_id
+        and math.isclose(record.confidence, payload.confidence, rel_tol=0, abs_tol=1e-12)
+        and math.isclose(record.iou, payload.iou, rel_tol=0, abs_tol=1e-12)
+        and recorded_files == requested_files
+    )
+
+
+def _existing_create_request(payload: TestCreate, db: Session) -> dict | None:
+    if payload.request_id is None:
+        return None
+    record = db.scalar(_record_query(payload.request_id))
+    if record is None:
+        return None
+    if not _matching_create_request(record, payload):
+        raise HTTPException(409, "模型测试请求标识已用于另一条记录，请重新发起测试")
+    return record_public(get_record(db, record.id))
+
+
 def _create_test(payload: TestCreate, db: Session):
     declared_upload_bytes = sum(item.size for item in payload.files)
     if declared_upload_bytes > MAX_TOTAL_BYTES:
         raise HTTPException(413, "一次测试的图片总大小不能超过 100 MB")
+    existing = _existing_create_request(payload, db)
+    if existing is not None:
+        return existing
     active = db.scalar(select(func.count()).select_from(ModelTest).where(ModelTest.status.in_(ACTIVE_STATUSES))) or 0
     if active >= 20:
         raise HTTPException(429, "同时处理的测试记录已达上限，请稍后重试")
@@ -1163,8 +1320,13 @@ def _create_test(payload: TestCreate, db: Session):
                 raise HTTPException(422, "历史检测记录与当前训练任务不一致")
             if rerun_source.artifact_id is None or rerun_source.artifact_id != artifact.id:
                 raise HTTPException(409, "历史记录的原权重关联已失效，无法按原权重重测")
-        model, artifact, source_run, model_sha256, model_size = _verified_weight_version(
-            db, artifact.id, expected_sha256=expected_sha256, expected_size=expected_size,
+        # Reject unavailable sources before reserving upload space. Full digest
+        # verification and the immutable copy remain in the preparing phase.
+        _, _, _, model_sha256, model_size = _available_weight_version(
+            db,
+            artifact.id,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
         )
         snapshot = (
             dict(rerun_source.model_snapshot or {})
@@ -1192,8 +1354,11 @@ def _create_test(payload: TestCreate, db: Session):
                 raise HTTPException(422, "历史检测记录不是独立模型测试")
             if rerun_source.model_asset_id is None or rerun_source.model_asset_id != asset.id:
                 raise HTTPException(409, "历史记录的原模型来源已失效，无法按原权重重测")
-        model, asset, model_sha256, model_size = _verified_model_asset_version(
-            db, asset.id, expected_sha256=expected_sha256, expected_size=expected_size,
+        _, _, model_sha256, model_size = _available_model_asset_version(
+            db,
+            asset.id,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
         )
         snapshot = (
             dict(rerun_source.model_snapshot or {})
@@ -1209,7 +1374,7 @@ def _create_test(payload: TestCreate, db: Session):
     snapshot["history_group"] = _history_group_snapshot(db, task=task, asset=asset)
     snapshot.update({"weight_size": model_size, "sha256": model_sha256})
 
-    test_id = uuid.uuid4().hex
+    test_id = payload.request_id or uuid.uuid4().hex
     estimate = estimate_test_storage(
         model_bytes=model_size,
         declared_upload_bytes=declared_upload_bytes,
@@ -1245,10 +1410,13 @@ def _create_test(payload: TestCreate, db: Session):
         return record_public(get_record(db, test_id))
     except Exception:
         db.rollback()
-        try:
-            delete_test_history(scope, test_id)
-        except (OSError, ValueError):
-            logger.warning("model_test_create_cleanup_failed test_id=%s", test_id)
+        # A committed record with the same client request ID owns this path.
+        # Never remove its history directory while handling a lost-response retry.
+        if db.get(ModelTest, test_id) is None:
+            try:
+                delete_test_history(scope, test_id)
+            except (OSError, ValueError):
+                logger.warning("model_test_create_cleanup_failed test_id=%s", test_id)
         raise
 
 
@@ -1339,44 +1507,56 @@ def _start_test(test_id: str, db: Session):
             image.uploaded and (directory / "images" / f"{image.ordinal}.jpg").is_file() for image in images
         ):
             raise HTTPException(409, "请先上传全部图片")
-        if not record.model_sha256 or record.model_size is None:
-            raise HTTPException(409, "检测记录没有固定权重版本，请重新创建检测")
         record.status = "preparing"
         record.error = None
         record.finished_at = None
         db.commit()
+        artifact_id = record.artifact_id
+        model_asset_id = record.model_asset_id
+        expected_sha256 = record.model_sha256
+        expected_size = record.model_size
+
+    try:
+        if model_asset_id is not None:
+            model, _, model_sha256, model_size = _verified_model_asset_version(
+                db, model_asset_id,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+            )
+        else:
+            model, _, _, model_sha256, model_size = _verified_weight_version(
+                db, artifact_id,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+            )
+        _pin_weight(model, test_id, model_sha256, model_size)
+    except Exception as exc:
+        db.rollback()
+        failed = db.get(ModelTest, test_id)
+        if failed and failed.status == "preparing":
+            failed.status = "failed"
+            failed.error = _error_message(exc)
+            failed.finished_at = utcnow()
+            db.commit()
+            _persist_settled_storage(db, failed)
         try:
-            if record.model_asset_id is not None:
-                model, _, _, _ = _verified_model_asset_version(
-                    db, record.model_asset_id,
-                    expected_sha256=record.model_sha256,
-                    expected_size=record.model_size,
-                )
-            else:
-                model, _, _, _, _ = _verified_weight_version(
-                    db, record.artifact_id,
-                    expected_sha256=record.model_sha256,
-                    expected_size=record.model_size,
-                )
-            _pin_weight(model, record.id, record.model_sha256, record.model_size)
-        except Exception as exc:
-            db.rollback()
-            failed = db.get(ModelTest, test_id)
-            if failed and failed.status == "preparing":
-                failed.status = "failed"
-                failed.error = _error_message(exc)
-                failed.finished_at = utcnow()
-                db.commit()
-                _persist_settled_storage(db, failed)
-            try:
-                delete_test_work(test_id)
-            except (OSError, ValueError):
-                logger.warning("model_test_start_cleanup_failed test_id=%s", test_id)
-            raise
+            delete_test_work(test_id)
+        except (OSError, ValueError):
+            logger.warning("model_test_start_cleanup_failed test_id=%s", test_id)
+        raise
+
+    with worker.lock:
         record = get_record(db, test_id)
         if record.status != "preparing" or record.delete_requested:
             delete_test_work(test_id)
             raise HTTPException(409, "当前测试不能启动")
+        record.model_sha256 = model_sha256
+        record.model_size = model_size
+        record.model_snapshot = {
+            **(record.model_snapshot or {}),
+            "weight_size": model_size,
+            "sha256": model_sha256,
+        }
         record.status = "queued"
         db.commit()
         return record_public(get_record(db, test_id))

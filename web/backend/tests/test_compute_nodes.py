@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -57,6 +57,10 @@ def create(client, name="Remote"):
 
 def headers(credential):
     return {"Authorization": "Bearer " + credential["token"]}
+
+
+def parsed_time(value: str):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def test_local_compute_sampling_does_not_block_api_caller(monkeypatch):
@@ -195,7 +199,11 @@ def test_offline_disabled_rotation_and_removal(monitoring_client):
     assert client.post("/api/compute/nodes/local/token").status_code == 409
 
 
-def test_active_model_fetch_protects_node_management(monitoring_client):
+@pytest.mark.parametrize(("operation_kind", "payload"), [
+    ("fetch_model", {"model_asset_id": "a" * 32, "path": "/models/test.pt"}),
+    ("fetch_log", {"run_id": "remote-run", "log_path": "/logs/train.log"}),
+])
+def test_active_file_transfer_protects_node_management(monitoring_client, operation_kind, payload):
     client, factory = monitoring_client
     credential = create(client, "Model transfer node")
     node_id = credential["node"]["id"]
@@ -203,9 +211,9 @@ def test_active_model_fetch_protects_node_management(monitoring_client):
         id="f" * 32,
         node_id=node_id,
         task_id="model-asset:" + "a" * 32,
-        kind="fetch_model",
+        kind=operation_kind,
         status="pending",
-        payload={"model_asset_id": "a" * 32, "path": "/models/test.pt"},
+        payload=payload,
     )
     with factory() as db:
         db.add(operation)
@@ -245,12 +253,47 @@ def test_validation_stale_reports_and_cpu_only_nodes(monitoring_client):
     assert client.post(url, headers=headers(credential), json=payload).status_code == 200
     older = sample()
     older["compute"]["sampled_at"] = (utcnow() - timedelta(hours=1)).isoformat()
-    assert client.post(url, headers=headers(credential), json=older).status_code == 409
+    stale = client.post(url, headers=headers(credential), json=older)
+    assert stale.status_code == 200 and stale.json()["status"] == "stale"
     detail = client.get(url.removesuffix("/report")).json()
     assert detail["status"] == "online" and detail["compute"]["available"] is False
+    assert parsed_time(detail["compute"]["sampled_at"]) == parsed_time(payload["compute"]["sampled_at"])
     payload["compute"]["host"]["load_average"] = [-1]
     assert client.post(url, headers=headers(credential), json=payload).status_code == 422
     assert client.post(url, headers=headers(credential), content=b"x" * (monitoring.MAX_REPORT_BYTES + 1)).status_code == 413
+
+
+def test_ordered_agent_reports_survive_clock_rollback_and_reject_replays(monitoring_client):
+    client, _ = monitoring_client
+    credential = create(client)
+    url = f"/api/compute/nodes/{credential['node']['id']}/report"
+    first = sample()
+    first.update(agent_version="2.0.6", boot_id="a" * 32, report_seq=1)
+    assert client.post(url, headers=headers(credential), json=first).status_code == 200
+
+    rollback = sample()
+    rollback.update(agent_version="2.0.6", boot_id="a" * 32, report_seq=2)
+    rollback["compute"]["sampled_at"] = (utcnow() - timedelta(days=2)).isoformat()
+    rollback["training"]["output_writable"] = True
+    accepted = client.post(url, headers=headers(credential), json=rollback)
+    assert accepted.status_code == 200 and accepted.json()["status"] == "ok"
+    detail = client.get(url.removesuffix("/report")).json()
+    assert parsed_time(detail["sampled_at"]) == parsed_time(rollback["compute"]["sampled_at"])
+    assert detail["training"]["output_writable"] is True
+
+    replay = sample()
+    replay.update(agent_version="9.9.9", boot_id="a" * 32, report_seq=1)
+    stale = client.post(url, headers=headers(credential), json=replay)
+    assert stale.status_code == 200 and stale.json()["status"] == "stale"
+    assert client.get(url.removesuffix("/report")).json()["agent_version"] == "2.0.6"
+
+    restarted = sample()
+    restarted.update(agent_version="2.0.6", boot_id="b" * 32, report_seq=1)
+    restarted["compute"]["sampled_at"] = (utcnow() - timedelta(days=3)).isoformat()
+    assert client.post(url, headers=headers(credential), json=restarted).json()["status"] == "ok"
+    assert parsed_time(client.get(url.removesuffix("/report")).json()["sampled_at"]) == parsed_time(
+        restarted["compute"]["sampled_at"],
+    )
 
 
 def test_remote_online_status_uses_center_receive_time_when_agent_clock_lags(monitoring_client):

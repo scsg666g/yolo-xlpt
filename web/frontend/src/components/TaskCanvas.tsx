@@ -16,6 +16,7 @@ import { LogViewerModal } from './LogViewerModal'
 import { ModelTestModal } from './ModelTestModal'
 import { isSupportedModelTestTask, modelTestMetrics } from './ModelTestShared'
 import { TrainingTraceModal } from './TrainingTraceModal'
+import { AttemptDeletionHistory } from './AttemptDeletionHistory'
 
 const nodeTypes = { panel: CanvasNode }
 const initialEdges: Edge[] = [
@@ -477,10 +478,11 @@ function TaskCanvasInner() {
     <header className="canvas-toolbar">
       <button className="icon-button" onClick={() => navigate('/')}><ArrowLeft size={19} /></button>
       <div className="canvas-title"><span className={`status-dot ${viewTask.status}`} /><div><strong>{task.name}</strong><span>{task.task_type} · {viewTask.model_path.split('/').pop()}</span></div></div>
-      {runs.length > 0 && <label className="attempt-picker"><History size={15} /><select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {{ fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[run.launch_mode]} · {trainingStatusLabel(run)}</option>)}</select></label>}
+      {runs.length > 0 && <label className="attempt-picker"><History size={15} /><select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {{ fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[run.launch_mode]} · {run.deletion_status ? ({ pending: '等待清理', running: '清理中', failed: '清理失败', succeeded: '已清理' }[run.deletion_status]) : trainingStatusLabel(run)}</option>)}</select></label>}
       <div className="canvas-state" title={earlyStoppingExplanation(viewTask) || undefined}><Clock3 size={14} />{selectedRun ? `Attempt ${String(selectedRun.attempt_number).padStart(3, '0')} · ${launchModeLabel} · ` : ''}{trainingStatusLabel(viewTask)} · Epoch {viewTask.completed_epochs}/{trainingEpochTarget(viewTask)}</div>
       <div className={`canvas-heartbeat ${currentIsActive ? 'active' : ''} ${syncDelayed || outputWaiting ? 'delayed' : ''}`} title={syncError || `接口响应：${syncAge} 秒前；本次查看中最近观察到输出变化：${outputAge} 秒前。无新输出不代表训练失败。`}><Radio size={13} /><i /><span>{heartbeatLabel}</span><strong>{syncAge}秒前</strong></div>
       <div className="canvas-actions">
+        <AttemptDeletionHistory taskId={task.id} />
         {notice && <span className="toast"><Check size={14} />{notice}</span>}
         {layoutFeedback && <span className={`toast ${layoutFeedback.kind}`} role={layoutFeedback.kind === 'error' ? 'alert' : 'status'} title={layoutFeedback.message}>{layoutFeedback.kind === 'saving' ? <LoaderCircle className="spin" size={14} /> : layoutFeedback.kind === 'error' ? <AlertCircle size={14} /> : <Check size={14} />}{layoutFeedback.message}</span>}
         {syncError && <span className="canvas-sync-error" role="alert" title={syncError}>同步失败：{syncError}</span>}
@@ -504,7 +506,7 @@ function TaskCanvasInner() {
     </div>
     <EditParametersModal task={task} open={editingParameters} onClose={() => setEditingParameters(false)} onSaved={(updated) => { setTask(updated); setEditingParameters(false); setNotice('训练参数已保存'); window.setTimeout(() => setNotice(''), 1800) }} />
     <EditResourceModal task={task} mode={editingResource} onClose={() => setEditingResource(null)} onSave={saveResource} />
-    <LogViewerModal task={viewTask} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
+    <LogViewerModal task={viewTask} runId={selectedRunId} lines={logs} open={viewingLogs} onClose={() => setViewingLogs(false)} />
     <CanvasDetailModal kind={detailKind} task={viewTask} run={selectedRun} metrics={metrics} artifacts={artifacts} effectiveBestWeight={effectiveBestWeight} events={events} onClose={() => setDetailKind(null)} onTest={(artifact) => { setDetailKind(null); setTestingArtifact(artifact); setModelTestOpen(true) }} testDisabledReason={testDisabledReason} />
     <TrainingTraceModal task={viewTask} run={selectedRun} open={viewingTrace} onClose={() => setViewingTrace(false)} />
     {modelTestOpen && <ModelTestModal key={testingArtifact?.id || 'history'} artifact={testingArtifact} taskId={task.id} taskName={task.name} taskType={viewTask.task_type} runId={selectedRun?.id || null} attemptNumber={modelTestAttempt} bestMetric={modelTestBestMetric} newTestDisabledReason={testDisabledReason} onClose={() => setModelTestOpen(false)} />}

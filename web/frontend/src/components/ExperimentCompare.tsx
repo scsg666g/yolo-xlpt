@@ -6,6 +6,7 @@ import { readStoredCompareRuns, useCompareLimit, writeStoredCompareRuns } from '
 import type { MetricPoint, TaskGroup, TrainingRun, TrainingTask } from '../types'
 import { CompareRunDetailModal, type CompareRunDetails } from './CompareRunDetailModal'
 import { LineChartView } from './LineChart'
+import { AttemptDeletionHistory } from './AttemptDeletionHistory'
 
 interface ComparisonRun {
   id: string
@@ -175,6 +176,9 @@ export function ExperimentCompare() {
   const detailRequest = useRef<AbortController | null>(null)
   const requestVersion = useRef(0)
   const activeRequest = useRef<AbortController | null>(null)
+  const catalog = useRef<ComparisonRun[]>([])
+  const catalogLoadedAt = useRef(0)
+  const metricCache = useRef(new Map<string, { revision: string; points: MetricPoint[] }>())
   const [metricKey, setMetricKey] = useState('metrics/mAP50(B)')
   const [baselineId, setBaselineId] = useState('')
   const [evaluationMode, setEvaluationMode] = useState<'latest' | 'best'>('latest')
@@ -193,15 +197,29 @@ export function ExperimentCompare() {
     if (params.has('runs') || params.has('tasks')) return [...new Set(incoming)].slice(0, compareLimit)
     return readStoredCompareRuns().slice(0, compareLimit)
   })
+  const lastSelectionUrl = useRef(params.toString())
   const selected = useMemo(() => selectedIds.map((id) => experiments.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[], [experiments, selectedIds])
 
   useEffect(() => {
+    if (lastSelectionUrl.current !== params.toString()) {
+      lastSelectionUrl.current = params.toString()
+      requestVersion.current++
+      activeRequest.current?.abort()
+      const incoming = (params.get('runs') || params.get('tasks') || '').split(',').filter(Boolean)
+      const next = [...new Set(incoming)].slice(0, compareLimit)
+      setSelectedIds(next)
+      setBaselineId((current) => next.includes(current) ? current : next[0] || '')
+      return
+    }
     writeStoredCompareRuns(selectedIds)
     const next = new URLSearchParams(window.location.search)
     next.delete('tasks')
     if (selectedIds.length) next.set('runs', selectedIds.join(',')); else next.delete('runs')
-    if (next.toString() !== params.toString()) setParams(next, { replace: true })
-  }, [selectedIds, params, setParams])
+    if (next.toString() !== params.toString()) {
+      lastSelectionUrl.current = next.toString()
+      setParams(next, { replace: true })
+    }
+  }, [compareLimit, selectedIds, params, setParams])
 
   const invalidateActiveRequest = useCallback(() => {
     requestVersion.current++
@@ -223,17 +241,36 @@ export function ExperimentCompare() {
     const controller = new AbortController()
     activeRequest.current = controller
     try {
-      const [taskList, taskGroups] = await Promise.all([
-        api.tasks(controller.signal),
-        api.taskGroups(controller.signal),
-      ])
-      const runLists = await Promise.all(taskList.map(async (task) => [task, await api.runs(task.id, controller.signal)] as const))
-      const items = runLists.flatMap(([task, runs]) => [...runs]
-        .sort((left, right) => right.attempt_number - left.attempt_number)
-        .map((run) => ({ id: run.id, task, run, view: runView(task, run) })))
+      const refreshCatalog = Date.now() - catalogLoadedAt.current >= 60_000
+      let items = catalog.current
+      let taskGroups: TaskGroup[] | undefined
+      if (refreshCatalog) {
+        const [firstPage, groups] = await Promise.all([api.experiments(0, controller.signal), api.taskGroups(controller.signal)])
+        const rows = [...firstPage.items]
+        for (let offset = firstPage.limit; offset < firstPage.total; offset += firstPage.limit) {
+          rows.push(...(await api.experiments(offset, controller.signal)).items)
+        }
+        items = [...new Map(rows.map(({ task, run }) => [run.id, { id: run.id, task, run, view: runView(task, run) }])).values()]
+        taskGroups = groups
+      } else {
+        const refreshIds = [...new Set([...selectedIds, ...items.filter((item) =>
+          activeRunStatuses.has(item.run.status) || ['pending', 'running'].includes(item.run.deletion_status || '')
+        ).map((item) => item.id)])]
+        const refreshed = new Map<string, ComparisonRun>()
+        for (let offset = 0; offset < refreshIds.length; offset += 200) {
+          const page = await api.experiments(0, controller.signal, refreshIds.slice(offset, offset + 200))
+          page.items.forEach(({ task, run }) => refreshed.set(run.id, { id: run.id, task, run, view: runView(task, run) }))
+        }
+        const requested = new Set(refreshIds)
+        const known = new Set(items.map((item) => item.id))
+        items = items.flatMap((item) => refreshed.has(item.id) ? [refreshed.get(item.id)!] : requested.has(item.id) ? [] : [item])
+        items.push(...[...refreshed.values()].filter((item) => !known.has(item.id)))
+      }
       if (version !== requestVersion.current) return
+      catalog.current = items
+      if (refreshCatalog) catalogLoadedAt.current = Date.now()
       setExperiments(items)
-      setGroups(taskGroups)
+      if (taskGroups) setGroups(taskGroups)
       const normalizedIds = selectedIds.map((id) => {
         const exactRun = items.find((item) => item.id === id)
         if (exactRun) return exactRun.run.deletion_status ? undefined : exactRun.id
@@ -254,7 +291,14 @@ export function ExperimentCompare() {
         }
       }
       const selectedItems = limitedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
-      const results = await Promise.allSettled(selectedItems.map((item) => api.runMetrics(item.task.id, item.run.id, controller.signal)))
+      const results = await Promise.allSettled(selectedItems.map(async (item) => {
+        const revision = `${item.run.updated_at}:${item.run.completed_epochs}:${item.run.status}`
+        const cached = metricCache.current.get(item.id)
+        if (cached?.revision === revision) return cached.points
+        const points = await api.runMetrics(item.task.id, item.run.id, controller.signal)
+        if (version === requestVersion.current) metricCache.current.set(item.id, { revision, points })
+        return points
+      }))
       if (version !== requestVersion.current) return
       const points: Record<string, MetricPoint[]> = {}
       const failures: Record<string, string> = {}
@@ -277,14 +321,23 @@ export function ExperimentCompare() {
     let timer: number | undefined
 
     async function poll() {
+      if (document.hidden) return
       await load()
-      if (!cancelled) timer = window.setTimeout(poll, 5000)
+      const active = catalog.current.some((item) => activeRunStatuses.has(item.run.status)
+        || ['pending', 'running'].includes(item.run.deletion_status || ''))
+      if (!cancelled && !document.hidden) timer = window.setTimeout(poll, active ? 5000 : 30_000)
     }
-
+    function visibilityChanged() {
+      window.clearTimeout(timer)
+      if (document.hidden) invalidateActiveRequest()
+      else void poll()
+    }
+    document.addEventListener('visibilitychange', visibilityChanged)
     void poll()
     return () => {
       cancelled = true
       window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', visibilityChanged)
       invalidateActiveRequest()
     }
   }, [invalidateActiveRequest, load])
@@ -353,6 +406,8 @@ export function ExperimentCompare() {
       if (detailRunId === target.id) closeRunDetails()
       setDeleteTarget(null)
       setDeleteNotice(result.message || 'Attempt 清理已提交，正在等待后台完成。')
+      catalogLoadedAt.current = 0
+      void load()
     } catch (reason) {
       setDeleteError(reason instanceof Error ? reason.message : '删除 Attempt 失败，请稍后重试')
     } finally {
@@ -486,6 +541,7 @@ export function ExperimentCompare() {
   } as React.CSSProperties
 
   return <div className="page compare-page" style={experimentLayout}>
+    <div className="compare-cleanup-actions"><AttemptDeletionHistory /></div>
     <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较任意历史 Attempt 的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择运行 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
     {pickerOpen && <div className="compare-picker">
       <header><div><strong>选择参与对比的训练运行</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；可选择每个任务的任意历史 Attempt</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>

@@ -3,6 +3,7 @@ import { Clock3, FileArchive, Info, ListTree, LoaderCircle, Monitor, RefreshCw, 
 import { formatBytes, statusLabel } from '../api'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
+import { FullLogDownload } from './FullLogDownload'
 
 export interface CompareRunDetails {
   loading: boolean
@@ -131,6 +132,7 @@ export function CompareRunDetailModal({ task, run, view, details, onClose, onRef
         {tab === 'logs' && <section className="compare-run-detail-section compare-run-detail-tab-section compare-run-detail-log-section">
           <div className="compare-run-detail-section-heading"><div><h3>日志末尾</h3><p title={details?.logs?.path || ''}>{details?.logs?.path || '没有记录日志路径'}</p></div><Clock3 size={17} /></div>
           {remote && <p className="compare-run-detail-log-note">远程日志最多显示 Agent 最近同步到平台的内容。</p>}
+          <FullLogDownload taskId={task.id} runId={run.id} />
           <pre>{details?.logs ? details.logs.lines.length ? details.logs.lines.join('\n') : '暂无日志内容' : '正在读取日志…'}</pre>
         </section>}
       </div>

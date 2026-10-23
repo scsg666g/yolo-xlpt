@@ -31,6 +31,9 @@ from .compute_nodes import (
     router as compute_nodes_router,
 )
 from .database import Base, SessionLocal, engine, get_db, migrate_database
+from .experiments import router as experiments_router
+from .log_files import tail_log
+from .training_logs import router as training_logs_router
 from .gpu_reservations import acquire_node_claim_lock, release_gpu_reservations
 from .dataset_uploads import (
     cleanup_managed_dataset_workdirs,
@@ -64,6 +67,7 @@ from .services import (
     backfill_training_runs,
     create_training_run,
     current_run,
+    discover_classification_datasets,
     discover_files,
     effective_best_weight,
     gpu_inventory,
@@ -74,11 +78,12 @@ from .services import (
     resume_checkpoint,
     scheduler,
     sync_metrics,
-    validate_dataset_config,
     validate_input_path,
+    validate_remote_training_data_path,
+    validate_training_data_path,
 )
 from .run_deletions import active_attempt_delete_operation, attempt_deletion_state
-from .deletion_jobs import deletion_preview, list_deletion_jobs, reject_local_task_cleanup
+from .deletion_jobs import deletion_preview, list_attempt_deletion_jobs, list_deletion_jobs, reject_local_task_cleanup
 
 logger = logging.getLogger("yolo-platform.requests")
 _task_snapshot = ""
@@ -146,6 +151,8 @@ app.include_router(inference_router)
 app.include_router(model_assets_router)
 app.include_router(compute_nodes_router)
 app.include_router(remote_operations_router)
+app.include_router(experiments_router)
+app.include_router(training_logs_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -312,6 +319,7 @@ def resources():
         "gpus": gpu_inventory(),
         "models": discover_files(MODEL_ROOTS, {".pt", ".pth", ".onnx", ".yaml", ".yml"}),
         "datasets": discover_files(DATASET_ROOTS, {".yaml", ".yml"}),
+        "classification_datasets": discover_classification_datasets(DATASET_ROOTS),
     }
 
 
@@ -473,10 +481,14 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             acquire_node_claim_lock(db, node.id)
             db.refresh(node)
             reject_unavailable_remote_training(node, 422)
-            model_path, data_path = payload.model_path.strip(), payload.data_path.strip()
+            model_path = payload.model_path.strip()
+            try:
+                data_path = validate_remote_training_data_path(payload.task_type, payload.data_path)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
             output_root = (payload.remote_output_root or "").strip()
-            if not Path(model_path).is_absolute() or not Path(data_path).is_absolute() or not Path(output_root).is_absolute():
-                raise HTTPException(422, "远程模型、数据 YAML 和输出目录都必须是远程服务器上的绝对路径")
+            if not Path(model_path).is_absolute() or not Path(output_root).is_absolute():
+                raise HTTPException(422, "远程模型和输出目录都必须是远程服务器上的绝对路径")
             if any("\x00" in value for value in (model_path, data_path, output_root)):
                 raise HTTPException(422, "路径不能包含空字符")
             reject_active_remote_delete(db, node.id)
@@ -484,7 +496,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             reject_local_task_cleanup(db)
             try:
                 model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
-                data_path = str(validate_dataset_config(payload.data_path))
+                data_path = str(validate_training_data_path(payload.task_type, payload.data_path))
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
         task_id = uuid.uuid4().hex[:16]
@@ -546,11 +558,15 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
         reject_unavailable_remote_training(node, 409)
         reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
+        try:
+            validate_remote_training_data_path(task.task_type, task.data_path)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     else:
         if not Path(task.model_path).exists() or not Path(task.data_path).exists():
             raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
         try:
-            validate_dataset_config(task.data_path)
+            validate_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     run = create_training_run(db, task, "fresh")
@@ -578,6 +594,10 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
         reject_unavailable_remote_training(node, 409)
         reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
+        try:
+            validate_remote_training_data_path(task.task_type, task.data_path)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         checkpoint_artifact = db.scalar(select(Artifact).where(
             Artifact.run_id == previous.id, Artifact.name == "weights/last.pt", Artifact.size > 0,
         )) if previous else None
@@ -593,7 +613,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
         raise HTTPException(409, "数据集路径已经失效，无法继续训练")
     if not task.execution_node_id:
         try:
-            validate_dataset_config(task.data_path)
+            validate_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     if task.epochs <= task.completed_epochs:
@@ -624,10 +644,14 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
         reject_unavailable_remote_training(node, 409)
         reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
+        try:
+            validate_remote_training_data_path(task.task_type, task.data_path)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
     else:
         try:
             validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
-            validate_dataset_config(task.data_path)
+            validate_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     run = create_training_run(db, task, "retry")
@@ -896,6 +920,13 @@ def task_deletion_jobs(limit: int = Query(default=50, ge=1, le=200), db: Session
     return list_deletion_jobs(db, limit=limit)
 
 
+@app.get("/api/attempt-deletions")
+def attempt_deletion_jobs(limit: int = Query(default=50, ge=1, le=200),
+                          task_id: str | None = Query(default=None, max_length=64),
+                          db: Session = Depends(get_db)):
+    return list_attempt_deletion_jobs(db, limit=limit, task_id=task_id)
+
+
 @app.get("/api/tasks/{task_id}/deletion-preview")
 def task_deletion_preview(task_id: str, db: Session = Depends(get_db)):
     return deletion_preview(db, get_task_or_404(db, task_id, include_deleted=True))
@@ -980,11 +1011,9 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
                     task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
             if payload.data_path is not None:
                 if task.execution_node_id:
-                    if not Path(payload.data_path).is_absolute() or "\x00" in payload.data_path:
-                        raise ValueError("远程数据集 YAML 必须是绝对路径")
-                    task.data_path = payload.data_path.strip()
+                    task.data_path = validate_remote_training_data_path(task.task_type, payload.data_path)
                 else:
-                    task.data_path = str(validate_dataset_config(payload.data_path))
+                    task.data_path = str(validate_training_data_path(task.task_type, payload.data_path))
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         current_config = dict(task.config or {})
@@ -1042,8 +1071,7 @@ def task_logs(task_id: str, tail: int = Query(default=400, ge=20, le=5000), db: 
         return {"lines": (run.remote_log_tail or [])[-tail:], "path": run.log_path}
     if not run or not run.log_path or not Path(run.log_path).exists():
         return {"lines": [], "path": run.log_path if run else None}
-    lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
-    return {"lines": lines[-tail:], "path": run.log_path}
+    return {"lines": tail_log(run.log_path, tail), "path": run.log_path}
 
 
 @app.get("/api/tasks/{task_id}/runs", response_model=list[RunRead])
@@ -1128,8 +1156,7 @@ def run_logs(task_id: str, run_id: str, tail: int = Query(default=400, ge=20, le
         return {"lines": (run.remote_log_tail or [])[-tail:], "path": run.log_path}
     if not run.log_path or not Path(run.log_path).exists():
         return {"lines": [], "path": run.log_path}
-    lines = Path(run.log_path).read_text(encoding="utf-8", errors="replace").splitlines()
-    return {"lines": lines[-tail:], "path": run.log_path}
+    return {"lines": tail_log(run.log_path, tail), "path": run.log_path}
 
 
 @app.get("/api/tasks/{task_id}/runs/{run_id}/trace")

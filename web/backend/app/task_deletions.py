@@ -155,6 +155,45 @@ def _protected_model_assets(
     return protected
 
 
+def validate_local_model_references(
+    db: Session,
+    deleting_task_id: str,
+    targets: list[str | Path],
+    *,
+    include_task_active_tests: bool = False,
+) -> None:
+    """Protect local weights registered in the model library or used externally."""
+    test_query = select(ModelTest).where(
+        ModelTest.status.in_(ACTIVE_TEST_STATUSES),
+        or_(ModelTest.execution_node_id.is_(None), ModelTest.execution_node_id == "local"),
+    )
+    if not include_task_active_tests:
+        test_query = test_query.where(
+            or_(ModelTest.task_id.is_(None), ModelTest.task_id != deleting_task_id),
+        )
+    active_tests = db.scalars(test_query).all()
+    assets = _protected_model_assets(db, deleting_task_id)
+    for target in targets:
+        for asset, retained_by_history in assets:
+            if asset.path and _target_overlaps_reference(
+                target,
+                asset.path,
+                reference_base=model_asset_service.PROJECT_ROOT,
+            ):
+                if retained_by_history:
+                    raise ValueError(
+                        f"已移除的模型登记「{asset.name}」仍有模型测试历史引用；"
+                        "请先删除相关历史记录后再永久删除任务"
+                    )
+                raise ValueError(f"训练产物仍被模型来源「{asset.name}」登记，请先移除该模型来源")
+        if any(
+            test.model_source_path
+            and _target_overlaps_reference(target, test.model_source_path)
+            for test in active_tests
+        ):
+            raise ValueError("训练产物正被其他模型检测使用，请等待检测结束或取消后重试")
+
+
 def _validate_references(
     db: Session,
     task: TrainingTask,
@@ -179,26 +218,8 @@ def _validate_references(
             if artifact.path
         )
 
-    external_active_tests = db.scalars(select(ModelTest).where(
-        ModelTest.status.in_(ACTIVE_TEST_STATUSES),
-        or_(ModelTest.execution_node_id.is_(None), ModelTest.execution_node_id == "local"),
-        or_(ModelTest.task_id.is_(None), ModelTest.task_id != task.id),
-    )).all()
-    protected.extend(test.model_source_path for test in external_active_tests if test.model_source_path)
-
+    validate_local_model_references(db, task.id, targets)
     for target in targets:
-        for asset, retained_by_history in _protected_model_assets(db, task.id):
-            if asset.path and _target_overlaps_reference(
-                target,
-                asset.path,
-                reference_base=model_asset_service.PROJECT_ROOT,
-            ):
-                if retained_by_history:
-                    raise ValueError(
-                        f"已移除的模型登记「{asset.name}」仍有模型测试历史引用；"
-                        "请先删除相关历史记录后再永久删除任务"
-                    )
-                raise ValueError(f"训练产物仍被模型来源「{asset.name}」登记，请先移除该模型来源")
         if any(_target_overlaps_reference(target, candidate) for candidate in protected):
             raise ValueError("待清理本机路径仍被基础资源、模型测试或其他任务引用，已拒绝永久删除")
 

@@ -170,6 +170,151 @@ def configure_standalone_models(tmp_path, monkeypatch):
     return project_root, model_root
 
 
+def test_create_request_id_is_idempotent_and_reports_partial_upload(image_test_client):
+    client, db, artifact, _, _ = image_test_client
+    request_id = "1" * 32
+    first = create(client, artifact, ["first.png", "second.png"], request_id=request_id)
+    assert first.status_code == 201
+    assert first.json()["id"] == request_id
+    assert client.put(
+        f"/api/model-tests/{request_id}/images/0", content=image_bytes(),
+    ).status_code == 204
+    directory = storage.test_history_root(artifact.task_id, request_id)
+    marker = directory / "keep.marker"
+    marker.write_text("owned", encoding="utf-8")
+
+    retried = create(client, artifact, ["first.png", "second.png"], request_id=request_id)
+
+    assert retried.status_code == 201
+    assert retried.json()["id"] == request_id
+    assert [item["uploaded"] for item in retried.json()["files"]] == [True, False]
+    assert len(db.scalars(select(ModelTest)).all()) == 1
+    assert marker.read_text(encoding="utf-8") == "owned"
+
+    collision = create(
+        client, artifact, ["different.png"], request_id=request_id,
+    )
+    assert collision.status_code == 409
+    assert "请求标识" in collision.json()["detail"]
+    assert marker.read_text(encoding="utf-8") == "owned"
+    assert len(db.scalars(select(ModelTest)).all()) == 1
+
+
+@pytest.mark.parametrize("status", ["preparing", "queued", "running", "completed"])
+def test_create_retry_never_resets_existing_status(image_test_client, status):
+    client, db, artifact, _, _ = image_test_client
+    request_id = "2" * 32
+    assert create(client, artifact, request_id=request_id).status_code == 201
+    record = db.get(ModelTest, request_id)
+    record.status = status
+    record.finished_at = utcnow() if status == "completed" else None
+    db.commit()
+
+    retried = create(client, artifact, request_id=request_id)
+
+    assert retried.status_code == 201
+    assert retried.json()["status"] == status
+    db.expire_all()
+    assert db.get(ModelTest, request_id).status == status
+
+
+def test_create_retry_bypasses_active_record_limit(image_test_client):
+    client, db, artifact, _, _ = image_test_client
+    first_id = f"{1:032x}"
+    assert create(client, artifact, request_id=first_id).status_code == 201
+    for index in range(2, 21):
+        assert create(client, artifact, request_id=f"{index:032x}").status_code == 201
+    assert len(db.scalars(select(ModelTest)).all()) == 20
+
+    assert create(client, artifact, request_id=first_id).status_code == 201
+    assert create(client, artifact, request_id=f"{21:032x}").status_code == 429
+    assert len(db.scalars(select(ModelTest)).all()) == 20
+
+
+def test_create_defers_digest_but_rejects_missing_training_weight(
+    image_test_client, monkeypatch,
+):
+    client, db, artifact, _, _ = image_test_client
+
+    def unexpected_digest(_path):
+        raise AssertionError("create must not hash the model")
+
+    monkeypatch.setattr(inference, "_digest_stable_file", unexpected_digest)
+    created = create(client, artifact, request_id="3" * 32)
+    assert created.status_code == 201
+    assert created.json()["model_sha256"] is None
+
+    Path(artifact.path).unlink()
+    missing = create(client, artifact, request_id="4" * 32)
+    assert missing.status_code == 404
+    assert db.get(ModelTest, "4" * 32) is None
+    assert not storage.test_history_root(artifact.task_id, "4" * 32).exists()
+
+
+def test_create_rejects_unready_or_missing_standalone_source(
+    image_test_client, tmp_path, monkeypatch,
+):
+    client, db, _, _, _ = image_test_client
+    _, model_root = configure_standalone_models(tmp_path, monkeypatch)
+    checkpoint = model_root / "available.pt"
+    checkpoint.write_bytes(b"available-model")
+    asset_payload = client.post("/api/model-assets/local", json={"path": str(checkpoint)}).json()
+    asset = db.get(ModelAsset, asset_payload["id"])
+    asset.status = "failed"
+    asset.error = "模型准备失败"
+    db.commit()
+
+    unready = client.post("/api/model-tests", json={
+        "request_id": "5" * 32,
+        "model_asset_id": asset.id,
+        "files": [{"name": "input.png", "size": len(image_bytes())}],
+    })
+    assert unready.status_code == 409
+
+    asset.status = "ready"
+    asset.error = None
+    db.commit()
+    checkpoint.unlink()
+    missing = client.post("/api/model-tests", json={
+        "request_id": "6" * 32,
+        "model_asset_id": asset.id,
+        "files": [{"name": "input.png", "size": len(image_bytes())}],
+    })
+    assert missing.status_code == 404
+    assert db.get(ModelTest, "6" * 32) is None
+
+
+def test_start_persists_preparing_before_verification_and_is_idempotent(
+    image_test_client, monkeypatch,
+):
+    client, db, artifact, _, _ = image_test_client
+    test_id = create(client, artifact).json()["id"]
+    upload_all(client, test_id)
+    observed_statuses = []
+    real_verify = inference._verified_weight_version
+
+    def observe_preparing(session, artifact_id, **kwargs):
+        session.expire_all()
+        observed_statuses.append(session.get(ModelTest, test_id).status)
+        return real_verify(session, artifact_id, **kwargs)
+
+    monkeypatch.setattr(inference, "_verified_weight_version", observe_preparing)
+    started = client.post(f"/api/model-tests/{test_id}/start")
+    repeated = client.post(f"/api/model-tests/{test_id}/start")
+
+    assert started.status_code == repeated.status_code == 202
+    assert started.json()["status"] == repeated.json()["status"] == "queued"
+    assert observed_statuses == ["preparing"]
+
+    record = db.get(ModelTest, test_id)
+    record.status = "preparing"
+    db.commit()
+    still_preparing = client.post(f"/api/model-tests/{test_id}/start")
+    assert still_preparing.status_code == 202
+    assert still_preparing.json()["status"] == "preparing"
+    assert observed_statuses == ["preparing"]
+
+
 def test_local_model_assets_are_portable_listed_and_restricted(image_test_client, tmp_path, monkeypatch):
     client, db, _, _, _ = image_test_client
     project_root, model_root = configure_standalone_models(tmp_path, monkeypatch)
@@ -230,6 +375,8 @@ def test_training_history_group_is_snapshotted_and_refreshed_for_reruns(image_te
 
     source_record = db.get(ModelTest, source["id"])
     source_record.status = "completed"
+    source_record.model_sha256 = hashlib.sha256(b"test-checkpoint").hexdigest()
+    source_record.model_size = len(b"test-checkpoint")
     source_record.finished_at = utcnow()
     artifact.task.group_id = current_group.id
     db.commit()
@@ -283,6 +430,13 @@ def test_standalone_history_groups_include_model_source_and_remote_node(
     remote_model.write_bytes(b"remote-model")
     db.add_all([node, remote_asset])
     db.commit()
+    monkeypatch.setattr(
+        inference,
+        "_available_model_asset_version",
+        lambda _db, _asset_id, **_kwargs: (
+            remote_model, remote_asset, remote_asset.sha256, remote_asset.size,
+        ),
+    )
     monkeypatch.setattr(
         inference,
         "_verified_model_asset_version",
@@ -392,8 +546,11 @@ def test_historical_local_rerun_failure_does_not_poison_current_asset(
         "rerun_of_test_id": source["id"],
         "files": [{"name": "rerun.png", "size": len(image_bytes())}],
     })
-    assert rerun.status_code == 409
-    assert rerun.json()["detail"] == "原模型权重版本已变化，无法按原权重重测"
+    assert rerun.status_code == 201
+    upload_all(client, rerun.json()["id"])
+    rejected = client.post(f"/api/model-tests/{rerun.json()['id']}/start")
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"] == "原模型权重版本已变化，无法按原权重重测"
 
     db.expire_all()
     current = db.get(ModelAsset, asset["id"])
@@ -444,15 +601,18 @@ def test_completed_test_persists_and_is_listed_after_reopen(image_test_client, m
         "kind": "ungrouped", "id": None, "name": "未分组",
     }
     expected_sha256 = hashlib.sha256(b"test-checkpoint").hexdigest()
-    assert created["model_sha256"] == expected_sha256
+    assert created["model_sha256"] is None
     assert created["model_size"] == len(b"test-checkpoint")
-    assert created["model"]["sha256"] == expected_sha256
+    assert created["model"]["sha256"] is None
     test_id = created["id"]
     directory = storage.test_history_root(artifact.task_id, test_id)
     assert directory.parent.name == artifact.task_id
     assert client.post(f"/api/model-tests/{test_id}/start").status_code == 409
     upload_all(client, test_id, 2)
-    assert client.post(f"/api/model-tests/{test_id}/start").json()["status"] == "queued"
+    started = client.post(f"/api/model-tests/{test_id}/start").json()
+    assert started["status"] == "queued"
+    assert started["model_sha256"] == expected_sha256
+    assert started["model"]["sha256"] == expected_sha256
 
     install_fake_process(monkeypatch, expected_images=2)
     assert test_worker.process_one()
@@ -1561,6 +1721,8 @@ def test_remote_rerun_uses_exact_legacy_cache_after_artifact_refresh(
     source_payload = create(client, artifact).json()
     source = db.get(ModelTest, source_payload["id"])
     source.status = "completed"
+    source.model_sha256 = hashlib.sha256(old_weight).hexdigest()
+    source.model_size = len(old_weight)
     source.finished_at = utcnow()
     # Simulate a cache record written before fetch digests were persisted.
     old_operation.payload = {
@@ -1601,10 +1763,12 @@ def test_remote_rerun_uses_exact_legacy_cache_after_artifact_refresh(
     assert rerun["artifact_name"] == source.artifact_name
     assert rerun["source_attempt_number"] == source.source_attempt_number
     db.refresh(old_operation)
-    assert old_operation.payload["sha256"] == rerun["model_sha256"]
+    assert "sha256" not in old_operation.payload
 
     upload_all(client, rerun["id"])
     assert client.post(f"/api/model-tests/{rerun['id']}/start").status_code == 202
+    db.refresh(old_operation)
+    assert old_operation.payload["sha256"] == rerun["model_sha256"]
     seen_models = []
     install_fake_process(monkeypatch, seen_models=seen_models)
     assert test_worker.process_one()
@@ -1654,6 +1818,74 @@ def test_remote_history_cache_falls_back_after_newest_candidate_is_corrupt(
     assert selected == valid_cache
 
 
+def test_remote_history_create_does_not_digest_cache_until_start(
+    image_test_client, tmp_path, monkeypatch,
+):
+    client, db, artifact, _, _ = image_test_client
+    weight = b"historical-remote-model"
+    sha256 = hashlib.sha256(weight).hexdigest()
+    artifact.run.execution_node_id = "remote-node"
+    artifact.task.execution_node_id = "remote-node"
+    artifact.size = len(weight)
+    operation = RemoteOperation(
+        id="e" * 32,
+        node_id="remote-node",
+        task_id=artifact.task_id,
+        kind="fetch",
+        status="succeeded",
+        payload={
+            "artifact_id": artifact.id,
+            "run_id": artifact.run_id,
+            "name": artifact.name,
+            "size": len(weight),
+            "modified_at": artifact.modified_at.isoformat(),
+            "sha256": sha256,
+        },
+    )
+    cache = tmp_path / "historical-cache.pt"
+    cache.write_bytes(weight)
+    monkeypatch.setattr(inference, "operation_file", lambda _operation: cache)
+    db.add(operation)
+    source = ModelTest(
+        id="7" * 32,
+        task_id=artifact.task_id,
+        run_id=artifact.run_id,
+        source_run_id=artifact.run_id,
+        artifact_id=artifact.id,
+        artifact_name=artifact.name,
+        model_name="best.pt",
+        model_source_type="training_artifact",
+        execution_node_id="remote-node",
+        model_source_path=artifact.path,
+        model_sha256=sha256,
+        model_size=len(weight),
+        attempt_number=artifact.run.attempt_number,
+        source_attempt_number=artifact.run.attempt_number,
+        confidence=0.25,
+        iou=0.7,
+        model_snapshot={"weight_name": "best.pt", "weight_size": len(weight), "sha256": sha256},
+        status="completed",
+        finished_at=utcnow(),
+    )
+    db.add(source)
+    db.commit()
+
+    def unexpected_digest(*_args, **_kwargs):
+        raise AssertionError("create must not digest a historical cache")
+
+    monkeypatch.setattr(inference, "cached_fetch_digest", unexpected_digest)
+    rerun = create(
+        client,
+        artifact,
+        request_id="8" * 32,
+        rerun_of_test_id=source.id,
+    )
+
+    assert rerun.status_code == 201
+    assert rerun.json()["model_sha256"] == sha256
+    assert rerun.json()["model_size"] == len(weight)
+
+
 @pytest.mark.parametrize("task_type", ["detect", "segment", "classify", "pose", "obb"])
 def test_remote_weight_uses_verified_center_cache(image_test_client, tmp_path, monkeypatch, task_type):
     client, db, artifact, _, test_worker = image_test_client
@@ -1682,13 +1914,15 @@ def test_remote_weight_uses_verified_center_cache(image_test_client, tmp_path, m
     assert created.status_code == 201
     payload = created.json()
     expected_sha256 = hashlib.sha256(remote_weight).hexdigest()
-    assert payload["model_sha256"] == expected_sha256
+    assert payload["model_sha256"] is None
     assert payload["model_size"] == len(remote_weight)
-    db.refresh(operation)
-    assert operation.payload["sha256"] == expected_sha256
     test_id = payload["id"]
     upload_all(client, test_id)
-    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    started = client.post(f"/api/model-tests/{test_id}/start")
+    assert started.status_code == 202
+    assert started.json()["model_sha256"] == expected_sha256
+    db.refresh(operation)
+    assert operation.payload["sha256"] == expected_sha256
     seen_models = []
     install_fake_process(monkeypatch, seen_models=seen_models)
     test_worker.process_one()

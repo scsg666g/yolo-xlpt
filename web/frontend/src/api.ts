@@ -48,6 +48,7 @@ export const api = {
     confidence: number,
     iou: number,
     files: File[],
+    request_id: string,
     signal: AbortSignal,
     run_id?: string | null,
     rerun_of_test_id?: string | null,
@@ -55,6 +56,7 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({
       artifact_id,
+      request_id,
       confidence,
       iou,
       run_id: run_id || undefined,
@@ -68,12 +70,14 @@ export const api = {
     confidence: number,
     iou: number,
     files: File[],
+    request_id: string,
     signal: AbortSignal,
     rerun_of_test_id?: string | null,
   ) => requestWithTimeout<ModelTest>('/api/model-tests', {
     method: 'POST',
     body: JSON.stringify({
       model_asset_id,
+      request_id,
       confidence,
       iou,
       rerun_of_test_id: rerun_of_test_id || undefined,
@@ -138,6 +142,7 @@ export const api = {
   reorderTasks: (task_ids: string[]) => request<void>('/api/tasks/order', { method: 'PATCH', body: JSON.stringify({ task_ids }) }),
   deletedTasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks?deleted_only=true', { signal }).then((tasks) => tasks.filter((task) => task.deleted_at)),
   taskDeletionJobs: (signal?: AbortSignal) => requestWithTimeout<DeletionJob[]>('/api/task-deletions?limit=50', { signal }),
+  attemptDeletionJobs: (signal?: AbortSignal, taskId?: string) => requestWithTimeout<import('./types').AttemptDeletionJob[]>(`/api/attempt-deletions?limit=50${taskId ? `&task_id=${encodeURIComponent(taskId)}` : ''}`, { signal }),
   taskDeletionPreview: (id: string, signal?: AbortSignal) => requestWithTimeout<TaskDeletionPreview>(
     `/api/tasks/${encodeURIComponent(id)}/deletion-preview`, { signal }, 15_000, '删除范围读取超时，请重试',
   ),
@@ -171,7 +176,10 @@ export const api = {
   events: (id: string) => request<TaskEvent[]>(`/api/tasks/${id}/events`),
   logs: (id: string) => request<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/logs?tail=240`),
   runs: (id: string, signal?: AbortSignal) => requestWithTimeout<TrainingRun[]>(`/api/tasks/${id}/runs`, { signal }),
-  deleteRun: (taskId: string, runId: string) => requestWithTimeout<{ status: 'pending' | 'running' | 'failed' | 'succeeded'; message: string }>(
+  experiments: (offset: number, signal?: AbortSignal, runIds?: string[]) => requestWithTimeout<{
+    items: Array<{ task: TrainingTask; run: TrainingRun }>; total: number; offset: number; limit: number
+  }>(`/api/experiments?offset=${offset}&limit=200${runIds ? `&run_ids=${encodeURIComponent(runIds.join(','))}` : ''}`, { signal }),
+  deleteRun: (taskId: string, runId: string) => requestWithTimeout<{ status: 'pending' | 'running' | 'failed' | 'succeeded'; message: string; operation_id: string }>(
     `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}`,
     { method: 'DELETE' }, 30_000, '删除 Attempt 请求超时，后台可能已经受理，请稍后刷新确认状态',
   ),
@@ -180,6 +188,9 @@ export const api = {
   runEffectiveBestWeight: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<EffectiveBestWeight>(`/api/tasks/${id}/runs/${runId}/effective-best-weight`, { signal }),
   runEvents: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<TaskEvent[]>(`/api/tasks/${id}/runs/${runId}/events`, { signal }),
   runLogs: (id: string, runId: string, signal?: AbortSignal) => requestWithTimeout<{ lines: string[]; path: string | null }>(`/api/tasks/${id}/runs/${runId}/logs?tail=240`, { signal }),
+  prepareRunLog: (id: string, runId: string, refresh: boolean, signal?: AbortSignal) => requestWithTimeout<{
+    status: 'ready' | 'pending' | 'running' | 'finalizing' | 'failed'; message?: string; snapshot_at?: string
+  }>(`/api/tasks/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/logs/prepare?refresh=${refresh}`, { method: 'POST', signal }),
   trainingTrace: (id: string, runId: string) => request<TrainingTrace>(`/api/tasks/${id}/runs/${runId}/trace`),
   resources: () => request<Resources>('/api/resources'),
   compute: () => request<ComputeResources>('/api/compute'),

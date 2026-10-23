@@ -3,7 +3,7 @@ import {
   AlertCircle, Box, CheckCircle2, Clock3, Cpu, FileArchive, Gauge, Images, Info,
   LoaderCircle, Maximize2, ScanEye, Target, X,
 } from 'lucide-react'
-import { formatBytes } from '../api'
+import { api, formatBytes } from '../api'
 import type { Artifact, ModelTest, ModelTestSummary, YoloTaskType } from '../types'
 import '../inference.css'
 
@@ -21,6 +21,126 @@ export const modelTestStatusLabels: Record<ModelTest['status'], string> = {
 export const activeModelTestStatuses = new Set<ModelTest['status']>([
   'uploading', 'preparing', 'queued', 'running', 'cancel_requested',
 ])
+
+export function createModelTestRequestId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID().replaceAll('-', '')
+  const bytes = crypto.getRandomValues(new Uint8Array(16))
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+export function validateModelTestFiles(test: ModelTest, files: File[]) {
+  const aligned = test.files.length === files.length && test.files.every((item, index) => (
+    item.name === files[index].name && item.size === files[index].size
+  ))
+  if (!aligned) throw new Error('服务器返回的图片清单与本次测试不一致，请重新发起测试')
+  return test
+}
+
+function requestStatus(reason: unknown) {
+  return (reason as { status?: number } | null)?.status
+}
+
+export function modelTestRequestMayHaveReachedServer(reason: unknown) {
+  const status = requestStatus(reason)
+  return status === undefined || status === 408 || status >= 500
+}
+
+async function recoveryPause(signal: AbortSignal, duration = 400) {
+  await new Promise<void>((resolve, reject) => {
+    const finish = () => {
+      signal.removeEventListener('abort', abort)
+      resolve()
+    }
+    const timer = window.setTimeout(finish, duration)
+    const abort = () => {
+      window.clearTimeout(timer)
+      signal.removeEventListener('abort', abort)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) abort()
+  })
+}
+
+export async function recoverModelTest(requestId: string, files: File[], signal: AbortSignal) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    signal.throwIfAborted()
+    try {
+      return validateModelTestFiles(await api.modelTest(requestId, signal), files)
+    } catch (reason) {
+      const status = requestStatus(reason)
+      if ((status !== 404 && !modelTestRequestMayHaveReachedServer(reason)) || attempt === 7) return null
+      await recoveryPause(signal)
+    }
+  }
+  return null
+}
+
+export async function createOrRecoverModelTest(
+  requestId: string,
+  files: File[],
+  signal: AbortSignal,
+  create: () => Promise<ModelTest>,
+) {
+  try {
+    const created = validateModelTestFiles(await create(), files)
+    if (created.id !== requestId) throw new Error('服务器返回了错误的模型测试请求标识')
+    return created
+  } catch (reason) {
+    if (!modelTestRequestMayHaveReachedServer(reason)) throw reason
+    const recovered = await recoverModelTest(requestId, files, signal)
+    if (recovered) return recovered
+    throw reason
+  }
+}
+
+export async function uploadPendingModelTestImages(
+  initial: ModelTest,
+  files: File[],
+  signal: AbortSignal,
+  onProgress: (index: number, file: File) => void,
+) {
+  let current = validateModelTestFiles(initial, files)
+  if (current.status !== 'uploading') return current
+  for (let index = 0; index < files.length; index += 1) {
+    if (current.files[index].uploaded) continue
+    onProgress(index, files[index])
+    try {
+      await api.uploadModelTestImage(current.id, index, files[index], signal)
+      current = {
+        ...current,
+        files: current.files.map((item, itemIndex) => itemIndex === index ? { ...item, uploaded: true } : item),
+      }
+    } catch (reason) {
+      if (!modelTestRequestMayHaveReachedServer(reason)) throw reason
+      const recovered = await recoverModelTest(current.id, files, signal)
+      if (!recovered || (recovered.status === 'uploading' && !recovered.files[index].uploaded)) throw reason
+      current = recovered
+      if (current.status !== 'uploading') return current
+    }
+  }
+  return current
+}
+
+export async function startOrRecoverModelTest(initial: ModelTest, files: File[], signal: AbortSignal) {
+  let current = validateModelTestFiles(initial, files)
+  if (current.status !== 'uploading') return current
+  let lastReason: unknown = new Error('模型测试启动状态暂未确认')
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return validateModelTestFiles(await api.startModelTest(current.id, signal), files)
+    } catch (reason) {
+      lastReason = reason
+      if (!modelTestRequestMayHaveReachedServer(reason)) throw reason
+      const recovered = await recoverModelTest(current.id, files, signal)
+      if (!recovered) throw reason
+      current = recovered
+      if (current.status !== 'uploading') return current
+      if (!current.files.every((file) => file.uploaded)) throw reason
+    }
+  }
+  throw lastReason
+}
 
 export function modelTestDetectionLabel(count: number | null) {
   return count === null ? '结果未就绪' : count > 0 ? `检测到 ${count} 个目标` : '未检测到目标'

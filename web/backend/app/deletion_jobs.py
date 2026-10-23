@@ -5,11 +5,12 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .compute_nodes import agent_version_at_least, as_utc
-from .models import ComputeNode, ModelTest, RemoteOperation, TrainingTask, utcnow
+from .compute_nodes import REQUIRED_AGENT_VERSION, agent_version_at_least, as_utc
+from .models import ComputeNode, ModelTest, RemoteOperation, TrainingRun, TrainingTask, utcnow
 
 
 TASK_DELETE_AGENT_VERSION = "2.0.4"
+LEGACY_FLAT_DELETE_AGENT_VERSION = "2.0.1"
 ACTIVE = {"pending", "running", "finalizing", "center_cleaning"}
 PHASES = {
     "remote_cleanup": "waiting_agent",
@@ -66,6 +67,18 @@ def _node_status(node: ComputeNode | None) -> str:
 def serialize_deletion_job(operation: RemoteOperation, task: TrainingTask | None, node: ComputeNode | None) -> dict:
     payload = operation.payload or {}
     remote = operation.kind == "delete"
+    attempt_scope = payload.get("scope") == "attempt"
+    attempt_runs = payload.get("runs") if isinstance(payload.get("runs"), list) else []
+    legacy_flat_attempt = attempt_scope and any(
+        isinstance(item, dict) and item.get("layout") == "legacy_flat"
+        for item in attempt_runs
+    )
+    if attempt_scope:
+        required_agent_version = LEGACY_FLAT_DELETE_AGENT_VERSION if legacy_flat_attempt else REQUIRED_AGENT_VERSION
+        required_agent_parts = (2, 0, 1) if legacy_flat_attempt else (1, 8, 0)
+    else:
+        required_agent_version = TASK_DELETE_AGENT_VERSION
+        required_agent_parts = (2, 0, 4)
     node_status = _node_status(node) if remote else "online"
     raw_phase = payload.get("phase") or ("remote_cleanup" if remote else "queued")
     phase = PHASES.get(raw_phase, raw_phase)
@@ -86,9 +99,10 @@ def serialize_deletion_job(operation: RemoteOperation, task: TrainingTask | None
     if status in {"failed", "cancelled"}:
         message = operation.error or message
     elif remote and phase in {"waiting_agent", "deleting_files"}:
-        if not agent_version_at_least(node.agent_version if node else None, (2, 0, 4)):
+        if not agent_version_at_least(node.agent_version if node else None, required_agent_parts):
             phase = "agent_upgrade_required"
-            message = f"完整任务清理需要 Agent {TASK_DELETE_AGENT_VERSION} 或以上版本"
+            subject = "旧版平铺 Attempt 清理" if legacy_flat_attempt else "Attempt 清理" if attempt_scope else "完整任务清理"
+            message = f"{subject}需要 Agent {required_agent_version} 或以上版本"
         elif node_status != "online":
             message = "远程 Agent 已禁用，请启用后继续" if node_status == "disabled" else "等待远程 Agent 重新连接；文件清理尚未确认完成"
     return {
@@ -100,7 +114,7 @@ def serialize_deletion_job(operation: RemoteOperation, task: TrainingTask | None
         "node_status": node_status,
         "last_seen_at": as_utc(node.last_seen_at) if node and remote and node.last_seen_at else None,
         "agent_version": node.agent_version if node and remote else None,
-        "required_agent_version": TASK_DELETE_AGENT_VERSION if remote else None,
+        "required_agent_version": required_agent_version if remote else None,
         "status": status, "phase": phase, "message": message,
         "error": operation.error,
         "retryable": task is not None and operation.status in {"failed", "cancelled"},
@@ -135,6 +149,75 @@ def list_deletion_jobs(db: Session, *, limit: int = 50) -> list[dict]:
     tasks = {task.id: task for task in db.scalars(select(TrainingTask).where(TrainingTask.id.in_(task_ids)))}
     nodes = {node.id: node for node in db.scalars(select(ComputeNode).where(ComputeNode.id.in_(node_ids)))}
     return [serialize_deletion_job(operation, tasks.get(operation.task_id), nodes.get(operation.node_id)) for operation in operations]
+
+
+def list_attempt_deletion_jobs(db: Session, *, limit: int = 50, task_id: str | None = None) -> list[dict]:
+    """Return local/remote Attempt cleanup progress without hiding failures."""
+    query = select(RemoteOperation).where(
+            RemoteOperation.kind.in_({"local_delete", "delete"}),
+            RemoteOperation.payload["scope"].as_string() == "attempt",
+        )
+    if task_id is not None:
+        query = query.where(RemoteOperation.task_id == task_id)
+    operations = list(db.scalars(query.order_by(
+            RemoteOperation.updated_at.desc(), RemoteOperation.created_at.desc(), RemoteOperation.id.desc(),
+        )))
+    retained = [operation for operation in operations if operation.status in ACTIVE or operation.status == "failed"]
+    history = [operation for operation in operations if operation.status not in ACTIVE and operation.status != "failed"]
+    operations = sorted(
+        [*retained, *history[:max(0, limit)]],
+        key=lambda operation: (as_utc(operation.updated_at), operation.id),
+        reverse=True,
+    )
+    task_ids = {operation.task_id for operation in operations}
+    run_ids = {
+        run_id
+        for operation in operations
+        if isinstance((run_id := (operation.payload or {}).get("run_id")), str) and run_id
+    }
+    node_ids = {operation.node_id for operation in operations if operation.kind == "delete"}
+    tasks = {
+        task.id: task
+        for task in db.scalars(select(TrainingTask).where(TrainingTask.id.in_(task_ids)))
+    } if task_ids else {}
+    runs = {
+        run.id: run
+        for run in db.scalars(select(TrainingRun).where(TrainingRun.id.in_(run_ids)))
+    } if run_ids else {}
+    nodes = {
+        node.id: node
+        for node in db.scalars(select(ComputeNode).where(ComputeNode.id.in_(node_ids)))
+    } if node_ids else {}
+    active_task_ids = {
+        operation.task_id
+        for operation in db.scalars(select(RemoteOperation).where(
+            RemoteOperation.task_id.in_(task_ids),
+            RemoteOperation.kind.in_({"local_delete", "delete"}),
+            RemoteOperation.status.in_(ACTIVE),
+        ))
+    } if task_ids else set()
+
+    jobs: list[dict] = []
+    for operation in operations:
+        payload = operation.payload or {}
+        task = tasks.get(operation.task_id)
+        run = runs.get(payload.get("run_id"))
+        job = serialize_deletion_job(operation, task, nodes.get(operation.node_id))
+        job.update({
+            "scope": "attempt",
+            "run_id": payload.get("run_id"),
+            "attempt_number": payload.get("attempt_number") or (run.attempt_number if run else None),
+            "retryable": (
+                operation.status in {"failed", "cancelled"}
+                and task is not None
+                and task.deleted_at is None
+                and run is not None
+                and run.task_id == task.id
+                and task.id not in active_task_ids
+            ),
+        })
+        jobs.append(job)
+    return jobs
 
 
 def deletion_preview(db: Session, task: TrainingTask) -> dict:

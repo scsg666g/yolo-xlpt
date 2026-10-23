@@ -1019,3 +1019,7 @@ button { color: inherit; }
   .settings-subsection-heading > span { text-align: left; }
   .settings-node-details { flex-direction: column; gap: 5px; }
 }
+.full-log-download { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: 100%; }
+.full-log-download small { max-width: 380px; overflow-wrap: anywhere; font-size: 12px; }
+.cleanup-receipt { max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.compare-cleanup-actions { display: flex; justify-content: flex-end; margin-bottom: 10px; }

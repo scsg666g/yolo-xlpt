@@ -6,9 +6,9 @@ import {
 import { api, formatBytes } from '../api'
 import type { Artifact, ModelTest, ModelTestSummary } from '../types'
 import {
-  activeModelTestStatuses, hasExactModelVersion, ModelStrip, modelTestAttemptText,
-  modelTestDate, modelTestParameterText, modelTestResultLabel, modelTestStatusLabels, modelTestTaskLabel, modelTestTaskType, modelTestWeightName,
-  type SelectedImage, TestWorkspace,
+  activeModelTestStatuses, createModelTestRequestId, createOrRecoverModelTest, hasExactModelVersion, ModelStrip, modelTestAttemptText,
+  modelTestDate, modelTestParameterText, modelTestRequestMayHaveReachedServer, modelTestResultLabel, modelTestStatusLabels, modelTestTaskLabel, modelTestTaskType, modelTestWeightName,
+  startOrRecoverModelTest, type SelectedImage, TestWorkspace, uploadPendingModelTestImages,
 } from './ModelTestShared'
 
 interface Props {
@@ -317,22 +317,25 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
           await pause()
         }
       }
-      const created = await api.createModelTest(
-        artifactId, confidence, iou, files, signal, runId, rerunSource?.id,
-      )
-      createdId = created.id
+      const requestId = createModelTestRequestId()
+      createdId = requestId
+      pendingUploadId.current = requestId
+      const created = await createOrRecoverModelTest(requestId, files, signal, () => api.createModelTest(
+        artifactId, confidence, iou, files, requestId, signal, runId, rerunSource?.id,
+      ))
       lastKnown = created
-      pendingUploadId.current = created.id
       setTest(created)
       setStage(modelTestStatusLabels[created.status])
-      for (let index = 0; index < files.length; index++) {
-        setStage(`正在上传 ${index + 1}/${files.length}：${files[index].name}`)
-        await api.uploadModelTestImage(created.id, index, files[index], signal)
-      }
-      setStage('正在准备模型副本…')
-      let current = await api.startModelTest(created.id, signal)
+      let current = await uploadPendingModelTestImages(created, files, signal, (index, file) => {
+        setStage(`正在上传 ${index + 1}/${files.length}：${file.name}`)
+      })
       lastKnown = current
-      pendingUploadId.current = null
+      if (current.status === 'uploading') {
+        setStage('正在准备模型副本…')
+        current = await startOrRecoverModelTest(current, files, signal)
+        lastKnown = current
+      }
+      if (current.status !== 'uploading') pendingUploadId.current = null
       const inferenceDeadline = Date.now() + 15 * 60_000
       while (true) {
         lastKnown = current
@@ -342,19 +345,23 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
         if (current.status === 'completed') break
         if (Date.now() > inferenceDeadline) throw new Error('等待测试超时，请稍后在历史记录中查看')
         await pause()
-        current = await api.modelTest(created.id, signal)
+        current = await api.modelTest(requestId, signal)
       }
       await refreshHistory(signal, true)
     } catch (reason) {
       if (!signal.aborted) {
         const message = reason instanceof Error ? reason.message : '模型测试请求失败'
-        if (createdId) {
+        const uncertainCreate = createdId !== null && lastKnown === null && modelTestRequestMayHaveReachedServer(reason)
+        if (createdId && (lastKnown !== null || uncertainCreate)) {
           try {
             lastKnown = await api.modelTest(createdId, signal)
             setTest(lastKnown)
           } catch {
             // Keep the last confirmed server state when the status request also fails.
           }
+        }
+        if (createdId && lastKnown === null && !uncertainCreate && pendingUploadId.current === createdId) {
+          pendingUploadId.current = null
         }
         if (lastKnown?.status === 'failed') {
           setStage(modelTestStatusLabels.failed)
@@ -410,6 +417,11 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
         } catch (statusReason) {
           setError(statusReason instanceof Error ? statusReason.message : '读取测试状态失败，请在历史记录中确认')
         }
+      } else if (requestError.status === 404) {
+        pendingUploadId.current = null
+        setTest(null); setStage('')
+        setError('服务器暂未找到本次测试记录，已解除本页占用；请刷新历史记录确认后再重试')
+        await refreshHistory(undefined, true)
       } else {
         setError(requestError.message || '取消上传失败，请重试')
         setStage(modelTestStatusLabels.failed)

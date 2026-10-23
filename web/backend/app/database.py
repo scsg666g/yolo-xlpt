@@ -292,9 +292,25 @@ def migrate_database() -> Path | None:
             display_order_needs_repair = bool(connection.scalar(text(
                 "SELECT 1 FROM training_tasks WHERE display_order IS NULL OR display_order = 0 LIMIT 1"
             )))
+    remote_run_node_needs_repair = False
+    if (
+        run_columns
+        and "execution_node_id" in run_columns
+        and "execution_node_id" in task_columns
+    ):
+        with engine.connect() as connection:
+            remote_run_node_needs_repair = bool(connection.scalar(text("""
+                SELECT 1
+                FROM training_runs AS run
+                JOIN training_tasks AS task ON task.id = run.task_id
+                WHERE run.execution_node_id IS NULL
+                  AND task.execution_node_id IS NOT NULL
+                LIMIT 1
+            """)))
     needs_migration = (
         "display_order" not in task_columns
         or display_order_needs_repair
+        or remote_run_node_needs_repair
         or "current_run_id" not in task_columns
         or "deleted_at" not in task_columns
         or "deleted_reason" not in task_columns
@@ -378,6 +394,22 @@ def migrate_database() -> Path | None:
         if run_columns and "execution_node_id" not in run_columns:
             connection.execute(text("ALTER TABLE training_runs ADD COLUMN execution_node_id VARCHAR(64)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_runs_execution_node_id ON training_runs (execution_node_id)"))
+        if run_columns and "execution_node_id" in task_columns:
+            connection.execute(text("""
+                UPDATE training_runs
+                SET execution_node_id = (
+                    SELECT task.execution_node_id
+                    FROM training_tasks AS task
+                    WHERE task.id = training_runs.task_id
+                )
+                WHERE execution_node_id IS NULL
+                  AND EXISTS (
+                      SELECT 1
+                      FROM training_tasks AS task
+                      WHERE task.id = training_runs.task_id
+                        AND task.execution_node_id IS NOT NULL
+                  )
+            """))
         if run_columns and "stop_requested" not in run_columns:
             connection.execute(text("ALTER TABLE training_runs ADD COLUMN stop_requested BOOLEAN NOT NULL DEFAULT 0"))
         if run_columns and "remote_log_tail" not in run_columns:

@@ -804,6 +804,24 @@ def test_prepare_dataset_config_makes_dataset_root_absolute(tmp_path: Path, monk
     assert destination.parent.name == "runtime"
 
 
+def test_classification_dataset_uses_directory_without_runtime_yaml(tmp_path: Path, monkeypatch):
+    dataset = tmp_path / "classification"
+    (dataset / "train" / "cat").mkdir(parents=True)
+    (dataset / "val" / "cat").mkdir(parents=True)
+    (dataset / "data.yaml").write_text("train: train\n", encoding="utf-8")
+    monkeypatch.setattr("app.services.DATASET_ROOTS", [tmp_path])
+    destination = tmp_path / "runtime" / "dataset.yaml"
+
+    resolved = services_module.prepare_training_data_path("classify", str(dataset), destination)
+
+    assert resolved == dataset.resolve()
+    assert not destination.exists()
+    with pytest.raises(ValueError, match="必须是 YAML"):
+        services_module.validate_training_data_path("detect", str(dataset))
+    with pytest.raises(ValueError, match="必须是目录"):
+        services_module.validate_training_data_path("classify", str(dataset / "data.yaml"))
+
+
 def test_training_environment_adds_nonsecret_run_markers(monkeypatch):
     monkeypatch.setattr(services_module, "platform_instance_id", lambda: "c" * 32)
 
@@ -1134,6 +1152,48 @@ def test_legacy_schema_migration_creates_backup_and_run_columns(tmp_path: Path, 
     assert image_foreign_keys[0]["referred_table"] == "model_tests"
 
 
+def test_migration_backfills_missing_remote_run_node_without_overwriting_history(tmp_path: Path, monkeypatch):
+    database_path = tmp_path / "remote-run-node.db"
+    legacy_engine = create_engine(f"sqlite:///{database_path}")
+    Base.metadata.create_all(legacy_engine)
+    factory = sessionmaker(bind=legacy_engine, expire_on_commit=False)
+    with factory() as session:
+        remote = make_task(
+            "remote-history", execution_node_id="remote-current", display_order=1000,
+        )
+        inherited = TrainingRun(
+            id="remote-run-missing", task=remote, attempt_number=1,
+            model_path=remote.model_path, data_path=remote.data_path,
+        )
+        preserved = TrainingRun(
+            id="remote-run-preserved", task=remote, attempt_number=2,
+            execution_node_id="remote-original",
+            model_path=remote.model_path, data_path=remote.data_path,
+        )
+        local = make_task("local-history", display_order=2000)
+        local_run = TrainingRun(
+            id="local-run", task=local, attempt_number=1,
+            model_path=local.model_path, data_path=local.data_path,
+        )
+        session.add_all([remote, inherited, preserved, local, local_run])
+        session.commit()
+    monkeypatch.setattr(database_module, "engine", legacy_engine)
+
+    backup = database_module.migrate_database()
+
+    assert backup and backup.is_file()
+    with sqlite3.connect(backup) as saved:
+        assert saved.execute(
+            "SELECT execution_node_id FROM training_runs WHERE id = 'remote-run-missing'"
+        ).fetchone() == (None,)
+    with factory() as session:
+        assert session.get(TrainingRun, "remote-run-missing").execution_node_id == "remote-current"
+        assert session.get(TrainingRun, "remote-run-preserved").execution_node_id == "remote-original"
+        assert session.get(TrainingRun, "local-run").execution_node_id is None
+    assert database_module.migrate_database() is None
+    assert len(list(tmp_path.glob("remote-run-node.db.backup-*"))) == 1
+
+
 def test_model_test_migration_repairs_missing_history_indexes(tmp_path: Path, monkeypatch):
     database_path = tmp_path / "missing-history-indexes.db"
     legacy_engine = create_engine(f"sqlite:///{database_path}")
@@ -1200,7 +1260,10 @@ def test_backfill_registers_existing_task_as_attempt_one(tmp_path: Path, monkeyp
     Base.metadata.create_all(engine)
     local_session = sessionmaker(bind=engine, expire_on_commit=False)
     with local_session() as session:
-        task = make_task("legacy-task", status="interrupted", completed_epochs=7, progress=35)
+        task = make_task(
+            "legacy-task", status="interrupted", completed_epochs=7, progress=35,
+            execution_node_id="remote-node",
+        )
         session.add(task)
         session.flush()
         session.add(MetricPoint(task_id=task.id, epoch=7, elapsed=10, values={"score": 0.3}))
@@ -1214,6 +1277,7 @@ def test_backfill_registers_existing_task_as_attempt_one(tmp_path: Path, monkeyp
         point = session.scalar(select(MetricPoint).where(MetricPoint.task_id == task.id))
         assert run and run.attempt_number == 1
         assert (run.status, run.completed_epochs) == ("interrupted", 7)
+        assert run.execution_node_id == "remote-node"
         assert point.run_id == run.id
 
 
