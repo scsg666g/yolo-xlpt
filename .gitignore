@@ -177,6 +177,7 @@ weights/
 !web/frontend/src/useModalFocus.ts
 !web/frontend/src/remoteOutputPaths.ts
 !web/frontend/src/trainingCompletion.ts
+!web/frontend/src/chartMetrics.ts
 !web/frontend/vite.config.ts
 *.pb
 *.onnx

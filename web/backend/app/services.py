@@ -678,8 +678,9 @@ def parse_number(value: Any) -> float | str | None:
     if value is None or value == "":
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return str(value)
 
 
@@ -703,14 +704,31 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
             rows = list(csv.DictReader(handle))
     except (OSError, csv.Error):
         return
-    existing = set(db.scalars(select(MetricPoint.epoch).where(MetricPoint.run_id == run.id)).all())
+    existing = {
+        point.epoch: point
+        for point in db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()
+    }
+    for point in existing.values():
+        normalized_values = {
+            key: None if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and not math.isfinite(value) else value
+            for key, value in (point.values or {}).items()
+        }
+        if point.values != normalized_values:
+            point.values = normalized_values
+        if not isinstance(point.elapsed, (int, float)) or not math.isfinite(point.elapsed):
+            # elapsed is a required numeric API/database field; match the
+            # fallback used below for newly parsed invalid CSV durations.
+            point.elapsed = 0.0
     latest: dict[str, Any] = {}
     latest_epoch = run.completed_epochs
+    has_valid_epoch = False
     for row in rows:
         try:
             epoch = int(float(row.get("epoch", "0")))
-        except ValueError:
+        except (TypeError, ValueError, OverflowError):
             continue
+        has_valid_epoch = True
         values = {key.strip(): parse_number(value) for key, value in row.items() if key and key.strip() not in {"epoch", "time"}}
         try:
             elapsed = float(row.get("time") or 0)
@@ -721,12 +739,16 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
         if epoch not in existing:
             try:
                 with db.begin_nested():
-                    db.add(MetricPoint(task_id=task.id, run_id=run.id, epoch=epoch, elapsed=elapsed, values=values))
+                    point = MetricPoint(
+                        task_id=task.id, run_id=run.id, epoch=epoch, elapsed=elapsed, values=values,
+                    )
+                    db.add(point)
                     db.flush()
+                    existing[epoch] = point
             except IntegrityError:
                 pass
         latest, latest_epoch = values, max(latest_epoch, epoch)
-    if rows:
+    if has_valid_epoch:
         epochs = int(
             (run.completion_info or {}).get("expected_epochs")
             or (run.parameter_snapshot or {}).get("epochs")

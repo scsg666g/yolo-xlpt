@@ -31,7 +31,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.6"
+VERSION = "2.0.7"
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -2044,8 +2044,11 @@ def read_remote_progress(run_dir: Path) -> tuple[int, dict, list[dict]]:
     completed = 0
     for row in rows:
         try:
-            epoch = int(float((row.get("epoch") or "0").strip()))
-        except (ValueError, AttributeError):
+            epoch_number = float(row.get("epoch", "0"))
+            if not math.isfinite(epoch_number):
+                continue
+            epoch = int(epoch_number)
+        except (TypeError, ValueError, OverflowError, AttributeError):
             continue
         values = {}
         for key, raw in row.items():
@@ -2058,8 +2061,10 @@ def read_remote_progress(run_dir: Path) -> tuple[int, dict, list[dict]]:
                 values[key.strip()] = raw[:200]
         try:
             elapsed = float(row.get("time") or 0)
-        except ValueError:
-            elapsed = 0
+            if not math.isfinite(elapsed) or elapsed < 0:
+                elapsed = 0.0
+        except (TypeError, ValueError, OverflowError):
+            elapsed = 0.0
         completed = max(completed, epoch)
         latest = values
         metrics.append({"epoch": epoch, "elapsed": elapsed, "values": values})

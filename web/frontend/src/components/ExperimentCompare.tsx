@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Folder, Info, Layers3, LoaderCircle, Minus, Search, Trash2, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
+import { finiteMetricValue, metricSeriesDisplay } from '../chartMetrics'
 import { readStoredCompareRuns, useCompareLimit, writeStoredCompareRuns } from '../preferences'
 import type { MetricPoint, TaskGroup, TrainingRun, TrainingTask } from '../types'
 import { CompareRunDetailModal, type CompareRunDetails } from './CompareRunDetailModal'
@@ -499,13 +500,36 @@ export function ExperimentCompare() {
     grid: { left: 55, right: 22, top: 48, bottom: 40 },
     xAxis: { type: 'value', name: 'Epoch', nameTextStyle: { color: '#728692' }, axisLabel: { color: '#718692' }, axisLine: { lineStyle: { color: '#bccdd5' } }, splitLine: { show: false } },
     yAxis: { type: 'value', axisLabel: { color: '#718692' }, axisLine: { show: false }, splitLine: { lineStyle: { color: '#dbe6eb', type: 'dashed' } } },
-    series: selected.map((item, index) => ({
-      name: `${item.task.name} · A${String(item.run.attempt_number).padStart(3, '0')}`, type: 'line', smooth: true, showSymbol: false, symbolSize: 5,
-      lineStyle: { width: 2.4, color: palette[index] }, itemStyle: { color: palette[index] },
-      areaStyle: { opacity: 0.035, color: palette[index] },
-      data: (metrics[item.id] || []).map((point) => [point.epoch, typeof point.values[metricKey] === 'number' ? point.values[metricKey] : null]),
-    })),
+    series: selected.map((item, index) => {
+      const data = (metrics[item.id] || []).map((point) => [point.epoch, finiteMetricValue(point.values[metricKey]) ? point.values[metricKey] : null])
+      return {
+        name: `${item.task.name} · A${String(item.run.attempt_number).padStart(3, '0')}`, type: 'line', smooth: true,
+        ...metricSeriesDisplay(data.map((point) => point[1])),
+        lineStyle: { width: 2.4, color: palette[index] }, itemStyle: { color: palette[index] },
+        areaStyle: { opacity: 0.035, color: palette[index] },
+        data,
+      }
+    }),
   }), [selected, metrics, metricKey])
+
+  const chartPointCounts = selected.map((item) => (metrics[item.id] || []).reduce((count, point) => count + (finiteMetricValue(point.values[metricKey]) ? 1 : 0), 0))
+  const chartPointCount = chartPointCounts.reduce((total, count) => total + count, 0)
+  const chartRunsLoading = selected.filter((item) => metrics[item.id] === undefined && !metricErrors[item.id]).length
+  const chartRunsWithErrors = selected.filter((item) => Boolean(metricErrors[item.id])).length
+  const chartRunsWithoutData = chartPointCounts.filter((count, index) => count === 0 && metrics[selected[index].id] !== undefined && !metricErrors[selected[index].id]).length
+  const chartRunsWithSinglePoint = chartPointCounts.filter((count) => count === 1).length
+  const selectedMetricLabel = metricOptions.find((option) => option.key === metricKey)?.label || metricKey
+  const chartContextNote = [
+    chartRunsLoading && chartPointCount > 0 ? `${chartRunsLoading} 个运行的曲线数据仍在加载，当前先显示已加载结果` : '',
+    chartRunsWithSinglePoint ? `${chartRunsWithSinglePoint} 个运行目前只有 1 个验证点，下一轮完成后将形成趋势线` : '',
+    chartRunsWithoutData ? `${chartRunsWithoutData} 个运行尚无“${selectedMetricLabel}”指标` : '',
+    chartRunsWithErrors ? `${chartRunsWithErrors} 个运行的曲线数据加载失败` : '',
+  ].filter(Boolean).join('；')
+  const chartEmptyMessage = chartRunsLoading
+    ? '正在加载指标曲线…'
+    : chartRunsWithErrors === selected.length
+      ? '所选运行的指标曲线加载失败'
+      : `当前选择的运行尚无“${selectedMetricLabel}”指标曲线`
 
   const filteredExperiments = experiments.filter((item) => {
     const keyword = search.trim().toLowerCase()
@@ -627,7 +651,7 @@ export function ExperimentCompare() {
           </tbody>
         </table></div>
       </section>
-      <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={metricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header><LineChartView option={chart} style={{ height: 390 }} /></section>
+      <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={metricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header>{chartPointCount ? <LineChartView option={chart} style={{ height: 390 }} /> : <div className="compare-chart-empty">{chartEmptyMessage}</div>}{chartContextNote && <p className="compare-chart-note">{chartContextNote}。</p>}</section>
       <section className="compare-panel parameter-panel"><header><div><Layers3 size={17} /><div><h2>训练参数差异</h2><span>来自每次运行的固化参数快照</span></div></div></header><div className="comparison-table"><table style={{ minWidth: 170 + selected.length * 200 }}><thead><tr><th>参数</th>{selected.map((item, index) => <th key={item.id}><i style={{ background: palette[index] }} />{item.task.name} · A{String(item.run.attempt_number).padStart(3, '0')}</th>)}</tr></thead><tbody>{parameterRows.map((parameter) => { const values = selected.map((item) => parameter.value(item.view)); const different = new Set(values.map(String)).size > 1; return <tr className={different ? 'different' : ''} key={parameter.label}><td>{parameter.label}{different && <em>不同</em>}</td>{values.map((value, index) => <td key={`${parameter.label}-${selected[index].id}`}>{value}</td>)}</tr> })}</tbody></table></div></section>
       </>}
     </>}

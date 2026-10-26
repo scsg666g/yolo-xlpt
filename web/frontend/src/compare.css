@@ -360,3 +360,8 @@ body:has(.compare-page) { min-width: 0; }
   .compare-run-delete-modal > footer > span { display: none; }
   .compare-run-delete-modal > footer .button { flex: 1; }
 }
+
+.compare-chart-empty { min-height: 390px; display: grid; place-items: center; color: #7d909c; font-size: 12px; }
+.compare-chart-note { margin: -8px 20px 16px; color: #d5b166; font-size: 11px; line-height: 1.55; text-align: center; }
+:root[data-theme='light'] .compare-chart-empty { color: #657d8a; }
+:root[data-theme='light'] .compare-chart-note { color: #89641d; }

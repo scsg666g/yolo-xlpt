@@ -76,6 +76,34 @@ def test_real_directory_cleanup_keeps_external_log(agent, training, monkeypatch)
     assert not list(Path(config["training_state_dir"]).glob("*.json"))
 
 
+def test_remote_progress_skips_invalid_epochs_and_normalizes_elapsed(agent, tmp_path):
+    run_dir = tmp_path / "attempt-001"
+    run_dir.mkdir()
+    (run_dir / "results.csv").write_text(
+        "epoch,time,score,note\n"
+        "NaN,5,0.1,ignored-nan\n"
+        "Infinity,6,0.2,ignored-positive-infinity\n"
+        "-Infinity,7,0.3,ignored-negative-infinity\n"
+        "1e309,8,0.4,ignored-overflow\n"
+        "invalid,9,0.5,ignored-text\n"
+        ",10,0.6,ignored-empty\n"
+        "1,NaN,NaN,ready\n"
+        "2,Infinity,Infinity,running\n"
+        "3,-4,0.8,done\n",
+        encoding="utf-8",
+    )
+
+    completed, latest, metrics = agent.read_remote_progress(run_dir)
+
+    assert completed == 3
+    assert latest == {"score": 0.8, "note": "done"}
+    assert metrics == [
+        {"epoch": 1, "elapsed": 0.0, "values": {"score": None, "note": "ready"}},
+        {"epoch": 2, "elapsed": 0.0, "values": {"score": None, "note": "running"}},
+        {"epoch": 3, "elapsed": 0.0, "values": {"score": 0.8, "note": "done"}},
+    ]
+
+
 def test_remote_detect_command_includes_training_trace_runner(agent, training, tmp_path):
     config, task = training
     config["enable_training_trace"] = True

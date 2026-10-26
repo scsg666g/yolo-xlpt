@@ -30,6 +30,7 @@ from app.services import (
     import_existing_runs,
     migrate_training_logs,
     mirror_run_to_task,
+    parse_number,
     path_is_within,
     permanently_delete_task_files,
     prepare_dataset_config,
@@ -1075,6 +1076,138 @@ def test_same_epoch_is_stored_for_each_run(tmp_path: Path):
 
     points = session.scalars(select(MetricPoint).where(MetricPoint.task_id == task.id)).all()
     assert [(point.run_id, point.epoch) for point in points] == [("run-1", 1), ("run-2", 1)]
+    session.close()
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("NaN", None), ("Infinity", None), ("-Infinity", None), ("0.25", 0.25), ("not-a-number", "not-a-number"),
+])
+def test_parse_number_normalizes_nonfinite_values(value, expected):
+    assert parse_number(value) == expected
+
+
+def test_sync_metrics_normalizes_nonfinite_values_and_skips_invalid_epoch(tmp_path: Path):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "attempt-001"
+    run_dir.mkdir()
+    (run_dir / "results.csv").write_text(
+        "epoch,time,score,note\nInfinity,1,0.1,ignored\n1,NaN,NaN,ready\n2,Infinity,Infinity,done\n",
+        encoding="utf-8",
+    )
+    task = make_task("task-nonfinite-metrics", status="running", epochs=10)
+    run = TrainingRun(
+        id="run-nonfinite-metrics", task=task, attempt_number=1, launch_mode="fresh", status="running",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={"epochs": 10},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+
+    sync_metrics(session, task, run)
+    session.commit()
+
+    points = session.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id).order_by(MetricPoint.epoch)).all()
+    assert [(point.epoch, point.elapsed, point.values) for point in points] == [
+        (1, 0.0, {"score": None, "note": "ready"}),
+        (2, 0.0, {"score": None, "note": "done"}),
+    ]
+    assert run.latest_metrics == task.latest_metrics == {"score": None, "note": "done"}
+    assert run.completed_epochs == task.completed_epochs == 2
+
+    session.expire_all()
+    task = session.get(TrainingTask, task.id)
+    run = session.get(TrainingRun, run.id)
+    sync_metrics(session, task, run)
+    assert not session.new
+    assert not session.is_modified(run)
+    assert not session.is_modified(task)
+    session.close()
+
+
+def test_sync_metrics_repairs_nonfinite_existing_metric_point(tmp_path: Path):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "attempt-001"
+    run_dir.mkdir()
+    (run_dir / "results.csv").write_text(
+        "epoch,time,score,loss,note\n1,Infinity,NaN,-Infinity,ready\n",
+        encoding="utf-8",
+    )
+    task = make_task("task-existing-nonfinite", status="running", epochs=10)
+    run = TrainingRun(
+        id="run-existing-nonfinite", task=task, attempt_number=1, launch_mode="fresh", status="running",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={"epochs": 10},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.flush()
+    session.add(MetricPoint(
+        task_id=task.id,
+        run_id=run.id,
+        epoch=1,
+        elapsed=float("inf"),
+        values={"score": float("nan"), "loss": float("-inf"), "note": "ready"},
+    ))
+    session.commit()
+
+    sync_metrics(session, task, run)
+    session.commit()
+    session.expire_all()
+
+    point = session.scalar(select(MetricPoint).where(MetricPoint.run_id == run.id))
+    run = session.get(TrainingRun, run.id)
+    task = session.get(TrainingTask, task.id)
+    assert point.elapsed == 0.0
+    assert point.values == {"score": None, "loss": None, "note": "ready"}
+    assert run.latest_metrics == task.latest_metrics == point.values
+    assert len(session.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()) == 1
+
+    sync_metrics(session, task, run)
+    assert not session.new
+    assert not session.is_modified(point)
+    assert not session.is_modified(run)
+    assert not session.is_modified(task)
+    session.close()
+
+
+def test_sync_metrics_invalid_epoch_rows_preserve_summary_and_clean_history(tmp_path: Path):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "attempt-001"
+    run_dir.mkdir()
+    (run_dir / "results.csv").write_text(
+        "epoch,time,score\nNaN,5,0.1\nInfinity,6,0.2\ninvalid,7,0.3\n",
+        encoding="utf-8",
+    )
+    summary = {"score": 0.4}
+    task = make_task(
+        "task-invalid-epochs", status="running", epochs=10,
+        completed_epochs=3, progress=30, latest_metrics=summary,
+    )
+    run = TrainingRun(
+        id="run-invalid-epochs", task=task, attempt_number=1, launch_mode="fresh", status="running",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={"epochs": 10},
+        completed_epochs=3, progress=30, latest_metrics=summary,
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.flush()
+    session.add(MetricPoint(
+        task_id=task.id,
+        run_id=run.id,
+        epoch=3,
+        elapsed=float("inf"),
+        values={"score": float("nan")},
+    ))
+    session.commit()
+
+    sync_metrics(session, task, run)
+
+    point = session.scalar(select(MetricPoint).where(MetricPoint.run_id == run.id))
+    assert point.elapsed == 0.0
+    assert point.values == {"score": None}
+    assert (run.completed_epochs, run.progress, run.latest_metrics) == (3, 30, summary)
+    assert (task.completed_epochs, task.progress, task.latest_metrics) == (3, 30, summary)
+    assert not session.is_modified(run)
+    assert not session.is_modified(task)
     session.close()
 
 

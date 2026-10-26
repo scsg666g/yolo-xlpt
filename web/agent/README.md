@@ -43,7 +43,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-当前脚本为 **Agent 2.0.6**，配套开发平台为 **1.4.9**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
+当前脚本为 **Agent 2.0.7**，配套开发平台为 **1.4.10**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -63,6 +63,7 @@ python3 monitor_agent.py --config agent-config.json
 | 整任务清理回执 | 2.0.4 | 核验冻结计划摘要与全部清理目标，返回逐项目标已删除或原本不存在的回执，中心验证后才删除任务记录 |
 | 训练结束记录与恢复判定 | 2.0.5 | 完整训练和最终验证返回后原子保存本次 Run 的结果；区分正常早停、达到轮数和训练异常，恢复时不凭早停提示或满轮数判成功 |
 | 分类数据目录、时钟回拨恢复与完整日志传输 | 2.0.6 | `classify` 使用含 `train/<类别>/` 的目录，其他任务使用 YAML；上报携带进程会话与递增序号；远程完整日志按固定快照分块传输并校验 SHA-256 |
+| 远程 CSV 异常数值容错 | 2.0.7 | 跳过非有限或无法解析的 Epoch；非有限或负耗时归零，其他有效指标继续回传 |
 
 当前中心在创建、启动、续训、重新训练和领取阶段都会拒绝低于 1.8.0 的 Agent。只需监控的旧 Agent 仍可上报算力，但不应用于新的远程训练。下例假设 Agent 配置目录与项目目录 `yolo` 是兄弟目录，按服务器实际布局调整：
 
@@ -104,7 +105,7 @@ workspace 登记以 `node_id` 的稳定哈希作为 owner，不依赖配置文�
 
 Agent 1.5.0+ 会在远程目标检测训练中自动采集最多 24 个真实 Batch 的输入张量、网络层统计、损失和采样图片，并增量上传到中台的过程解析接口。平台不会上传完整特征图、模型权重或数据集；采样图片单张最多 512 KiB。采集失败不会中断训练，网络暂时不可用时会在下一次轮询重试。若远程服务器资源紧张，可在配置中设置 `"enable_training_trace": false`，关闭过程采集但保留普通训练、指标和日志回传。替换 Agent 后需重新领取或重新启动训练，已经运行的旧 Attempt 不会补采历史 Batch。
 
-中心从源码配置动态生成参数目录，Agent 2.0.6 与平台 1.4.9 的参数目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。
+中心从源码配置动态生成参数目录，Agent 2.0.7 与平台 1.4.10 的参数目录一致。Agent 参数序列化只接受标量，列表和字典会被拒绝；后续中心目录变化时仍需同步 Agent。配置训练后应核对实际命令与产物中的 `args.yaml`，并确认远程 YOLO 版本支持所选参数。Agent 2.0.7 只增加 CSV 解析容错，没有改变通信协议或参数目录；升级时替换脚本并保留原有配置、Token 和状态目录。
 
 ### 远程任务与文件操作（Agent 1.3.0）
 
@@ -175,7 +176,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `2.0.6`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
+确认输出为 `2.0.7`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -246,7 +247,8 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.0.6）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
+| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.0.7）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
+| 远程训练有进度但曲线缺少某些 Epoch | 检查 `results.csv` 的 `epoch` 和 `time`；Agent 2.0.7 会跳过非有限或无法解析的 Epoch，并将非有限或负耗时归零，其他有效指标仍会回传 |
 | 旧 Attempt 单独删除提示 Agent 版本过低 | 旧版平铺 Attempt 001 需要 Agent 2.0.1 才能精细清理；替换脚本并重启 Agent，确认页面报告 2.0.1 后重试 |
 | 远程指定模型无法测试 | 确认 Agent 为 2.0.3、`enable_training=true`，并用 `--check-config` 核对模型所在目录已加入 `model_test_roots`；模型必须是该范围内的非空普通 `.pt` 文件，路径不能包含符号链接。若只在最终校验阶段超时，调整 `model_transfer_finalize_timeout_seconds` |
 | 远程完整日志无法下载 | 确认 Agent 为 2.0.6 且节点已连接；检查日志路径仍属于该 Attempt、文件未被替换或截断，大小没有超过 `PLATFORM_LOG_DOWNLOAD_MAX_BYTES` |
