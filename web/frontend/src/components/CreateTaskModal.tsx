@@ -30,6 +30,7 @@ function availableDatasets(resources: Resources | null, taskType: string) {
 export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
   const [resources, setResources] = useState<Resources | null>(null)
   const [nodes, setNodes] = useState<ComputeNode[]>([])
+  const [registeredDatasets, setRegisteredDatasets] = useState<import('../types').ManagedDataset[]>([])
   const [form, setForm] = useState<TaskCreatePayload>(initial)
   const outputDrafts = useRef<Record<string, string>>({})
   const [advanced, setAdvanced] = useState(false)
@@ -68,6 +69,7 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
       }))
     }).catch((reason) => setError(reason.message))
     api.computeNodes().then(setNodes).catch(() => setNodes([]))
+    api.datasetEntries().then(setRegisteredDatasets).catch(() => setRegisteredDatasets([]))
   }, [open])
 
   useEffect(() => {
@@ -89,9 +91,9 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
 
   if (!open) return null
 
-  if (uploading) return <UploadDatasetModal onClose={() => setUploading(false)} onUploaded={(result) => {
+  if (uploading) return <UploadDatasetModal initialNode={form.execution_node_id || 'local'} onClose={() => setUploading(false)} onUploaded={(result) => {
     setResources((current) => current ? { ...current, datasets: [...current.datasets.filter((file) => file.path !== result.resource.path), result.resource] } : { gpus: [], models: [], datasets: [result.resource], classification_datasets: [] })
-    setForm((current) => ({ ...current, data_path: result.resource.path }))
+    setForm((current) => ({ ...current, data_path: result.resource.path, execution_node_id: result.node_id === 'local' ? null : result.node_id || current.execution_node_id }))
     setUploaded(result); setError(''); setUploading(false)
   }} />
 
@@ -183,7 +185,7 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
             <label className="span-2">执行服务器<select value={form.execution_node_id || ''} onChange={(e) => selectExecutionNode(e.target.value || null)}><option value="">本机（中台服务器）</option>{nodes.filter((node) => node.kind === 'agent' && node.enabled).map((node) => <option key={node.id} value={node.id}>{node.name} · {node.address || node.hostname || node.status}</option>)}</select><small>{isRemote ? `远程 Agent：${remoteTrainingUnavailableReason || '训练已就绪'}` : '使用中台服务器本机资源与路径'}</small></label>
             <label>任务类型<select value={form.task_type} onChange={(e) => selectTaskType(e.target.value)}><option value="detect">目标检测</option><option value="segment">实例分割</option><option value="classify">图像分类</option><option value="pose">姿态估计</option><option value="obb">旋转框</option></select></label>
             <label>GPU 设备{isRemote ? <input value={form.device} onChange={(e) => update('device', e.target.value)} placeholder="例如 0 或 0,1；也可填 cpu" /> : <select value={form.device} onChange={(e) => update('device', e.target.value)}>{resources?.gpus.map((gpu) => <option key={gpu.index} value={gpu.index}>{gpu.index} · {gpu.name}</option>)}{(resources?.gpus.length || 0) > 1 && <option value={resources!.gpus.map((gpu) => gpu.index).join(',')}>全部 GPU（DDP）</option>}<option value="cpu">CPU</option></select>}</label>
-            {isRemote ? <><label className="span-2">远程基础模型绝对路径<input required value={form.model_path} onChange={(e) => update('model_path', e.target.value)} placeholder="填写远程服务器上的模型文件绝对路径" /></label><label className="span-2">远程{trainingDataLabel(form.task_type)}绝对路径<input required value={form.data_path} aria-invalid={Boolean(dataPathError)} onChange={(e) => update('data_path', e.target.value)} placeholder={form.task_type === 'classify' ? '填写包含 train/val 的远程分类数据集目录' : '填写远程服务器上的 data.yaml 绝对路径'} />{dataPathError && <span className="alert error" role="alert" style={{ marginBottom: 0 }}>{dataPathError}</span>}</label><label className="span-2">远程训练输出根目录
+            {isRemote ? <>{form.task_type === 'detect' && <button type="button" className="button ghost span-2" onClick={() => setUploading(true)}>上传数据集到远程服务器</button>}<label className="span-2">远程基础模型绝对路径<input required value={form.model_path} onChange={(e) => update('model_path', e.target.value)} placeholder="填写远程服务器上的模型文件绝对路径" /></label><label className="span-2">远程{trainingDataLabel(form.task_type)}绝对路径<input required list="registered-remote-datasets" value={form.data_path} aria-invalid={Boolean(dataPathError)} onChange={(e) => update('data_path', e.target.value)} placeholder={form.task_type === 'classify' ? '填写包含 train/val 的远程分类数据集目录' : '填写远程服务器上的 data.yaml 绝对路径'} /><datalist id="registered-remote-datasets">{registeredDatasets.filter(d => d.node_id === form.execution_node_id && d.status === 'ready').map(d => <option key={d.id} value={d.config_path}>{d.name}</option>)}</datalist>{dataPathError && <span className="alert error" role="alert" style={{ marginBottom: 0 }}>{dataPathError}</span>}</label><label className="span-2">远程训练输出根目录
               <input required list="remote-training-output-roots" value={form.remote_output_root} aria-invalid={Boolean(outputPathError)} aria-describedby="remote-output-help" onChange={(e) => { if (form.execution_node_id) outputDrafts.current[form.execution_node_id] = e.target.value; update('remote_output_root', e.target.value) }} placeholder={outputRoots.length ? '选择允许目录，也可填写已存在的子目录' : '填写远程 Agent 允许写入训练结果的绝对路径'} />
               <datalist id="remote-training-output-roots">{outputRoots.map((root) => <option key={root} value={root} />)}</datalist>
               <small id="remote-output-help">{outputRoots.length ? '可选择以下 Agent 允许目录，或填写其中已存在的子目录。如需新目录，请先在远程服务器创建。最终以远程 Agent 的文件检查为准。' : '此 Agent 尚未上报允许目录，请按远程配置手动填写已存在的目录；升级 Agent 后可直接选择目录。'}</small>

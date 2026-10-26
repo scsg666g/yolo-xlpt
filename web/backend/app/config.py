@@ -177,3 +177,9 @@ def platform_instance_id() -> str:
 
 # Grace period before escalating a local training stop to SIGKILL.
 TRAINING_STOP_TIMEOUT_SECONDS = max(1, min(300, int(os.getenv("TRAINING_STOP_TIMEOUT_SECONDS", "15"))))
+
+# 数据集目录白名单；相对路径相对于项目根目录，界面不能越过此范围。
+DATASET_STORAGE_ALLOWED_ROOTS = project_path_list_env(
+    "PLATFORM_DATASET_STORAGE_ALLOWED_ROOTS", str(PROJECT_ROOT), base=PROJECT_ROOT,
+)
+DATASET_STORAGE_QUOTA_BYTES = nonnegative_int_env("PLATFORM_DATASET_STORAGE_QUOTA_BYTES", 100 * 1024**3)

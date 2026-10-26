@@ -151,7 +151,9 @@ class TrainingCapability(BaseModel):
     output_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
     model_test_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
 
-    @field_validator("output_roots", "model_test_roots")
+    dataset_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
+
+    @field_validator("output_roots", "model_test_roots", "dataset_roots")
     @classmethod
     def absolute_output_roots(cls, value: list[str]) -> list[str]:
         if any(not PurePosixPath(root).is_absolute() or "\x00" in root for root in value):
@@ -641,6 +643,9 @@ def update_node(node_id: str, payload: NodeSettings, db: Session = Depends(get_d
         TrainingRun.status.in_(["starting", "running", "stopping"]),
     ).limit(1)):
         raise HTTPException(409, "该服务器正在执行训练，请先停止并等待状态上报后再禁用")
+    from .dataset_store import node_has_dataset_work
+    if not payload.enabled and node_has_dataset_work(db, node_id):
+        raise HTTPException(409, '该服务器仍有数据集操作，请等待完成或取消后再禁用')
     if not payload.enabled and has_active_file_transfer(db, node_id):
         raise HTTPException(409, "该服务器正在传输远程文件，请等待传输结束后再禁用")
     for key, value in payload.model_dump().items():
@@ -661,6 +666,9 @@ def rotate_token(node_id: str, db: Session = Depends(get_db)):
         TrainingRun.status.in_(["starting", "running", "stopping"]),
     ).limit(1)):
         raise HTTPException(409, "该服务器正在执行训练，请等待完成后再更换 Token")
+    from .dataset_store import node_has_dataset_work
+    if node_has_dataset_work(db, node_id):
+        raise HTTPException(409, '该服务器仍有数据集操作，请等待完成或取消后再更换 Token')
     if has_active_file_transfer(db, node_id, include_pending=False):
         raise HTTPException(409, "该服务器正在传输远程文件，请等待传输结束后再更换 Token")
     token = issue_token(node)
@@ -675,6 +683,12 @@ def rotate_token(node_id: str, db: Session = Depends(get_db)):
 def delete_node(node_id: str, db: Session = Depends(get_db)):
     acquire_node_claim_lock(db, node_id)
     node = node_or_404(db, node_id)
+    from .models import DatasetLocation, DatasetEntry, DatasetOperation
+    if db.scalar(select(DatasetLocation.id).where(DatasetLocation.node_id == node_id)) or db.scalar(
+            select(DatasetEntry.id).where(DatasetEntry.node_id == node_id, DatasetEntry.status != 'deleted')) or any(
+            node_id in (op.node_id, op.payload.get('source_node'), op.payload.get('target_node'))
+            for op in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_(('pending', 'running', 'committing', 'failed'))))):
+        raise HTTPException(409, '该节点仍有关联数据集目录、数据或未完成操作，请先处理')
     if node.kind == "local":
         raise HTTPException(409, "不能移除本机服务器")
     if has_active_file_transfer(db, node_id):
@@ -738,6 +752,9 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     # Serialize all claims for this node. Reservation keys alone cannot
     # arbitrate a node-wide legacy/automatic claim against a UUID claim.
     acquire_node_claim_lock(db, node_id)
+    from .dataset_store import mutation_pending, node_dataset_file_work
+    if mutation_pending(db, node_id) or node_dataset_file_work(db, node_id):
+        return {'task': None, 'poll_interval_seconds': 5, 'message': '等待数据集文件操作完成'}
     # Terminal rows can be left behind when the process exited between two
     # heartbeats. Reconcile their durable GPU ownership before selecting work.
     from .gpu_reservations import release_terminal_gpu_reservations

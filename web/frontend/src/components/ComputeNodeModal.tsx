@@ -89,6 +89,8 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
         report_interval_seconds: '算力采样和状态上报间隔，单位为秒。',
         nvidia_smi_bin: 'GPU 信息采集程序；默认从运行 Agent 的 PATH 查找 nvidia-smi。',
         enable_training: '默认 false，仅上报算力。配置好训练环境和允许目录后再改为 true。',
+        dataset_roots: 'Agent 2.1.0 数据集保存目录白名单。相对路径基于 training_cwd；空列表禁用数据集文件管理。启用训练时必须位于 allowed_training_roots 内。保存位置通过平台校验、选择或创建，不会自动改动原数据。',
+        dataset_staging_quota_bytes: 'Agent 数据集中转配额（字节），默认 100 GiB；传输采用 SHA-256 和断点回执，状态保存在配置文件旁的 .dataset-state。',
         training_cwd: '训练工作目录；相对路径以此配置文件所在目录为基准。默认 . 表示配置文件所在目录。',
         allowed_training_roots: '允许访问模型、数据集及输出的目录列表；相对路径以 training_cwd 为基准。启用训练前必须填写。',
         training_output_roots: '训练结果允许写入的目录列表，必须包含在 allowed_training_roots 中；相对路径以 training_cwd 为基准。开发版与使用版应使用互不重叠的输出目录。空列表会兼容使用 allowed_training_roots，建议明确配置。',
@@ -101,6 +103,7 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
       report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi',
       training_stop_timeout_seconds: 15,
       enable_training: false, training_cwd: '.', allowed_training_roots: [], training_output_roots: [],
+      dataset_roots: [], dataset_staging_quota_bytes: 100 * 1024 ** 3,
       yolo_bin: 'yolo', training_lock_file: '.yolo-forge-training.lock', enable_training_trace: true,
     }, null, 2)
   }

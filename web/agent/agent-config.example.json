@@ -21,7 +21,11 @@
     "enable_training_trace": "是否启用真实 Batch 过程采样；对支持的新训练生效，会增加采样开销。",
     "deployment": "填写身份和目录后执行 --check-config，核对解析后的路径；变更配置需在训练空闲时重启 Agent。示例目录仅供参考，按服务器实际布局调整。",
     "training_stop_timeout_seconds": "停止训练的宽限秒数，整数 1～300，默认 15；超时后强制终止进程组。新启动和恢复接管进程均适用，需要 Agent 2.0.8 或以上。",
-    "resume_dependency_cleanup": "Agent 2.0.8 支持历史续训依赖释放；删除前验证后续 Attempt 的独立 best.pt、last.pt，缺失或变化时拒绝清理。"
+    "resume_dependency_cleanup": "Agent 2.0.8 支持历史续训依赖释放；删除前验证后续 Attempt 的独立 best.pt、last.pt，缺失或变化时拒绝清理。",
+    "dataset_roots": "Agent 2.1.0 数据集管理白名单。相对路径基于 training_cwd；启用训练时必须在 allowed_training_roots 内。空列表表示禁用数据集文件操作。通过平台设置添加具体保存位置，目录不存在时需明确选择创建。请勿将系统根目录作为白名单。",
+    "dataset_staging_quota_bytes": "数据集中转文件配额，单位字节，默认 107374182400（100 GiB），必须为正整数。传输前检查空间；原始数据和发布临时副本也需要磁盘余量。",
+    "dataset_state": "分块断点与提交回执保存在配置文件旁的 .dataset-state；升级保留此目录和 .training-state。网络断开会复用已确认分块。后台校验或迁移失败可在平台操作历史重试。",
+    "dataset_ownership": "普通登记的外部数据不会被平台删除；只有明确接管的数据且无训练引用才允许永久删除。Agent 文件操作期间会占用工作区锁，不会与已启动的 Agent 训练同时读写文件。"
   },
   "center_url": "http://YOUR_CENTER:18088",
   "node_id": "00000000000000000000000000000000",
@@ -45,5 +49,9 @@
   "yolo_bin": "yolo",
   "training_lock_file": ".yolo-forge-training.lock",
   "enable_training_trace": true,
-  "training_stop_timeout_seconds": 15
+  "training_stop_timeout_seconds": 15,
+  "dataset_roots": [
+    "datasets"
+  ],
+  "dataset_staging_quota_bytes": 107374182400
 }

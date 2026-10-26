@@ -428,9 +428,28 @@ def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
     return path
 
 
+def training_dataset_roots(raw: str) -> list[Path]:
+    """Keep legacy roots, adding only this registered, ready local dataset."""
+    from .models import DatasetEntry
+    from .config import DATASET_STORAGE_ALLOWED_ROOTS
+    from sqlalchemy import inspect
+    candidate = Path(raw).expanduser().resolve()
+    roots = list(DATASET_ROOTS)
+    if path_is_within(candidate, roots):
+        return roots
+    with SessionLocal() as db:
+        if inspect(db.get_bind()).has_table('dataset_entries'):
+            for entry in db.scalars(select(DatasetEntry).where(DatasetEntry.node_id == 'local', DatasetEntry.status == 'ready')):
+                directory = Path(entry.path)
+                if path_is_within(directory, DATASET_STORAGE_ALLOWED_ROOTS) and path_is_within(candidate, [directory]):
+                    roots.append(directory)
+                    break
+    return roots
+
+
 def validate_dataset_config(raw: str) -> Path:
     """Validate the dataset YAML and resolve train/val entries before queuing a run."""
-    path = validate_input_path(raw, DATASET_ROOTS, "数据集配置")
+    path = validate_input_path(raw, training_dataset_roots(raw), "数据集配置")
     if not path.is_file() or path.suffix.lower() not in {".yaml", ".yml"}:
         raise ValueError(f"非分类任务的数据集必须是 YAML 文件：{path}")
     try:
@@ -1256,6 +1275,10 @@ class TrainingScheduler:
     ) -> bool:
         """Durably claim a queued local run before any process can be created."""
         acquire_node_claim_lock(db, "local")
+        from .dataset_store import mutation_pending
+        if mutation_pending(db, 'local'):
+            db.rollback()
+            return False
         candidate = db.get(TrainingRun, run_id)
         candidate_task = db.get(TrainingTask, candidate.task_id) if candidate else None
         if not candidate or not candidate_task:

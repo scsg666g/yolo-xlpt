@@ -1,5 +1,11 @@
 # 算力监控与可选远程训练 Agent
 
+## 1.5.0 数据集存储与跨节点管理
+
+新增本机/远程具名保存位置、默认目录与真实路径/空间检查；上传目标固定并支持 SHA-256 断点恢复，后台传输、登记已有目录、跨节点复制迁移、外部目录接管及引用保护删除。历史上传目录自动兼容，迁移保留编号与原路径历史，操作可追踪、重试和提交前取消。远程新能力需要 Agent **2.1.0**，原有训练最低兼容门槛保持不变。完整配置、空间要求、恢复和删除规则见 [数据集存储说明](../../docs/dataset-storage.md)。
+
+
+
 中心平台的「算力资源 → 添加服务器」填写名称、地址和备注，保存后下载 `monitor_agent.py` 与专属 `agent-config.json`。地址字段用于展示，不是 SSH 连接地址；中心地址需能从训练服务器访问。
 
 Agent 默认仅采集 GPU、计算进程和主机信息。只有在远程配置显式启用训练并设置允许目录后，才会从中台领取训练任务、运行配置好的 YOLO CLI 并回报指标与日志。Agent 使用 Python 3.9+ 标准库，无第三方 Python 依赖，但当前实现依赖 Linux/POSIX 的 `fcntl`、进程组信号和 `/proc`，不应当作 Windows 通用脚本。训练所需依赖由远程 `yolo` 环境提供。GPU 显存单位为 MB，主机内存为字节。
@@ -51,7 +57,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-当前脚本为 **Agent 2.0.8**，配套开发平台为 **1.4.11**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
+当前脚本为 **Agent 2.1.0**，配套开发平台为 **1.5.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -185,7 +191,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `2.0.8`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
+确认输出为 `2.1.0`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py

@@ -1,3 +1,4 @@
+import { DatasetStorageSettings } from './DatasetStorage'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Activity, Boxes, Check, Cpu, Database, Download, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Server, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -468,6 +469,7 @@ export function Layout() {
                 </>}
 
                 {settingsSection === 'storage' && <>
+                  <DatasetStorageSettings />
                   <div className="form-grid settings-path-grid">
                     <label className="span-2">平台服务器 · 训练输出目录<input readOnly title={storageHealth?.path || health.details?.runs_root || ''} value={storageHealth?.path || health.details?.runs_root || '—'} /></label>
                   </div>
@@ -493,7 +495,7 @@ export function Layout() {
                       {modelRoots.length ? <details><summary>模型测试目录 · {modelRoots.length} 项</summary><div className="settings-storage-roots">{modelRoots.map((root) => <code key={root}>{root}</code>)}</div></details> : <small>Agent 尚未上报允许的模型测试目录</small>}
                     </div>
                   })}</div> : <div className="settings-empty-state">尚未登记远程 Agent</div>}
-                  <p className="settings-readonly-note">路径由各自的运行环境提供；本页只读取状态，不创建文件或修改目录。</p>
+                  <p className="settings-readonly-note">训练和模型目录来自运行环境；数据集保存位置可在上方配置，目录检查结果含服务器时间。</p>
                 </>}
               </section>
             </div>

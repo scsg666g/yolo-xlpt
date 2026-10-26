@@ -349,6 +349,7 @@ export interface Resources {
 }
 
 export interface DatasetUploadResult {
+  node_id?: string
   name: string
   directory: string
   names: string[]
@@ -365,6 +366,13 @@ export interface ManagedDatasetReference {
 }
 
 export interface ManagedDataset {
+  node_name?: string
+  id: string
+  node_id: string
+  location_id: string
+  ownership: string
+  status: string
+  history?: Array<{ node_id: string; path: string; operation_id: string }>
   name: string
   directory: string
   config_path: string
@@ -538,4 +546,17 @@ export interface RunDeletionPreview {
   indexed_bytes: number
   checkpoint_releases: Array<{ run_id: string; attempt_number: number }>
   note: string
+}
+
+export interface DatasetLocation {
+  node_name?: string
+  id: string; node_id: string; name: string; path: string; resolved_path: string | null
+  enabled: boolean; is_default: boolean; status: string; updated_at: string
+  details: { free_bytes?: number; total_bytes?: number; message?: string; checked_at?: string }
+}
+export interface DatasetOperation {
+  id: string; kind: string; status: string; phase: string; name: string; node_id: string
+  transferred: number; total_bytes: number; error: string | null; can_cancel: boolean
+  source_path?: string; destination?: string; waiting_offline?: boolean; waiting_training?: boolean
+  created_at: string; updated_at: string; result: Partial<DatasetUploadResult> & { dataset_id?: string }
 }

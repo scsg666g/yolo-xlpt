@@ -48,6 +48,7 @@ from .inference import (
     stage_task_test_cancellation,
     worker as inference_worker,
 )
+from .dataset_store import router as dataset_store_router, worker as dataset_worker, reject_training_mutation
 from .models import Artifact, ComputeNode, MetricPoint, RemoteOperation, TaskEvent, TaskGroup, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete, queue_local_run_delete
 from .model_assets import router as model_assets_router
@@ -126,6 +127,7 @@ async def lifespan(_: FastAPI):
         import_existing_runs()
     backfill_training_runs()
     migrate_training_logs()
+    dataset_worker.start()
     scheduler.start()
     inference_worker.start()
     local_deletion_worker.start()
@@ -139,12 +141,14 @@ async def lifespan(_: FastAPI):
             await snapshot_task
         except asyncio.CancelledError:
             pass
+        dataset_worker.stop()
         local_deletion_worker.stop()
         inference_worker.stop()
         scheduler.stop()
 
 
 app = FastAPI(title="YOLO 模型训练平台", version=PLATFORM_VERSION, lifespan=lifespan)
+app.include_router(dataset_store_router)
 app.include_router(dataset_upload_router)
 app.include_router(dataset_management_router)
 app.include_router(inference_router)
@@ -174,8 +178,9 @@ async def log_slow_requests(request: Request, call_next):
                            request.url.path, elapsed * 1000)
 
 
-def serialize_managed_dataset_references():
+def serialize_managed_dataset_references(db: Session = Depends(get_db)):
     with managed_dataset_mutation():
+        reject_training_mutation(db, 'local')
         yield
 
 
@@ -224,6 +229,7 @@ def serialize_run(db: Session, run: TrainingRun) -> RunRead:
 
 
 def reject_active_remote_delete(db: Session, node_id: str) -> None:
+    reject_training_mutation(db, node_id)
     if active_remote_delete(db, node_id):
         raise HTTPException(
             409,
@@ -313,12 +319,22 @@ def storage_health():
         return {"path": str(RUNS_ROOT), "status": "unavailable", "free_bytes": None, "total_bytes": None}
 
 
+def registered_dataset_resources(db):
+    from .models import DatasetEntry
+    found = discover_files(DATASET_ROOTS, {'.yaml', '.yml'})
+    for entry in db.scalars(select(DatasetEntry).where(DatasetEntry.node_id == 'local', DatasetEntry.status == 'ready')):
+        path = str(Path(entry.path) / 'data.yaml')
+        if Path(path).is_file() and not any(item['path'] == path for item in found):
+            found.append({'name': entry.name, 'path': path, 'root': str(Path(entry.path).parent), 'size': Path(path).stat().st_size})
+    return found
+
+
 @app.get("/api/resources")
-def resources():
+def resources(db: Session = Depends(get_db)):
     return {
         "gpus": gpu_inventory(),
         "models": discover_files(MODEL_ROOTS, {".pt", ".pth", ".onnx", ".yaml", ".yml"}),
-        "datasets": discover_files(DATASET_ROOTS, {".yaml", ".yml"}),
+        "datasets": registered_dataset_resources(db),
         "classification_datasets": discover_classification_datasets(DATASET_ROOTS),
     }
 
@@ -475,8 +491,10 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
     node = db.get(ComputeNode, payload.execution_node_id) if payload.execution_node_id else None
     if payload.execution_node_id:
         reject_unavailable_remote_training(node, 422)
-    guard = nullcontext() if node else managed_dataset_mutation()
+    guard = managed_dataset_mutation()
     with guard:
+        acquire_node_claim_lock(db, node.id if node else 'local')
+        reject_training_mutation(db, node.id if node else 'local')
         if node:
             acquire_node_claim_lock(db, node.id)
             db.refresh(node)
@@ -551,6 +569,8 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/start", response_model=TaskRead)
 def start_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
+    acquire_node_claim_lock(db, task.execution_node_id or "local")
+    reject_training_mutation(db, task.execution_node_id or "local")
     if task.status != "draft":
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
     if task.execution_node_id:
@@ -579,6 +599,8 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/resume", response_model=TaskRead)
 def resume_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
+    acquire_node_claim_lock(db, task.execution_node_id or "local")
+    reject_training_mutation(db, task.execution_node_id or "local")
     if task.status not in {"stopped", "interrupted"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
     previous = current_run(db, task)
@@ -637,6 +659,8 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
 @app.post("/api/tasks/{task_id}/retry", response_model=TaskRead)
 def retry_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
+    acquire_node_claim_lock(db, task.execution_node_id or "local")
+    reject_training_mutation(db, task.execution_node_id or "local")
     if task.status not in {"failed", "stopped", "interrupted", "completed"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能重新训练")
     if task.execution_node_id:
@@ -803,6 +827,8 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     source = get_task_or_404(db, task_id)
     guard = nullcontext() if source.execution_node_id else managed_dataset_mutation()
     with guard:
+        acquire_node_claim_lock(db, source.execution_node_id or 'local')
+        reject_training_mutation(db, source.execution_node_id or 'local')
         if not source.execution_node_id:
             db.refresh(source)
             reject_local_task_cleanup(db)
@@ -897,7 +923,7 @@ def permanently_delete_task(task_id: str, db: Session = Depends(get_db)):
             raise HTTPException(409, "运行中或排队中的任务不能永久删除")
         if active_attempt_delete_operation(db, task.id):
             raise HTTPException(409, "该任务已有 Attempt 文件清理正在进行，请等待完成后再删除任务")
-        guard = nullcontext() if task.execution_node_id else managed_dataset_mutation()
+        guard = managed_dataset_mutation()
         with guard:
             try:
                 # Queue first: remote serialization may restart a read-only
@@ -987,8 +1013,10 @@ def update_task_config(task_id: str, payload: TaskConfigUpdate, db: Session = De
 @app.patch("/api/tasks/{task_id}/resources", response_model=TaskRead)
 def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
-    guard = nullcontext() if task.execution_node_id else managed_dataset_mutation()
+    guard = managed_dataset_mutation()
     with guard:
+        acquire_node_claim_lock(db, task.execution_node_id or 'local')
+        reject_training_mutation(db, task.execution_node_id or 'local')
         if not task.execution_node_id:
             db.refresh(task)
             reject_local_task_cleanup(db)

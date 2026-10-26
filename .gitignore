@@ -250,3 +250,6 @@ results.csv
 fuzz-sources/
 fuzz-datasets/
 fuzz-models/
+
+# Dataset upload resume helper is source, not a transport-stream video.
+!/web/frontend/src/datasetUploadSession.ts

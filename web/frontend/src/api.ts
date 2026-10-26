@@ -1,4 +1,4 @@
-import type { Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -122,13 +122,27 @@ export const api = {
     request<ModelTest>(`/api/model-tests/${id}/abandon`, { method: 'POST', keepalive }),
   modelTest: (id: string, signal: AbortSignal) => requestWithTimeout<ModelTest>(`/api/model-tests/${id}`, { signal }),
   deleteModelTest: (id: string) => requestWithTimeout<void>(`/api/model-tests/${id}`, { method: 'DELETE' }),
-  createDatasetUpload: (name: string, files: Array<{ path: string; size: number }>, signal: AbortSignal) =>
-    request<{ upload_id: string; destination: string }>('/api/datasets/uploads', { method: 'POST', body: JSON.stringify({ name, files }), signal }),
+  createDatasetUpload: (name: string, files: Array<{ path: string; size: number; sha256?: string }>, signal: AbortSignal, location_id?: string) =>
+    request<{ upload_id: string; destination: string }>('/api/datasets/uploads', { method: 'POST', body: JSON.stringify({ name, files, location_id }), signal }),
   datasetUploadStatus: (id: string, signal: AbortSignal) =>
-    request<{ uploaded_indices: number[]; result?: DatasetUploadResult }>(`/api/datasets/uploads/${id}`, { signal }),
+    request<{ uploaded_indices: number[]; result?: DatasetUploadResult; operation?: DatasetOperation }>(`/api/datasets/uploads/${id}`, { signal }),
   completeDatasetUpload: (id: string, names: string[], signal: AbortSignal) =>
-    request<DatasetUploadResult>(`/api/datasets/uploads/${id}/complete`, { method: 'POST', body: JSON.stringify({ names }), signal }),
+    request<DatasetUploadResult | { operation: DatasetOperation }>(`/api/datasets/uploads/${id}/complete`, { method: 'POST', body: JSON.stringify({ names }), signal }),
   cancelDatasetUpload: (id: string) => request<void>(`/api/datasets/uploads/${id}`, { method: 'DELETE' }),
+  datasetLocations: () => request<DatasetLocation[]>('/api/dataset-storage/locations'),
+  createDatasetLocation: (payload: { node_id: string; name: string; path: string; create: boolean; is_default: boolean }) => request<{ id: string; operation_id: string }>('/api/dataset-storage/locations', { method: 'POST', body: JSON.stringify(payload) }),
+  updateDatasetLocation: (id: string, enabled: boolean, is_default: boolean) => request(`/api/dataset-storage/locations/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled, is_default }) }),
+  checkDatasetLocation: (id: string, create = false) => request<DatasetOperation>(`/api/dataset-storage/locations/${id}/check`, { method: 'POST', body: JSON.stringify({ create }) }),
+  forgetDatasetLocation: (id: string) => request<void>(`/api/dataset-storage/locations/${id}`, { method: 'DELETE' }),
+  datasetEntries: (signal?: AbortSignal) => request<ManagedDataset[]>('/api/dataset-storage/datasets', { signal }),
+  registerDataset: (location_id: string, name: string, ownership: string, acknowledge: boolean) => request<DatasetOperation>('/api/dataset-storage/datasets/register', { method: 'POST', body: JSON.stringify({ location_id, name, ownership, acknowledge }) }),
+  migrateDataset: (id: string, location_id: string, name: string, remove_source: boolean) => request<DatasetOperation>(`/api/dataset-storage/datasets/${id}/migrate`, { method: 'POST', body: JSON.stringify({ location_id, name, remove_source }) }),
+  adoptDataset: (id: string, confirm_path: string) => request(`/api/dataset-storage/datasets/${id}/adopt`, { method: 'POST', body: JSON.stringify({ confirm_path }) }),
+  datasetDeletePreview: (id: string) => request<ManagedDataset & { can_delete: boolean }>(`/api/dataset-storage/datasets/${id}/delete-preview`),
+  deleteDatasetEntry: (id: string) => request<DatasetOperation>(`/api/dataset-storage/datasets/${id}`, { method: 'DELETE' }),
+  datasetOperations: () => request<DatasetOperation[]>('/api/dataset-storage/operations'),
+  datasetOperation: (id: string, signal?: AbortSignal) => request<DatasetOperation>(`/api/dataset-storage/operations/${id}`, { signal }),
+  controlDatasetOperation: (id: string, action: 'retry' | 'cancel') => request<DatasetOperation>(`/api/dataset-storage/operations/${id}/${action}`, { method: 'POST' }),
   managedDatasets: (signal?: AbortSignal) => requestWithTimeout<ManagedDataset[]>('/api/datasets/managed', { signal }),
   deleteManagedDataset: (name: string) => requestWithTimeout<void>(`/api/datasets/managed/${encodeURIComponent(name)}`, { method: 'DELETE' }, 30_000,
     '删除请求超时，请刷新数据集列表确认状态'),

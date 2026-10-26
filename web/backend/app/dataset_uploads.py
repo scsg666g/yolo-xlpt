@@ -1,6 +1,7 @@
 """Directory uploads: stage files privately, validate, then publish a named dataset."""
 from __future__ import annotations
 
+import hashlib
 import fcntl
 import json
 import logging
@@ -48,11 +49,13 @@ MANAGED_STAT_KEYS = {"train_images", "val_images", "labels", "classes", "backgro
 class UploadFileSpec(BaseModel):
     path: str = Field(min_length=1, max_length=1024)
     size: int = Field(ge=0, le=MAX_FILE_BYTES)
+    sha256: str | None = Field(default=None, pattern=r'^[0-9a-f]{64}$')
 
 
 class UploadCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     files: list[UploadFileSpec] = Field(min_length=1, max_length=MAX_FILES)
+    location_id: str | None = None
 
 
 class UploadComplete(BaseModel):
@@ -254,6 +257,11 @@ def delete_managed_dataset(name: str, db: Session = Depends(get_db)):
         metadata = managed_marker(directory) if directory.is_dir() and not directory.is_symlink() else None
         if metadata is None:
             raise HTTPException(404, "平台上传的数据集不存在")
+        from .models import DatasetEntry
+        from .dataset_store import busy_entry
+        entry = db.scalar(select(DatasetEntry).where(DatasetEntry.node_id == 'local', DatasetEntry.path == str(directory)))
+        if entry and busy_entry(db, entry.id):
+            raise HTTPException(409, '该数据集已有未完成操作')
         config_path = str((directory / "data.yaml").resolve())
         references = dataset_references(db, config_path)
         if references:
@@ -267,6 +275,9 @@ def delete_managed_dataset(name: str, db: Session = Depends(get_db)):
         try:
             quarantine.mkdir(parents=True, exist_ok=True)
             directory.replace(detached)
+            if entry:
+                entry.status = 'deleted'
+                db.commit()
         except OSError as exc:
             raise HTTPException(507, "数据集无法移入清理区，请检查目录权限和磁盘状态") from exc
         marker_upload_id = metadata.get("upload_id")
@@ -358,7 +369,9 @@ def cleanup_expired_uploads() -> None:
         try:
             if time.time() - (directory / ".lock").stat().st_mtime < SESSION_TTL:
                 continue
-            with upload_session(directory.name, touch=False):
+            with upload_session(directory.name, touch=False) as (_, manifest):
+                if manifest.get('operation_id'):
+                    continue  # The durable operation owns its staging until cleanup.
                 if time.time() - (directory / ".lock").stat().st_mtime >= SESSION_TTL:
                     shutil.rmtree(directory)
         except (OSError, HTTPException):
@@ -431,10 +444,14 @@ def completed_indices(directory: Path, manifest: dict) -> list[int]:
 
 
 @router.post("", status_code=201)
-def create_upload(payload: UploadCreate):
+def create_upload(payload: UploadCreate, db: Session = Depends(get_db)):
     validate_name(payload.name)
-    destination = DATASET_ROOTS[0] / payload.name
-    if destination.exists() or destination.is_symlink():
+    location = None
+    if payload.location_id:
+        from .dataset_store import location_get
+        location = location_get(db, payload.location_id, ready=True)
+    destination = Path(location.resolved_path) / payload.name if location else DATASET_ROOTS[0] / payload.name
+    if (not location or location.node_id == "local") and (destination.exists() or destination.is_symlink()):
         raise HTTPException(409, f"服务器已存在同名目录“{payload.name}”，请重命名本地文件夹后上传")
     seen: set[str] = set()
     image_keys: set[str] = set()
@@ -476,13 +493,20 @@ def create_upload(payload: UploadCreate):
     (directory / "files").mkdir(parents=True)
     (directory / ".lock").touch()
     manifest = {"name": payload.name, "files": [file.model_dump() for file in payload.files]}
+    if location:
+        manifest.update(location_id=location.id, node_id=location.node_id, root=location.resolved_path)
     (directory / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     return {"upload_id": upload_id, "destination": str(destination.resolve()), "total_bytes": total}
 
 
 @router.get("/{upload_id}")
-def get_upload(upload_id: str):
+def get_upload(upload_id: str, db: Session = Depends(get_db)):
     with upload_session(upload_id) as (directory, manifest):
+        if manifest.get('operation_id'):
+            from .dataset_store import get_operation
+            op = get_operation(manifest['operation_id'], db)
+            return {'uploaded_indices': list(range(len(manifest['files']))), 'operation': op,
+                    **({'result': op['result']} if op['status'] == 'completed' else {})}
         if "result" in manifest:
             return {"uploaded_indices": list(range(len(manifest["files"]))), "result": manifest["result"]}
         return {"uploaded_indices": completed_indices(directory, manifest)}
@@ -491,14 +515,15 @@ def get_upload(upload_id: str):
 @router.put("/{upload_id}/files/{index}", status_code=204)
 async def upload_file(upload_id: str, index: int, request: Request):
     with upload_session(upload_id) as (directory, manifest):
-        if "result" in manifest:
-            raise HTTPException(409, "该数据集已保存，不能继续修改上传文件")
+        if "result" in manifest or manifest.get("operation_id"):
+            raise HTTPException(409, "该数据集已提交处理，不能继续修改上传文件")
         if index < 0 or index >= len(manifest["files"]):
             raise HTTPException(404, "上传文件不存在")
         spec = manifest["files"][index]
         target = directory / "files" / spec["path"]
         temporary = directory / f".part-{index}"
         size = 0
+        checksum = hashlib.sha256()
         try:
             with temporary.open("wb") as handle:
                 async for chunk in request.stream():
@@ -506,6 +531,9 @@ async def upload_file(upload_id: str, index: int, request: Request):
                     if size > spec["size"]:
                         raise HTTPException(413, "文件大小超过申报大小，请重新选择文件夹")
                     handle.write(chunk)
+                    checksum.update(chunk)
+            if spec.get('sha256') and checksum.hexdigest() != spec['sha256']:
+                raise HTTPException(422, '文件 SHA-256 与上传清单不一致，请重新选择文件夹')
             if size != spec["size"]:
                 raise HTTPException(422, "文件传输不完整，请重试")
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -647,11 +675,28 @@ def published_upload_result(destination: Path, upload_id: str) -> dict | None:
 
 
 @router.post("/{upload_id}/complete")
-def complete_upload(upload_id: str, payload: UploadComplete):
+def complete_upload(upload_id: str, payload: UploadComplete, db: Session = Depends(get_db)):
     with upload_session(upload_id) as (directory, manifest):
         if "result" in manifest:
             return manifest["result"]
         files_root = directory / "files"
+        if manifest.get('location_id'):
+            from .dataset_store import queue_upload, get_operation
+            if manifest.get('operation_id'):
+                op = get_operation(manifest['operation_id'], db)
+                return op['result'] if op['status'] == 'completed' else {'operation': op}
+            if len(completed_indices(directory, manifest)) != len(manifest['files']):
+                raise HTTPException(409, '文件尚未全部上传')
+            names = class_names(files_root, payload.names)
+            stats, warnings = validate_contents(files_root, manifest, names)
+            with managed_dataset_mutation():
+                from .gpu_reservations import acquire_node_claim_lock
+                acquire_node_claim_lock(db, manifest['node_id'])
+                op = queue_upload(db, upload_id, directory, manifest, names, stats, warnings)
+            receipt = directory / '.manifest.tmp'
+            receipt.write_text(json.dumps({**manifest, 'operation_id': op['id']}, ensure_ascii=False), encoding='utf-8')
+            receipt.replace(directory / 'manifest.json')
+            return {'operation': op}
         destination = DATASET_ROOTS[0] / manifest["name"]
         receipt = directory / ".manifest.tmp"
 
@@ -740,8 +785,11 @@ def complete_upload(upload_id: str, payload: UploadComplete):
 
 
 @router.delete("/{upload_id}", status_code=204)
-def cancel_upload(upload_id: str):
+def cancel_upload(upload_id: str, db: Session = Depends(get_db)):
     with upload_session(upload_id) as (directory, manifest):
+        if manifest.get('operation_id'):
+            from .dataset_store import control_operation
+            control_operation(manifest['operation_id'], 'cancel', db)
         publication = DATASET_ROOTS[0] / f"{MANAGED_PUBLICATION_PREFIX}{upload_id}"
         try:
             remove_publication_workdir(publication)

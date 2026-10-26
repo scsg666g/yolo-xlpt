@@ -1,3 +1,6 @@
+import { hashDatasetFile, datasetSessionKey } from '../datasetUploadSession'
+import { datasetPhaseLabel } from '../datasetUploadSession'
+import type { DatasetLocation, DatasetOperation } from '../types'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, LoaderCircle, Upload, X } from 'lucide-react'
 import { api, formatBytes, uploadDatasetFile } from '../api'
@@ -8,13 +11,14 @@ import '../upload.css'
 interface Props {
   onClose: () => void
   onUploaded: (result: DatasetUploadResult) => void
+  initialNode?: string
 }
 
 const imageExtensions = /\.(jpg|jpeg|png|bmp|webp|tif|tiff)$/i
 const ignoredFiles = /(^|\/)(\.[^/]+|__MACOSX|Thumbs\.db|desktop\.ini)(\/|$)|\.cache$/i
 const directoryAttributes = { webkitdirectory: '', directory: '' }
 
-export function UploadDatasetModal({ onClose, onUploaded }: Props) {
+export function UploadDatasetModal({ onClose, onUploaded, initialNode = 'local' }: Props) {
   const [files, setFiles] = useState<File[]>([])
   const [folderName, setFolderName] = useState('')
   const [namesText, setNamesText] = useState('')
@@ -27,6 +31,9 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
   const [bytes, setBytes] = useState(0)
   const [completedFiles, setCompletedFiles] = useState(0)
   const [destination, setDestination] = useState('')
+  const [locations, setLocations] = useState<DatasetLocation[]>([])
+  const [locationId, setLocationId] = useState('')
+  const sessionKey = useRef('')
   const inputRef = useRef<HTMLInputElement>(null)
   const uploadId = useRef<string | null>(null)
   const controller = useRef<AbortController | null>(null)
@@ -42,9 +49,19 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
     return () => {
       active.current = false
       controller.current?.abort()
-      if (uploadId.current) void api.cancelDatasetUpload(uploadId.current).catch(() => undefined)
     }
   }, [])
+
+  useEffect(() => {
+    let mounted = true
+    void api.datasetLocations().then(ls => {
+      if (!mounted) return
+      const valid = ls.filter(l => l.enabled && l.status === 'ready')
+      setLocations(valid)
+      setLocationId(valid.find(l => l.node_id === initialNode && l.is_default)?.id || valid.find(l => l.node_id === initialNode)?.id || '')
+    }).catch((e: Error) => { if (mounted) setError(e.message) })
+    return () => { mounted = false }
+  }, [initialNode])
 
   const { totalBytes, trainCount, valCount } = useMemo(() => {
     let totalBytes = 0; let trainCount = 0; let valCount = 0
@@ -62,7 +79,6 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
   async function selectFolder(list: FileList | null) {
     if (!list?.length) return
     const version = ++selectionVersion.current
-    if (uploadId.current) void api.cancelDatasetUpload(uploadId.current).catch(() => undefined)
     uploadId.current = null
     setError(''); setSelectionError(''); setNamesText(''); setDestination(''); setBytes(0); setCompletedFiles(0); setStage('')
     const all = Array.from(list)
@@ -99,7 +115,7 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
 
   async function submit(event: React.FormEvent) {
     event.preventDefault()
-    if (busy || !files.length || selectionError) return
+    if (busy || !files.length || selectionError || !locationId) return
     const hasConfig = files.some((file) => ['data.yaml', 'data.yml'].includes(file.webkitRelativePath.slice(folderName.length + 1)))
     if (!names.length && !hasConfig) { setError('请填写类别名称，每行一个；类别编号按顺序从 0 开始。'); return }
     if (new Set(names).size !== names.length) { setError('类别名称不能重复。'); return }
@@ -108,14 +124,52 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
     const signal = abortController.signal
     setBusy(true); setError(''); setStage('准备上传…')
     try {
+      const manifest = []
+      for (let index = 0; index < files.length; index++) {
+        setStage(`正在核对文件指纹：${index + 1} / ${files.length}`)
+        manifest.push({ path: files[index].webkitRelativePath.slice(folderName.length + 1), size: files[index].size, sha256: await hashDatasetFile(files[index], signal) })
+      }
+      sessionKey.current = datasetSessionKey(locationId, folderName, manifest)
       if (!uploadId.current) {
-        const session = await api.createDatasetUpload(folderName, files.map((file) => ({ path: file.webkitRelativePath.slice(folderName.length + 1), size: file.size })), signal)
+        try { uploadId.current = localStorage.getItem(sessionKey.current) } catch { /* Upload still works without browser storage. */ }
+        if (uploadId.current) {
+          try { await api.datasetUploadStatus(uploadId.current, signal) } catch (e) {
+            if ((e as Error & { status?: number }).status === 404) { uploadId.current = null; localStorage.removeItem(sessionKey.current) } else throw e
+          }
+        }
+      }
+      if (!uploadId.current) {
+        const session = await api.createDatasetUpload(folderName, manifest, signal, locationId)
         uploadId.current = session.upload_id
+        try { localStorage.setItem(sessionKey.current, session.upload_id) } catch { /* Optional cross-page resume. */ }
         setDestination(session.destination)
       }
       const id = uploadId.current
       const status = await api.datasetUploadStatus(id, signal)
-      if (status.result) { uploadId.current = null; if (active.current) onUploaded(status.result); return }
+      if (status.result) { uploadId.current = null; try { localStorage.removeItem(sessionKey.current) } catch { /* optional storage */ } if (active.current) onUploaded(status.result); return }
+      async function waitForOperation(first: DatasetOperation): Promise<DatasetUploadResult> {
+        let op = first
+        while (op.status !== 'completed') {
+          if (op.status === 'failed') throw new Error(op.error || '后台处理失败，请在数据集管理的操作历史中重试')
+          if (op.status === 'cancelled') throw new Error('后台操作已取消，请重新上传')
+          if (active.current) setStage(op.waiting_offline ? '等待远程服务器上线，可关闭窗口并在操作历史中查看' : op.waiting_training ? '等待服务器训练结束后传输，可关闭窗口并在操作历史中查看' : `${datasetPhaseLabel[op.phase] || op.phase}，可关闭窗口并在操作历史中查看`)
+          await new Promise<void>((resolve, reject) => {
+            const abort = () => { window.clearTimeout(timer); reject(new DOMException('已暂停', 'AbortError')) }
+            const timer = window.setTimeout(() => { signal.removeEventListener('abort', abort); resolve() }, 2000)
+            signal.addEventListener('abort', abort, { once: true })
+            if (signal.aborted) abort()
+          })
+          op = await api.datasetOperation(op.id, signal)
+        }
+        return op.result as DatasetUploadResult
+      }
+      if (status.operation) {
+        setFinalizing(true)
+        const result = await waitForOperation(status.operation)
+        uploadId.current = null; try { localStorage.removeItem(sessionKey.current) } catch { /* optional storage */ }
+        if (active.current) onUploaded(result)
+        return
+      }
       const uploaded = new Set(status.uploaded_indices)
       let sent = files.reduce((sum, file, index) => sum + (uploaded.has(index) ? file.size : 0), 0)
       let count = uploaded.size
@@ -131,8 +185,10 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
       }
       setFinalizing(true)
       setStage('上传完成，正在检查图片和标签并生成配置，请稍候…')
-      const result = await api.completeDatasetUpload(id, names, signal)
+      const response = await api.completeDatasetUpload(id, names, signal)
+      const result = 'operation' in response ? await waitForOperation(response.operation) : response
       uploadId.current = null
+      try { localStorage.removeItem(sessionKey.current) } catch { /* optional storage */ }
       if (active.current) onUploaded(result)
     } catch (reason) {
       if (active.current) setError(reason instanceof DOMException && reason.name === 'AbortError'
@@ -149,12 +205,15 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
       <header><div><span className="eyebrow">UPLOAD DATASET</span><h2 id="dataset-upload-title">上传数据集文件夹</h2></div><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭上传窗口"><X size={20} /></button></header>
       <div className="modal-body">
         <p className="upload-intro">保留你选择的文件夹原名，上传后自动生成 data.yaml 并选中该数据集。</p>
+        <label className="upload-classes">保存位置<select required value={locationId} disabled={busy || !!uploadId.current} onChange={e => { setLocationId(e.target.value); setDestination('') }}><option value="">请选择已校验的保存位置</option>{locations.map(l => <option key={l.id} value={l.id}>{l.node_name || (l.node_id === 'local' ? '本机' : '远程服务器')} · {l.name}{l.is_default ? ' · 默认' : ''}</option>)}</select></label>
+        <p className="upload-destination">最终目录：<code>{locations.find(l => l.id === locationId)?.resolved_path || '请先在设置或数据集管理中添加并检查保存位置'}/{folderName || '文件夹原名'}</code></p>
+        <p className="upload-help">关闭窗口会保留已上传文件。重新选择同一文件夹时，逐文件 SHA-256 一致才会复用断点；后台传输可在数据集管理查看。</p>
         <div className="upload-format">
           <strong>目录格式要求 · YOLO 目标检测</strong>
           <p>请选择包含 images 和 labels 的最外层文件夹。</p>
           <pre>{`${folderName || '我的数据集'}/\n├── images/\n│   ├── train/   # 训练图片\n│   └── val/     # 验证图片\n└── labels/\n    ├── train/   # 训练标签 .txt\n    └── val/     # 验证标签 .txt`}</pre>
           <ul><li>图片与标签同名：images/train/a.jpg 对应 labels/train/a.txt。</li><li>标签每行：类别编号 中心x 中心y 宽 高，坐标在 0～1 之间，宽高大于 0。</li><li>类别编号从 0 开始；无标签或空标签的图片会作为背景图提示。</li></ul>
-          <details><summary>标签示例与文件限制</summary><pre>0 0.5 0.5 0.2 0.3</pre><p>支持 JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF；单张图片最大 256 MB，标签或配置最大 4 MB，总计最大 50 GB / 20 万个文件。第一版仅支持目标检测。</p></details>
+          <details><summary>标签示例与文件限制</summary><pre>0 0.5 0.5 0.2 0.3</pre><p>支持 JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF；单张图片最大 256 MB，标签或配置最大 4 MB，总计最大 50 GB / 20 万个文件。此上传格式支持 YOLO 目标检测。</p></details>
         </div>
         <input ref={inputRef} type="file" multiple {...directoryAttributes} hidden disabled={busy} onChange={(event) => { void selectFolder(event.target.files); event.target.value = '' }} aria-label="选择数据集文件夹" />
         <button type="button" className="upload-folder-picker" data-modal-initial-focus disabled={busy} onClick={() => inputRef.current?.click()}><FolderOpen size={26} /><span><strong>{folderName || '选择数据集文件夹'}</strong><small>{files.length ? `${files.length} 个文件 · ${formatBytes(totalBytes)} · 训练 ${trainCount} 张 / 验证 ${valCount} 张` : '点击选择本地文件夹，支持中文目录名'}</small></span><span className="button compact">{folderName ? '重新选择' : '选择文件夹'}</span></button>
@@ -166,7 +225,14 @@ export function UploadDatasetModal({ onClose, onUploaded }: Props) {
         {(selectionError || error) && <div className="alert error" role="alert">{selectionError || error}</div>}
         {stage && <div className="upload-progress" role="status" aria-live="polite"><div><span>{stage}</span><strong>{percentage}%</strong></div><progress max={100} value={percentage} /><small>{completedFiles} / {files.length} 个文件 · {formatBytes(bytes)} / {formatBytes(totalBytes)}</small></div>}
       </div>
-      <footer>{busy ? <button type="button" className="button ghost" disabled={finalizing} onClick={() => controller.current?.abort()}>{finalizing ? '正在校验并保存' : '暂停上传'}</button> : <button type="button" className="button ghost" onClick={onClose}>取消</button>}<button type="submit" className="button primary" disabled={busy || !files.length || !!selectionError}>{busy ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}{busy ? '正在处理…' : uploadId.current ? '继续上传 / 重试' : '上传并使用'}</button></footer>
+      <footer>{!busy && uploadId.current && <button type="button" className="button danger" onClick={() => {
+        const id = uploadId.current
+        if (id && window.confirm('确认取消并清理本次上传的临时数据？已进入文件提交阶段的操作不能取消。')) void api.cancelDatasetUpload(id).then(() => {
+          uploadId.current = null
+          try { localStorage.removeItem(sessionKey.current) } catch { /* optional storage */ }
+          setBytes(0); setCompletedFiles(0); setStage('本次上传已取消，可重新上传'); setError('')
+        }).catch((e: Error) => setError(e.message))
+      }}>取消并清理上传</button>}{busy ? <button type="button" className="button ghost" onClick={() => { controller.current?.abort(); if (finalizing) onClose() }}>{finalizing ? '关闭并在后台处理' : '暂停上传'}</button> : <button type="button" className="button ghost" onClick={onClose}>取消</button>}<button type="submit" className="button primary" disabled={busy || !files.length || !!selectionError || !locationId}>{busy ? <LoaderCircle size={16} className="spin" /> : <Upload size={16} />}{busy ? '正在处理…' : uploadId.current ? '继续上传 / 重试' : '上传并使用'}</button></footer>
     </form>
   </div>
 }
