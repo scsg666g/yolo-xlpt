@@ -7,43 +7,65 @@
 本文说明平台的安装与基本使用；页面操作见 [Web 平台说明](web/README.md)，远程接入见 [Agent 说明](web/agent/README.md)，服务维护见 [部署说明](web/deploy/README.md)。架构、代码职责、验证结果和当前改进建议集中记录在 [项目分析](docs/project-analysis.md)。当前平台版本为 **1.4.11**，随仓库提供的远程 Agent 为 **2.0.8**。
 
 
-## 1.4.11 训练生命周期与清理预检查
-
-- 单次 Attempt 删除增加只读预检查：展示阻止原因、清理路径、已登记产物容量，以及将解除引用的后续 Attempt；容量不代表完整磁盘占用，提交和执行前仍会再次校验。
-- 后续续训 Attempt 为已完成或已停止、已有训练进度且拥有独立的 `weights/best.pt` 和 `weights/last.pt` 时，可清理旧检查点。运行中、失败、中断、缺少独立权重以及其他模型/测试/任务引用仍受保护。兼容已有记录及旧版平铺 Attempt；不会仅因状态结束而放开删除。
-- 删除确认后将来源 Attempt、检查点路径和节点保存到 `checkpoint_source`，再解除实际检查点依赖；在实验对比的运行详情中显示来源已清理。旧记录自动兼容，无须手动修改数据库。
-- 远程解除依赖至少需要 Agent **2.0.8**；Agent 删除前核对后续独立权重的真实文件、大小和路径，拒绝缺失、变更及符号链接。旧 Agent 仍可使用原有不涉及依赖释放的清理功能。
-- 任务中心、画布和运行详情显示具体排队原因：本地设备不存在/资源占用，远程设备或 UUID 缺失、资源预约、节点离线及环境不可用。任务领取后清除原因，节点恢复后更新提示。
-- 本地与远程停止增加宽限超时处理。默认 15 秒后升级为进程组强制停止，接管进程仍检查身份。本地通过 `TRAINING_STOP_TIMEOUT_SECONDS` 环境变量设置，Agent 通过 `training_stop_timeout_seconds` 设置（1～300 秒）；Agent 新启动和恢复接管的训练均适用。
-
-本次只实现生命周期首批优化；数据集版本、增量指标读取、远程推理、维护模式和完整备份恢复仍为后续工作。数据库启动迁移先备份再增加字段；发布需要重启开发版后端。远程脚本由维护者在训练空闲时复制并重启，保留配置及 `.training-state/`，不覆盖使用版平台项目。
-
-
 ## 界面预览
 
-<p align="center">
-  <img src="docs/screenshots/training-canvas.png" alt="YOLO Forge 可视化训练画布" width="100%">
-</p>
-<p align="center"><sub>可视化训练画布 · 数据集、模型、参数、训练状态、指标、日志与产物集中呈现</sub></p>
+以下截图采自 **2026-10-26 的开发版 v1.4.11**，使用明亮主题。截图中的服务器地址、部署路径已遮挡；任务状态、训练指标和测试结果均为当时的实际记录。点击图片可查看原尺寸。
 
-<table>
-  <tr>
-    <td width="50%" align="center">
-      <img src="docs/screenshots/dashboard.png" alt="训练任务中心">
-      <br><sub>训练任务中心</sub>
-    </td>
-    <td width="50%" align="center">
-      <img src="docs/screenshots/compute-monitor.png" alt="多服务器算力监控">
-      <br><sub>多服务器算力监控</sub>
-    </td>
-  </tr>
-  <tr>
-    <td colspan="2" align="center">
-      <img src="docs/screenshots/experiment-compare.png" alt="实验指标对比" width="76%">
-      <br><sub>实验配置与指标对比</sub>
-    </td>
-  </tr>
-</table>
+### 任务中心：分组整理训练任务
+
+支持折叠分组、搜索与状态筛选，卡片显示执行服务器、轮数进度、指标和 GPU。每次进入页面默认收起分组；下图手动展开“火检测”分组。
+
+[![任务中心：折叠分组、任务卡片与训练指标](docs/screenshots/v1.4.11-task-center.png)](docs/screenshots/v1.4.11-task-center.png)
+
+### 训练画布：配置、指标与产物集中查看
+
+按 Attempt 查看数据集、模型、参数、运行状态、曲线、日志和权重。节点支持双击查看详情；有可用权重时，可从 best.pt 或“模型测试”节点打开图片测试。
+
+[![训练画布：Attempt 选择、指标曲线、模型权重与测试入口](docs/screenshots/v1.4.11-training-canvas.png)](docs/screenshots/v1.4.11-training-canvas.png)
+
+### 模型测试：原图与结果并排查看
+
+历史记录保留原图、结果图、阈值、模型版本和统计信息，可放大图片及下载结果。下图为已有检测记录，不是本次更新文档时新运行的推理。
+
+[![模型测试历史：原图、检测框、目标数量和置信度](docs/screenshots/v1.4.11-model-test-history.png)](docs/screenshots/v1.4.11-model-test-history.png)
+
+<details>
+<summary>算力资源：本机与远程服务器、Agent 状态及 GPU 监控</summary>
+
+按服务器展开 GPU、显存、功耗、温度、进程和主机信息。下图收起本机、展开远程节点；为截取同一时刻的数据，临时暂停了当前截图浏览器的自动刷新。
+
+[![算力资源：本机与远程节点、Agent 2.0.8、GPU 和进程监控](docs/screenshots/v1.4.11-compute-resources.png)](docs/screenshots/v1.4.11-compute-resources.png)
+
+</details>
+
+<details>
+<summary>新建模型测试：选择来源、拖入图片与设置阈值</summary>
+
+支持本机路径、训练产物和远程 Agent 模型来源；上传图片后设置置信度与适用的 NMS IoU。原图、结果和测试参数保存在全局历史中。远程权重准备完成后，推理由中心服务执行。
+
+[![新建模型测试：模型来源、图片拖拽上传和阈值设置](docs/screenshots/v1.4.11-model-testing.png)](docs/screenshots/v1.4.11-model-testing.png)
+
+</details>
+
+<details>
+<summary>实验对比：选择历史 Attempt 与显示阶段性数据</summary>
+
+需要至少两个训练运行才能生成对比。截图时开发版仅有一个可选 Attempt，因此展示真实的“至少需要两个训练运行才能对比”提示；已停止运行标记为“阶段性数据”，不等同于完整训练结果。
+
+[![实验对比：单个 Attempt 的选择状态和运行数量不足提示](docs/screenshots/v1.4.11-experiment-compare.png)](docs/screenshots/v1.4.11-experiment-compare.png)
+
+</details>
+
+<details>
+<summary>数据集管理：上传入口、规模统计与任务引用</summary>
+
+此页面管理通过平台上传的数据集。直接填写 YAML 路径的训练数据不会自动出现在这里；截图时没有平台上传记录，页面展示上传引导。
+
+[![数据集管理：上传入口、统计和暂无平台数据集的提示](docs/screenshots/v1.4.11-datasets.png)](docs/screenshots/v1.4.11-datasets.png)
+
+</details>
+
+完整操作步骤见 [Web 平台说明](web/README.md#页面与任务操作)，截图清单和更新约定见 [截图说明](docs/screenshots/README.md)。
 
 ## 主要功能
 
@@ -72,6 +94,17 @@
 官方 Agent 从 **2.0.0** 开始上报 `training.gpu_parallelism=true`。中心实际以该能力字段为并行开关，并要求设备清单具备请求 GPU 的 UUID；同卡仍互斥，多卡任务仍按整组预约。未上报该能力的官方旧 Agent 保持整机串行，版本号本身不会代替能力上报。远程并行还要求中心支持 GPU 预约并在任务中下发有效的 `gpu_assignment`，仅替换 Agent 不会使旧中心获得并行调度。
 
 已结束任务可在训练画布修改模型或数据集路径。编辑草稿不会被画布的定时刷新覆盖；保存后更新的是任务当前配置，旧 Attempt 继续保留训练时的路径快照。画布在两者不同时同时显示，并明确标注新路径将由下一次重新训练使用。
+
+## 1.4.11 训练生命周期与清理预检查
+
+- 单次 Attempt 删除增加只读预检查：展示阻止原因、清理路径、已登记产物容量，以及将解除引用的后续 Attempt；容量不代表完整磁盘占用，提交和执行前仍会再次校验。
+- 后续续训 Attempt 为已完成或已停止、已有训练进度且拥有独立的 `weights/best.pt` 和 `weights/last.pt` 时，可清理旧检查点。运行中、失败、中断、缺少独立权重以及其他模型/测试/任务引用仍受保护。兼容已有记录及旧版平铺 Attempt；不会仅因状态结束而放开删除。
+- 删除确认后将来源 Attempt、检查点路径和节点保存到 `checkpoint_source`，再解除实际检查点依赖；在实验对比的运行详情中显示来源已清理。旧记录自动兼容，无须手动修改数据库。
+- 远程解除依赖至少需要 Agent **2.0.8**；Agent 删除前核对后续独立权重的真实文件、大小和路径，拒绝缺失、变更及符号链接。旧 Agent 仍可使用原有不涉及依赖释放的清理功能。
+- 任务中心、画布和运行详情显示具体排队原因：本地设备不存在/资源占用，远程设备或 UUID 缺失、资源预约、节点离线及环境不可用。任务领取后清除原因，节点恢复后更新提示。
+- 本地与远程停止增加宽限超时处理。默认 15 秒后升级为进程组强制停止，接管进程仍检查身份。本地通过 `TRAINING_STOP_TIMEOUT_SECONDS` 环境变量设置，Agent 通过 `training_stop_timeout_seconds` 设置（1～300 秒）；Agent 新启动和恢复接管的训练均适用。
+
+本次只实现生命周期首批优化；数据集版本、增量指标读取、远程推理、维护模式和完整备份恢复仍为后续工作。数据库启动迁移先备份再增加字段；发布需要重启开发版后端。远程脚本由维护者在训练空闲时复制并重启，保留配置及 `.training-state/`，不覆盖使用版平台项目。
 
 ## 技术栈
 
