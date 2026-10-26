@@ -179,6 +179,7 @@ export const api = {
   experiments: (offset: number, signal?: AbortSignal, runIds?: string[]) => requestWithTimeout<{
     items: Array<{ task: TrainingTask; run: TrainingRun }>; total: number; offset: number; limit: number
   }>(`/api/experiments?offset=${offset}&limit=200${runIds ? `&run_ids=${encodeURIComponent(runIds.join(','))}` : ''}`, { signal }),
+  previewRunDeletion: (taskId: string, runId: string) => requestWithTimeout<import('./types').RunDeletionPreview>(`/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/deletion-preview`),
   deleteRun: (taskId: string, runId: string) => requestWithTimeout<{ status: 'pending' | 'running' | 'failed' | 'succeeded'; message: string; operation_id: string }>(
     `/api/tasks/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}`,
     { method: 'DELETE' }, 30_000, '删除 Attempt 请求超时，后台可能已经受理，请稍后刷新确认状态',

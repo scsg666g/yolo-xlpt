@@ -94,10 +94,12 @@ export function ComputeNodeModal({ node, connect = false, onClose, onSaved }: Pr
         training_output_roots: '训练结果允许写入的目录列表，必须包含在 allowed_training_roots 中；相对路径以 training_cwd 为基准。开发版与使用版应使用互不重叠的输出目录。空列表会兼容使用 allowed_training_roots，建议明确配置。',
         yolo_bin: 'YOLO 命令。仅填 yolo 时从 PATH 查找；包含路径分隔符的相对路径以 training_cwd 为基准。',
         training_lock_file: '训练互斥锁文件；相对路径以 training_cwd 为基准。同一训练工作区的多个 Agent 应共用锁文件，不能通过改锁名绕过占用保护。',
+        training_stop_timeout_seconds: '停止训练的宽限秒数，范围 1～300，默认 15；超时后强制终止，需 Agent 2.0.8 或以上。',
         enable_training_trace: '是否采样真实 Batch 的训练过程；仅受支持的新训练任务生成 Trace，会增加少量采样开销。',
       },
       center_url: center.trim().replace(/\/+$/, ''), node_id: savedNode.id, token,
       report_interval_seconds: savedNode.report_interval_seconds, nvidia_smi_bin: 'nvidia-smi',
+      training_stop_timeout_seconds: 15,
       enable_training: false, training_cwd: '.', allowed_training_roots: [], training_output_roots: [],
       yolo_bin: 'yolo', training_lock_file: '.yolo-forge-training.lock', enable_training_trace: true,
     }, null, 2)

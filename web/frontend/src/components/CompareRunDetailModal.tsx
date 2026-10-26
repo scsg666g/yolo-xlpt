@@ -81,6 +81,8 @@ export function CompareRunDetailModal({ task, run, view, details, onClose, onRef
       <nav className="compare-run-detail-tabs" aria-label="运行详情分类">{tabs.map(({ id, label, icon: Icon }) => <button type="button" key={id} className={tab === id ? 'active' : ''} aria-pressed={tab === id} onClick={() => setTab(id)}><Icon size={15} />{label}{id === 'artifacts' && details?.artifacts ? <small>{details.artifacts.length}</small> : id === 'events' && details?.events ? <small>{details.events.length}</small> : null}</button>)}</nav>
 
       <div className="compare-run-detail-body">
+        {run.status === 'queued' && run.queue_reason && <p role="status">排队原因：{run.queue_reason}</p>}
+        {run.checkpoint_source?.source_deleted && <p>续训来源：Attempt {run.checkpoint_source.attempt_number}（源文件已清理，来源信息已保留）</p>}
         {details?.loading && !details.loaded && <div className="compare-run-detail-loading"><LoaderCircle size={18} className="spin" /><span>正在读取指标、产物、事件和日志…</span></div>}
         {details?.errors.length ? <div className="compare-run-detail-load-error" role="alert"><strong>部分详情读取失败</strong><span>{details.errors.join('；')}</span></div> : null}
 

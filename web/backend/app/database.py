@@ -314,6 +314,8 @@ def migrate_database() -> Path | None:
         or "current_run_id" not in task_columns
         or "deleted_at" not in task_columns
         or "deleted_reason" not in task_columns
+        or "queue_reason" not in task_columns
+        or (bool(run_columns) and not {"queue_reason", "checkpoint_source"} <= run_columns)
         or "completion_info" not in task_columns
         or "run_id" not in metric_columns
         or "run_id" not in artifact_columns
@@ -387,6 +389,12 @@ def migrate_database() -> Path | None:
         if "execution_node_id" not in task_columns:
             connection.execute(text("ALTER TABLE training_tasks ADD COLUMN execution_node_id VARCHAR(64)"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_training_tasks_execution_node_id ON training_tasks (execution_node_id)"))
+        if "queue_reason" not in task_columns:
+            connection.execute(text("ALTER TABLE training_tasks ADD COLUMN queue_reason TEXT"))
+        if run_columns and "queue_reason" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN queue_reason TEXT"))
+        if run_columns and "checkpoint_source" not in run_columns:
+            connection.execute(text("ALTER TABLE training_runs ADD COLUMN checkpoint_source JSON NOT NULL DEFAULT '{}'"))
         if "completion_info" not in task_columns:
             connection.execute(text("ALTER TABLE training_tasks ADD COLUMN completion_info JSON NOT NULL DEFAULT '{}'"))
         if run_columns and "completion_info" not in run_columns:

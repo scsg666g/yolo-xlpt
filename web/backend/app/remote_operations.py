@@ -59,6 +59,7 @@ from .run_deletions import (
     remote_attempt_path_candidates,
     remote_output_root_for_run,
     validate_attempt_deletion,
+    checkpoint_releases,
 )
 from .services import add_event, artifact_kind
 
@@ -828,8 +829,8 @@ def queue_delete(db: Session, task: TrainingTask) -> RemoteOperation:
     return operation
 
 
-def queue_attempt_delete(db: Session, task: TrainingTask, run: TrainingRun) -> RemoteOperation:
-    """Queue one remote Attempt for Agent cleanup while retaining its task."""
+def prepare_attempt_delete_payload(db: Session, task: TrainingTask, run: TrainingRun) -> dict:
+    """Read-only preflight shared by previews and actual delete submissions."""
     validate_attempt_deletion(db, task, run)
     if not task.execution_node_id:
         raise ValueError("本机 Attempt 应使用本机删除队列")
@@ -850,13 +851,23 @@ def queue_attempt_delete(db: Session, task: TrainingTask, run: TrainingRun) -> R
         )
     if active_remote_delete(db, task.execution_node_id):
         raise ValueError("该远程服务器正在清理其他任务文件，请稍后重试")
+    releases = checkpoint_releases(db, task, run)
+    if releases and not agent_version_at_least(node.agent_version, (2, 0, 8)):
+        raise ValueError("释放历史续训检查点依赖需要 Agent 2.0.8 或以上版本")
     payload = {
+        "required_files": [file for release in releases for file in release["required_files"]],
         "scope": "attempt",
         "run_id": run.id,
         "attempt_number": run.attempt_number,
         "runs": [payload_run],
         "protected_paths": live_protected_paths(db, task.execution_node_id, task.id, deleting_run_id=run.id),
     }
+    return payload
+
+
+def queue_attempt_delete(db: Session, task: TrainingTask, run: TrainingRun) -> RemoteOperation:
+    """Queue one remote Attempt for Agent cleanup while retaining its task."""
+    payload = prepare_attempt_delete_payload(db, task, run)
     operation = enqueue(db, task.execution_node_id, task.id, "delete", payload)
     add_event(db, task.id, "run_delete_queued", f"已提交远程 Attempt {run.attempt_number:03d} 文件清理", run_id=run.id)
     return operation
@@ -871,6 +882,9 @@ def live_protected_paths(
 ) -> list[str]:
     """Return current references that a queued remote deletion must preserve."""
     protected: set[str] = set()
+    source = db.get(TrainingRun, deleting_run_id) if deleting_run_id else None
+    source_task = db.get(TrainingTask, deleting_task_id) if source else None
+    released = {item["run_id"] for item in checkpoint_releases(db, source_task, source)} if source_task else set()
     tasks = db.scalars(select(TrainingTask).where(TrainingTask.execution_node_id == node_id))
     for task in tasks:
         # Task resources are shared by all its Attempts and must never be
@@ -881,7 +895,9 @@ def live_protected_paths(
         for run in task.runs:
             if task.id == deleting_task_id and deleting_run_id and run.id == deleting_run_id:
                 continue
-            protected.update(path for path in (run.model_path, run.data_path, run.checkpoint_path) if path)
+            protected.update(path for path in (run.model_path, run.data_path) if path)
+            if run.checkpoint_path and run.id not in released:
+                protected.add(run.checkpoint_path)
             protected.update(
                 artifact.path for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id))
             )
@@ -1086,8 +1102,19 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
             return {"operation": None, "message": message}
         # A node can be offline for a long time after deletion was queued. Refresh
         # references immediately before dispatch so newly-created tasks are safe.
+        if attempt_scope:
+            try:
+                validate_attempt_deletion(db, task, target_run, ignore_operation_id=operation.id)
+                releases = checkpoint_releases(db, task, target_run)
+                if releases and not agent_version_at_least(node.agent_version, (2, 0, 8)):
+                    raise ValueError("释放历史续训检查点依赖需要 Agent 2.0.8 或以上版本")
+            except ValueError as exc:
+                operation.status, operation.error = "failed", str(exc)
+                db.commit()
+                return {"operation": None, "message": str(exc)}
         operation_payload = {
             **operation.payload,
+            **({"required_files": [file for release in releases for file in release["required_files"]]} if attempt_scope else {}),
             "protected_paths": live_protected_paths(
                 db,
                 node_id,

@@ -1,3 +1,4 @@
+import type { RunDeletionPreview } from '../types'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Folder, Info, Layers3, LoaderCircle, Minus, Search, Trash2, Trophy, X } from 'lucide-react'
 import { useSearchParams } from 'react-router-dom'
@@ -190,6 +191,7 @@ export function ExperimentCompare() {
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<ComparisonRun | null>(null)
   const [deleteError, setDeleteError] = useState('')
+  const [deletePreview, setDeletePreview] = useState<RunDeletionPreview | null>(null)
   const [deleteNotice, setDeleteNotice] = useState('')
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null)
   const [params, setParams] = useSearchParams()
@@ -377,6 +379,18 @@ export function ExperimentCompare() {
     })
   }
 
+  useEffect(() => {
+    if (!deleteTarget) return
+    let cancelled = false
+    setDeletePreview(null)
+    api.previewRunDeletion(deleteTarget.task.id, deleteTarget.run.id).then((preview) => {
+      if (!cancelled) setDeletePreview(preview)
+    }).catch((error) => {
+      if (!cancelled) setDeleteError(error instanceof Error ? error.message : '删除预检查失败，请关闭后重试')
+    })
+    return () => { cancelled = true }
+  }, [deleteTarget])
+
   function openDeleteRun(item: ComparisonRun) {
     if (deletingRunId) return
     if (activeRunStatuses.has(item.run.status)) {
@@ -386,12 +400,13 @@ export function ExperimentCompare() {
     if (item.run.deletion_status === 'pending' || item.run.deletion_status === 'running') return
     setDeleteError('')
     setDeleteNotice('')
+    setDeletePreview(null)
     setDeleteTarget(item)
   }
 
   async function confirmDeleteRun() {
     const target = deleteTarget
-    if (!target || deletingRunId) return
+    if (!target || deletingRunId || !deletePreview?.allowed) return
     if (activeRunStatuses.has(target.run.status)) {
       setDeleteError('训练进行中不能删除 Attempt，请先停止训练并等待状态稳定。')
       return
@@ -605,8 +620,8 @@ export function ExperimentCompare() {
     {deleteTarget && <div className="modal-backdrop compare-run-delete-backdrop" onMouseDown={() => !deletingRunId && setDeleteTarget(null)}>
       <div className="modal compare-run-delete-modal" role="dialog" aria-modal="true" aria-labelledby="compare-run-delete-title" onMouseDown={(event) => event.stopPropagation()}>
         <header><div className="compare-run-delete-heading"><Trash2 size={19} /><div><span className="eyebrow">DELETE TRAINING ATTEMPT</span><h2 id="compare-run-delete-title">删除训练 Attempt</h2><p>{deleteTarget.task.name} · Attempt {String(deleteTarget.run.attempt_number).padStart(3, '0')}</p></div></div><button type="button" className="icon-button" title="关闭" aria-label="关闭删除 Attempt 弹窗" disabled={Boolean(deletingRunId)} onClick={() => setDeleteTarget(null)}><X size={18} /></button></header>
-        <div className="compare-run-delete-body"><p>此操作会清理该 Attempt 的训练目录、独立日志、权重、指标图表和 Trace 文件。</p><ul><li>保留任务配置、其他 Attempt、基础模型和数据集。</li><li>独立保存的模型检测历史不会删除。</li><li>{deleteTarget.task.execution_node_id ? '远程任务会等待 Agent 确认清理；失败时保留记录并可重试。' : '本地任务会在后台清理；失败时保留记录并可重试。'}</li></ul>{deleteError && <div className="alert error" role="alert">{deleteError}</div>}</div>
-        <footer><span>删除后该 Attempt 将从实验对比中移除。</span><button type="button" className="button ghost" disabled={Boolean(deletingRunId)} onClick={() => setDeleteTarget(null)}>取消</button><button type="button" className="button danger" disabled={Boolean(deletingRunId)} onClick={() => void confirmDeleteRun()}>{deletingRunId ? <><LoaderCircle size={14} className="spin" />提交中…</> : <><Trash2 size={14} />{deleteTarget.run.deletion_status === 'failed' ? '重试清理' : '确认删除 Attempt'}</>}</button></footer>
+        <div className="compare-run-delete-body"><p>此操作会清理该 Attempt 的训练目录、独立日志、权重、指标图表和 Trace 文件。</p><ul><li>保留任务配置、其他 Attempt、基础模型和数据集。</li><li>独立保存的模型检测历史不会删除。</li><li>{deleteTarget.task.execution_node_id ? '远程任务会等待 Agent 确认清理；失败时保留记录并可重试。' : '本地任务会在后台清理；失败时保留记录并可重试。'}</li></ul>{!deletePreview && !deleteError && <p role="status">正在检查文件范围与续训引用…</p>}{deletePreview && <div className="run-deletion-preview">{deletePreview.blockers.map((reason) => <p className="alert error" role="alert" key={reason}>{reason}</p>)}{deletePreview.allowed && <><p>已登记产物：{(deletePreview.indexed_bytes / 1024 / 1024).toFixed(1)} MB</p><details><summary>查看清理路径</summary><ul>{deletePreview.paths.map((path) => <li key={path} style={{ overflowWrap: 'anywhere' }}>{path}</li>)}</ul></details>{deletePreview.checkpoint_releases.length > 0 && <p>将解除 Attempt {deletePreview.checkpoint_releases.map((item) => String(item.attempt_number).padStart(3, '0')).join('、')} 对旧检查点的依赖，保留续训来源记录。后续独立权重必须通过执行前校验。</p>}<small>{deletePreview.note}</small></>}</div>}{deleteError && <div className="alert error" role="alert">{deleteError}</div>}</div>
+        <footer><span>删除后该 Attempt 将从实验对比中移除。</span><button type="button" className="button ghost" disabled={Boolean(deletingRunId)} onClick={() => setDeleteTarget(null)}>取消</button><button type="button" className="button danger" disabled={Boolean(deletingRunId) || !deletePreview?.allowed} onClick={() => void confirmDeleteRun()}>{deletingRunId ? <><LoaderCircle size={14} className="spin" />提交中…</> : <><Trash2 size={14} />{deleteTarget.run.deletion_status === 'failed' ? '重试清理' : '确认删除 Attempt'}</>}</button></footer>
       </div>
     </div>}
     {deleteNotice && <div className="compare-notice compare-delete-success" role="status"><Check size={17} /><div><strong>Attempt 清理已提交</strong><span>{deleteNotice}</span></div></div>}

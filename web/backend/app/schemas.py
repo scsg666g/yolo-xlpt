@@ -182,6 +182,7 @@ class TaskRead(BaseModel):
     progress: float
     pid: int | None
     exit_code: int | None
+    queue_reason: str | None = None
     error_message: str | None
     completion_info: dict[str, Any] = Field(default_factory=dict)
     config: dict[str, Any]
@@ -213,6 +214,7 @@ class RunRead(BaseModel):
     parameter_snapshot: dict[str, Any]
     model_path: str
     data_path: str
+    checkpoint_source: dict[str, Any] = Field(default_factory=dict)
     checkpoint_path: str | None
     run_dir: str | None
     log_path: str | None
@@ -220,6 +222,7 @@ class RunRead(BaseModel):
     progress: float
     latest_metrics: dict[str, Any]
     exit_code: int | None
+    queue_reason: str | None = None
     error_message: str | None
     completion_info: dict[str, Any] = Field(default_factory=dict)
     queued_at: datetime | None

@@ -780,6 +780,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         TrainingRun.status == "queued",
     ).order_by(TrainingRun.queued_at, TrainingRun.id)).all()
     candidates = ([expired] if expired else []) + [item for item in queued if not expired or item.id != expired.id]
+    from .services import set_queue_reason
     last_message = None
     for run in candidates:
         task = db.get(TrainingTask, run.task_id)
@@ -831,12 +832,14 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
             }
             if not indices or any(index not in inventory_indices for index in indices):
                 last_message = "任务请求的 GPU 编号未出现在远程 Agent 的设备清单中，任务继续排队"
+                set_queue_reason(db, run, last_message)
                 continue
             assignments = resolve_gpu_assignments(
                 device, remote_gpus, node_id=node_id, require_uuid=True,
             )
             if assignments is None:
                 last_message = "远程 Agent 未上报请求 GPU 的 UUID，任务继续排队"
+                set_queue_reason(db, run, last_message)
                 continue
             exclusive_node = False
         else:
@@ -850,6 +853,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         claimed_at = utcnow()
         lease = secrets.token_hex(16)
         run_dir = str(Path(snapshot.get("remote_output_root") or "runs") / task.task_type / task.id / f"attempt-{run.attempt_number:03d}")
+        resources_claimed = False
         with db.begin_nested() as candidate_tx:
             claimed = db.execute(update(TrainingRun).where(
                 TrainingRun.id == run.id,
@@ -864,8 +868,13 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
                 exclusive_node=exclusive_node,
             ):
                 candidate_tx.rollback()
-                continue
+            else:
+                resources_claimed = True
+        if not resources_claimed:
+            set_queue_reason(db, run, "远程 GPU 或节点资源已被预约，等待释放")
+            continue
         db.refresh(run)
+        run.queue_reason = None
         mirror_run_to_task(task, run)
         add_event(db, task.id, "remote_claimed", f"远程服务器已领取 Attempt {run.attempt_number:03d}", run_id=run.id)
         db.commit()

@@ -772,6 +772,7 @@ export function Dashboard() {
       <div className="progress"><i style={{ width: `${epochProgress}%` }} /></div>
       {completionNote && <p className="training-completion-note">{completionNote}</p>}
       <div className="metric-strip" title={`最新 Epoch ${task.completed_epochs} 指标`}><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>{task.device === 'cpu' ? 'CPU' : `GPU ${task.device}`}</strong></div></div>
+      {task.status === 'queued' && task.queue_reason && <div className="task-warning">{task.queue_reason}</div>}
       {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
       <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
         {task.status === 'draft' && <button type="button" disabled={taskActionIds.has(task.id)} aria-busy={taskActionIds.has(task.id)} title="启动训练" aria-label={`启动训练：${task.name}`} onClick={(e) => taskAction(e, task.id, () => api.start(task.id))}><Zap size={15} /></button>}

@@ -1086,6 +1086,32 @@ def task_run(task_id: str, run_id: str, db: Session = Depends(get_db)):
     return serialize_run(db, get_run_or_404(db, task_id, run_id))
 
 
+@app.get("/api/tasks/{task_id}/runs/{run_id}/deletion-preview")
+def preview_training_run_deletion(task_id: str, run_id: str, db: Session = Depends(get_db)):
+    from .run_deletions import (checkpoint_releases, build_local_attempt_delete_plan,
+                                remote_attempt_path_candidates)
+    from .remote_operations import prepare_attempt_delete_payload
+    task = get_task_or_404(db, task_id)
+    run = get_run_or_404(db, task_id, run_id)
+    paths, releases, blockers = [], [], []
+    artifacts = list(db.scalars(select(Artifact).where(Artifact.run_id == run.id)))
+    try:
+        if task.execution_node_id:
+            prepare_attempt_delete_payload(db, task, run)
+            paths = remote_attempt_path_candidates(task, run, [a.path for a in artifacts])
+        else:
+            paths = build_local_attempt_delete_plan(db, task, run)["targets"]
+        releases = checkpoint_releases(db, task, run)
+    except ValueError as exc:
+        blockers.append(str(exc))
+    except HTTPException as exc:
+        blockers.append(str(exc.detail))
+    return {"allowed": not blockers, "blockers": blockers, "paths": [str(path) for path in paths],
+            "indexed_bytes": sum(max(0, a.size or 0) for a in artifacts),
+            "checkpoint_releases": [{"run_id": item["run_id"], "attempt_number": item["attempt_number"]} for item in releases],
+            "note": "容量为已登记产物的合计，不含未索引文件；提交和执行前会再次检查。"}
+
+
 @app.delete("/api/tasks/{task_id}/runs/{run_id}", status_code=202)
 def delete_training_run(task_id: str, run_id: str, db: Session = Depends(get_db)):
     """Queue deletion of one terminal Attempt and its owned files."""

@@ -174,3 +174,6 @@ def platform_instance_id() -> str:
                 return platform_instance_id()
         finally:
             temporary.unlink(missing_ok=True)
+
+# Grace period before escalating a local training stop to SIGKILL.
+TRAINING_STOP_TIMEOUT_SECONDS = max(1, min(300, int(os.getenv("TRAINING_STOP_TIMEOUT_SECONDS", "15"))))

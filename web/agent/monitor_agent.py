@@ -31,7 +31,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.0.7"
+VERSION = "2.0.8"
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -505,6 +505,9 @@ def load_config(path: Path) -> dict:
     interval = config.get("report_interval_seconds", 5)
     if type(interval) is not int or not 5 <= interval <= 300:
         raise ValueError("report_interval_seconds 必须为 5～300 的整数")
+    stop_timeout = config.get("training_stop_timeout_seconds", 15)
+    if type(stop_timeout) is not int or not 1 <= stop_timeout <= 300:
+        raise ValueError("training_stop_timeout_seconds 必须为 1～300 的整数")
     model_finalize_timeout = config.get(
         "model_transfer_finalize_timeout_seconds", MODEL_TRANSFER_FINALIZE_TIMEOUT_SECONDS,
     )
@@ -543,6 +546,7 @@ def load_config(path: Path) -> dict:
     return {"center_url": center, "node_id": node_id, "token": token,
             "report_interval_seconds": interval, "nvidia_smi_bin": binary,
             "model_transfer_finalize_timeout_seconds": model_finalize_timeout,
+            "training_stop_timeout_seconds": stop_timeout,
             "enable_training": enabled, "allowed_training_roots": [str(item) for item in resolved_roots],
             "training_output_roots": [str(item) for item in resolved_outputs],
             "model_test_roots": paths["model_test_roots"],
@@ -1640,7 +1644,21 @@ def delete_remote_files(config: dict, payload: dict) -> dict | None:
                 "检测到另一个 Agent 也登记或正在使用相同训练输出目录，"
                 "为防止跨平台误删已拒绝清理；请为每个平台配置独立的 training_output_roots"
             )
+        required_files = payload.get("required_files", [])
+        if not isinstance(required_files, list):
+            raise ValueError("续训权重校验清单无效")
+        required_paths = []
+        for item in required_files:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str) or type(item.get("size")) is not int or item["size"] <= 0:
+                raise ValueError("续训权重校验清单无效")
+            candidate = Path(item["path"])
+            resolved = candidate.resolve()
+            if (candidate != resolved or not any(root in resolved.parents for root in requested_roots)
+                    or not candidate.is_file() or candidate.stat().st_size != item["size"]):
+                raise ValueError("后续 Attempt 的独立权重缺失、变更或路径不可验证，已拒绝清理旧检查点")
+            required_paths.append(resolved)
         protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
+        protected.extend(required_paths)
         protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])
         deletion_targets = []
         for run, (run_dir, log, layout) in zip(runs, plans):
@@ -2523,15 +2541,24 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                     requested_stop, stop_reason = True, "platform_stop"
             except (OSError, ValueError, HTTPError, URLError):
                 pass
+            if requested_stop:
+                break
             stop.wait(2)
         if stop.is_set() and process_identity_matches(identity):
             requested_stop, stop_reason = True, "agent_shutdown"
             _terminate_recovered_process(identity)
-        deadline = time.monotonic() + 15
+        if requested_stop:
+            _terminate_recovered_process(identity)
+        deadline = time.monotonic() + config.get("training_stop_timeout_seconds", 15)
         while process_identity_matches(identity) and time.monotonic() < deadline:
             time.sleep(0.2)
         if process_identity_matches(identity):
             _terminate_recovered_process(identity, force=True)
+            kill_deadline = time.monotonic() + 5
+            while process_identity_matches(identity) and time.monotonic() < kill_deadline:
+                time.sleep(0.1)
+            if process_identity_matches(identity):
+                raise RuntimeError("强制停止后进程仍存活，保留活动记录以便重试")
         completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
         completed = max(completed, task.get("completed_epochs", 0))
         latest = latest or task.get("latest_metrics", {})
@@ -2622,7 +2649,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             report_progress({"status": "running", "pid": process.pid, "run_dir": task["run_dir"],
                              "completed_epochs": task.get("completed_epochs", 0),
                              "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {})})
-            while process.poll() is None and not stop.is_set():
+            while process.poll() is None and not stop.is_set() and not requested_stop:
                 if stop.wait(2):
                     break
                 try:
@@ -2631,6 +2658,8 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                         request_stop("platform_stop")
                 except (OSError, ValueError, HTTPError, URLError):
                     pass
+                if requested_stop:
+                    break
                 completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
                 completed = max(completed, task.get("completed_epochs", 0))
                 latest = latest or task.get("latest_metrics", {})
@@ -2656,9 +2685,12 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             if stop.is_set() and process.poll() is None:
                 request_stop("agent_shutdown")
             try:
-                exit_code = process.wait(timeout=15)
+                exit_code = process.wait(timeout=config.get("training_stop_timeout_seconds", 15))
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 exit_code = process.wait()
         completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
         completed = max(completed, task.get("completed_epochs", 0))

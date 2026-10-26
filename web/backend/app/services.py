@@ -34,6 +34,7 @@ from .config import (
     RUNTIME_ROOT,
     RUNS_ROOT,
     TRAINING_MKL_THREADING_LAYER,
+    TRAINING_STOP_TIMEOUT_SECONDS,
     ULTRALYTICS_ROOT,
     YOLO_BIN,
 )
@@ -131,6 +132,8 @@ class ManagedTrainingProcess:
     started_at: datetime
     popen: subprocess.Popen | None = None
     adopted: bool = False
+    stop_deadline: float | None = None
+    stop_escalated: bool = False
 
     def poll(self) -> int | None:
         if self.popen is not None:
@@ -172,6 +175,22 @@ def parameter_snapshot(task: TrainingTask) -> dict[str, Any]:
     }
 
 
+def set_queue_reason(db, run: TrainingRun, reason: str) -> None:
+    # Conditional writes cannot put a stale queued explanation onto a Run
+    # concurrently claimed or cancelled by another request.
+    if run.status != "queued":
+        return
+    db.execute(update(TrainingRun).where(
+        TrainingRun.id == run.id, TrainingRun.status == "queued",
+        (TrainingRun.queue_reason.is_(None)) | (TrainingRun.queue_reason != reason),
+    ).values(queue_reason=reason))
+    db.execute(update(TrainingTask).where(
+        TrainingTask.id == run.task_id, TrainingTask.current_run_id == run.id,
+        TrainingTask.status == "queued",
+        (TrainingTask.queue_reason.is_(None)) | (TrainingTask.queue_reason != reason),
+    ).values(queue_reason=reason))
+
+
 def mirror_run_to_task(task: TrainingTask, run: TrainingRun) -> None:
     """Keep the old task response useful while run-aware clients migrate."""
     task.current_run_id = run.id
@@ -182,6 +201,9 @@ def mirror_run_to_task(task: TrainingTask, run: TrainingRun) -> None:
     task.progress = run.progress
     task.pid = run.pid
     task.exit_code = run.exit_code
+    if run.status != "queued":
+        run.queue_reason = None
+    task.queue_reason = run.queue_reason
     task.error_message = run.error_message
     task.completion_info = dict(run.completion_info or {})
     task.latest_metrics = dict(run.latest_metrics or {})
@@ -234,6 +256,7 @@ def create_training_run(
         attempt_number=attempt,
         launch_mode=launch_mode,
         status="queued",
+        queue_reason="等待远程 Agent 领取任务" if task.execution_node_id else "等待本地调度器分配资源",
         execution_node_id=task.execution_node_id,
         parameter_snapshot=parameter_snapshot(task),
         model_path=task.model_path,
@@ -1255,7 +1278,7 @@ class TrainingScheduler:
                 TrainingRun.execution_node_id.is_(None),
                 TrainingRun.status == "queued",
                 TrainingRun.stop_requested.is_(False),
-            ).values(status="starting", error_message=None, finished_at=None)
+            ).values(status="starting", queue_reason=None, error_message=None, finished_at=None)
         )
         if claimed.rowcount != 1:
             db.rollback()
@@ -1500,6 +1523,25 @@ class TrainingScheduler:
                 pass
         return True
 
+    def _enforce_stop(self, db, task, run, managed) -> None:
+        # poll() verifies adopted identities; check again before signalling.
+        if managed.adopted and not process_matches_training(managed.pid, managed.command, managed.started_at):
+            return
+        now = time.monotonic()
+        if managed.stop_deadline is None:
+            managed.stop_deadline = now + TRAINING_STOP_TIMEOUT_SECONDS
+            signum = signal.SIGTERM
+        elif now >= managed.stop_deadline and not managed.stop_escalated:
+            managed.stop_escalated = True
+            signum = signal.SIGKILL
+            add_event(db, task.id, "stop_escalated", "训练未在停止宽限期内退出，已强制终止进程组", "warning", run_id=run.id)
+        else:
+            return
+        try:
+            os.killpg(managed.pid, signum)
+        except ProcessLookupError:
+            pass
+
     def _poll_processes(self, db) -> None:
         with self._process_lock:
             processes = list(self.processes.items())
@@ -1528,6 +1570,8 @@ class TrainingScheduler:
             sync_metrics(db, task, run)
             code = managed.poll()
             if code is None:
+                if run.status == "stopping" or run.stop_requested:
+                    self._enforce_stop(db, task, run, managed)
                 now = time.monotonic()
                 if now - self._last_artifact_scan.get(run_id, 0.0) >= 10:
                     sync_artifacts(db, task, run)
@@ -1558,6 +1602,18 @@ class TrainingScheduler:
     def _run_once(self) -> None:
         with self.session_factory() as db:
             self._poll_processes(db)
+            from .compute_nodes import remote_training_unavailable_reason
+            from .models import ComputeNode
+            for waiting in db.scalars(select(TrainingRun).where(
+                TrainingRun.status == "queued", TrainingRun.execution_node_id.is_not(None),
+            )):
+                reason = remote_training_unavailable_reason(db.get(ComputeNode, waiting.execution_node_id))
+                # Prefix distinguishes node availability from a GPU reason
+                # last reported by the Agent; clear it when the node recovers.
+                if reason:
+                    set_queue_reason(db, waiting, "节点不可用：" + reason)
+                elif not waiting.queue_reason or waiting.queue_reason.startswith("节点不可用："):
+                    set_queue_reason(db, waiting, "等待远程 Agent 领取任务")
             db.commit()
             queued_ids = db.scalars(select(TrainingRun.id).where(
                 TrainingRun.status == "queued", TrainingRun.execution_node_id.is_(None),
@@ -1567,7 +1623,11 @@ class TrainingScheduler:
                 db.expire_all()
                 run = db.get(TrainingRun, run_id)
                 task = db.get(TrainingTask, run.task_id) if run else None
-                if not run or not task or task.current_run_id != run.id or not self._available(db, task):
+                if not run or not task or task.current_run_id != run.id:
+                    continue
+                if not self._available(db, task):
+                    set_queue_reason(db, run, "所选 GPU 正被其他本地任务占用")
+                    db.commit()
                     continue
                 device = str((run.parameter_snapshot or {}).get("device", task.device) or "").strip().lower()
                 if device in {"cpu", "mps"}:
@@ -1575,12 +1635,16 @@ class TrainingScheduler:
                 elif device and all(part.strip().isdigit() for part in device.split(",")):
                     assignments = resolve_gpu_assignments(device, local_gpus, node_id="local")
                     if assignments is None:
-                        # Inventory doesn't confirm this GPU index. Leave the
-                        # run queued instead of launching without a reservation.
+                        set_queue_reason(db, run, "所选 GPU 不在本地设备清单中，请检查设备编号及驱动")
+                        db.commit()
                         continue
                 else:
                     assignments = [node_serial_assignment("local")]
                 if not self._claim_queued_run(db, run.id, assignments):
+                    waiting = db.get(TrainingRun, run_id)
+                    if waiting and waiting.status == "queued":
+                        set_queue_reason(db, waiting, "GPU 或节点资源已被预约，等待释放")
+                        db.commit()
                     continue
                 db.expire_all()
                 claimed_run = db.get(TrainingRun, run.id)

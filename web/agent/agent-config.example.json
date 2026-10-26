@@ -19,7 +19,9 @@
     "yolo_bin": "仅写 yolo 时从运行环境 PATH 查找。带 / 的相对路径以 training_cwd 为基准；需要指定 Conda 环境时填写对应程序路径。",
     "training_lock_file": "相对路径基于 training_cwd。Agent 2.0.0 对兼容锁使用共享锁并按 GPU UUID 互斥；旧 Agent 使用独占锁。不要删除运行中的锁文件或改锁名绕过保护。",
     "enable_training_trace": "是否启用真实 Batch 过程采样；对支持的新训练生效，会增加采样开销。",
-    "deployment": "填写身份和目录后执行 --check-config，核对解析后的路径；变更配置需在训练空闲时重启 Agent。示例目录仅供参考，按服务器实际布局调整。"
+    "deployment": "填写身份和目录后执行 --check-config，核对解析后的路径；变更配置需在训练空闲时重启 Agent。示例目录仅供参考，按服务器实际布局调整。",
+    "training_stop_timeout_seconds": "停止训练的宽限秒数，整数 1～300，默认 15；超时后强制终止进程组。新启动和恢复接管进程均适用，需要 Agent 2.0.8 或以上。",
+    "resume_dependency_cleanup": "Agent 2.0.8 支持历史续训依赖释放；删除前验证后续 Attempt 的独立 best.pt、last.pt，缺失或变化时拒绝清理。"
   },
   "center_url": "http://YOUR_CENTER:18088",
   "node_id": "00000000000000000000000000000000",
@@ -29,10 +31,19 @@
   "nvidia_smi_bin": "nvidia-smi",
   "enable_training": false,
   "training_cwd": ".",
-  "allowed_training_roots": ["models", "datasets", "runs"],
-  "training_output_roots": ["runs"],
-  "model_test_roots": ["pt"],
+  "allowed_training_roots": [
+    "models",
+    "datasets",
+    "runs"
+  ],
+  "training_output_roots": [
+    "runs"
+  ],
+  "model_test_roots": [
+    "pt"
+  ],
   "yolo_bin": "yolo",
   "training_lock_file": ".yolo-forge-training.lock",
-  "enable_training_trace": true
+  "enable_training_trace": true,
+  "training_stop_timeout_seconds": 15
 }

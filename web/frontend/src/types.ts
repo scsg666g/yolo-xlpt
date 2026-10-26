@@ -62,6 +62,7 @@ export interface TrainingTask {
   progress: number
   pid: number | null
   exit_code: number | null
+  queue_reason?: string | null
   error_message: string | null
   completion_info?: TrainingCompletionInfo | null
   config: Record<string, unknown>
@@ -153,6 +154,7 @@ export interface TrainingRun {
   parameter_snapshot: Record<string, unknown>
   model_path: string
   data_path: string
+  checkpoint_source?: { run_id?: string; attempt_number?: number; checkpoint_path?: string; source_deleted?: boolean }
   checkpoint_path: string | null
   run_dir: string | null
   log_path: string | null
@@ -160,6 +162,7 @@ export interface TrainingRun {
   progress: number
   latest_metrics: Record<string, number | string | null>
   exit_code: number | null
+  queue_reason?: string | null
   error_message: string | null
   completion_info?: TrainingCompletionInfo | null
   queued_at: string | null
@@ -526,4 +529,13 @@ export interface ModelTestSummary extends Omit<ModelTest, 'timings' | 'files'> {
 export interface ModelTestPage {
   items: ModelTestSummary[]
   next_cursor: string | null
+}
+
+export interface RunDeletionPreview {
+  allowed: boolean
+  blockers: string[]
+  paths: string[]
+  indexed_bytes: number
+  checkpoint_releases: Array<{ run_id: string; attempt_number: number }>
+  note: string
 }

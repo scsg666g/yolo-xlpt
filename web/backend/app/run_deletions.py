@@ -272,6 +272,78 @@ def _remote_overlaps(first: PurePosixPath, second: PurePosixPath) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
+def releasable_checkpoint_files(db: Session, task: TrainingTask, source: TrainingRun, other: TrainingRun) -> list[dict]:
+    """Only completed/stopped descendants with independent best AND last can detach.
+
+    Remote evidence is revalidated on the Agent before any unlink. Historical
+    provenance is retained separately when the deletion is acknowledged.
+    """
+    if (other.status not in {"completed", "stopped"} or other.completed_epochs <= 0 or not other.run_dir
+            or other.attempt_number <= source.attempt_number or other.launch_mode != "resume"
+            or other.execution_node_id not in {None, task.execution_node_id}):
+        return []
+    remote = bool(task.execution_node_id)
+    convert = PurePosixPath if remote else Path
+    try:
+        layout = remote_attempt_layout(task, other)[0] if remote else local_attempt_layout(task, other)[0]
+    except ValueError:
+        return []
+    if layout != CANONICAL_LAYOUT:
+        return []
+    artifacts = list(db.scalars(select(Artifact).where(Artifact.run_id == other.id, Artifact.kind == "weight")))
+    result = []
+    for name in ("best.pt", "last.pt"):
+        expected = convert(other.run_dir) / "weights" / name
+        artifact = next((item for item in artifacts if convert(item.path) == expected and item.size > 0), None)
+        if not artifact:
+            return []
+        if not remote:
+            try:
+                if expected.is_symlink() or expected.resolve() != expected.absolute() or not expected.is_file() or expected.stat().st_size != artifact.size:
+                    return []
+            except OSError:
+                return []
+        result.append({"path": str(expected), "size": artifact.size, "run_id": other.id})
+    return result
+
+
+def checkpoint_is_owned(task: TrainingTask, source: TrainingRun, checkpoint: str, targets: list) -> bool:
+    remote = bool(task.execution_node_id)
+    convert = PurePosixPath if remote else Path
+    overlaps = _remote_overlaps if remote else _overlaps
+    if any(overlaps(convert(checkpoint), target) for target in targets):
+        return True
+    # Legacy flat paths must remain identifiable after files were removed,
+    # including old Runs that never indexed their checkpoint as an Artifact.
+    try:
+        if remote:
+            layout, _, directory = remote_attempt_layout(task, source)
+        else:
+            layout, directory = local_attempt_layout(task, source)
+        if layout != LEGACY_FLAT_LAYOUT:
+            return False
+        path = PurePosixPath(posixpath.normpath(checkpoint)) if remote else Path(checkpoint).resolve(strict=False)
+        relative = path.relative_to(directory)
+        return bool(relative.parts) and not ATTEMPT_DIRECTORY_PATTERN.fullmatch(relative.parts[0])
+    except (ValueError, OSError):
+        return False
+
+
+def checkpoint_releases(db: Session, task: TrainingTask, source: TrainingRun) -> list[dict]:
+    remote = bool(task.execution_node_id)
+    artifacts = list(db.scalars(select(Artifact).where(Artifact.run_id == source.id)))
+    targets = (remote_attempt_path_candidates(task, source, [a.path for a in artifacts])
+               if remote else attempt_path_candidates(task, source))
+    result = []
+    for other in db.scalars(select(TrainingRun).where(TrainingRun.task_id == task.id, TrainingRun.id != source.id)):
+        if other.checkpoint_path and checkpoint_is_owned(task, source, other.checkpoint_path, targets):
+            files = releasable_checkpoint_files(db, task, source, other)
+            if files:
+                result.append({"run_id": other.id, "attempt_number": other.attempt_number,
+                               "checkpoint_path": other.checkpoint_path, "required_files": files})
+    return result
+
+
 def validate_attempt_deletion(
     db: Session,
     task: TrainingTask,
@@ -341,16 +413,15 @@ def validate_attempt_deletion(
         # A verified legacy-flat run owns root-level entries, not the task
         # container itself. Treating that container as exclusive would make
         # every newer canonical Attempt look overlapped and undeletable.
-        other_paths = [convert_path(other.log_path)] if other.log_path else []
+        other_paths = [convert_path(path) for path in (other.log_path, other.model_path, other.data_path) if path]
         if other.run_dir and other_layout != LEGACY_FLAT_LAYOUT:
             other_paths.append(convert_path(other.run_dir))
         protected_paths.extend(other_paths)
         if any(overlaps(target, candidate) for target in target_paths for candidate in other_paths):
             raise ValueError("该 Attempt 的训练目录或日志与其他 Attempt 重叠，不能安全删除")
-        if other.checkpoint_path and any(
-            overlaps(convert_path(other.checkpoint_path), target) for target in target_paths
-        ):
-            raise ValueError("该 Attempt 的检查点仍被其他续训 Attempt 引用")
+        if other.checkpoint_path and checkpoint_is_owned(task, run, other.checkpoint_path, target_paths):
+            if not releasable_checkpoint_files(db, task, run, other):
+                raise ValueError(f"该 Attempt 的检查点仍被 Attempt {other.attempt_number:03d} 引用；需结束续训并保有独立 best.pt 和 last.pt 后才能清理")
         for artifact in other_artifacts:
             artifact_path = convert_path(artifact.path)
             protected_paths.append(artifact_path)
@@ -379,6 +450,11 @@ def validate_attempt_deletion(
             Artifact.task_id == task.id, Artifact.run_id != run.id,
         ))
     )
+    if remote:
+        from .remote_operations import live_protected_paths
+        protected_paths.extend(PurePosixPath(path) for path in live_protected_paths(
+            db, task.execution_node_id, task.id, deleting_run_id=run.id,
+        ))
     if any(overlaps(target, protected) for target in target_paths for protected in protected_paths):
         raise ValueError("该 Attempt 路径仍被其他任务或资源引用，不能安全删除")
 
@@ -600,6 +676,16 @@ def delete_attempt_records(db: Session, task_id: str, run_id: str) -> TrainingTa
     task = db.get(TrainingTask, task_id)
     if not run or not task or run.task_id != task.id:
         return task
+    # Files have been removed and acknowledged; archive the origin, then drop
+    # only the released runtime dependency. Do not erase the training history.
+    for release in checkpoint_releases(db, task, run):
+        other = db.get(TrainingRun, release["run_id"])
+        other.checkpoint_source = {
+            **(other.checkpoint_source or {}), "run_id": run.id,
+            "attempt_number": run.attempt_number, "checkpoint_path": other.checkpoint_path,
+            "execution_node_id": task.execution_node_id, "source_deleted": True,
+        }
+        other.checkpoint_path = None
     artifacts = list(db.scalars(select(Artifact).where(Artifact.run_id == run.id)))
     artifact_ids = [artifact.id for artifact in artifacts]
     artifact_paths = {artifact.path for artifact in artifacts}
@@ -634,6 +720,7 @@ def delete_attempt_records(db: Session, task_id: str, run_id: str) -> TrainingTa
         task.completed_epochs = 0
         task.progress = 0.0
         task.pid = task.exit_code = None
+        task.queue_reason = None
         task.error_message = None
         task.latest_metrics = {}
         task.completion_info = {}

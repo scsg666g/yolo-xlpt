@@ -156,3 +156,10 @@ curl --fail http://127.0.0.1:18088/api/health
 更新平台前后端，重新构建前端并由维护者安排服务重启。完整远程日志下载与分类训练适配需要同步部署 Agent 2.0.6；只替换分发脚本和说明，保留各节点 `agent-config.json`、Token、实际目录和 `.training-state/`。现有训练和远程清理协议保持兼容。
 
 单份日志大小、日志缓存配额和磁盘余量分别由 `PLATFORM_LOG_DOWNLOAD_MAX_BYTES`、`PLATFORM_REMOTE_LOG_CACHE_QUOTA_BYTES`、`PLATFORM_REMOTE_LOG_MIN_FREE_BYTES` 配置，默认 256 MiB / 2 GiB / 2 GiB；均为非负字节数，`0` 关闭对应限制。
+
+
+### 1.4.11 生命周期升级
+
+本地训练停止宽限期由 `TRAINING_STOP_TIMEOUT_SECONDS` 配置，默认 15 秒，范围限制为 1～300 秒；远程使用 Agent 配置 `training_stop_timeout_seconds`。接管进程在发送信号前仍核验身份。
+
+升级后端前备份数据库和相关文件。启动迁移增加可空 `queue_reason` 与默认空对象 `checkpoint_source`，迁移自动生成数据库备份，旧 Run 保持原有状态。重启开发版后端后，新的预检查接口和排队原因才会生效。Agent 2.0.8 在远程服务器训练空闲时单独升级；只更新两个分发包不代表远程运行进程已升级。

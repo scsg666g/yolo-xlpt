@@ -198,7 +198,9 @@ function RuntimeDetails({ task, run }: Pick<Props, 'task' | 'run'>) {
         <DetailField label="数据配置" value={task.data_path} wide mono />
         <DetailField label="输出目录" value={task.run_dir || '等待创建'} wide mono />
         <DetailField label="日志文件" value={task.log_path || '等待创建'} wide mono />
-        <DetailField label="恢复检查点" value={run?.checkpoint_path || '未使用'} wide mono />
+        <DetailField label="恢复检查点" value={run?.checkpoint_path || run?.checkpoint_source?.checkpoint_path || '未使用'} wide mono />
+        {run?.checkpoint_source?.source_deleted && <DetailField label="续训来源" value={`Attempt ${run.checkpoint_source.attempt_number} · 源文件已清理，来源信息保留`} wide />}
+        {task.status === 'queued' && task.queue_reason && <DetailField label="排队原因" value={task.queue_reason} wide />}
       </div>
     </section>
     <section className="canvas-detail-section">
