@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 from . import dataset_files as files
 from .config import DATA_ROOT, DATASET_ROOTS, DATASET_STORAGE_ALLOWED_ROOTS, DATASET_STORAGE_QUOTA_BYTES, PROJECT_ROOT
 from .database import SessionLocal, get_db
-from .models import ComputeNode, DatasetEntry, DatasetLocation, DatasetOperation, TrainingRun, TrainingTask, utcnow
+from .models import ComputeNode, DatasetEntry, DatasetLocation, DatasetOperation, DatasetOperationHistoryRemoval, TrainingRun, TrainingTask, utcnow
 from .gpu_reservations import acquire_node_claim_lock
 from .dataset_uploads import managed_dataset_mutation, dataset_references, managed_marker, validate_name
 
@@ -92,6 +92,7 @@ def operation_read(op, db=None):
              'transferred': op.transferred, 'total_bytes': op.payload.get('archive_size', 0),
              'created_at': operation_time(op.created_at), 'updated_at': operation_time(op.updated_at), 'result': op.result,
              'source_path': op.payload.get('source_path') or op.payload.get('path'), 'destination': op.payload.get('destination'),
+             'can_delete_history': op.status in TERMINAL,
              'can_cancel': op.status in ('pending', 'running', 'failed') and not op.payload.get('published') and not op.payload.get('commit_started')}
     if db:
         def node_name(identity):
@@ -427,41 +428,15 @@ def delete_entry(identity: str, db: Session = Depends(get_db)):
         return operation_read(op)
 
 
-@router.get('/operations')
-def list_operations(db: Session = Depends(get_db)):
-    return [operation_read(op, db) for op in db.scalars(select(DatasetOperation).order_by(DatasetOperation.created_at.desc()).limit(200))]
+def visible_operation():
+    return ~select(DatasetOperationHistoryRemoval.operation_id).where(
+        DatasetOperationHistoryRemoval.operation_id == DatasetOperation.id).exists()
 
 
-@router.get('/operations/summary')
-def operation_summary(db: Session = Depends(get_db)):
-    counts = dict(db.execute(select(DatasetOperation.status, func.count()).group_by(DatasetOperation.status)).all())
-    node_ids = set(db.scalars(select(DatasetOperation.node_id).distinct()))
-    for key in ('source_node', 'target_node'):
-        node_ids.update(db.scalars(select(DatasetOperation.payload[key].as_string()).distinct()))
-    nodes = {n.id: n.name for n in db.scalars(select(ComputeNode))}
-    catalog_changed = db.scalar(select(func.max(DatasetEntry.updated_at)))
-    finished_changed = db.scalar(select(func.max(DatasetOperation.updated_at)).where(
-        DatasetOperation.status.in_((*TERMINAL, 'failed'))))
-    # Progress heartbeats do not force a full catalogue/reference reload.
-    revision = json.dumps([counts, str(catalog_changed), str(finished_changed)], sort_keys=True)
-    return {'total': sum(counts.values()), 'active': sum(counts.get(s, 0) for s in ACTIVE),
-            'failed': counts.get('failed', 0), 'counts': counts, 'revision': revision,
-            'latest_created_at': operation_time(db.scalar(select(func.max(DatasetOperation.created_at)))),
-            'snapshot': utcnow(),
-            'nodes': [{'id': identity, 'name': nodes.get(identity, '本机' if identity == 'local' else identity)}
-                      for identity in sorted(n for n in node_ids if n)]}
-
-
-@router.get('/operations/page')
-def operation_page(
-    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
-    status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all',
-    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete'] = 'all',
-    node_id: str = Query('all', max_length=64), q: str = Query('', max_length=160),
-    before: datetime | None = None, db: Session = Depends(get_db),
-):
-    cutoff = operation_time(before or utcnow())
-    query = select(DatasetOperation).where(DatasetOperation.created_at <= cutoff)
+def history_query(status='all', kind='all', node_id='all', q='', before=None, after=None):
+    query = select(DatasetOperation).where(visible_operation(), DatasetOperation.created_at <= operation_time(before or utcnow()))
+    if after:
+        query = query.where(DatasetOperation.created_at >= operation_time(after))
     if status != 'all':
         statuses = (*ACTIVE, 'failed') if status == 'attention' else ACTIVE if status == 'active' else (status,)
         query = query.where(DatasetOperation.status.in_(statuses))
@@ -475,6 +450,47 @@ def operation_page(
         location_ids = select(DatasetLocation.id).where(DatasetLocation.name.contains(q.strip(), autoescape=True))
         query = query.where(or_(DatasetOperation.payload['name'].as_string().contains(q.strip(), autoescape=True),
                                (DatasetOperation.kind == 'check') & DatasetOperation.payload['location_id'].as_string().in_(location_ids)))
+    return query
+
+
+@router.get('/operations')
+def list_operations(db: Session = Depends(get_db)):
+    return [operation_read(op, db) for op in db.scalars(history_query().order_by(DatasetOperation.created_at.desc(), DatasetOperation.id.desc()).limit(200))]
+
+
+@router.get('/operations/summary')
+def operation_summary(db: Session = Depends(get_db)):
+    counts = dict(db.execute(select(DatasetOperation.status, func.count()).where(visible_operation()).group_by(DatasetOperation.status)).all())
+    node_ids = set(db.scalars(select(DatasetOperation.node_id).where(visible_operation()).distinct()))
+    for key in ('source_node', 'target_node'):
+        node_ids.update(db.scalars(select(DatasetOperation.payload[key].as_string()).where(visible_operation()).distinct()))
+    nodes = {n.id: n.name for n in db.scalars(select(ComputeNode))}
+    catalog_changed = db.scalar(select(func.max(DatasetEntry.updated_at)))
+    finished_changed = db.scalar(select(func.max(DatasetOperation.updated_at)).where(
+        DatasetOperation.status.in_((*TERMINAL, 'failed'))))
+    # Progress heartbeats do not force a full catalogue/reference reload.
+    revision = json.dumps([counts, str(catalog_changed), str(finished_changed)], sort_keys=True)
+    return {'total': sum(counts.values()), 'active': sum(counts.get(s, 0) for s in ACTIVE),
+            'failed': counts.get('failed', 0), 'counts': counts, 'revision': revision,
+            'latest_created_at': operation_time(db.scalar(select(func.max(DatasetOperation.created_at)).where(visible_operation()))),
+            'snapshot': utcnow(),
+            'nodes': [{'id': identity, 'name': nodes.get(identity, '本机' if identity == 'local' else identity)}
+                      for identity in sorted(n for n in node_ids if n)]}
+
+
+@router.get('/operations/page')
+def operation_page(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all',
+    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete'] = 'all',
+    node_id: str = Query('all', max_length=64), q: str = Query('', max_length=160),
+    before: datetime | None = None, after: datetime | None = None, through: datetime | None = None, db: Session = Depends(get_db),
+):
+    cutoff = operation_time(before or utcnow())
+    upper = min(cutoff, operation_time(through)) if through else cutoff
+    if after and operation_time(after) > upper:
+        raise HTTPException(422, '开始时间不能晚于结束时间')
+    query = history_query(status, kind, node_id, q, upper, after)
     total = db.scalar(select(func.count()).select_from(query.subquery()))
     # Clamp after cancellations/filter changes without changing the creation snapshot.
     page = min(page, max(1, (total + page_size - 1) // page_size))
@@ -482,6 +498,67 @@ def operation_page(
                       .offset((page - 1) * page_size).limit(page_size))
     return {'items': [operation_read(op, db) for op in rows], 'total': total,
             'page': page, 'page_size': page_size, 'snapshot': cutoff}
+
+
+class HistoryRemovalRequest(BaseModel):
+    ids: list[str] | None = Field(default=None, min_length=1, max_length=500)
+    status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all'
+    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete'] = 'all'
+    node_id: str = Field(default='all', max_length=64)
+    q: str = Field(default='', max_length=160)
+    before: datetime
+    after: datetime | None = None
+    fingerprint: str | None = None
+
+
+def removal_candidates(db, body):
+    if body.after and operation_time(body.after) > operation_time(body.before):
+        raise HTTPException(422, '开始时间不能晚于结束时间')
+    if body.ids is not None:
+        rows = db.execute(select(DatasetOperation.id, DatasetOperation.status).where(DatasetOperation.id.in_(body.ids))).all()
+        if {row.id for row in rows} != set(body.ids):
+            raise HTTPException(404, '部分操作记录不存在，请刷新后重试')
+        if any(row.status not in TERMINAL for row in rows):
+            raise HTTPException(409, '只能删除已完成或已取消的操作记录；失败操作请先重试或取消')
+        removed = set(db.scalars(select(DatasetOperationHistoryRemoval.operation_id).where(DatasetOperationHistoryRemoval.operation_id.in_(body.ids))))
+        identities = [row.id for row in rows if row.id not in removed]
+    else:
+        identities = list(db.scalars(history_query(body.status, body.kind, body.node_id, body.q, body.before, body.after)
+                               .where(DatasetOperation.status.in_(TERMINAL)).with_only_columns(DatasetOperation.id)))
+    fingerprint = hashlib.sha256(json.dumps(sorted(identities)).encode()).hexdigest()
+    return identities, fingerprint
+
+
+@router.post('/operations/history-removal-preview')
+def history_removal_preview(body: HistoryRemovalRequest, db: Session = Depends(get_db)):
+    rows, fingerprint = removal_candidates(db, body)
+    return {'count': len(rows), 'fingerprint': fingerprint}
+
+
+@router.post('/operations/history-removal')
+def remove_history(body: HistoryRemovalRequest, db: Session = Depends(get_db)):
+    with managed_dataset_mutation():
+        rows, fingerprint = removal_candidates(db, body)
+        if not body.fingerprint or fingerprint != body.fingerprint:
+            raise HTTPException(409, '可清理记录已变化，请重新预览并确认数量')
+        # Journal rows, leases and timestamps remain intact for replay and cleanup.
+        db.add_all([DatasetOperationHistoryRemoval(operation_id=identity) for identity in rows])
+        db.commit()
+    return {'removed': len(rows)}
+
+
+@router.delete('/operations/{identity}/history')
+def remove_history_entry(identity: str, db: Session = Depends(get_db)):
+    with managed_dataset_mutation():
+        op = db.get(DatasetOperation, identity)
+        if not op:
+            raise HTTPException(404, '操作记录不存在')
+        if op.status not in TERMINAL:
+            raise HTTPException(409, '只能删除已完成或已取消的操作记录')
+        if not db.get(DatasetOperationHistoryRemoval, identity):
+            db.add(DatasetOperationHistoryRemoval(operation_id=identity))
+            db.commit()
+    return {'removed': 1}
 
 
 @router.get('/operations/{identity}')

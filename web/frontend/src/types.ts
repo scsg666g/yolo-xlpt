@@ -557,6 +557,7 @@ export interface DatasetLocation {
   details: { free_bytes?: number; total_bytes?: number; message?: string; checked_at?: string }
 }
 export interface DatasetOperation {
+  can_delete_history?: boolean
   node_name?: string; source_node?: string; source_node_name?: string; target_node?: string; target_node_name?: string
   id: string; kind: string; status: string; phase: string; name: string; node_id: string
   transferred: number; total_bytes: number; error: string | null; can_cancel: boolean
@@ -571,3 +572,9 @@ export interface DatasetOperationSummary {
 export interface DatasetOperationPage {
   items: DatasetOperation[]; total: number; page: number; page_size: number; snapshot: string
 }
+
+export interface DatasetHistoryRemoval {
+  ids?: string[]; status?: string; kind?: string; node_id?: string; q?: string
+  before: string; after?: string; fingerprint?: string
+}
+export interface DatasetHistoryRemovalPreview { count: number; fingerprint: string }

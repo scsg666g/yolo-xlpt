@@ -1,4 +1,4 @@
-import type { DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -140,6 +140,8 @@ export const api = {
   adoptDataset: (id: string, confirm_path: string) => request(`/api/dataset-storage/datasets/${id}/adopt`, { method: 'POST', body: JSON.stringify({ confirm_path }) }),
   datasetDeletePreview: (id: string) => request<ManagedDataset & { can_delete: boolean }>(`/api/dataset-storage/datasets/${id}/delete-preview`),
   deleteDatasetEntry: (id: string) => request<DatasetOperation>(`/api/dataset-storage/datasets/${id}`, { method: 'DELETE' }),
+  previewDatasetHistoryRemoval: (payload: DatasetHistoryRemoval, signal?: AbortSignal) => requestWithTimeout<DatasetHistoryRemovalPreview>('/api/dataset-storage/operations/history-removal-preview', { method: 'POST', body: JSON.stringify(payload), signal }),
+  removeDatasetHistory: (payload: DatasetHistoryRemoval) => requestWithTimeout<{ removed: number }>('/api/dataset-storage/operations/history-removal', { method: 'POST', body: JSON.stringify(payload) }),
   datasetOperationSummary: (signal?: AbortSignal) => requestWithTimeout<DatasetOperationSummary>('/api/dataset-storage/operations/summary', { signal }),
   datasetOperationPage: (params: URLSearchParams, signal?: AbortSignal) => requestWithTimeout<DatasetOperationPage>(`/api/dataset-storage/operations/page?${params}`, { signal }),
   datasetOperations: () => request<DatasetOperation[]>('/api/dataset-storage/operations'),

@@ -539,3 +539,139 @@ def test_history_summary_revision_ignores_progress_but_tracks_catalogue_and_comp
         op.status = 'completed'
         db.commit()
     assert summary() != catalogued
+
+
+def test_hide_upload_history_keeps_result_files_and_reclamation(env):
+    from datetime import timedelta
+    from app.models import DatasetOperationHistoryRemoval, utcnow
+    client, factory, root, _ = env
+    loc = location(client, root / 'datasets')
+    finish_local()
+    identity = upload(client, loc)
+    finish_local()
+    dataset = entries(client)[0]
+    actual = Path(dataset['directory'])
+    before = operation(client, identity)
+    request = {'ids': [identity], 'before': utcnow().isoformat()}
+    preview = client.post('/api/dataset-storage/operations/history-removal-preview', json=request).json()
+    assert preview['count'] == 1
+    response = client.post('/api/dataset-storage/operations/history-removal', json={**request, 'fingerprint': preview['fingerprint']})
+    assert response.status_code == 200, response.text
+    assert response.json()['removed'] == 1
+    assert operation(client, identity) == before
+    assert (actual / 'data.yaml').is_file() and (actual / 'images/train/a.png').is_file()
+    assert entries(client)[0]['id'] == dataset['id']
+    assert identity not in {j['id'] for j in client.get('/api/dataset-storage/operations').json()}
+    page = client.get('/api/dataset-storage/operations/page', params={'kind': 'upload'}).json()
+    assert page['total'] == 0
+    summary = client.get('/api/dataset-storage/operations/summary').json()
+    assert summary['total'] == 1 and summary['counts'] == {'completed': 1}  # location check remains
+    replay = client.post(f'/api/datasets/uploads/{identity}/complete', json={'names': ['人员']})
+    assert replay.status_code == 200, replay.text
+    with factory() as db:
+        assert db.get(DatasetOperationHistoryRemoval, identity)
+        op = db.get(DatasetOperation, identity)
+        op.updated_at = utcnow() - timedelta(hours=25)
+        db.commit()
+    assert store.job_dir(identity).is_dir()
+    finish_local()
+    assert not store.job_dir(identity).exists()
+    assert not (uploads.UPLOAD_ROOT / identity).exists()
+    assert (actual / 'data.yaml').is_file()
+    assert client.delete(f'/api/dataset-storage/operations/{identity}/history').status_code == 200
+
+
+@pytest.mark.parametrize('status', ['pending', 'running', 'committing', 'failed'])
+def test_history_removal_rejects_unfinished_and_never_partially_hides_selection(env, status):
+    from app.models import DatasetOperationHistoryRemoval, utcnow
+    client, factory, _, _ = env
+    with factory() as db:
+        db.add_all([DatasetOperation(id='protected', node_id='offline', kind='migrate', status=status,
+                    payload={'phase': 'remove', 'published': True, 'commit_started': True}, result={}),
+                    DatasetOperation(id='finished', node_id='local', kind='check', status='completed', payload={}, result={})])
+        db.commit()
+    body = {'ids': ['finished', 'protected'], 'before': utcnow().isoformat()}
+    assert client.post('/api/dataset-storage/operations/history-removal-preview', json=body).status_code == 409
+    assert client.post('/api/dataset-storage/operations/history-removal', json={**body, 'fingerprint': 'invalid'}).status_code == 409
+    assert client.delete('/api/dataset-storage/operations/protected/history').status_code == 409
+    with factory() as db:
+        assert db.get(DatasetOperationHistoryRemoval, 'finished') is None
+        assert db.get(DatasetOperationHistoryRemoval, 'protected') is None
+        assert db.get(DatasetOperation, 'protected').status == status
+
+
+def test_bulk_history_removal_across_pages_nodes_dates_and_offline_agent_replay(env):
+    from datetime import timedelta
+    from app.models import utcnow
+    client, factory, _, _ = env
+    cutoff = utcnow()
+    with factory() as db:
+        db.add_all([DatasetOperation(id=f'{i:032x}', node_id='local', kind='migrate', status='completed',
+                    payload={'name': '安全帽_100%', 'source_node': 'offline-source', 'target_node': 'offline-target', 'phase': 'import'},
+                    result={}, created_at=cutoff - timedelta(hours=1)) for i in range(205)])
+        db.add_all([DatasetOperation(id='old', node_id='local', kind='migrate', status='completed', payload={'name': '安全帽_100%', 'target_node': 'offline-target'}, result={}, created_at=cutoff - timedelta(days=2)),
+                    DatasetOperation(id='active', node_id='offline-target', kind='migrate', status='running', payload={'name': '安全帽_100%'}, result={}, created_at=cutoff - timedelta(minutes=30)),
+                    DatasetOperation(id='failed', node_id='offline-target', kind='migrate', status='failed', payload={'name': '安全帽_100%'}, result={}, created_at=cutoff - timedelta(minutes=30)),
+                    DatasetOperation(id='future', node_id='offline-target', kind='migrate', status='completed', payload={'name': '安全帽_100%'}, result={}, created_at=cutoff + timedelta(hours=1))])
+        db.commit()
+    body = {'node_id': 'offline-target', 'kind': 'migrate', 'q': '_100%', 'before': cutoff.isoformat(), 'after': (cutoff - timedelta(days=1)).isoformat()}
+    preview = client.post('/api/dataset-storage/operations/history-removal-preview', json=body).json()
+    assert preview['count'] == 205  # more than both one page and legacy limit
+    assert client.post('/api/dataset-storage/operations/history-removal', json={**body, 'fingerprint': preview['fingerprint']}).json()['removed'] == 205
+    assert client.get('/api/dataset-storage/operations/page', params={'node_id': 'offline-source'}).json()['total'] == 0
+    page = client.get('/api/dataset-storage/operations/page', params={'page': 11, 'before': cutoff.isoformat()}).json()
+    assert page['page'] == 1 and page['total'] == 3
+    completed = f'{0:032x}'
+    assert client.get(f'/api/dataset-storage/operations/{completed}').status_code == 200
+    # A completed journal still acknowledges late remote completion after it is hidden.
+    ack = client.post(f'/api/dataset-storage/agent/offline-target/{completed}/finish', json={'token': 'old-token', 'phase': 'import', 'result': {}})
+    assert ack.status_code == 200, ack.text
+    assert client.get('/api/dataset-storage/operations/summary').json()['active'] == 1
+    assert client.post('/api/dataset-storage/operations/history-removal-preview', json=body).json()['count'] == 0
+    assert client.get('/api/dataset-storage/operations/page', params={'after': cutoff.isoformat(), 'through': (cutoff - timedelta(days=1)).isoformat()}).status_code == 422
+
+
+def test_history_removal_preview_detects_changed_candidates_and_requires_confirmation(env):
+    from app.models import utcnow
+    client, factory, _, _ = env
+    with factory() as db:
+        db.add_all([DatasetOperation(id='done', node_id='local', kind='check', status='completed', payload={}, result={}),
+                    DatasetOperation(id='finishing', node_id='local', kind='check', status='running', payload={}, result={})])
+        db.commit()
+    body = {'before': utcnow().isoformat()}
+    first = client.post('/api/dataset-storage/operations/history-removal-preview', json=body).json()
+    assert first['count'] == 1
+    assert client.post('/api/dataset-storage/operations/history-removal', json=body).status_code == 409
+    with factory() as db:
+        db.get(DatasetOperation, 'finishing').status = 'completed'
+        db.commit()
+    assert client.post('/api/dataset-storage/operations/history-removal', json={**body, 'fingerprint': first['fingerprint']}).status_code == 409
+    assert client.get('/api/dataset-storage/operations/page').json()['total'] == 2
+    second = client.post('/api/dataset-storage/operations/history-removal-preview', json=body).json()
+    assert second['count'] == 2
+    assert client.post('/api/dataset-storage/operations/history-removal', json={**body, 'fingerprint': second['fingerprint']}).json()['removed'] == 2
+    for request in ({'ids': [], **body}, {'ids': ['missing'], **body}, {'after': 'bad', **body}):
+        assert client.post('/api/dataset-storage/operations/history-removal-preview', json=request).status_code in (404, 422)
+
+
+def test_old_database_gets_history_marker_table_without_changing_existing_jobs(env):
+    from sqlalchemy import inspect
+    from app.models import DatasetOperationHistoryRemoval
+    client, factory, _, _ = env
+    engine = factory.kw['bind']
+    with factory() as db:
+        db.add(DatasetOperation(id='old-cancelled', node_id='offline', kind='upload', status='cancelled',
+                               payload={'phase': 'import', 'target_node': 'offline'}, result={}))
+        db.commit()
+    # Simulate a database from before history cleanup was introduced.
+    DatasetOperationHistoryRemoval.__table__.drop(engine)
+    Base.metadata.create_all(engine)
+    assert inspect(engine).has_table('dataset_operation_history_removals')
+    assert client.get('/api/dataset-storage/operations/page').json()['total'] == 1
+    assert client.delete('/api/dataset-storage/operations/old-cancelled/history').status_code == 200
+    assert client.get('/api/dataset-storage/operations/page').json()['total'] == 0
+    # New sessions keep the visibility marker; cancellation is still durable.
+    with factory() as db:
+        assert db.get(DatasetOperationHistoryRemoval, 'old-cancelled')
+        assert db.get(DatasetOperation, 'old-cancelled').status == 'cancelled'
+    assert client.get('/api/dataset-storage/operations/old-cancelled').json()['status'] == 'cancelled'

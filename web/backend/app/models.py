@@ -371,3 +371,10 @@ class DatasetOperation(Base):
     transferred: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class DatasetOperationHistoryRemoval(Base):
+    """Hide journal entries without changing execution/receipt retention state."""
+    __tablename__ = 'dataset_operation_history_removals'
+    operation_id: Mapped[str] = mapped_column(String(64), ForeignKey('dataset_operations.id'), primary_key=True)
+    removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
