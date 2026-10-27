@@ -257,6 +257,37 @@ body:has(.datasets-page) { min-width: 0; }
 .dataset-location-form label:has(input[type='checkbox']) > span { display: flex; align-items: center; gap: 8px; }
 .dataset-location-form input[type='checkbox'] { width: 16px; height: 16px; margin: 0; flex-shrink: 0; }
 
+/* Registration and migration use a single column, including non-label content. */
+.dataset-action-modal { width: min(740px, calc(100vw - 28px)); max-height: calc(100dvh - 40px); display: flex; flex-direction: column; overflow: visible; }
+.dataset-action-modal > header, .dataset-action-modal > footer { position: static; flex-shrink: 0; }
+.dataset-action-modal > header { gap: 16px; border-radius: 13px 13px 0 0; }
+.dataset-action-modal > header > div { min-width: 0; }
+.dataset-action-modal > header h2 { margin: 0; font-size: 18px; line-height: 1.5; }
+.dataset-action-modal > header p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.dataset-action-modal > header .icon-button { flex-shrink: 0; }
+.dataset-action-modal > footer { border-radius: 0 0 13px 13px; }
+.dataset-action-body { grid-template-columns: minmax(0, 1fr); gap: 20px; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.dataset-action-body > * { min-width: 0; margin: 0; }
+.dataset-action-body label, .dataset-action-field { display: grid; gap: 8px; color: var(--text); font-size: 12px; line-height: 1.6; }
+.dataset-action-body input:not([type='checkbox']), .dataset-action-body select { min-width: 0; height: 42px; font-size: 13px; text-overflow: ellipsis; }
+.dataset-action-body .dataset-server-trigger { width: 100%; min-height: 42px; font-size: 13px; }
+.dataset-action-body small { color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.dataset-action-path { display: grid; gap: 9px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.dataset-action-path strong { color: var(--muted); font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+.dataset-action-path code { display: block; color: var(--text); font-size: 13px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+.dataset-action-help { padding: 14px 16px; border-left: 3px solid var(--green); border-radius: 0 7px 7px 0; background: color-mix(in srgb, var(--green) 5%, var(--panel)); color: var(--muted); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.dataset-action-help strong { color: var(--text); font-weight: 500; }
+.dataset-action-help p { margin: 6px 0 0; }
+.dataset-action-check > span { display: flex; align-items: flex-start; gap: 9px; }
+.dataset-action-check input[type='checkbox'] { width: 16px; height: 16px; margin: 2px 0 0; padding: 0; flex-shrink: 0; accent-color: var(--green); }
+@media (max-width: 600px) {
+  .dataset-action-modal { max-height: calc(100dvh - 24px); }
+  .dataset-action-modal > header, .dataset-action-modal > footer, .dataset-action-body { padding: 16px; }
+  .dataset-action-modal > header h2 { font-size: 16px; }
+  .dataset-action-path, .dataset-action-help { padding: 12px; }
+  .dataset-action-modal > footer .button { flex: 1; }
+}
+
 .dataset-history-drawer { position: relative; }
 .dataset-history-content { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .dataset-history-row-main { display: flex; align-items: center; gap: 8px; }

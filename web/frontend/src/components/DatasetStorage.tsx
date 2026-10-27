@@ -98,11 +98,25 @@ export function DatasetActionModal({ dataset, onClose, onDone }: { dataset?: Man
   const [ownership, setOwnership] = useState('external')
   const [acknowledge, setAcknowledge] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const ref = useModalFocus<HTMLFormElement>(true, onClose, { canClose: !busy })
-  useEffect(() => { let active = true; void api.datasetLocations().then(ls => { if (active) { const valid = ls.filter(l => l.enabled && l.status === 'ready'); setLocations(valid); setTarget(valid.find(l => l.is_default)?.id || valid[0]?.id || '') } }).catch((e: Error) => { if (active) setError(e.message) }); return () => { active = false } }, [])
+  useEffect(() => {
+    const controller = new AbortController()
+    void api.datasetLocations(controller.signal).then(ls => {
+      if (controller.signal.aborted) return
+      const valid = ls.filter(l => l.enabled && l.status === 'ready')
+      setLocations(valid); setTarget(valid.find(l => l.is_default)?.id || valid[0]?.id || '')
+    }).catch((e: Error) => { if (!controller.signal.aborted) setError(e.message) })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    const previous = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => { controller.abort(); document.body.style.overflow = previous }
+  }, [])
   async function submit(e: React.FormEvent) {
-    e.preventDefault(); setBusy(true); setError('')
+    e.preventDefault()
+    if (busy || loading || !target) return
+    setBusy(true); setError('')
     try {
       if (dataset) await api.migrateDataset(dataset.id, target, name, remove)
       else await api.registerDataset(target, name, ownership, acknowledge)
@@ -110,16 +124,22 @@ export function DatasetActionModal({ dataset, onClose, onDone }: { dataset?: Man
     } catch (e) { setError(e instanceof Error ? e.message : '提交失败') } finally { setBusy(false) }
   }
   const location = locations.find(l => l.id === target)
-  return <div className="modal-backdrop" onMouseDown={() => { if (!busy) onClose() }}><form ref={ref} className="modal" role="dialog" aria-modal="true" aria-labelledby="dataset-action-title" onSubmit={submit} onMouseDown={e => e.stopPropagation()}>
-    <header><h2 id="dataset-action-title">{dataset ? '复制或迁移数据集' : '登记服务器已有数据集'}</h2></header>
-    <div className="modal-body form-grid">
-      {dataset && <p className="span-2">源目录：<code>{dataset.directory}</code>。原任务配置和历史路径保留；有引用时只能复制。</p>}
-      <label className="span-2">{dataset ? '目标保存位置' : '已有目录所在位置'}<select required value={target} disabled={busy} onChange={e => setTarget(e.target.value)}>{locations.map(l => <option key={l.id} value={l.id}>{l.node_name || (l.node_id === 'local' ? '本机' : '远程')} · {l.name} · {l.resolved_path}</option>)}</select></label>
-      <label className="span-2">数据集文件夹名称<input required maxLength={160} value={name} disabled={busy} onChange={e => setName(e.target.value)} placeholder="例如：安全帽_v2" /></label>
-      <p className="span-2 dataset-destination-preview">实际目录：<code>{location?.resolved_path || '请先在保存位置中添加并校验目录'}/{name || '文件夹名称'}</code></p>
-      {!dataset && <><p className="span-2">登记要求自包含 YOLO 检测目录（images/train、images/val、labels 和 data.yaml）；会完整校验图片、标签及 SHA-256。远程校验需经过中台传输。</p><label className="span-2">文件管理方式<select value={ownership} onChange={e => setOwnership(e.target.value)}><option value="external">仅登记：保留外部文件所有权</option><option value="managed">接管：允许平台永久删除文件</option></select></label>{ownership === 'managed' && <label className="span-2"><span><input type="checkbox" checked={acknowledge} onChange={e => setAcknowledge(e.target.checked)} />我确认该目录可由平台管理与删除</span></label>}</>}
-      {dataset && <label className="span-2"><span><input type="checkbox" checked={remove} disabled={dataset.references.length > 0 || dataset.ownership !== 'managed'} onChange={e => setRemove(e.target.checked)} />目标校验保存成功后，删除源目录</span><small>未勾选时只复制。任何任务（含历史和回收站）引用源目录时不会清理源文件。</small></label>}
-      {error && <div className="span-2 alert error" role="alert">{error}</div>}
-    </div><footer><button type="button" className="button ghost" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || !target || (ownership === 'managed' && !dataset && !acknowledge)}>{busy ? '正在提交…' : '提交后台处理'}</button></footer>
+  const serverName = (l: DatasetLocation) => l.node_name || (l.node_id === 'local' ? '本机服务器' : l.node_id)
+  const serverOptions = Array.from(new Set(locations.map(l => l.node_id))).map(id => ({ id, name: serverName(locations.find(l => l.node_id === id)!) }))
+  const serverLocations = locations.filter(l => l.node_id === location?.node_id)
+  const destination = location ? `${(location.resolved_path || location.path).replace(/\/+$/, '')}/${name || '文件夹名称'}` : ''
+  return <div className="modal-backdrop" onMouseDown={() => { if (!busy) onClose() }}><form ref={ref} className="modal dataset-action-modal" role="dialog" aria-modal="true" aria-labelledby="dataset-action-title" tabIndex={-1} onSubmit={submit} onMouseDown={e => e.stopPropagation()}>
+    <header><div><h2 id="dataset-action-title">{dataset ? '复制或迁移数据集' : '登记服务器已有数据集'}</h2><p>{dataset ? '选择目标服务器和保存位置，校验成功后完成复制或迁移。' : '将服务器上已有的数据集加入平台，无需重新上传。'}</p></div><button type="button" className="icon-button" aria-label="关闭数据集操作" disabled={busy} onClick={onClose}><X size={20} /></button></header>
+    <div className="modal-body form-grid dataset-action-body" aria-busy={loading}>
+      {dataset && <section className="dataset-action-path"><strong>源目录 · {dataset.node_name || (dataset.node_id === 'local' ? '本机服务器' : dataset.node_id)}</strong><code>{dataset.directory}</code><small>原任务配置和历史路径保留；有引用时只能复制。</small></section>}
+      <div className="dataset-action-field"><span>{dataset ? '目标服务器' : '已有目录所在服务器'}</span><DatasetServerSelect label={dataset ? '目标服务器' : '已有目录所在服务器'} value={location?.node_id || ''} options={serverOptions} disabled={busy || loading || !locations.length} onChange={id => { const candidates = locations.filter(l => l.node_id === id); setTarget((candidates.find(l => l.is_default) || candidates[0]).id) }} /></div>
+      <label>{dataset ? '目标保存位置' : '已有目录所在位置'}<select required aria-label={dataset ? '目标保存位置' : '已有目录所在位置'} title={location?.resolved_path || location?.path} value={target} disabled={busy || loading || !locations.length} onChange={e => setTarget(e.target.value)}>{!target && <option value="">{loading ? '正在加载保存位置…' : '暂无可用保存位置'}</option>}{serverLocations.map(l => <option key={l.id} value={l.id} title={l.resolved_path || l.path}>{l.name}{l.is_default ? '（默认）' : ''}{serverLocations.some(other => other.id !== l.id && other.name === l.name) ? ` · ${l.resolved_path || l.path}` : ''}</option>)}</select></label>
+      {!loading && !locations.length && !error && <p className="dataset-action-help" role="status">暂无已启用且校验通过的保存位置。请关闭此窗口，在“保存位置”中添加并校验服务器目录。</p>}
+      <label>数据集文件夹名称<input required maxLength={160} value={name} disabled={busy} onChange={e => setName(e.target.value)} placeholder="例如：安全帽_v2" aria-describedby="dataset-action-destination" /></label>
+      <section className="dataset-action-path" id="dataset-action-destination"><strong>{dataset ? '目标实际目录' : '实际目录'}{location ? ` · ${serverName(location)}` : ''}</strong>{destination ? <code>{destination}</code> : <small>{loading ? '正在加载保存位置…' : '选择可用保存位置后显示完整目录'}</small>}</section>
+      {!dataset && <><aside className="dataset-action-help"><strong>登记前请确认</strong><p>目录需包含 images/train、images/val、labels 和 data.yaml，且数据文件均在该目录内。</p><p>提交后将在后台完整校验图片、标签及 SHA-256；远程校验需经过中台传输。</p></aside><label>文件管理方式<select value={ownership} disabled={busy} onChange={e => setOwnership(e.target.value)}><option value="external">仅登记：保留外部文件所有权</option><option value="managed">接管：允许平台永久删除文件</option></select><small>{ownership === 'external' ? '仅建立登记信息，平台不会删除原始数据集文件。' : '接管后可在平台删除数据集及其实际文件，请确认目录用途。'}</small></label>{ownership === 'managed' && <label className="dataset-action-check"><span><input type="checkbox" checked={acknowledge} disabled={busy} onChange={e => setAcknowledge(e.target.checked)} />我确认该目录可由平台管理与删除</span></label>}</>}
+      {dataset && <label className="dataset-action-check"><span><input type="checkbox" checked={remove} disabled={busy || dataset.references.length > 0 || dataset.ownership !== 'managed'} onChange={e => setRemove(e.target.checked)} />目标校验保存成功后，删除源目录</span><small>未勾选时只复制。任何任务（含历史和回收站）引用源目录时不会清理源文件。</small></label>}
+      {error && <div className="alert error" role="alert">{error}</div>}
+    </div><footer><button type="button" className="button ghost" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="button primary" disabled={busy || loading || !target || (ownership === 'managed' && !dataset && !acknowledge)}>{busy ? '正在提交…' : '提交后台处理'}</button></footer>
   </form></div>
 }
