@@ -1,7 +1,11 @@
-import { DatasetStorageSettings, DatasetOperationHistory, DatasetActionModal } from './DatasetStorage'
+import { DatasetStorageModal, DatasetActionModal } from './DatasetStorage'
+import { DatasetOperationDrawer } from './DatasetOperationDrawer'
+import { DatasetServerSelect } from './DatasetServerSelect'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  History,
+  Settings2,
   CheckCircle2,
   Database,
   FolderOpen,
@@ -16,7 +20,7 @@ import {
   X,
 } from 'lucide-react'
 import { api, formatBytes, statusLabel } from '../api'
-import type { DatasetUploadResult, ManagedDataset } from '../types'
+import type { ComputeNode, DatasetOperationSummary, DatasetUploadResult, ManagedDataset } from '../types'
 import { UploadDatasetModal } from './UploadDatasetModal'
 
 type DatasetFilter = 'all' | 'deletable' | 'referenced'
@@ -43,6 +47,13 @@ export function Datasets() {
   const [deleting, setDeleting] = useState(false)
   const [actionTarget, setActionTarget] = useState<ManagedDataset | 'register' | null>(null)
   const [serverFilter, setServerFilter] = useState('all')
+  const [storageOpen, setStorageOpen] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [operationSummary, setOperationSummary] = useState<DatasetOperationSummary | null>(null)
+  const [historyError, setHistoryError] = useState('')
+  const [nodes, setNodes] = useState<ComputeNode[]>([])
+  const [summaryRefresh, setSummaryRefresh] = useState(0)
+  const previousSignature = useRef('')
   const loadRequest = useRef<{ version: number; controller: AbortController } | null>(null)
   const loadVersion = useRef(0)
   const deleteDialog = useRef<HTMLDivElement>(null)
@@ -78,6 +89,42 @@ export function Datasets() {
   }, [loadDatasets])
 
   useEffect(() => {
+    let active = true; let running = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let controller: AbortController | null = null
+    async function load() {
+      if (!active || running || document.hidden) return
+      running = true; controller = new AbortController()
+      const result = await Promise.allSettled([api.datasetOperationSummary(controller.signal), api.computeNodes(controller.signal)])
+      if (active && !controller.signal.aborted) {
+        const [history, compute] = result
+        if (history.status === 'fulfilled') {
+          setOperationSummary(history.value); setHistoryError('')
+          const signature = history.value.revision
+          if (previousSignature.current && signature !== previousSignature.current) void loadDatasets()
+          previousSignature.current = signature
+        } else setHistoryError(history.reason instanceof Error ? history.reason.message : '操作统计暂不可用')
+        if (compute.status === 'fulfilled') setNodes(compute.value)
+      }
+      running = false
+      if (active) timer = setTimeout(load, 5000)
+    }
+    function visible() { if (!document.hidden) { clearTimeout(timer); void load() } }
+    void load(); document.addEventListener('visibilitychange', visible)
+    return () => { active = false; controller?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
+  }, [loadDatasets, summaryRefresh])
+
+  const servers = useMemo(() => {
+    const options = new Map<string, { id: string; name: string; status?: string; count?: number }>()
+    options.set('local', { id: 'local', name: '本机（中台）' })
+    for (const n of operationSummary?.nodes || []) options.set(n.id, { id: n.id, name: n.name })
+    for (const d of datasets) if (!options.has(d.node_id)) options.set(d.node_id, { id: d.node_id, name: d.node_name || d.node_id })
+    for (const n of nodes) options.set(n.id, { id: n.id, name: n.kind === 'local' ? '本机（中台）' : n.name, status: !n.enabled ? '已禁用' : n.status === 'online' ? '在线' : n.status === 'pending' ? '待连接' : '离线' })
+    return [{ id: 'all', name: '全部服务器', count: datasets.length }, ...Array.from(options.values()).map(n => ({ ...n, count: datasets.filter(d => d.node_id === n.id).length }))]
+  }, [nodes, datasets, operationSummary])
+  function operationsChanged() { setSummaryRefresh(v => v + 1); void loadDatasets() }
+
+  useEffect(() => {
     if (!deleteTarget) return
     deleteCancelButton.current?.focus()
     return () => {
@@ -102,7 +149,7 @@ export function Datasets() {
     const query = search.trim().toLocaleLowerCase()
     return datasets.filter((dataset) => {
       if (serverFilter !== 'all' && dataset.node_id !== serverFilter) return false
-      if (filter === 'deletable' && dataset.references.length) return false
+      if (filter === 'deletable' && !dataset.can_delete) return false
       if (filter === 'referenced' && !dataset.references.length) return false
       if (!query) return true
       return [dataset.name, dataset.directory, dataset.config_path, ...dataset.classes]
@@ -125,7 +172,7 @@ export function Datasets() {
     const name = deleteTarget.name
     try {
       await api.deleteDatasetEntry(deleteTarget.id)
-      setDatasets((current) => current.filter((dataset) => dataset.id !== deleteTarget.id))
+      operationsChanged()
       setDeleteTarget(null)
       setNotice(`数据集“${name}”已提交永久删除，请在操作历史中查看完成状态。`)
     } catch (reason) {
@@ -187,7 +234,10 @@ export function Datasets() {
         <p>统一管理本机和远程数据集：保存位置、上传、已有目录登记、复制迁移及安全删除。</p>
       </div>
       <div className="header-actions datasets-header-actions">
-        <button type="button" className="button ghost" disabled={loading || deleting} onClick={() => { setNotice(''); void loadDatasets() }}>
+        <button type="button" className="button ghost" onClick={() => setStorageOpen(true)}><Settings2 size={16} />保存位置</button>
+        <button type="button" className="button ghost" title={historyError || '查看全部数据集操作记录'} onClick={() => setHistoryOpen(true)}><History size={16} />操作记录{operationSummary && operationSummary.active > 0 && <span className="dataset-count-badge">{operationSummary.active} 进行中</span>}{operationSummary && operationSummary.failed > 0 && <span className="dataset-count-badge failed">{operationSummary.failed} 失败</span>}{historyError && <AlertTriangle size={14} />}</button>
+        <button type="button" className="button ghost" onClick={() => setActionTarget('register')}><FolderOpen size={16} />登记已有目录</button>
+        <button type="button" className="button ghost" disabled={loading || deleting} onClick={() => { setNotice(''); operationsChanged() }}>
           <RefreshCw size={16} className={loading ? 'spin' : ''} />刷新
         </button>
         <button type="button" className="button primary" disabled={deleting} onClick={() => { setError(''); setNotice(''); setUploading(true) }}>
@@ -198,10 +248,6 @@ export function Datasets() {
 
     {notice && <div className="dataset-feedback success" role="status"><CheckCircle2 size={17} />{notice}</div>}
     {error && <div className="dataset-feedback error" role="alert"><AlertTriangle size={17} /><span>{error}</span><button type="button" onClick={() => setError('')} aria-label="关闭错误提示"><X size={15} /></button></div>}
-
-    <details className="dataset-storage-panel"><summary>保存位置配置</summary><DatasetStorageSettings /></details>
-    <DatasetOperationHistory onChanged={loadDatasets} />
-    <button type="button" className="button ghost" onClick={() => setActionTarget('register')}>登记已有服务器目录</button>
 
     <section className="dataset-overview" aria-label="数据集概览">
       <article><Database size={19} /><div><strong>{summary.count}</strong><span>平台数据集</span></div></article>
@@ -220,7 +266,7 @@ export function Datasets() {
         {([['all', '全部'], ['deletable', '可删除'], ['referenced', '已引用']] as Array<[DatasetFilter, string]>).map(([value, label]) =>
           <button key={value} type="button" className={filter === value ? 'active' : ''} onClick={() => setFilter(value)} aria-pressed={filter === value}>{label}</button>)}
       </div>
-      <select aria-label="按服务器筛选" value={serverFilter} onChange={e => setServerFilter(e.target.value)}><option value="all">全部服务器</option>{Array.from(new Set(datasets.map(d => d.node_id))).map(id => <option key={id} value={id}>{datasets.find(d => d.node_id === id)?.node_name || (id === 'local' ? '本机' : `远程 ${id.slice(0, 8)}`)}</option>)}</select>
+      <DatasetServerSelect options={servers} value={serverFilter} onChange={setServerFilter} />
       <span className="dataset-result-count">当前显示 {visibleDatasets.length} / {datasets.length}</span>
     </section>
 
@@ -229,11 +275,11 @@ export function Datasets() {
         {visibleDatasets.map((dataset) => {
           const referenced = dataset.references.length > 0
           const classCount = dataset.stats.classes ?? dataset.classes.length
-          return <article className="dataset-card" key={dataset.directory}>
+          return <article className="dataset-card" key={dataset.id}>
             <header>
               <div className="dataset-card-icon"><Database size={19} /></div>
               <div className="dataset-card-title"><h2 title={dataset.name}>{dataset.name}</h2><span>{dataset.node_name || (dataset.node_id === 'local' ? '本机' : '远程')} · {dataset.ownership === 'managed' ? '平台管理' : '外部登记'} · {formatCreatedAt(dataset.created_at)}</span></div>
-              <span className={`dataset-reference-state ${referenced ? 'referenced' : 'free'}`}><i />{referenced ? `${dataset.references.length} 个引用` : dataset.ownership === 'managed' ? '无引用' : '外部文件'}</span>
+              <span className={`dataset-reference-state ${dataset.blocking_operation_id ? 'busy' : referenced ? 'referenced' : 'free'}`}><i />{dataset.blocking_operation_id ? '操作未完成' : referenced ? `${dataset.references.length} 个引用` : dataset.ownership === 'managed' ? '无引用' : '外部文件'}</span>
             </header>
 
             <div className="dataset-metrics">
@@ -263,17 +309,19 @@ export function Datasets() {
 
             <footer>
               <span>{valueOrZero(dataset.stats.labels).toLocaleString('zh-CN')} 个标签文件{valueOrZero(dataset.stats.background_images) > 0 ? ` · ${dataset.stats.background_images} 张背景图` : ''}</span>
-              <button type="button" className="button ghost compact" onClick={() => setActionTarget(dataset)}>复制 / 迁移</button>
-              {dataset.ownership === 'external' && <button type="button" className="button ghost compact" onClick={() => { const path = window.prompt(`接管后平台将有权删除文件，请输入完整目录确认：\n${dataset.directory}`); if (path) void api.adoptDataset(dataset.id, path).then(loadDatasets).catch((e: Error) => setError(e.message)) }}>接管文件</button>}
-              <button type="button" className="button danger compact" disabled={referenced || deleting || dataset.ownership !== 'managed'} title={referenced ? '请先更换或永久删除引用该数据集的任务' : '永久删除数据集'} onClick={(event) => openDeleteDialog(dataset, event.currentTarget)}>
-                <Trash2 size={14} />{referenced ? '仍被引用' : '删除'}
+              <button type="button" className="button ghost compact" disabled={!!dataset.blocking_operation_id} onClick={() => setActionTarget(dataset)}>复制 / 迁移</button>
+              {dataset.ownership === 'external' && <button type="button" className="button ghost compact" disabled={!!dataset.blocking_operation_id} onClick={() => { const path = window.prompt(`接管后平台将有权删除文件，请输入完整目录确认：\n${dataset.directory}`); if (path) void api.adoptDataset(dataset.id, path).then(loadDatasets).catch((e: Error) => setError(e.message)) }}>接管文件</button>}
+              <button type="button" className="button danger compact" disabled={!dataset.can_delete || deleting} title={dataset.blocking_operation_id ? '请先完成或取消该数据集的未完成操作' : referenced ? '请先更换或永久删除引用该数据集的任务' : '永久删除数据集'} onClick={(event) => openDeleteDialog(dataset, event.currentTarget)}>
+                <Trash2 size={14} />{dataset.blocking_operation_id ? '操作未完成' : referenced ? '仍被引用' : '删除'}
               </button>
             </footer>
           </article>
         })}
-      </section> : <div className="empty dataset-empty"><Database size={28} /><strong>{datasets.length ? '没有匹配的数据集' : '还没有平台数据集'}</strong><span>{datasets.length ? '请调整搜索关键词或筛选条件。' : '上传 YOLO 数据集文件夹后，可在这里统一管理。'}</span>{!datasets.length && <button type="button" className="button primary" onClick={() => setUploading(true)}><Upload size={15} />上传数据集</button>}</div>}
+      </section> : <div className="empty dataset-empty"><Database size={28} /><strong>{datasets.length ? '没有匹配的数据集' : '还没有平台数据集'}</strong><span>{datasets.length ? '请调整搜索关键词或筛选条件。' : '上传 YOLO 数据集文件夹后，可在这里统一管理。'}</span>{datasets.length > 0 && <button type="button" className="button ghost" onClick={() => { setSearch(''); setFilter('all'); setServerFilter('all') }}>重置筛选</button>}{!datasets.length && <button type="button" className="button primary" onClick={() => setUploading(true)}><Upload size={15} />上传数据集</button>}</div>}
 
-    {actionTarget && <DatasetActionModal dataset={actionTarget === 'register' ? undefined : actionTarget} onClose={() => setActionTarget(null)} onDone={() => { void loadDatasets() }} />}
+    {storageOpen && <DatasetStorageModal onClose={() => { setStorageOpen(false); setSummaryRefresh(v => v + 1) }} />}
+    {historyOpen && <DatasetOperationDrawer onClose={() => setHistoryOpen(false)} onChanged={operationsChanged} summary={operationSummary} servers={servers.map(({ id, name, status }) => ({ id, name, status }))} />}
+    {actionTarget && <DatasetActionModal dataset={actionTarget === 'register' ? undefined : actionTarget} onClose={() => setActionTarget(null)} onDone={operationsChanged} />}
     {uploading && !deleting && <UploadDatasetModal onClose={() => setUploading(false)} onUploaded={(result) => { void handleUploaded(result) }} />}
 
     {deleteTarget && <div className="modal-backdrop dataset-delete-backdrop" onMouseDown={closeDeleteDialog}>

@@ -16,12 +16,13 @@ import shutil
 import threading
 import time
 import uuid
-from datetime import timedelta, timezone
+from typing import Literal
+from datetime import datetime, timedelta, timezone
 
 import yaml
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import dataset_files as files
@@ -78,13 +79,31 @@ def node_has_dataset_work(db, node_id):
                for op in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_(ACTIVE))))
 
 
+def operation_time(value):
+    """SQLite returns naive UTC timestamps; APIs always include the timezone."""
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
 def operation_read(op, db=None):
     value = {'id': op.id, 'kind': op.kind, 'status': op.status, 'phase': op.payload.get('phase'),
              'node_id': op.node_id, 'name': op.payload.get('name', ''), 'error': op.error,
              'transferred': op.transferred, 'total_bytes': op.payload.get('archive_size', 0),
-             'created_at': op.created_at, 'updated_at': op.updated_at, 'result': op.result,
-             'source_path': op.payload.get('source_path'), 'destination': op.payload.get('destination'),
+             'created_at': operation_time(op.created_at), 'updated_at': operation_time(op.updated_at), 'result': op.result,
+             'source_path': op.payload.get('source_path') or op.payload.get('path'), 'destination': op.payload.get('destination'),
              'can_cancel': op.status in ('pending', 'running', 'failed') and not op.payload.get('published') and not op.payload.get('commit_started')}
+    if db:
+        def node_name(identity):
+            node = db.get(ComputeNode, identity) if identity else None
+            return node.name if node else ('本机' if identity == 'local' else identity)
+        value['node_name'] = node_name(op.node_id)
+        for key in ('source_node', 'target_node'):
+            value[key] = op.payload.get(key)
+            value[key + '_name'] = node_name(op.payload.get(key))
+        if not value['name'] and op.payload.get('location_id'):
+            location = db.get(DatasetLocation, op.payload['location_id'])
+            value['name'] = location.name if location else ''
     if db and op.node_id != 'local' and op.status in ACTIVE:
         node = db.get(ComputeNode, op.node_id)
         seen = node.last_seen_at if node else None
@@ -131,12 +150,16 @@ def remote_config_guards(db, node_id, source_path):
 
 def entry_read(entry, db):
     d = entry.details or {}
+    references = reference_rows(db, entry)
+    blocking = busy_entry(db, entry.id)
     return {'id': entry.id, 'location_id': entry.location_id, 'node_id': entry.node_id,
             'name': entry.name, 'node_name': (db.get(ComputeNode, entry.node_id).name if db.get(ComputeNode, entry.node_id) else ('本机' if entry.node_id == 'local' else entry.node_id)), 'directory': entry.path, 'config_path': str(PurePosixPath(entry.path) / 'data.yaml'),
             'ownership': entry.ownership, 'status': entry.status, 'created_at': entry.created_at,
             'total_bytes': d.get('total_bytes', 0), 'stats': d.get('stats', {}), 'classes': d.get('names', []),
             'warnings': d.get('warnings', []), 'fingerprint': d.get('fingerprint'),
-            'history': d.get('history', []), 'references': reference_rows(db, entry)}
+            'history': d.get('history', []), 'references': references,
+            'blocking_operation_id': blocking.id if blocking else None,
+            'can_delete': not references and entry.ownership == 'managed' and entry.status == 'ready' and not blocking}
 
 
 def bootstrap(db):
@@ -169,8 +192,8 @@ def bootstrap(db):
 
 
 def busy_entry(db, identity):
-    return next((op for op in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_((*ACTIVE, 'failed'))))
-                 if op.payload.get('entry_id') == identity), None)
+    return db.scalar(select(DatasetOperation).where(DatasetOperation.status.in_((*ACTIVE, 'failed')),
+                     DatasetOperation.payload['entry_id'].as_string() == identity).limit(1))
 
 
 def mutation_pending(db, node_id):
@@ -341,7 +364,6 @@ def delete_preview(identity: str, db: Session = Depends(get_db)):
     if not e or e.status == 'deleted':
         raise HTTPException(404, '数据集不存在')
     value = entry_read(e, db)
-    value['can_delete'] = not value['references'] and e.ownership == 'managed' and not busy_entry(db, identity)
     return value
 
 
@@ -408,6 +430,58 @@ def delete_entry(identity: str, db: Session = Depends(get_db)):
 @router.get('/operations')
 def list_operations(db: Session = Depends(get_db)):
     return [operation_read(op, db) for op in db.scalars(select(DatasetOperation).order_by(DatasetOperation.created_at.desc()).limit(200))]
+
+
+@router.get('/operations/summary')
+def operation_summary(db: Session = Depends(get_db)):
+    counts = dict(db.execute(select(DatasetOperation.status, func.count()).group_by(DatasetOperation.status)).all())
+    node_ids = set(db.scalars(select(DatasetOperation.node_id).distinct()))
+    for key in ('source_node', 'target_node'):
+        node_ids.update(db.scalars(select(DatasetOperation.payload[key].as_string()).distinct()))
+    nodes = {n.id: n.name for n in db.scalars(select(ComputeNode))}
+    catalog_changed = db.scalar(select(func.max(DatasetEntry.updated_at)))
+    finished_changed = db.scalar(select(func.max(DatasetOperation.updated_at)).where(
+        DatasetOperation.status.in_((*TERMINAL, 'failed'))))
+    # Progress heartbeats do not force a full catalogue/reference reload.
+    revision = json.dumps([counts, str(catalog_changed), str(finished_changed)], sort_keys=True)
+    return {'total': sum(counts.values()), 'active': sum(counts.get(s, 0) for s in ACTIVE),
+            'failed': counts.get('failed', 0), 'counts': counts, 'revision': revision,
+            'latest_created_at': operation_time(db.scalar(select(func.max(DatasetOperation.created_at)))),
+            'snapshot': utcnow(),
+            'nodes': [{'id': identity, 'name': nodes.get(identity, '本机' if identity == 'local' else identity)}
+                      for identity in sorted(n for n in node_ids if n)]}
+
+
+@router.get('/operations/page')
+def operation_page(
+    page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+    status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all',
+    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete'] = 'all',
+    node_id: str = Query('all', max_length=64), q: str = Query('', max_length=160),
+    before: datetime | None = None, db: Session = Depends(get_db),
+):
+    cutoff = operation_time(before or utcnow())
+    query = select(DatasetOperation).where(DatasetOperation.created_at <= cutoff)
+    if status != 'all':
+        statuses = (*ACTIVE, 'failed') if status == 'attention' else ACTIVE if status == 'active' else (status,)
+        query = query.where(DatasetOperation.status.in_(statuses))
+    if kind != 'all':
+        query = query.where(DatasetOperation.kind == kind)
+    if node_id != 'all':
+        query = query.where(or_(DatasetOperation.node_id == node_id,
+                               DatasetOperation.payload['source_node'].as_string() == node_id,
+                               DatasetOperation.payload['target_node'].as_string() == node_id))
+    if q.strip():
+        location_ids = select(DatasetLocation.id).where(DatasetLocation.name.contains(q.strip(), autoescape=True))
+        query = query.where(or_(DatasetOperation.payload['name'].as_string().contains(q.strip(), autoescape=True),
+                               (DatasetOperation.kind == 'check') & DatasetOperation.payload['location_id'].as_string().in_(location_ids)))
+    total = db.scalar(select(func.count()).select_from(query.subquery()))
+    # Clamp after cancellations/filter changes without changing the creation snapshot.
+    page = min(page, max(1, (total + page_size - 1) // page_size))
+    rows = db.scalars(query.order_by(DatasetOperation.created_at.desc(), DatasetOperation.id.desc())
+                      .offset((page - 1) * page_size).limit(page_size))
+    return {'items': [operation_read(op, db) for op in rows], 'total': total,
+            'page': page, 'page_size': page_size, 'snapshot': cutoff}
 
 
 @router.get('/operations/{identity}')

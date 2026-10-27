@@ -438,3 +438,104 @@ def test_remote_config_alias_change_cannot_bypass_reference_protection(env):
     pump(client, factory, remote_root, agent, remote_id)
     assert operation(client, response.json()['id'])['status'] == 'completed'
     assert not Path(a['directory']).exists() and Path(b['directory']).exists()
+
+
+def test_operation_history_all_counts_pagination_snapshot_and_filters(env):
+    from datetime import timedelta, timezone
+    from app.models import utcnow
+    client, factory, _, _ = env
+    timestamp = utcnow() - timedelta(hours=1)
+    with factory() as db:
+        db.add_all([DatasetOperation(id=f'{i:032x}', node_id='local', kind='upload',
+                    status='completed', payload={'name': f'数据集{i}'}, result={}, created_at=timestamp)
+                    for i in range(205)])
+        db.add(DatasetOperation(id='failed', node_id='local', kind='migrate', status='failed',
+               payload={'name': '安全帽_100%', 'source_node': 'old-remote', 'target_node': 'new-remote'},
+               result={}, created_at=timestamp - timedelta(hours=1)))
+        db.add(DatasetOperation(id='active', node_id='old-remote', kind='delete', status='running',
+               payload={'name': '旧数据集'}, result={}, created_at=timestamp - timedelta(hours=2)))
+        db.commit()
+    summary = client.get('/api/dataset-storage/operations/summary').json()
+    assert summary['total'] == 207 and summary['active'] == 1 and summary['failed'] == 1
+    assert {'local', 'old-remote', 'new-remote'} == {n['id'] for n in summary['nodes']}
+    assert summary['latest_created_at'].endswith('Z') or summary['latest_created_at'].endswith('+00:00')
+    first = client.get('/api/dataset-storage/operations/page').json()
+    assert len(first['items']) == 20 and first['total'] == 207
+    assert first['items'][0]['id'] == f'{204:032x}'
+    assert first['items'][0]['created_at'].endswith(('Z', '+00:00'))
+    with factory() as db:
+        db.add(DatasetOperation(id='new', node_id='local', kind='check', status='pending', payload={}, result={}))
+        db.commit()
+    second = client.get('/api/dataset-storage/operations/page', params={'page': 2, 'before': first['snapshot']}).json()
+    assert second['total'] == 207 and second['page'] == 2
+    assert not {j['id'] for j in first['items']} & {j['id'] for j in second['items']}
+    assert second['items'][0]['id'] == f'{184:032x}'
+    for node_id in ('old-remote', 'new-remote'):
+        response = client.get('/api/dataset-storage/operations/page', params={'node_id': node_id, 'kind': 'migrate', 'q': '_100%'}).json()
+        assert response['total'] == 1 and response['items'][0]['id'] == 'failed'
+    assert client.get('/api/dataset-storage/operations/page', params={'status': 'attention', 'before': first['snapshot']}).json()['total'] == 2
+    assert client.get('/api/dataset-storage/operations/page', params={'q': '安全帽X100'}).json()['total'] == 0
+    assert len(client.get('/api/dataset-storage/operations').json()) == 200
+    assert client.get('/api/dataset-storage/operations/page', params={'page': 999}).json()['page'] == 11
+    for params in ({'page': 0}, {'page_size': 101}, {'kind': 'bad'}, {'status': 'bad'}, {'before': 'bad'}):
+        assert client.get('/api/dataset-storage/operations/page', params=params).status_code == 422
+    offset = (timestamp + timedelta(minutes=1)).astimezone(timezone(timedelta(hours=8)))
+    assert client.get('/api/dataset-storage/operations/page', params={'before': offset.isoformat()}).json()['total'] == 207
+
+
+def test_dataset_deletable_state_blocks_external_and_unfinished_operations(env):
+    client, factory, root, _ = env
+    loc = location(client, root / 'datasets')
+    finish_local()
+    upload(client, loc)
+    finish_local()
+    item = entries(client)[0]
+    assert item['can_delete'] and item['blocking_operation_id'] is None
+    with factory() as db:
+        entry = db.get(DatasetEntry, item['id'])
+        entry.ownership = 'external'
+        db.commit()
+    assert not entries(client)[0]['can_delete']
+    with factory() as db:
+        entry = db.get(DatasetEntry, item['id'])
+        entry.ownership = 'managed'
+        db.add(DatasetOperation(id='blocking', node_id='local', kind='migrate', status='failed',
+                               payload={'entry_id': entry.id}, result={}))
+        db.commit()
+    blocked = entries(client)[0]
+    assert not blocked['can_delete'] and blocked['blocking_operation_id'] == 'blocking'
+    assert not client.get(f"/api/dataset-storage/datasets/{item['id']}/delete-preview").json()['can_delete']
+    assert client.post('/api/dataset-storage/operations/blocking/cancel').status_code == 200
+    assert entries(client)[0]['can_delete']
+    result = client.get('/api/dataset-storage/operations/page', params={'kind': 'check', 'q': 'datasets'}).json()
+    assert result['total'] == 1 and result['items'][0]['name'] == 'datasets'
+
+
+def test_history_summary_revision_ignores_progress_but_tracks_catalogue_and_completion(env, monkeypatch):
+    from datetime import timedelta
+    from app.models import utcnow
+    client, factory, _, _ = env
+    with factory() as db:
+        db.add(DatasetOperation(id='work', node_id='local', kind='upload', status='running', payload={}, result={}))
+        db.commit()
+    def summary():
+        return client.get('/api/dataset-storage/operations/summary').json()['revision']
+    initial = summary()
+    with factory() as db:
+        op = db.get(DatasetOperation, 'work')
+        op.transferred = 12345
+        op.updated_at = utcnow() + timedelta(seconds=1)
+        db.commit()
+    assert summary() == initial
+    with factory() as db:
+        db.add(DatasetEntry(id='data', node_id='local', location_id='loc', name='snapshot', path='/test'))
+        db.commit()
+    catalogued = summary()
+    assert catalogued != initial
+    # Aggregate history does not invoke expensive dataset file/reference reads.
+    monkeypatch.setattr(store, 'reference_rows', lambda *_: pytest.fail('summary must not scan references'))
+    with factory() as db:
+        op = db.get(DatasetOperation, 'work')
+        op.status = 'completed'
+        db.commit()
+    assert summary() != catalogued

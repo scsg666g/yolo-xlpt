@@ -366,6 +366,8 @@ export interface ManagedDatasetReference {
 }
 
 export interface ManagedDataset {
+  can_delete?: boolean
+  blocking_operation_id?: string | null
   node_name?: string
   id: string
   node_id: string
@@ -555,8 +557,17 @@ export interface DatasetLocation {
   details: { free_bytes?: number; total_bytes?: number; message?: string; checked_at?: string }
 }
 export interface DatasetOperation {
+  node_name?: string; source_node?: string; source_node_name?: string; target_node?: string; target_node_name?: string
   id: string; kind: string; status: string; phase: string; name: string; node_id: string
   transferred: number; total_bytes: number; error: string | null; can_cancel: boolean
   source_path?: string; destination?: string; waiting_offline?: boolean; waiting_training?: boolean
   created_at: string; updated_at: string; result: Partial<DatasetUploadResult> & { dataset_id?: string }
+}
+
+export interface DatasetOperationSummary {
+  total: number; active: number; failed: number; revision: string; counts: Record<string, number>
+  latest_created_at: string | null; snapshot: string; nodes: Array<{ id: string; name: string }>
+}
+export interface DatasetOperationPage {
+  items: DatasetOperation[]; total: number; page: number; page_size: number; snapshot: string
 }
