@@ -321,6 +321,7 @@ export interface ComputeNode extends ComputeNodeSettings {
     python_version: string | null
     output_writable: boolean
     output_roots?: string[]
+    dataset_discovery?: boolean
     model_test_roots?: string[]
     lock_occupied: boolean
     gpu_parallelism?: boolean
@@ -562,7 +563,7 @@ export interface DatasetOperation {
   id: string; kind: string; status: string; phase: string; name: string; node_id: string
   transferred: number; total_bytes: number; error: string | null; can_cancel: boolean
   source_path?: string; destination?: string; waiting_offline?: boolean; waiting_training?: boolean
-  created_at: string; updated_at: string; result: Partial<DatasetUploadResult> & { dataset_id?: string }
+  created_at: string; updated_at: string; result: Partial<DatasetUploadResult> & { dataset_id?: string; visited?: number; found?: number; limited?: boolean; limit_reason?: string }
 }
 
 export interface DatasetOperationSummary {
@@ -578,3 +579,24 @@ export interface DatasetHistoryRemoval {
   before: string; after?: string; fingerprint?: string
 }
 export interface DatasetHistoryRemovalPreview { count: number; fingerprint: string }
+
+export interface DatasetScanRequest {
+  request_id: string; location_ids: string[]; depth: number; max_candidates: number; max_directories: number; max_seconds: number
+}
+export interface DatasetScanProgress {
+  visited?: number; found?: number; skipped_links?: number; skipped_depth?: number; limited?: boolean; limit_reason?: string; current_path?: string
+}
+export interface DatasetScan {
+  id: string; specification: Omit<DatasetScanRequest, 'request_id'>; created_at: string; status: string
+  operations: Array<DatasetOperation & { progress: DatasetScanProgress }>; counts: Record<string, number>
+}
+export interface DatasetCandidate {
+  id: string; location_id: string; node_id: string; node_name: string; path: string; relative_path: string; name: string
+  state: string; reason: string; task: string; classes: string[]; selection_token: string
+}
+export interface DatasetCandidatePage { items: DatasetCandidate[]; total: number; counts: Record<string, number>; page: number; page_size: number }
+export interface DatasetBatchRequest { request_id: string; candidate_ids: string[]; candidate_tokens: Record<string, string>; ownership: 'external' | 'managed'; acknowledge: boolean }
+export interface DatasetRegistrationBatch {
+  id: string; session_id: string; created_at: string; status: string; counts: Record<string, number>
+  items: Array<{ candidate_id: string; name: string; path: string; node_id: string; status: string; error?: string; operation_id?: string; phase?: string; can_cancel?: boolean }>
+}

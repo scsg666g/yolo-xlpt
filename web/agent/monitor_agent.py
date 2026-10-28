@@ -31,7 +31,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -350,7 +350,7 @@ def training_capability(config: dict) -> dict:
                 "python_version": platform.python_version(), "output_writable": False,
                 "lock_occupied": False, "output_roots": [], "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", []))}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True}
     reported_roots = []
     try:
         reported_roots = [str(root) for root in configured_output_roots(config)]
@@ -390,7 +390,7 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": occupied,
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", []))}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True}
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
@@ -398,7 +398,7 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": False,
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", []))}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True}
 
 
 def next_report_sequence() -> int:
@@ -2846,6 +2846,12 @@ DATASET_FILES = {}
 exec(compile(DATASET_FILES_SOURCE, "<dataset_files>", "exec"), DATASET_FILES)
 # END PORTABLE DATASET CORE
 
+# BEGIN PORTABLE DISCOVERY CORE (generated from backend/app/dataset_discovery_files.py)
+DATASET_DISCOVERY_SOURCE = '"""Read-only, bounded discovery. Standard library only; also embedded in the Agent."""\nfrom __future__ import annotations\n\nimport hashlib\nimport os\nfrom pathlib import Path\nimport stat\nimport time\nimport uuid\n\nCONFIG_LIMIT = 64 * 1024\nSKIP = {\'images\', \'labels\', \'train\', \'val\', \'test\', \'runs\', \'weights\', \'node_modules\', \'__pycache__\'}\n\n\ndef discover(path, roots, limits, report, check):\n    """Publish small idempotent chunks; never read image/label contents or write sources.\n\n    A restart begins a new generation, so old partial candidates cannot be mistaken\n    for the completed result. The centre retains the last progress across restarts.\n    """\n    root = Path(path)\n    if not root.is_absolute() or root != root.resolve() or not root.is_dir():\n        raise ValueError(\'扫描目录不存在或包含符号链接\')\n    if not any(root == Path(r).resolve() or Path(r).resolve() in root.parents for r in roots):\n        raise ValueError(\'扫描目录不在允许范围内\')\n    depth = int(limits.get(\'depth\', 3))\n    maximum = int(limits.get(\'max_candidates\', 500))\n    directories = int(limits.get(\'max_directories\', 10000))\n    seconds = int(limits.get(\'max_seconds\', 120))\n    if not (0 <= depth <= 12 and 1 <= maximum <= 2000 and 1 <= directories <= 50000 and 5 <= seconds <= 600):\n        raise ValueError(\'扫描限制无效\')\n    generation = uuid.uuid4().hex\n    progress = {\'generation\': generation, \'visited\': 0, \'found\': 0, \'skipped_links\': 0,\n                \'skipped_depth\': 0, \'limited\': False, \'limit_reason\': \'\', \'current_path\': str(root)}\n    pending, stack = [], [(root, 0)]\n    started = last_report = time.monotonic()\n    entries_seen = 0\n\n    def flush(force=False):\n        nonlocal pending, last_report\n        if force or len(pending) >= 20 or time.monotonic() - last_report >= 2:\n            report({**progress, \'candidates\': pending})\n            pending = []\n            last_report = time.monotonic()\n\n    def limit(reason):\n        progress.update(limited=True, limit_reason=reason)\n\n    flush(True)\n    while stack:\n        check()\n        if progress[\'visited\'] >= directories:\n            limit(\'达到目录数量上限，请缩小扫描位置或调高限制\'); break\n        if time.monotonic() - started >= seconds:\n            limit(\'达到扫描时间上限，请缩小扫描位置或调高限制\'); break\n        directory, level = stack.pop()\n        progress.update(visited=progress[\'visited\'] + 1, current_path=str(directory))\n        item = None\n        try:\n            # Recheck every parent, rather than following a link swapped in mid-scan.\n            if directory != directory.resolve() or not directory.is_dir():\n                progress[\'skipped_links\'] += 1\n                continue\n            children, names = [], set()\n            with os.scandir(directory) as iterator:\n                for entry in iterator:\n                    entries_seen += 1\n                    if entries_seen % 128 == 0:\n                        check(); flush()\n                    if time.monotonic() - started >= seconds or entries_seen > directories * 100:\n                        limit(\'达到扫描时间或目录项数量上限，请缩小扫描范围\'); break\n                    if entry.name.startswith(\'.\'):\n                        continue\n                    if entry.name in {\'data.yaml\', \'data.yml\', \'images\', \'train\', \'val\'}:\n                        names.add(entry.name)\n                    if entry.is_symlink():\n                        progress[\'skipped_links\'] += 1\n                    elif entry.name not in SKIP and entry.is_dir(follow_symlinks=False):\n                        children.append(Path(entry.path))\n                        if len(children) + len(stack) > directories:\n                            limit(\'达到待检查目录数量上限，请缩小扫描范围\'); break\n            likely = \'data.yaml\' in names or \'data.yml\' in names or \'images\' in names or (\'train\' in names and \'val\' in names)\n            if likely:\n                item = {\'relative_path\': directory.relative_to(root).as_posix(), \'state\': \'needs_attention\',\n                        \'reason\': \'\', \'config_text\': \'\', \'config_sha256\': \'\',\n                        \'structure\': {n: (directory / n).is_dir() and not (directory / n).is_symlink()\n                                      for n in (\'images/train\', \'images/val\', \'labels\', \'train\', \'val\')}}\n                config = directory / \'data.yaml\'\n                if \'data.yaml\' not in names:\n                    item[\'reason\'] = \'缺少 data.yaml；请整理目录或使用上传导入\'\n                    if \'train\' in names and \'val\' in names and \'images\' not in names:\n                        item.update(state=\'unsupported\', reason=\'疑似分类数据集，当前登记校验器仅支持目标检测\')\n                else:\n                    flags = os.O_RDONLY | getattr(os, \'O_NOFOLLOW\', 0) | getattr(os, \'O_NONBLOCK\', 0)\n                    with os.fdopen(os.open(config, flags), \'rb\') as handle:\n                        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):\n                            raise ValueError(\'data.yaml 必须是普通文件\')\n                        raw = handle.read(CONFIG_LIMIT + 1)\n                    if len(raw) > CONFIG_LIMIT:\n                        item[\'reason\'] = \'data.yaml 超过扫描配置大小上限（64 KiB）\'\n                    else:\n                        item.update(state=\'candidate\', config_text=raw.decode(\'utf-8-sig\'),\n                                    config_sha256=hashlib.sha256(raw).hexdigest())\n            # Dataset internals are excluded, but nested sibling versions remain discoverable.\n            if level < depth:\n                stack.extend((child, level + 1) for child in sorted(children, reverse=True))\n            else:\n                progress[\'skipped_depth\'] += len(children)\n        except (OSError, UnicodeError, ValueError) as exc:\n            item = {\'relative_path\': directory.relative_to(root).as_posix(), \'state\': \'inaccessible\',\n                    \'reason\': (\'无法检查目录或配置：\' + str(exc))[:600], \'config_text\': \'\', \'config_sha256\': \'\', \'structure\': {}}\n        if item:\n            pending.append(item); progress[\'found\'] += 1\n        flush()\n        if progress[\'limited\']:\n            break\n        if progress[\'found\'] >= maximum:\n            if stack:\n                limit(\'达到候选数量上限，请缩小扫描位置或调高限制\')\n            break\n    flush(True)\n    return progress\n'
+DATASET_DISCOVERY = {}
+exec(compile(DATASET_DISCOVERY_SOURCE, '<dataset_discovery_files>', 'exec'), DATASET_DISCOVERY)
+# END PORTABLE DISCOVERY CORE
+
 def dataset_api(config, path, method='GET', payload=None, timeout=120):
     """Larger bounded response for a 200k-file manifest; redirects stay disabled."""
     headers = {'Authorization': 'Bearer ' + config['token'], 'Content-Type': 'application/json'}
@@ -2904,7 +2910,11 @@ def run_dataset_operation(config, work, stop):
                 if training_lock is None:
                     return  # Busy workspace is retried after the lease expires.
             roots = config['dataset_roots']
-            if phase == 'check':
+            if phase == 'discover':
+                def report(progress):
+                    dataset_api(config, base + '/heartbeat', 'POST', {'token': token, 'phase': phase, 'result': progress})
+                result = DATASET_DISCOVERY['discover'](work['path'], roots, work['limits'], report, check)
+            elif phase == 'check':
                 raw = Path(work['path']).expanduser()
                 path = raw if raw.is_absolute() else Path(config['training_cwd']) / raw
                 result = DATASET_FILES['check_root'](str(path.absolute()), roots, work.get('create', False))

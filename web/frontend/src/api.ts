@@ -1,4 +1,4 @@
-import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -129,6 +129,14 @@ export const api = {
   completeDatasetUpload: (id: string, names: string[], signal: AbortSignal) =>
     request<DatasetUploadResult | { operation: DatasetOperation }>(`/api/datasets/uploads/${id}/complete`, { method: 'POST', body: JSON.stringify({ names }), signal }),
   cancelDatasetUpload: (id: string) => request<void>(`/api/datasets/uploads/${id}`, { method: 'DELETE' }),
+  datasetScans: (signal?: AbortSignal) => requestWithTimeout<DatasetScan[]>('/api/dataset-storage/discovery/scans', { signal }),
+  createDatasetScan: (payload: DatasetScanRequest) => requestWithTimeout<DatasetScan>('/api/dataset-storage/discovery/scans', { method: 'POST', body: JSON.stringify(payload) }),
+  cancelDatasetScan: (id: string) => requestWithTimeout<DatasetScan>(`/api/dataset-storage/discovery/scans/${id}/cancel`, { method: 'POST' }),
+  datasetScan: (id: string, signal?: AbortSignal) => requestWithTimeout<DatasetScan>(`/api/dataset-storage/discovery/scans/${id}`, { signal }),
+  datasetCandidates: (id: string, params: URLSearchParams, signal?: AbortSignal) => requestWithTimeout<DatasetCandidatePage>(`/api/dataset-storage/discovery/scans/${id}/candidates?${params}`, { signal }),
+  datasetRegistrationBatches: (id: string, signal?: AbortSignal) => requestWithTimeout<DatasetRegistrationBatch[]>(`/api/dataset-storage/discovery/scans/${id}/batches`, { signal }),
+  registerDatasetBatch: (id: string, payload: DatasetBatchRequest) => requestWithTimeout<DatasetRegistrationBatch>(`/api/dataset-storage/discovery/scans/${id}/batches`, { method: 'POST', body: JSON.stringify(payload) }),
+  cancelDatasetBatch: (id: string) => requestWithTimeout<DatasetRegistrationBatch>(`/api/dataset-storage/discovery/batches/${id}/cancel`, { method: 'POST' }),
   datasetLocations: (signal?: AbortSignal) => requestWithTimeout<DatasetLocation[]>('/api/dataset-storage/locations', { signal }),
   createDatasetLocation: (payload: { node_id: string; name: string; path: string; create: boolean; is_default: boolean }) => request<{ id: string; operation_id: string }>('/api/dataset-storage/locations', { method: 'POST', body: JSON.stringify(payload) }),
   updateDatasetLocation: (id: string, enabled: boolean, is_default: boolean) => request(`/api/dataset-storage/locations/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled, is_default }) }),

@@ -7,7 +7,7 @@ import { useModalFocus } from '../useModalFocus'
 import { DatasetServerSelect, type DatasetServerOption } from './DatasetServerSelect'
 
 const statuses: Record<string, string> = { pending: '等待处理', running: '正在处理', committing: '提交文件中', completed: '已完成', failed: '失败', cancelled: '已取消' }
-const kinds: Record<string, string> = { check: '目录检查', upload: '上传', register: '登记', migrate: '复制 / 迁移', delete: '永久删除' }
+const kinds: Record<string, string> = { discover: '目录扫描', check: '目录检查', upload: '上传', register: '登记', migrate: '复制 / 迁移', delete: '永久删除' }
 
 export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }: {
   onClose: () => void; onChanged: () => void; summary: DatasetOperationSummary | null; servers: DatasetServerOption[]
@@ -128,6 +128,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
             <p>{j.waiting_offline ? '等待远程节点上线' : j.waiting_training ? '等待训练任务结束' : datasetPhaseLabel[j.phase] || j.phase}</p>
             <small>更新于 {new Date(j.updated_at).toLocaleString('zh-CN')} · 编号 {j.id}</small>
             {(j.source_path || j.destination) && <code>{j.source_path || '浏览器上传'}{j.destination ? ` → ${j.destination}` : ''}</code>}
+            {j.phase === 'discover' && <p>已检查 {j.result.visited || 0} 个目录 · 发现 {j.result.found || 0} 个候选{j.result.limited ? ` · 扫描达到限制：${j.result.limit_reason}` : ''}。候选与批次详情请打开“扫描已有数据集”。</p>}
             {j.transferred > 0 && <p>已传 {formatBytes(j.transferred)}{j.total_bytes ? ` / ${formatBytes(j.total_bytes)}` : ''}</p>}
             {j.error && <p role="alert" className="dataset-operation-error">{j.error}</p>}
             {j.result.directory && <code>目标已保存：{j.result.directory}</code>}

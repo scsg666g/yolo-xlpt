@@ -16,7 +16,7 @@ from PIL import Image
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app import dataset_files as core, dataset_store as store, dataset_uploads as uploads, services
+from app import dataset_files as core, dataset_store as store, dataset_uploads as uploads, services, dataset_discovery as discovery
 from app.database import Base, get_db
 from app.models import ComputeNode, DatasetEntry, DatasetOperation, TrainingTask
 
@@ -38,6 +38,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(services, 'DATASET_ROOTS', [tmp_path / 'legacy'])
     app = FastAPI()
     app.include_router(store.router)
+    app.include_router(discovery.router)
     app.include_router(uploads.router)
     app.include_router(uploads.management_router)
     def override():
@@ -675,3 +676,251 @@ def test_old_database_gets_history_marker_table_without_changing_existing_jobs(e
         assert db.get(DatasetOperationHistoryRemoval, 'old-cancelled')
         assert db.get(DatasetOperation, 'old-cancelled').status == 'cancelled'
     assert client.get('/api/dataset-storage/operations/old-cancelled').json()['status'] == 'cancelled'
+
+
+def make_existing(path, *, config=None, bad_label=False):
+    path.mkdir(parents=True, exist_ok=True)
+    for relative, content in images().items():
+        target = path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    (path / 'data.yaml').write_text(yaml.safe_dump(config or {'path': '.', 'train': 'images/train', 'val': 'images/val', 'names': ['人员']}, allow_unicode=True))
+    if bad_label:
+        (path / 'labels/train/a.txt').write_text('9 0.5 0.5 0.2 0.2\n')
+
+
+def start_scan(client, locations, **options):
+    payload = {'request_id': uuid.uuid4().hex, 'location_ids': locations, **options}
+    response = client.post('/api/dataset-storage/discovery/scans', json=payload)
+    assert response.status_code == 202, response.text
+    return response.json(), payload
+
+
+def candidates(client, identity, **params):
+    response = client.get(f'/api/dataset-storage/discovery/scans/{identity}/candidates', params=params)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_discovery_nested_batch_local_replay_and_partial_failure(env):
+    client, _, root, _ = env
+    loc = location(client, root / 'data'); finish_local()
+    make_existing(root / 'data/yan/v2')
+    make_existing(root / 'data/bad-labels', bad_label=True)
+    (root / 'data/incomplete/images').mkdir(parents=True)
+    scan, spec = start_scan(client, [loc]); finish_local()
+    assert client.post('/api/dataset-storage/discovery/scans', json=spec).json()['id'] == scan['id']
+    result = candidates(client, scan['id'])
+    assert result['counts'] == {'needs_attention': 1, 'ready': 2}
+    chosen = [c['id'] for c in result['items'] if c['state'] == 'ready']
+    payload = {'request_id': uuid.uuid4().hex, 'candidate_ids': chosen, 'candidate_tokens': {c['id']: c['selection_token'] for c in result['items'] if c['state'] == 'ready'}}
+    url = f"/api/dataset-storage/discovery/scans/{scan['id']}/batches"
+    response = client.post(url, json=payload)
+    assert response.status_code == 202, response.text
+    batch = response.json()
+    assert batch['counts']['pending'] == 2
+    assert client.post(url, json=payload).json()['id'] == batch['id']
+    assert client.post('/api/dataset-storage/datasets/register', json={'location_id': loc, 'relative_path': 'yan/v2'}).status_code == 409
+    finish_local()
+    batch = client.get(url).json()[0]
+    assert batch['counts']['completed'] == 1 and batch['counts']['failed'] == 1
+    assert batch['status'] == 'completed_with_errors'
+    registered = entries(client)
+    assert len(registered) == 1 and registered[0]['directory'] == str(root / 'data/yan/v2')
+    assert registered[0]['ownership'] == 'external'
+    assert not (root / 'data/yan/v2/.yolo-platform-dataset.json').exists()
+    counts = candidates(client, scan['id'])['counts']
+    assert counts['registered'] == 1 and counts['registering'] == 1
+    failed_op = next(i['operation_id'] for i in batch['items'] if i['status'] == 'failed')
+    assert client.post('/api/dataset-storage/operations/' + failed_op + '/cancel').status_code == 200
+    assert candidates(client, scan['id'])['counts']['ready'] == 1
+    assert client.post(url, json={**payload, 'ownership': 'managed', 'acknowledge': True}).status_code == 409
+
+
+def test_discovery_overlap_limits_and_no_source_mutation(env):
+    client, _, root, agent = env
+    from app import dataset_discovery_files as portable
+    assert agent.DATASET_DISCOVERY_SOURCE == Path(portable.__file__).read_text()
+    outer = location(client, root / 'data'); finish_local()
+    inner = location(client, root / 'data/nested'); finish_local()
+    make_existing(root / 'data/nested/a'); make_existing(root / 'data/z'); make_existing(root / 'outside')
+    (root / 'data/linked').symlink_to(root / 'outside', target_is_directory=True)
+    before = {str(p): p.read_bytes() for p in (root / 'data').rglob('*') if p.is_file() and not p.is_symlink()}
+    scan, _ = start_scan(client, [outer, inner]); finish_local()
+    result = candidates(client, scan['id'])
+    assert result['total'] == 2
+    assert not any('/linked' in c['path'] for c in result['items'])
+    assert candidates(client, scan['id'], page=50, page_size=1)['page'] == 2
+    assert candidates(client, scan['id'], q='nested')['total'] == 1
+    assert before == {str(p): p.read_bytes() for p in (root / 'data').rglob('*') if p.is_file() and not p.is_symlink()}
+    limited, _ = start_scan(client, [outer], max_candidates=1); finish_local()
+    summary = client.get('/api/dataset-storage/discovery/scans/' + limited['id']).json()
+    assert summary['operations'][0]['progress']['limited'] is True
+    assert candidates(client, limited['id'])['total'] == 1
+    shallow, _ = start_scan(client, [outer], depth=0); finish_local()
+    assert candidates(client, shallow['id'])['total'] == 0
+    assert client.get('/api/dataset-storage/discovery/scans/' + shallow['id']).json()['operations'][0]['progress']['skipped_depth'] > 0
+
+
+def test_discovery_remote_capability_chunks_and_batch_registration(env):
+    client, factory, root, agent = env
+    remote = node(factory, root / 'remote')
+    loc = location(client, root / 'remote', remote)
+    pump(client, factory, root / 'remote', agent, remote)
+    assert client.post('/api/dataset-storage/discovery/scans', json={'request_id': uuid.uuid4().hex, 'location_ids': [loc]}).status_code == 409
+    with factory() as db:
+        n = db.get(ComputeNode, remote)
+        n.agent_version, n.snapshot = '2.2.0', {'training': {'dataset_roots': [str(root / 'remote')], 'dataset_discovery': True}}
+        db.commit()
+    for i in range(23):
+        make_existing(root / f'remote/版本{i}')
+    scan, _ = start_scan(client, [loc]); pump(client, factory, root / 'remote', agent, remote)
+    result = candidates(client, scan['id'], page_size=100)
+    assert result['total'] == 23 and result['counts']['ready'] == 23
+    op = client.get('/api/dataset-storage/discovery/scans/' + scan['id']).json()['operations'][0]
+    assert op['progress']['found'] == 23 and not store.job_dir(op['id']).exists()
+    payload = {'request_id': uuid.uuid4().hex, 'candidate_ids': [result['items'][0]['id']], 'candidate_tokens': {result['items'][0]['id']: result['items'][0]['selection_token']}}
+    url = f"/api/dataset-storage/discovery/scans/{scan['id']}/batches"
+    batch = client.post(url, json=payload).json()
+    pump(client, factory, root / 'remote', agent, remote)
+    assert client.get(url).json()[0]['counts']['completed'] == 1
+    assert entries(client)[0]['node_id'] == remote
+    with factory() as db:
+        row = db.get(DatasetOperation, op['id'])
+        receipt = {'token': row.lease, 'phase': 'discover', 'result': row.result}
+    assert client.post(f"/api/dataset-storage/agent/{remote}/{op['id']}/finish", json=receipt).status_code == 200
+    assert candidates(client, scan['id'])['total'] == 23
+    assert len(entries(client)) == 1 and batch['id'] == payload['request_id']
+
+
+def test_discovery_configuration_change_requires_rescan_and_batch_cancel(env):
+    client, _, root, _ = env
+    loc = location(client, root / 'data'); finish_local()
+    make_existing(root / 'data/a'); make_existing(root / 'data/b')
+    scan, _ = start_scan(client, [loc]); finish_local()
+    chosen = candidates(client, scan['id'])['items']
+    (root / 'data/a/data.yaml').write_text('train: images/train\nval: images/val\nnames: [changed]\n')
+    url = f"/api/dataset-storage/discovery/scans/{scan['id']}/batches"
+    first = client.post(url, json={'request_id': uuid.uuid4().hex, 'candidate_ids': [chosen[0]['id']], 'candidate_tokens': {chosen[0]['id']: chosen[0]['selection_token']}}).json()
+    finish_local()
+    failed = client.get(url).json()[0]['items'][0]
+    assert failed['status'] == 'failed' and '扫描后发生变化' in failed['error']
+    assert not entries(client)
+    second = client.post(url, json={'request_id': uuid.uuid4().hex, 'candidate_ids': [chosen[1]['id']], 'candidate_tokens': {chosen[1]['id']: chosen[1]['selection_token']}}).json()
+    stopped = client.post('/api/dataset-storage/discovery/batches/' + second['id'] + '/cancel').json()
+    assert stopped['counts']['cancelled'] == 1
+    finish_local(); assert not entries(client)
+    assert client.get('/api/dataset-storage/operations/' + first['items'][0]['operation_id']).json()['can_cancel']
+
+
+def test_discovery_cancel_generations_and_untrusted_remote_paths(env):
+    client, factory, root, _ = env
+    remote = node(factory, root / 'remote')
+    from app.models import DatasetLocation
+    with factory() as db:
+        n = db.get(ComputeNode, remote)
+        n.agent_version = '2.2.0'
+        n.snapshot = {'training': {'dataset_roots': [str(root / 'remote')], 'dataset_discovery': True}}
+        loc = DatasetLocation(id=uuid.uuid4().hex, node_id=remote, name='远程盘', path=str(root / 'remote'), resolved_path=str(root / 'remote'), enabled=True, status='ready')
+        db.add(loc); db.commit(); loc_id = loc.id
+    scan, _ = start_scan(client, [loc_id])
+    op = client.post(f'/api/dataset-storage/agent/{remote}/poll').json()['operation']
+    url = f"/api/dataset-storage/agent/{remote}/{op['id']}/heartbeat"
+    progress = {'generation': uuid.uuid4().hex, 'visited': 1, 'found': 1, 'candidates': [{'relative_path': '../escape', 'state': 'needs_attention'}]}
+    payload = {'token': op['token'], 'phase': 'discover', 'result': progress}
+    assert client.post(url, json=payload).status_code == 422
+    progress['candidates'][0]['relative_path'] = 'a'
+    assert client.post(url, json=payload).status_code == 200
+    assert candidates(client, scan['id'])['counts']['scan_incomplete'] == 1
+    progress.update(generation=uuid.uuid4().hex, found=0, candidates=[])
+    assert client.post(url, json=payload).status_code == 200
+    assert candidates(client, scan['id'])['total'] == 0
+    assert client.post('/api/dataset-storage/discovery/scans/' + scan['id'] + '/cancel').status_code == 200
+    assert client.post(url, json=payload).status_code == 409
+    assert client.get('/api/dataset-storage/operations/page', params={'kind': 'discover'}).json()['total'] == 1
+    assert client.delete('/api/dataset-storage/operations/' + op['id'] + '/history').status_code == 200
+    assert client.get('/api/dataset-storage/operations/page', params={'kind': 'discover'}).json()['total'] == 0
+    assert client.get('/api/dataset-storage/discovery/scans/' + scan['id']).status_code == 200
+
+
+@pytest.mark.parametrize('relative', ['../outside', 'a/../../outside', '/absolute', 'a//b', 'a/./b', '.hidden', 'a\\b'])
+def test_manual_nested_registration_rejects_unsafe_paths(env, relative):
+    client, _, root, _ = env
+    loc = location(client, root / 'data'); finish_local()
+    assert client.post('/api/dataset-storage/datasets/register', json={'location_id': loc, 'relative_path': relative}).status_code == 422
+
+
+def test_discovery_rescan_invalidates_selection_and_old_database_adds_tables(env):
+    client, factory, root, _ = env
+    from app.models import DatasetDiscoveryCandidate
+    loc = location(client, root / 'data'); finish_local()
+    make_existing(root / 'data/a')
+    scan, _ = start_scan(client, [loc]); finish_local()
+    chosen = candidates(client, scan['id'])['items'][0]
+    # A restarted scan can reuse candidate IDs; the preview generation must still match.
+    with factory() as db:
+        candidate = db.get(DatasetDiscoveryCandidate, chosen['id'])
+        candidate.generation = uuid.uuid4().hex
+        op = db.get(DatasetOperation, candidate.operation_id)
+        op.result = {**op.result, 'generation': candidate.generation}
+        db.commit()
+    result = client.post(f"/api/dataset-storage/discovery/scans/{scan['id']}/batches", json={
+        'request_id': uuid.uuid4().hex, 'candidate_ids': [chosen['id']], 'candidate_tokens': {chosen['id']: chosen['selection_token']}})
+    assert result.status_code == 202, result.text
+    assert result.json()['counts']['skipped'] == 1
+    assert '预览后发生变化' in result.json()['items'][0]['error']
+    assert not entries(client)
+    # Empty old schemas gain only the new tables; pre-existing legacy rows remain intact.
+    from app.models import DatasetDiscoverySession, DatasetRegistrationBatch
+    engine = create_engine(f'sqlite:///{root}/old-schema.db')
+    new_tables = {m.__table__ for m in (DatasetDiscoveryCandidate, DatasetDiscoverySession, DatasetRegistrationBatch)}
+    Base.metadata.create_all(engine, tables=[t for t in Base.metadata.sorted_tables if t not in new_tables])
+    with engine.begin() as conn:
+        conn.execute(DatasetOperation.__table__.insert().values(id='old-op', kind='check', node_id='local', status='completed', payload={}, result={}, transferred=0))
+    Base.metadata.create_all(engine)
+    with engine.connect() as conn:
+        assert conn.scalar(select(DatasetOperation.__table__.c.id)) == 'old-op'
+        assert conn.scalar(select(__import__('sqlalchemy').func.count()).select_from(DatasetDiscoveryCandidate)) == 0
+    engine.dispose()
+
+
+def test_discovery_marks_non_detection_and_requires_explicit_takeover(env):
+    client, _, root, _ = env
+    loc = location(client, root / 'data'); finish_local()
+    make_existing(root / 'data/pose', config={'task': 'pose', 'train': 'images/train', 'val': 'images/val', 'names': ['person'], 'kpt_shape': [17, 3]})
+    make_existing(root / 'data/detect')
+    scan, _ = start_scan(client, [loc]); finish_local()
+    result = candidates(client, scan['id'])
+    assert result['counts']['unsupported'] == 1 and result['counts']['ready'] == 1
+    chosen = next(c for c in result['items'] if c['state'] == 'ready')
+    payload = {'request_id': uuid.uuid4().hex, 'candidate_ids': [chosen['id']], 'candidate_tokens': {chosen['id']: chosen['selection_token']}, 'ownership': 'managed'}
+    url = f"/api/dataset-storage/discovery/scans/{scan['id']}/batches"
+    assert client.post(url, json=payload).status_code == 422
+    assert client.post(url, json={**payload, 'acknowledge': True}).status_code == 202
+    finish_local()
+    assert entries(client)[0]['ownership'] == 'managed'
+
+
+def test_remote_discovery_waits_for_training_and_blocks_new_file_claims(env):
+    client, factory, root, agent = env
+    from app.models import TrainingRun
+    remote = node(factory, root / 'remote')
+    loc = location(client, root / 'remote', remote)
+    pump(client, factory, root / 'remote', agent, remote)
+    with factory() as db:
+        n = db.get(ComputeNode, remote)
+        n.agent_version = '2.2.0'
+        n.snapshot = {'training': {'dataset_roots': [str(root / 'remote')], 'dataset_discovery': True}}
+        task = TrainingTask(id='training-task', name='仍在训练', execution_node_id=remote, model_path='model.pt', data_path='/data.yaml', status='running')
+        db.add(task); db.flush()
+        db.add(TrainingRun(id='training-run', task_id=task.id, attempt_number=1, status='running', execution_node_id=remote, model_path=task.model_path, data_path=task.data_path))
+        db.commit()
+    scan, _ = start_scan(client, [loc])
+    assert client.post(f'/api/dataset-storage/agent/{remote}/poll').json()['operation'] is None
+    with factory() as db:
+        assert store.node_dataset_file_work(db, remote)
+        db.get(TrainingRun, 'training-run').status = 'stopped'; db.commit()
+    assert client.post(f'/api/dataset-storage/agent/{remote}/poll').json()['operation']['phase'] == 'discover'
+    assert client.post('/api/dataset-storage/discovery/scans/' + scan['id'] + '/cancel').status_code == 200
+    with factory() as db:
+        assert not store.node_dataset_file_work(db, remote)

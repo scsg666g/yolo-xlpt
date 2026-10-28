@@ -152,6 +152,7 @@ class TrainingCapability(BaseModel):
     model_test_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
 
     dataset_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
+    dataset_discovery: bool = False
 
     @field_validator("output_roots", "model_test_roots", "dataset_roots")
     @classmethod

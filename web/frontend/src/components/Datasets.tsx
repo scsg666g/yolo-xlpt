@@ -1,3 +1,4 @@
+import { DatasetDiscoveryModal } from './DatasetDiscoveryModal'
 import { DatasetStorageModal, DatasetActionModal } from './DatasetStorage'
 import { DatasetOperationDrawer } from './DatasetOperationDrawer'
 import { DatasetServerSelect } from './DatasetServerSelect'
@@ -47,6 +48,7 @@ export function Datasets() {
   const [deleting, setDeleting] = useState(false)
   const [actionTarget, setActionTarget] = useState<ManagedDataset | 'register' | null>(null)
   const [serverFilter, setServerFilter] = useState('all')
+  const [discoveryOpen, setDiscoveryOpen] = useState(false)
   const [storageOpen, setStorageOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [operationSummary, setOperationSummary] = useState<DatasetOperationSummary | null>(null)
@@ -236,6 +238,7 @@ export function Datasets() {
       <div className="header-actions datasets-header-actions">
         <button type="button" className="button ghost" onClick={() => setStorageOpen(true)}><Settings2 size={16} />保存位置</button>
         <button type="button" className="button ghost" title={historyError || '查看全部数据集操作记录'} onClick={() => setHistoryOpen(true)}><History size={16} />操作记录{operationSummary && operationSummary.active > 0 && <span className="dataset-count-badge">{operationSummary.active} 进行中</span>}{operationSummary && operationSummary.failed > 0 && <span className="dataset-count-badge failed">{operationSummary.failed} 失败</span>}{historyError && <AlertTriangle size={14} />}</button>
+        <button type="button" className="button ghost" onClick={() => setDiscoveryOpen(true)}><Search size={16} />扫描已有数据集</button>
         <button type="button" className="button ghost" onClick={() => setActionTarget('register')}><FolderOpen size={16} />登记已有目录</button>
         <button type="button" className="button ghost" disabled={loading || deleting} onClick={() => { setNotice(''); operationsChanged() }}>
           <RefreshCw size={16} className={loading ? 'spin' : ''} />刷新
@@ -319,6 +322,7 @@ export function Datasets() {
         })}
       </section> : <div className="empty dataset-empty"><Database size={28} /><strong>{datasets.length ? '没有匹配的数据集' : '还没有平台数据集'}</strong><span>{datasets.length ? '请调整搜索关键词或筛选条件。' : '上传 YOLO 数据集文件夹后，可在这里统一管理。'}</span>{datasets.length > 0 && <button type="button" className="button ghost" onClick={() => { setSearch(''); setFilter('all'); setServerFilter('all') }}>重置筛选</button>}{!datasets.length && <button type="button" className="button primary" onClick={() => setUploading(true)}><Upload size={15} />上传数据集</button>}</div>}
 
+    {discoveryOpen && <DatasetDiscoveryModal onClose={() => { setDiscoveryOpen(false); operationsChanged() }} onChanged={operationsChanged} />}
     {storageOpen && <DatasetStorageModal onClose={() => { setStorageOpen(false); setSummaryRefresh(v => v + 1) }} />}
     {historyOpen && <DatasetOperationDrawer onClose={() => setHistoryOpen(false)} onChanged={operationsChanged} summary={operationSummary} servers={servers.map(({ id, name, status }) => ({ id, name, status }))} />}
     {actionTarget && <DatasetActionModal dataset={actionTarget === 'register' ? undefined : actionTarget} onClose={() => setActionTarget(null)} onDone={operationsChanged} />}

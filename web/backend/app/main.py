@@ -49,6 +49,7 @@ from .inference import (
     worker as inference_worker,
 )
 from .dataset_store import router as dataset_store_router, worker as dataset_worker, reject_training_mutation
+from .dataset_discovery import router as dataset_discovery_router
 from .models import Artifact, ComputeNode, MetricPoint, RemoteOperation, TaskEvent, TaskGroup, TrainingRun, TrainingTask, utcnow
 from .local_deletions import local_deletion_worker, queue_local_delete, queue_local_run_delete
 from .model_assets import router as model_assets_router
@@ -149,6 +150,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="YOLO 模型训练平台", version=PLATFORM_VERSION, lifespan=lifespan)
 app.include_router(dataset_store_router)
+app.include_router(dataset_discovery_router)
 app.include_router(dataset_upload_router)
 app.include_router(dataset_management_router)
 app.include_router(inference_router)

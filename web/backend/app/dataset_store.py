@@ -209,7 +209,7 @@ def mutation_pending(db, node_id):
 
 
 def node_dataset_file_work(db, node_id):
-    return any(op.payload.get('phase') in ('export', 'import', 'remove') for op in db.scalars(
+    return any(op.payload.get('phase') in ('export', 'import', 'remove', 'discover') for op in db.scalars(
         select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE))))
 
 
@@ -257,7 +257,8 @@ class LocationUpdate(BaseModel):
 
 class Register(BaseModel):
     location_id: str
-    name: str
+    name: str = ''
+    relative_path: str | None = Field(default=None, max_length=4096)
     ownership: str = 'external'
     acknowledge: bool = False
 
@@ -344,19 +345,39 @@ def list_entries(db: Session = Depends(get_db)):
 
 @router.post('/datasets/register', status_code=202)
 def register(body: Register, db: Session = Depends(get_db)):
-    validate_name(body.name)
     if body.ownership not in ('external', 'managed') or (body.ownership == 'managed' and not body.acknowledge):
         raise HTTPException(422, '接管文件管理需要明确确认；普通登记不会取得文件删除权')
     with managed_dataset_mutation():
         loc = location_get(db, body.location_id, ready=True)
-        acquire_node_claim_lock(db, loc.node_id)
-        path = str(PurePosixPath(loc.resolved_path) / body.name)
-        if db.scalar(select(DatasetEntry.id).where(DatasetEntry.node_id == loc.node_id, DatasetEntry.path == path, DatasetEntry.status != 'deleted')):
-            raise HTTPException(409, '该目录已登记')
-        op = new_operation(db, 'register', loc.node_id, {'phase': 'export', 'source_node': loc.node_id,
-                           'source_path': path, 'location_id': loc.id, 'name': body.name, 'ownership': body.ownership})
+        relative = body.relative_path if body.relative_path is not None else body.name
+        op = queue_registration(db, loc, relative, body.name or PurePosixPath(relative).name or PurePosixPath(loc.resolved_path).name, body.ownership)
         db.commit()
         return operation_read(op)
+
+
+def queue_registration(db, loc, relative, name, ownership, config_sha256=None, batch_id=None, *, claim_locked=False):
+    from .dataset_discovery import relative_path
+    relative = relative_path(relative)
+    validate_name(name)
+    if not claim_locked:
+        acquire_node_claim_lock(db, loc.node_id)
+    path = str(PurePosixPath(loc.resolved_path) / relative)
+    if relative == '.' and ownership == 'managed':
+        raise HTTPException(409, '保存位置根目录只能外部登记，不能直接接管；请使用独立子目录')
+    for entry in db.scalars(select(DatasetEntry).where(DatasetEntry.node_id == loc.node_id, DatasetEntry.status != 'deleted')):
+        if entry.path == path:
+            raise HTTPException(409, '该目录已登记')
+        if (ownership == 'managed' or entry.ownership == 'managed') and (
+                PurePosixPath(entry.path) in PurePosixPath(path).parents or PurePosixPath(path) in PurePosixPath(entry.path).parents):
+            raise HTTPException(409, '目录与已登记的平台管理数据集互相包含，请使用独立目录')
+    if db.scalar(select(DatasetOperation.id).where(DatasetOperation.kind == 'register',
+            DatasetOperation.payload['source_node'].as_string() == loc.node_id,
+            DatasetOperation.payload['source_path'].as_string() == path,
+            DatasetOperation.status.in_((*ACTIVE, 'failed')))):
+        raise HTTPException(409, '该目录已有登记操作，请等待完成或重试／取消原操作')
+    return new_operation(db, 'register', loc.node_id, {'phase': 'export', 'source_node': loc.node_id,
+        'source_path': path, 'relative_path': relative, 'location_id': loc.id, 'name': name,
+        'ownership': ownership, 'scan_config_sha256': config_sha256, 'batch_id': batch_id})
 
 
 @router.get('/datasets/{identity}/delete-preview')
@@ -482,7 +503,7 @@ def operation_summary(db: Session = Depends(get_db)):
 def operation_page(
     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
     status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all',
-    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete'] = 'all',
+    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete', 'discover'] = 'all',
     node_id: str = Query('all', max_length=64), q: str = Query('', max_length=160),
     before: datetime | None = None, after: datetime | None = None, through: datetime | None = None, db: Session = Depends(get_db),
 ):
@@ -503,7 +524,7 @@ def operation_page(
 class HistoryRemovalRequest(BaseModel):
     ids: list[str] | None = Field(default=None, min_length=1, max_length=500)
     status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all'
-    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete'] = 'all'
+    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete', 'discover'] = 'all'
     node_id: str = Field(default='all', max_length=64)
     q: str = Field(default='', max_length=160)
     before: datetime
@@ -620,6 +641,8 @@ def verify_snapshot(op):
                 raise ValueError('已有数据集单文件超过上传大小限制')
         names = class_names(target, op.payload.get('names', []))
         stats, warnings = validate_contents(target, manifest, names)
+        if op.payload.get('scan_config_sha256') and files.digest(target / 'data.yaml') != op.payload['scan_config_sha256']:
+            raise ValueError('data.yaml 在扫描后发生变化，请取消本次登记并重新扫描确认')
         if op.kind in ('register', 'migrate'):
             cfg = yaml.safe_load((target / 'data.yaml').read_text(encoding='utf-8-sig'))
             root = PurePosixPath(op.payload['source_path'])
@@ -636,6 +659,8 @@ def verify_snapshot(op):
 def action_payload(op):
     p, phase = op.payload, op.payload['phase']
     common = {'id': op.id, 'token': op.lease, 'phase': phase}
+    if phase == 'discover':
+        return {**common, 'path': p['source_path'], 'limits': p['limits']}
     if phase == 'check':
         return {**common, 'path': p['path'], 'create': p.get('create', False)}
     if phase == 'export':
@@ -652,7 +677,11 @@ def action_payload(op):
 
 def phase_success(db, op, result):
     p, phase = op.payload, op.payload['phase']
-    if phase == 'check':
+    if phase == 'discover':
+        from .dataset_discovery import record_progress
+        record_progress(db, op, result)
+        op.status = 'completed'
+    elif phase == 'check':
         loc = db.get(DatasetLocation, p['location_id'])
         loc.resolved_path, loc.status, loc.details = result['resolved_path'], 'ready', {**result, 'checked_at': utcnow().isoformat()}
         if p.get('make_default'):
@@ -776,7 +805,16 @@ def execute_local(db, op):
     p = op.payload
     directory = job_dir(op.id)
     directory.mkdir(parents=True, exist_ok=True)
-    if phase == 'check':
+    if phase == 'discover':
+        from .dataset_discovery import record_progress
+        from .dataset_discovery_files import discover
+        def report(progress):
+            with managed_dataset_mutation():
+                current = lease_check(db, identity, token, phase)
+                record_progress(db, current, progress)
+                db.commit()
+        result = discover(p['source_path'], DATASET_STORAGE_ALLOWED_ROOTS, p['limits'], report, check)
+    elif phase == 'check':
         result = files.check_root(p['path'], DATASET_STORAGE_ALLOWED_ROOTS, p.get('create', False))
     elif phase in ('export', 'prepare_upload'):
         source = p['staging'] if phase == 'prepare_upload' else str(files.inside(p['source_path'], DATASET_STORAGE_ALLOWED_ROOTS))
@@ -876,11 +914,15 @@ def agent_poll(node_id: str, request: Request, db: Session = Depends(get_db)):
         op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at))
         if not op:
             return {'operation': None}
+        if op.payload['phase'] == 'discover':
+            from .dataset_discovery import supports_discovery
+            if not supports_discovery(db, node_id):
+                return {'operation': None, 'message': '目录扫描需要 Agent 2.2.0 及 dataset_discovery 能力'}
         # One Agent process executes a token at a time using its private flock.
         # An expired lease reuses that token, so a saved commit receipt is replayed.
         if op.lease_until and op.lease_until.replace(tzinfo=timezone.utc) > utcnow():
             return {'operation': None}
-        if op.payload['phase'] in ('export', 'import') and db.scalar(select(TrainingRun.id).where(
+        if op.payload['phase'] in ('export', 'import', 'discover') and db.scalar(select(TrainingRun.id).where(
                 TrainingRun.execution_node_id == node_id, TrainingRun.status.in_(('starting', 'running', 'stopping')))):
             return {'operation': None}
         if op.payload['phase'] == 'remove':
@@ -910,6 +952,13 @@ def agent_heartbeat(node_id: str, identity: str, body: AgentMessage, request: Re
         if not op or op.node_id != node_id:
             raise HTTPException(404, '操作不存在')
         lease_check(db, identity, body.token, body.phase, body.committing)
+        if body.phase == 'discover' and body.result:
+            from .dataset_discovery import record_progress
+            try:
+                record_progress(db, op, body.result)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise HTTPException(422, str(exc)) from exc
+            db.commit()
     return {'ok': True}
 
 

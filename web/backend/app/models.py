@@ -378,3 +378,33 @@ class DatasetOperationHistoryRemoval(Base):
     __tablename__ = 'dataset_operation_history_removals'
     operation_id: Mapped[str] = mapped_column(String(64), ForeignKey('dataset_operations.id'), primary_key=True)
     removed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DatasetDiscoverySession(Base):
+    __tablename__ = 'dataset_discovery_sessions'
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    specification: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DatasetDiscoveryCandidate(Base):
+    __tablename__ = 'dataset_discovery_candidates'
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(32), ForeignKey('dataset_discovery_sessions.id'), index=True)
+    operation_id: Mapped[str] = mapped_column(String(64), ForeignKey('dataset_operations.id'), index=True)
+    generation: Mapped[str] = mapped_column(String(32))
+    location_id: Mapped[str] = mapped_column(String(32))
+    node_id: Mapped[str] = mapped_column(String(64), index=True)
+    path: Mapped[str] = mapped_column(Text)
+    relative_path: Mapped[str] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(32))
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class DatasetRegistrationBatch(Base):
+    __tablename__ = 'dataset_registration_batches'
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(32), ForeignKey('dataset_discovery_sessions.id'), index=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    items: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
