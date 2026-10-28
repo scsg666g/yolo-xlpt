@@ -46,6 +46,8 @@ export function Datasets() {
   const [uploading, setUploading] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<ManagedDataset | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [refreshing, setRefreshing] = useState<string | null>(null)
+  const refreshSubmitting = useRef(false)
   const [actionTarget, setActionTarget] = useState<ManagedDataset | 'register' | null>(null)
   const [serverFilter, setServerFilter] = useState('all')
   const [discoveryOpen, setDiscoveryOpen] = useState(false)
@@ -125,6 +127,23 @@ export function Datasets() {
     return [{ id: 'all', name: '全部服务器', count: datasets.length }, ...Array.from(options.values()).map(n => ({ ...n, count: datasets.filter(d => d.node_id === n.id).length }))]
   }, [nodes, datasets, operationSummary])
   function operationsChanged() { setSummaryRefresh(v => v + 1); void loadDatasets() }
+
+  async function refreshDataset(dataset: ManagedDataset) {
+    if (refreshSubmitting.current || dataset.blocking_operation_id) return
+    refreshSubmitting.current = true
+    setRefreshing(dataset.id); setError(''); setNotice('')
+    try {
+      await api.refreshDatasetEntry(dataset.id)
+      setNotice(`“${dataset.name}”已提交重新加载，校验成功后更新图片、标签、类别、空间和警告；服务器训练中会等待。可在操作记录中查看进度。`)
+      operationsChanged()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '重新加载提交失败')
+      void loadDatasets()
+    } finally {
+      refreshSubmitting.current = false
+      setRefreshing(null)
+    }
+  }
 
   useEffect(() => {
     if (!deleteTarget) return
@@ -282,8 +301,17 @@ export function Datasets() {
             <header>
               <div className="dataset-card-icon"><Database size={19} /></div>
               <div className="dataset-card-title"><h2 title={dataset.name}>{dataset.name}</h2><span>{dataset.node_name || (dataset.node_id === 'local' ? '本机' : '远程')} · {dataset.ownership === 'managed' ? '平台管理' : '外部登记'} · {formatCreatedAt(dataset.created_at)}</span></div>
-              <span className={`dataset-reference-state ${dataset.blocking_operation_id ? 'busy' : referenced ? 'referenced' : 'free'}`}><i />{dataset.blocking_operation_id ? '操作未完成' : referenced ? `${dataset.references.length} 个引用` : dataset.ownership === 'managed' ? '无引用' : '外部文件'}</span>
+              <div className="dataset-card-actions">
+                <button type="button" className="dataset-reload" aria-label={`重新加载数据集：${dataset.name}`} title={dataset.blocking_operation_id ? '请先完成或在操作记录中重试／取消未完成操作' : '重新读取文件并校验统计，成功后更新卡片；不会修改源文件'} disabled={!!refreshing || !!dataset.blocking_operation_id || dataset.status !== 'ready'} onClick={() => void refreshDataset(dataset)}><RefreshCw size={14} className={refreshing === dataset.id || (dataset.blocking_operation_kind === 'refresh' && dataset.refresh_status !== 'failed') ? 'spin' : ''} /><span>重新加载</span></button>
+                <span className={`dataset-reference-state ${dataset.blocking_operation_id ? 'busy' : referenced ? 'referenced' : 'free'}`}><i />{dataset.blocking_operation_id ? '操作未完成' : referenced ? `${dataset.references.length} 个引用` : dataset.ownership === 'managed' ? '无引用' : '外部文件'}</span>
+              </div>
             </header>
+
+            <div className="dataset-check-status"><small>{dataset.checked_at ? `最近完整校验：${formatCreatedAt(dataset.checked_at)}` : '统计来自登记记录，完整校验时间未记录'}</small>
+              {dataset.blocking_operation_kind === 'refresh' && <button type="button" onClick={() => setHistoryOpen(true)}>{dataset.refresh_status === 'failed' ? '重新加载失败，保留上次统计；查看处理' : '重新加载中，保留上次统计；查看进度'}</button>}
+              {dataset.refresh_status === 'cancelled' && <small>上次重新加载已取消，保留上次统计</small>}
+              {dataset.refresh_error && dataset.refresh_status === 'failed' && <small role="alert">{dataset.refresh_error}</small>}
+            </div>
 
             <div className="dataset-metrics">
               <div><span>训练图片</span><strong>{valueOrZero(dataset.stats.train_images).toLocaleString('zh-CN')}</strong></div>

@@ -143,6 +143,7 @@ export const api = {
   checkDatasetLocation: (id: string, create = false) => request<DatasetOperation>(`/api/dataset-storage/locations/${id}/check`, { method: 'POST', body: JSON.stringify({ create }) }),
   forgetDatasetLocation: (id: string) => request<void>(`/api/dataset-storage/locations/${id}`, { method: 'DELETE' }),
   datasetEntries: (signal?: AbortSignal) => request<ManagedDataset[]>('/api/dataset-storage/datasets', { signal }),
+  refreshDatasetEntry: (id: string) => request<DatasetOperation>(`/api/dataset-storage/datasets/${encodeURIComponent(id)}/refresh`, { method: 'POST' }),
   registerDataset: (location_id: string, name: string, ownership: string, acknowledge: boolean) => request<DatasetOperation>('/api/dataset-storage/datasets/register', { method: 'POST', body: JSON.stringify({ location_id, name, ownership, acknowledge }) }),
   migrateDataset: (id: string, location_id: string, name: string, remove_source: boolean) => request<DatasetOperation>(`/api/dataset-storage/datasets/${id}/migrate`, { method: 'POST', body: JSON.stringify({ location_id, name, remove_source }) }),
   adoptDataset: (id: string, confirm_path: string) => request(`/api/dataset-storage/datasets/${id}/adopt`, { method: 'POST', body: JSON.stringify({ confirm_path }) }),

@@ -369,6 +369,10 @@ export interface ManagedDatasetReference {
 }
 
 export interface ManagedDataset {
+  checked_at?: string | null
+  refresh_status?: string | null
+  refresh_error?: string | null
+  blocking_operation_kind?: string | null
   can_delete?: boolean
   blocking_operation_id?: string | null
   node_name?: string

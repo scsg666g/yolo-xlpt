@@ -399,3 +399,18 @@ body:has(.datasets-page) { min-width: 0; }
 .dataset-progress-steps { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 3px; color: var(--muted); }
 .dataset-operation-progress code { display: block; max-width: 100%; overflow-wrap: anywhere; font-size: 12px; }
 .dataset-operation-progress .dataset-progress-stale { color: #b58435; }
+
+.dataset-card-actions { display: flex; flex: 0 0 auto; flex-direction: column; align-items: flex-end; gap: 5px; }
+.dataset-reload { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-height: 26px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; background: transparent; color: var(--muted); font-size: 10px; cursor: pointer; }
+.dataset-reload:hover:not(:disabled) { color: var(--green); border-color: var(--green); }
+.dataset-reload:disabled { opacity: .5; cursor: not-allowed; }
+.dataset-reload:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.dataset-check-status { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; color: var(--muted); overflow-wrap: anywhere; }
+.dataset-check-status small { font-size: 10px; }
+.dataset-check-status button { align-self: flex-start; padding: 0; border: 0; background: transparent; color: var(--green); font-size: 11px; text-align: left; cursor: pointer; }
+.dataset-check-status [role='alert'] { color: #d68b70; }
+@media (max-width: 560px) {
+  .dataset-card > header { flex-wrap: nowrap; }
+  .dataset-card-title { width: auto; flex: 1; }
+  .dataset-card-actions .dataset-reference-state { margin-left: 0; }
+}

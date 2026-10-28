@@ -7,7 +7,7 @@ import { useModalFocus } from '../useModalFocus'
 import { DatasetServerSelect, type DatasetServerOption } from './DatasetServerSelect'
 
 const statuses: Record<string, string> = { pending: '等待处理', running: '正在处理', committing: '提交文件中', completed: '已完成', failed: '失败', cancelled: '已取消' }
-const kinds: Record<string, string> = { discover: '目录扫描', check: '目录检查', upload: '上传', register: '登记', migrate: '复制 / 迁移', delete: '永久删除' }
+const kinds: Record<string, string> = { discover: '目录扫描', check: '目录检查', upload: '上传', register: '登记', refresh: '重新加载', migrate: '复制 / 迁移', delete: '永久删除' }
 
 export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }: {
   onClose: () => void; onChanged: () => void; summary: DatasetOperationSummary | null; servers: DatasetServerOption[]

@@ -89,8 +89,11 @@ def operation_time(value):
 
 
 def training_active(db, node_id):
+    node_filter = TrainingRun.execution_node_id == node_id
+    if node_id == 'local':
+        node_filter = or_(TrainingRun.execution_node_id.is_(None), node_filter)
     return bool(db.scalar(select(TrainingRun.id).where(
-        TrainingRun.execution_node_id == node_id,
+        node_filter,
         TrainingRun.status.in_(('starting', 'running', 'stopping'))).limit(1)))
 
 
@@ -157,6 +160,8 @@ def operation_read(op, db=None):
                     (DatasetOperation.created_at == op.created_at) & (DatasetOperation.id < op.id))))
             value['queue_ahead'] = sum(lightweight_operation(item) or bool(
                 item.lease_until and operation_time(item.lease_until) > utcnow()) for item in earlier)
+    if db and op.node_id == 'local' and op.kind == 'refresh' and op.payload.get('phase') == 'export':
+        value['waiting_training'] = op.status == 'pending' and training_active(db, 'local')
     return value
 
 
@@ -200,12 +205,19 @@ def entry_read(entry, db):
     d = entry.details or {}
     references = reference_rows(db, entry)
     blocking = busy_entry(db, entry.id)
+    refresh = db.scalar(select(DatasetOperation).where(
+        DatasetOperation.kind == 'refresh', DatasetOperation.payload['entry_id'].as_string() == entry.id)
+        .order_by(DatasetOperation.created_at.desc(), DatasetOperation.id.desc()).limit(1))
     return {'id': entry.id, 'location_id': entry.location_id, 'node_id': entry.node_id,
             'name': entry.name, 'node_name': (db.get(ComputeNode, entry.node_id).name if db.get(ComputeNode, entry.node_id) else ('本机' if entry.node_id == 'local' else entry.node_id)), 'directory': entry.path, 'config_path': str(PurePosixPath(entry.path) / 'data.yaml'),
             'ownership': entry.ownership, 'status': entry.status, 'created_at': entry.created_at,
             'total_bytes': d.get('total_bytes', 0), 'stats': d.get('stats', {}), 'classes': d.get('names', []),
             'warnings': d.get('warnings', []), 'fingerprint': d.get('fingerprint'),
             'history': d.get('history', []), 'references': references,
+            'checked_at': d.get('checked_at'),
+            'refresh_status': refresh.status if refresh else None,
+            'refresh_error': refresh.error if refresh else None,
+            'blocking_operation_kind': blocking.kind if blocking else None,
             'blocking_operation_id': blocking.id if blocking else None,
             'can_delete': not references and entry.ownership == 'managed' and entry.status == 'ready' and not blocking}
 
@@ -437,6 +449,25 @@ def queue_registration(db, loc, relative, name, ownership, config_sha256=None, b
         'ownership': ownership, 'scan_config_sha256': config_sha256, 'batch_id': batch_id})
 
 
+@router.post('/datasets/{identity}/refresh', status_code=202)
+def refresh_entry(identity: str, db: Session = Depends(get_db)):
+    with managed_dataset_mutation():
+        entry = db.get(DatasetEntry, identity)
+        if not entry or entry.status == 'deleted':
+            raise HTTPException(404, '数据集不存在')
+        if entry.status != 'ready' or busy_entry(db, identity):
+            raise HTTPException(409, '数据集已有未完成操作，请等待完成或在操作记录中重试／取消')
+        node_or_error(db, entry.node_id)
+        acquire_node_claim_lock(db, entry.node_id)
+        # Reuse the existing export protocol, including old Agents. Never import,
+        # replace source files, change ownership, or create another catalogue row.
+        op = new_operation(db, 'refresh', entry.node_id, {
+            'phase': 'export', 'entry_id': entry.id, 'source_node': entry.node_id,
+            'source_path': entry.path, 'name': entry.name})
+        db.commit()
+        return operation_read(op, db)
+
+
 @router.get('/datasets/{identity}/delete-preview')
 def delete_preview(identity: str, db: Session = Depends(get_db)):
     e = db.get(DatasetEntry, identity)
@@ -560,7 +591,7 @@ def operation_summary(db: Session = Depends(get_db)):
 def operation_page(
     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
     status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all',
-    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete', 'discover'] = 'all',
+    kind: Literal['all', 'check', 'upload', 'register', 'refresh', 'migrate', 'delete', 'discover'] = 'all',
     node_id: str = Query('all', max_length=64), q: str = Query('', max_length=160),
     before: datetime | None = None, after: datetime | None = None, through: datetime | None = None, db: Session = Depends(get_db),
 ):
@@ -581,7 +612,7 @@ def operation_page(
 class HistoryRemovalRequest(BaseModel):
     ids: list[str] | None = Field(default=None, min_length=1, max_length=500)
     status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all'
-    kind: Literal['all', 'check', 'upload', 'register', 'migrate', 'delete', 'discover'] = 'all'
+    kind: Literal['all', 'check', 'upload', 'register', 'refresh', 'migrate', 'delete', 'discover'] = 'all'
     node_id: str = Field(default='all', max_length=64)
     q: str = Field(default='', max_length=160)
     before: datetime
@@ -654,6 +685,13 @@ def control_operation(identity: str, action: str, db: Session = Depends(get_db))
         if not op:
             raise HTTPException(404, '操作记录不存在')
         if action == 'retry' and op.status == 'failed':
+            if op.kind == 'refresh':
+                # A corrected source must be exported again, with a new receipt
+                # token. Revalidating the cached failed snapshot cannot see fixes.
+                for name in ('bundle.part', 'bundle.tar', 'manifest.json'):
+                    (job_dir(op.id) / name).unlink(missing_ok=True)
+                op.payload = {key: op.payload[key] for key in ('entry_id', 'source_node', 'source_path', 'name')}
+                set_phase(op, 'export', op.payload['source_node'])
             op.status, op.error, op.lease_until = 'pending', None, None
             op.payload = {**op.payload, 'progress_run_id': uid(), 'progress': None, 'queued_at': utcnow().isoformat()}
         elif action == 'cancel' and op.status in ('pending', 'running', 'failed') and not op.payload.get('published') and not op.payload.get('commit_started'):
@@ -701,7 +739,7 @@ def verify_snapshot(op, check=None):
         stats, warnings = validate_contents(target, manifest, names, check)
         if op.payload.get('scan_config_sha256') and files.digest(target / 'data.yaml') != op.payload['scan_config_sha256']:
             raise ValueError('data.yaml 在扫描后发生变化，请取消本次登记并重新扫描确认')
-        if op.kind in ('register', 'migrate'):
+        if op.kind in ('register', 'refresh', 'migrate'):
             cfg = yaml.safe_load((target / 'data.yaml').read_text(encoding='utf-8-sig'))
             root = PurePosixPath(op.payload['source_path'])
             configured_root = PurePosixPath(str(cfg.get('path', root)))
@@ -753,14 +791,24 @@ def phase_success(db, op, result):
     elif phase == 'validate':
         manifest, names, stats, warnings = result
         op.payload = {**p, 'names': names, 'stats': stats, 'warnings': warnings}
-        if op.kind == 'register':
+        if op.kind == 'refresh':
+            entry = db.get(DatasetEntry, p['entry_id'])
+            if not entry or entry.status != 'ready' or entry.node_id != p['source_node'] or entry.path != p['source_path']:
+                raise ValueError('数据集位置或状态已改变，请取消并重新加载')
+            entry.details = {**(entry.details or {}), 'fingerprint': manifest['fingerprint'],
+                             'names': names, 'stats': stats, 'warnings': warnings,
+                             'total_bytes': manifest['total_bytes'], 'checked_at': utcnow().isoformat(),
+                             'config_sha256': next(f['sha256'] for f in manifest['files'] if f['path'] == 'data.yaml')}
+            op.result = {'dataset_id': entry.id}
+            op.status = 'completed'
+        elif op.kind == 'register':
             existing = db.scalar(select(DatasetEntry).where(DatasetEntry.node_id == p['source_node'], DatasetEntry.path == p['source_path'], DatasetEntry.status != 'deleted'))
             if existing:
                 raise ValueError('目录已经登记，拒绝重复登记')
             e = DatasetEntry(id=uid(), node_id=p['source_node'], location_id=p['location_id'], name=p['name'],
                              path=p['source_path'], ownership=p['ownership'], status='ready',
                              details={'fingerprint': manifest['fingerprint'], 'names': names, 'stats': stats,
-                                      'warnings': warnings, 'total_bytes': manifest['total_bytes'], 'config_sha256': next(f['sha256'] for f in manifest['files'] if f['path'] == 'data.yaml')})
+                                      'warnings': warnings, 'total_bytes': manifest['total_bytes'], 'checked_at': utcnow().isoformat(), 'config_sha256': next(f['sha256'] for f in manifest['files'] if f['path'] == 'data.yaml')})
             db.add(e)
             db.flush()
             op.result = {'dataset_id': e.id}
@@ -776,7 +824,7 @@ def phase_success(db, op, result):
             source = db.get(DatasetEntry, p['entry_id'])
             history = [*(source.details or {}).get('history', []), {'node_id': source.node_id, 'path': source.path, 'operation_id': op.id}]
         details = {'operation_id': op.id, 'fingerprint': result['fingerprint'], 'names': p['names'],
-                   'stats': p['stats'], 'warnings': p['warnings'], 'total_bytes': result.get('total_bytes', 0), 'config_sha256': result.get('config_sha256'), 'history': history}
+                   'stats': p['stats'], 'warnings': p['warnings'], 'total_bytes': result.get('total_bytes', 0), 'config_sha256': result.get('config_sha256'), 'history': history, 'checked_at': utcnow().isoformat()}
         if not dest:
             dest = DatasetEntry(id=uid(), node_id=p['target_node'], location_id=p['location_id'], name=p['name'], path=p['destination'])
             db.add(dest)
@@ -948,7 +996,12 @@ class DatasetWorker:
             except BlockingIOError:
                 return
             with SessionLocal() as db:
-                op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == 'local', DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at, DatasetOperation.id))
+                candidates = db.scalars(select(DatasetOperation).where(
+                    DatasetOperation.node_id == 'local', DatasetOperation.status.in_(ACTIVE))
+                    .order_by(DatasetOperation.created_at, DatasetOperation.id))
+                local_training = training_active(db, 'local')
+                op = next((item for item in candidates if not (
+                    local_training and item.kind == 'refresh' and item.payload.get('phase') == 'export')), None)
                 if op:
                     try:
                         execute_local(db, op)
