@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -92,6 +93,199 @@ def test_local_compute_sampling_does_not_block_api_caller(monkeypatch):
         assert monitoring.local_snapshot() == expected
     finally:
         release.set()
+
+
+def test_manual_local_refresh_waits_for_new_sample_and_keeps_previous_on_timeout(monkeypatch):
+    previous = sample()["compute"]
+    previous["sampled_at"] = "2026-01-01T00:00:00+00:00"
+    newer = sample()["compute"]
+    started, release = threading.Event(), threading.Event()
+
+    def slow_sample():
+        started.set()
+        release.wait(timeout=2)
+        return newer
+
+    monkeypatch.setattr(monitoring, "compute_inventory", slow_sample)
+    monkeypatch.setattr(monitoring, "_local_cache", previous)
+    monkeypatch.setattr(monitoring, "_local_sampled", time.monotonic())
+    monkeypatch.setattr(monitoring, "_local_refreshing", False)
+    monkeypatch.setattr(monitoring, "_local_sample_sequence", 0)
+    monkeypatch.setattr(monitoring, "_local_sample_error", False)
+    try:
+        assert monitoring.refresh_local_snapshot(0.02) == ("timeout", previous["sampled_at"])
+        assert started.wait(1)
+        assert monitoring._local_cache is previous
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            first = workers.submit(monitoring.refresh_local_snapshot, 1)
+            second = workers.submit(monitoring.refresh_local_snapshot, 1)
+            release.set()
+            assert first.result()[0] == "fresh"
+            assert second.result()[0] == "fresh"
+        assert monitoring._local_cache is newer
+    finally:
+        release.set()
+
+
+def test_manual_refresh_returns_current_details_and_old_agent_fallback(monitoring_client, monkeypatch):
+    client, _factory = monitoring_client
+    old = create(client)
+    assert client.post(f"/api/compute/nodes/{old['node']['id']}/report",
+                       headers=headers(old), json=sample()).status_code == 200
+    previous = sample()["compute"]["sampled_at"]
+    current = sample()["compute"]
+    monkeypatch.setattr(monitoring, "local_snapshot", lambda: current)
+    monkeypatch.setattr(monitoring, "refresh_local_snapshot", lambda timeout: ("fresh", previous))
+    response = client.post("/api/compute/nodes/refresh")
+    assert response.status_code == 200, response.text
+    nodes = {item["id"]: item for item in response.json()["nodes"]}
+    assert set(nodes) == {"local", old["node"]["id"]}
+    assert nodes["local"]["result"] == "fresh"
+    assert nodes["local"]["node"]["compute"] == current
+    assert nodes[old["node"]["id"]]["result"] == "unsupported"
+    assert "2.4.2" in nodes[old["node"]["id"]]["reason"]
+
+
+def test_manual_remote_refresh_waits_for_matching_agent_report(monitoring_client, monkeypatch):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    auth = headers(credential)
+    boot_id = "a" * 32
+    initial = sample()
+    initial.update(agent_version="2.4.2", boot_id=boot_id, report_seq=1)
+    initial_response = client.post(f"/api/compute/nodes/{node_id}/report", headers=auth, json=initial)
+    assert initial_response.status_code == 200, initial_response.text
+    assert "refresh_request_id" not in initial_response.json()
+    monkeypatch.setattr(monitoring, "refresh_local_snapshot", lambda timeout: ("fresh", None))
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        pending = workers.submit(client.post, "/api/compute/nodes/refresh")
+        request_id = None
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with factory() as db:
+                db.expire_all()
+                request_id = (db.get(ComputeNode, node_id).snapshot or {}).get("_refresh_request_id")
+            if request_id:
+                break
+            time.sleep(0.01)
+        assert request_id and len(request_id) == 32
+        intermediate = sample()
+        intermediate.update(agent_version="2.4.2", boot_id=boot_id, report_seq=2)
+        command = client.post(f"/api/compute/nodes/{node_id}/report", headers=auth, json=intermediate)
+        assert command.status_code == 200, command.text
+        assert command.json()["refresh_request_id"] == request_id
+        assert not pending.done()
+        final = sample()
+        final.update(agent_version="2.4.2", boot_id=boot_id, report_seq=3,
+                     refresh_request_id=request_id)
+        confirmed = client.post(f"/api/compute/nodes/{node_id}/report", headers=auth, json=final)
+        assert confirmed.status_code == 200, confirmed.text
+        assert "refresh_request_id" not in confirmed.json()
+        response = pending.result(timeout=3)
+    assert response.status_code == 200, response.text
+    refreshed = next(item for item in response.json()["nodes"] if item["id"] == node_id)
+    assert refreshed["result"] == "fresh"
+    assert parsed_time(refreshed["sampled_at"]) == parsed_time(final["compute"]["sampled_at"])
+    assert refreshed["node"]["compute"]["host"]["hostname"] == "remote-host"
+    assert not any(key.startswith("_refresh_") for key in refreshed["node"]["compute"])
+    assert not any(key.startswith("_refresh_") for key in client.get(f"/api/compute/nodes/{node_id}").json()["compute"])
+
+
+def test_refresh_request_reuses_nonce_committed_while_waiting_for_node_lock(monitoring_client, monkeypatch):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    request_id = "e" * 32
+    snapshot = {**sample()["compute"], "_refresh_request_id": request_id,
+                "_refresh_requested_at": utcnow().isoformat(), "_refresh_completed_id": None}
+
+    with factory() as db:
+        cached_node = db.get(ComputeNode, node_id)
+        assert "_refresh_request_id" not in (cached_node.snapshot or {})
+
+        def acquire_after_other_worker_commits(session, identity):
+            # PostgreSQL row locking does not expire the Session identity map.
+            # Another worker can commit a request before this lock is granted.
+            assert session is db and identity == node_id
+            assert session.get(ComputeNode, identity) is cached_node
+            with factory() as writer:
+                writer.get(ComputeNode, identity).snapshot = snapshot
+                writer.commit()
+
+        monkeypatch.setattr(monitoring, "acquire_node_claim_lock", acquire_after_other_worker_commits)
+        assert monitoring._request_remote_refresh(db, node_id) == request_id
+
+    with factory() as db:
+        assert db.get(ComputeNode, node_id).snapshot == snapshot
+
+
+def test_heartbeat_preserves_nonce_committed_while_waiting_for_node_lock(monitoring_client, monkeypatch):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    boot_id, request_id = "a" * 32, "f" * 32
+    initial = {**sample(), "agent_version": "2.5.0", "boot_id": boot_id, "report_seq": 1}
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=initial).status_code == 200
+
+    def acquire_after_other_worker_commits(session, identity):
+        # The authenticated node was loaded before waiting for the row lock.
+        assert identity == node_id
+        assert "_refresh_request_id" not in (session.get(ComputeNode, identity).snapshot or {})
+        with factory() as writer:
+            node = writer.get(ComputeNode, identity)
+            node.snapshot = {**node.snapshot, "_refresh_request_id": request_id,
+                             "_refresh_requested_at": utcnow().isoformat()}
+            writer.commit()
+
+    monkeypatch.setattr(monitoring, "acquire_node_claim_lock", acquire_after_other_worker_commits)
+    heartbeat = {**sample(), "agent_version": "2.5.0", "boot_id": boot_id, "report_seq": 2}
+    response = client.post(f"/api/compute/nodes/{node_id}/report", headers=headers(credential), json=heartbeat)
+    assert response.status_code == 200, response.text
+    assert response.json()["refresh_request_id"] == request_id
+    with factory() as db:
+        snapshot = db.get(ComputeNode, node_id).snapshot
+        assert snapshot["_refresh_request_id"] == request_id
+        assert snapshot["agent_report_seq"] == 2
+
+
+def test_manual_remote_refresh_timeout_preserves_snapshot_and_rejects_wrong_nonce(monitoring_client, monkeypatch):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    auth = headers(credential)
+    boot_id = "b" * 32
+    initial = sample()
+    initial.update(agent_version="2.4.2", boot_id=boot_id, report_seq=1)
+    assert client.post(f"/api/compute/nodes/{node_id}/report", headers=auth, json=initial).status_code == 200
+    monkeypatch.setattr(monitoring, "MANUAL_REFRESH_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(monitoring, "refresh_local_snapshot", lambda timeout: ("fresh", None))
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        future = workers.submit(client.post, "/api/compute/nodes/refresh")
+        request_id = None
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            with factory() as db:
+                request_id = (db.get(ComputeNode, node_id).snapshot or {}).get("_refresh_request_id")
+            if request_id:
+                break
+            time.sleep(0.01)
+        assert request_id
+        bad = sample()
+        bad.update(agent_version="2.4.2", boot_id=boot_id, report_seq=2,
+                   refresh_request_id="c" * 32)
+        response = client.post(f"/api/compute/nodes/{node_id}/report", headers=auth, json=bad)
+        assert response.status_code == 200, response.text
+        assert response.json()["refresh_request_id"] == request_id
+        stale = client.post(f"/api/compute/nodes/{node_id}/report", headers=auth, json=bad)
+        assert stale.status_code == 200, stale.text
+        assert stale.json()["status"] == "stale"
+        assert stale.json()["refresh_request_id"] == request_id
+        timed_out = future.result(timeout=2)
+    result = next(item for item in timed_out.json()["nodes"] if item["id"] == node_id)
+    assert result["result"] == "timeout"
+    assert result["node"]["compute"]["sampled_at"] == result["sampled_at"]
+    assert not any(key.startswith("_refresh_") for key in result["node"]["compute"])
 
 
 def test_node_credentials_isolation_and_persistence(monitoring_client):
@@ -434,8 +628,14 @@ def test_remote_claim_update_stop_and_node_isolation(monitoring_client):
         "completed_epochs": 1, "progress": 10, "latest_metrics": {"score": 0.5},
         "metrics": [{"epoch": 1, "values": {"score": 0.5}}], "log_tail": ["epoch 1"]})
     assert update.status_code == 200, update.text
+    corrected = client.post(update_url, headers=lease_headers, json={"status": "running", "pid": 1234,
+        "completed_epochs": 1, "progress": 10, "latest_metrics": {"score": 0.9},
+        "metrics": [{"epoch": 1, "elapsed": 2, "values": {"score": 0.9}}], "log_tail": ["epoch 1"]})
+    assert corrected.status_code == 200, corrected.text
     assert client.get("/api/tasks/remote-test/logs", params={"tail": 20}).json()["lines"] == ["epoch 1"]
-    assert len(client.get("/api/tasks/remote-test/metrics").json()) == 1
+    metrics = client.get("/api/tasks/remote-test/metrics").json()
+    assert len(metrics) == 1
+    assert metrics[0]["elapsed"] == 2 and metrics[0]["values"] == {"score": 0.9}
     assert client.post("/api/tasks/remote-test/stop").status_code == 200
     control = client.get(f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/control", headers=headers(first))
     assert control.json()["stop"] is True

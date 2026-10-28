@@ -3,7 +3,7 @@ import type { CSSProperties } from 'react'
 import { Activity, ChevronDown, Cpu, Gauge, HardDrive, MemoryStick, Pencil, Plus, RefreshCw, Search, Server, Settings2, Thermometer, Trash2, Zap } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { api, formatBytes } from '../api'
-import type { ComputeNode, ComputeResources as ComputeData, GpuInfo, GpuProcess } from '../types'
+import type { ComputeNode, ComputeNodeRefreshResult, ComputeResources as ComputeData, GpuInfo, GpuProcess } from '../types'
 import { ComputeNodeModal } from './ComputeNodeModal'
 
 function memoryLabel(value: number | null | undefined): string {
@@ -139,12 +139,25 @@ function dateLabel(value: string | null): string {
   return value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '尚未上报'
 }
 
+function refreshResultLabel(outcome: ComputeNodeRefreshResult, kind: ComputeNode['kind']): string {
+  switch (outcome.result) {
+    case 'fresh': return kind === 'local' ? '本机已完成新采样' : 'Agent 已上报新采样'
+    case 'stale': return '未确认新采样，显示现有数据'
+    case 'timeout': return '等待即时采样超时，显示现有数据'
+    case 'unsupported': return '无法请求即时采样，显示现有数据'
+    case 'error': return '即时采样失败，显示现有数据'
+  }
+}
+
 export function ComputeResources() {
   const [nodes, setNodes] = useState<ComputeNode[]>([])
   const [details, setDetails] = useState<Record<string, ComputeNode>>({})
   const [detailErrors, setDetailErrors] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [manualRefreshing, setManualRefreshing] = useState(false)
+  const [refreshOutcomes, setRefreshOutcomes] = useState<Record<string, ComputeNodeRefreshResult>>({})
+  const [refreshMessage, setRefreshMessage] = useState('')
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [countdown, setCountdown] = useState(refreshIntervalMs / 1000)
   const [pageVisible, setPageVisible] = useState(() => !document.hidden)
@@ -164,6 +177,7 @@ export function ComputeResources() {
   const controller = useRef<AbortController | null>(null)
   const requestId = useRef(0)
   const inFlight = useRef(false)
+  const manualInFlight = useRef(false)
   const nextRefreshAt = useRef(0)
 
   const visible = useMemo(() => nodes.filter((node) => (status === 'all' || node.status === status)
@@ -172,9 +186,9 @@ export function ComputeResources() {
   filters.current = { query, status }
   const lastFilter = useRef(`${status}\0${query}`)
 
-  const load = useCallback(async (manual = false, force = false) => {
-    // Let slow automatic requests finish; explicit actions supersede old requests.
-    if (inFlight.current && !manual && !force) return
+  const load = useCallback(async (force = false) => {
+    // Manual sampling owns the page until it finishes; automatic reads stay cache-only.
+    if (manualInFlight.current || (inFlight.current && !force)) return
     controller.current?.abort()
     const current = new AbortController()
     controller.current = current
@@ -197,6 +211,10 @@ export function ComputeResources() {
         else errors[ids[index]] = result.reason instanceof Error ? result.reason.message : '服务器详情读取失败'
       })
       setDetails((previous) => ({ ...previous, ...successful })); setDetailErrors(errors)
+      setRefreshOutcomes((previous) => Object.fromEntries(Object.entries(previous).filter(([id, outcome]) => {
+        const latest = list.find((node) => node.id === id)
+        return latest && latest.sampled_at === outcome.sampled_at
+      })))
     } catch (reason) {
       if (current.signal.aborted) return
       setError(reason instanceof SyntaxError ? '算力接口尚未就绪，请重启后端以加载新功能。' : reason instanceof Error ? reason.message : '算力信息加载失败')
@@ -210,6 +228,72 @@ export function ComputeResources() {
     }
   }, [])
 
+  const refreshNow = useCallback(async () => {
+    if (manualInFlight.current) return
+    // A click supersedes an in-flight cache read, but never another manual sample.
+    controller.current?.abort()
+    const current = new AbortController()
+    controller.current = current
+    const version = ++requestId.current
+    manualInFlight.current = true
+    inFlight.current = true
+    setManualRefreshing(true)
+    setRefreshing(true)
+    setRefreshMessage('正在等待各服务器的新采样…')
+    setRefreshOutcomes({})
+    try {
+      const response = await api.refreshComputeNodes(current.signal)
+      if (version !== requestId.current) return
+      const refreshed = response.nodes
+      setNodes(refreshed.map((entry) => entry.node))
+      setDetails(Object.fromEntries(refreshed.map((entry) => [entry.id, entry.node])))
+      setRefreshOutcomes(Object.fromEntries(refreshed.map((entry) => [entry.id, entry])))
+      setDetailErrors({})
+      setError('')
+      const fresh = refreshed.filter((entry) => entry.result === 'fresh').length
+      setRefreshMessage(refreshed.length === 0 ? '上次手动刷新：当前没有服务器可刷新。'
+        : fresh === refreshed.length ? `上次手动刷新：${fresh} 台服务器已取得新采样。`
+          : `上次手动刷新：${fresh}/${refreshed.length} 台服务器已确认即时采样；其余服务器请查看各节点提示。`)
+    } catch (reason) {
+      if (current.signal.aborted) return
+      if ([404, 405].includes((reason as Error & { status?: number })?.status || 0)) {
+        // A newly built UI may be served by an older backend until its next safe restart.
+        // Read its existing cache, and make clear that a fresh sample was not requested.
+        try {
+          const list = await api.computeNodes(current.signal)
+          const ids = list.filter((node) => expandedRef.current.includes(node.id)).map((node) => node.id)
+          const results = await Promise.allSettled(ids.map((id) => api.computeNode(id, current.signal)))
+          if (version !== requestId.current) return
+          const cached: Record<string, ComputeNode> = {}
+          results.forEach((result, index) => {
+            if (result.status === 'fulfilled') cached[ids[index]] = result.value
+          })
+          setNodes(list)
+          setDetails((previous) => ({ ...previous, ...cached }))
+          setRefreshMessage('上次手动刷新：后端尚未加载即时刷新接口；本次仅重新读取现有缓存，没有触发新采样。请在安全窗口重启开发版后端。')
+          setError('')
+        } catch (cacheError) {
+          if (current.signal.aborted) return
+          setRefreshMessage('')
+          setError(cacheError instanceof Error ? cacheError.message : '算力信息加载失败')
+        }
+        return
+      }
+      setRefreshMessage('')
+      setError(reason instanceof Error ? `立即刷新失败：${reason.message}` : '立即刷新失败，请稍后重试')
+    } finally {
+      if (version === requestId.current) {
+        manualInFlight.current = false
+        inFlight.current = false
+        nextRefreshAt.current = performance.now() + refreshIntervalMs
+        setCountdown(refreshIntervalMs / 1000)
+        setLoading(false)
+        setRefreshing(false)
+        setManualRefreshing(false)
+      }
+    }
+  }, [])
+
   useEffect(() => {
     void load()
     const mountedRequestId = requestId.current
@@ -217,6 +301,7 @@ export function ComputeResources() {
       controller.current?.abort()
       requestId.current = mountedRequestId + 1
       inFlight.current = false
+      manualInFlight.current = false
     }
   }, [load])
 
@@ -243,7 +328,7 @@ export function ComputeResources() {
   useEffect(() => {
     const key = `${status}\0${query}`
     if (lastFilter.current === key) return
-    const timer = window.setTimeout(() => { lastFilter.current = key; void load(false, true) }, 250)
+    const timer = window.setTimeout(() => { lastFilter.current = key; void load(true) }, 250)
     return () => window.clearTimeout(timer)
   }, [query, status, load])
 
@@ -255,7 +340,7 @@ export function ComputeResources() {
     const next = expanded.includes(id) ? expanded.filter((item) => item !== id) : [...expanded, id]
     expandedRef.current = next
     setExpanded(next)
-    if (next.includes(id)) void load(false, true)
+    if (next.includes(id)) void load(true)
   }
 
   async function remove(node: ComputeNode) {
@@ -265,7 +350,7 @@ export function ComputeResources() {
       await api.deleteComputeNode(node.id)
       setExpanded((previous) => previous.filter((id) => id !== node.id))
       setDetails((previous) => { const next = { ...previous }; delete next[node.id]; return next })
-      await load(false, true)
+      await load(true)
     } catch (reason) { setError(reason instanceof Error ? reason.message : '移除失败') }
     finally { setRemoving('') }
   }
@@ -275,7 +360,7 @@ export function ComputeResources() {
       <div><span className="eyebrow">COMPUTE MONITOR</span><h1>算力资源</h1><p>按服务器查看 GPU 负载、显存、功耗和计算进程，点击名称展开详情。</p></div>
       <div className="compute-actions">
         <button className={`auto-refresh ${autoRefresh ? 'active' : ''}`} aria-pressed={autoRefresh} title={autoRefresh ? '点击暂停自动刷新' : '点击开启自动刷新'} onClick={() => setAutoRefresh((value) => !value)}><i />{!autoRefresh ? '自动刷新已暂停' : !pageVisible ? '后台暂停刷新' : refreshing ? '刷新中…' : `下次刷新 ${countdown}s`}</button>
-        <button className="button" disabled={refreshing} onClick={() => void load(true)}><RefreshCw size={15} className={refreshing ? 'spin' : ''} />立即刷新</button>
+        <button className="button" disabled={manualRefreshing} onClick={() => void refreshNow()} title="等待本机新采样及远程 Agent 上报"><RefreshCw size={15} className={manualRefreshing ? 'spin' : ''} />{manualRefreshing ? '正在采样…' : '立即刷新'}</button>
         <button className="button primary" onClick={() => setModal({})}><Plus size={16} />添加服务器</button>
       </div>
     </header>
@@ -283,14 +368,16 @@ export function ComputeResources() {
       <label className="node-search"><Search size={16} /><input aria-label="搜索服务器" placeholder="搜索名称、地址或主机名" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
       <select className="node-status-filter" aria-label="服务器状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">全部状态</option>{Object.entries(statusNames).map(([key, value]) => <option key={key} value={key}>{value}</option>)}</select>
       <span>{nodes.length} 台服务器 · {nodes.filter((node) => node.status === 'online').length} 台在线</span>
-      <button className="button compact" onClick={() => { const next = [...new Set([...expanded, ...visible.map((node) => node.id)])]; expandedRef.current = next; setExpanded(next); void load(false, true) }}>展开全部</button>
+      <button className="button compact" onClick={() => { const next = [...new Set([...expanded, ...visible.map((node) => node.id)])]; expandedRef.current = next; setExpanded(next); void load(true) }}>展开全部</button>
       <button className="button compact" onClick={() => { expandedRef.current = []; setExpanded([]) }}>折叠全部</button>
     </div>
     {error && <div className="alert error" role="alert">{error} {nodes.length > 0 && '当前保留的是此前数据，请刷新重试。'}</div>}
+    {refreshMessage && <div className="node-refresh-message" role="status">{refreshMessage}</div>}
     {loading && !nodes.length && <div className="compute-loading"><RefreshCw className="spin" size={23} />正在读取服务器算力信息…</div>}
     <div className="node-list">{visible.map((node) => {
       const open = expanded.includes(node.id)
       const data = details[node.id]?.compute
+      const refreshOutcome = refreshOutcomes[node.id]
       const trainingUnavailableReason = node.training_unavailable_reason
       return <section className={`node-section ${open ? 'expanded' : ''}`} key={node.id}>
         <div className="node-heading">
@@ -298,6 +385,7 @@ export function ComputeResources() {
             <ChevronDown size={18} className={open ? 'rotated' : ''} /><Server size={20} />
             <span className="node-identity"><strong>{node.name}<em>{node.kind === 'local' ? '本机' : '远程'}</em></strong><small>{node.address || node.hostname || '等待 Agent 上报主机信息'}{node.notes ? ` · ${node.notes}` : ''}</small></span>
             <span className={`node-status ${node.status}`}><i />{statusNames[node.status]}</span>
+            {refreshOutcome && <span className={`node-refresh-badge ${refreshOutcome.result}`} title={refreshOutcome.reason || undefined}>{refreshOutcome.result === 'fresh' ? '已更新' : '未确认即时采样'}</span>}
             <span className="node-brief">{node.summary ? `${node.summary.gpu_count} GPU · ${node.summary.utilization == null ? '—' : `${node.summary.utilization}%`} · ${memoryLabel(node.summary.memory_used)} 显存` : '暂无采样'}</span>
           </button>
           <div className="node-controls">
@@ -306,7 +394,8 @@ export function ComputeResources() {
           </div>
         </div>
         {open && <div className="node-content" id={`node-${node.id}`}>
-          <div className="node-meta"><span>最后接收：{dateLabel(node.last_seen_at)}</span>{node.kind === 'agent' && <span>上报间隔：{node.report_interval_seconds}s · 超过 {node.offline_after_seconds}s 无新数据显示离线</span>}{node.agent_version && <span>Agent v{node.agent_version}</span>}</div>
+          <div className="node-meta"><span>{node.kind === 'local' ? '最后采样' : '最后上报'}：{dateLabel(node.last_seen_at)}</span>{node.kind === 'agent' && node.sampled_at && <span>采样时间：{dateLabel(node.sampled_at)}</span>}{node.kind === 'agent' && <span>上报间隔：{node.report_interval_seconds}s · 超过 {node.offline_after_seconds}s 无新数据显示离线</span>}{node.agent_version && <span>Agent v{node.agent_version}</span>}</div>
+          {refreshOutcome && <div className={`node-refresh-result ${refreshOutcome.result}`} role="status"><strong>{refreshResultLabel(refreshOutcome, node.kind)}</strong>{refreshOutcome.reason && <span> · {refreshOutcome.reason}</span>}</div>}
           {node.kind === 'agent' && <div className={`node-training-state ${trainingUnavailableReason ? 'not-ready' : 'ready'}`} role="status">
             <strong>{trainingUnavailableReason ? '暂不可训练' : '训练已就绪'}</strong>
             <span>{trainingUnavailableReason || '可接受远程训练任务'}</span>
@@ -328,6 +417,6 @@ export function ComputeResources() {
       </section>
     })}</div>
     {!loading && !visible.length && <div className="node-no-data"><Search size={26} /><span>没有匹配的服务器</span></div>}
-    {modal && <ComputeNodeModal node={modal.node} connect={modal.connect} onClose={() => setModal(null)} onSaved={() => void load(false, true)} />}
+    {modal && <ComputeNodeModal node={modal.node} connect={modal.connect} onClose={() => setModal(null)} onSaved={() => void load(true)} />}
   </div>
 }

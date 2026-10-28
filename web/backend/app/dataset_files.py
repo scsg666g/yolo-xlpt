@@ -108,8 +108,9 @@ def safe_member(name):
     return p
 
 
-def pack(root, archive, check=None):
-    manifest = scan(root, check)
+def pack(root, archive, check=None, *, manifest=None):
+    # Reuse quota/archive planning while retaining full source verification.
+    manifest = manifest if manifest is not None else scan(root, check)
     archive = Path(archive)
     archive.parent.mkdir(parents=True, exist_ok=True)
     temporary = archive.with_suffix('.tmp')

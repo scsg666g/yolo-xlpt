@@ -208,6 +208,19 @@ export function modelTestWeightName(test: ModelTestSummary) {
   return test.artifact_name || test.model_name || test.model.weight_name || 'best.pt'
 }
 
+export function modelTestExecutionLabel(test?: Pick<ModelTestSummary, 'model' | 'execution'> | null) {
+  return `中心服务器 · ${(test?.execution?.device || test?.model.device || 'CPU').toUpperCase()} · ${test?.model.imgsz || 640} px`
+}
+
+export function modelTestWaitingMessage(test: Pick<ModelTest, 'status' | 'queue_ahead' | 'status_message'>) {
+  if (test.status_message) return test.status_message
+  if (test.status === 'queued') return typeof test.queue_ahead === 'number' && Number.isFinite(test.queue_ahead) && test.queue_ahead >= 0
+    ? `等待中心服务器执行，前方 ${Math.floor(test.queue_ahead)} 个测试任务；这不是训练 GPU 的排队状态。`
+    : '等待中心服务器的测试工作线程执行；这不是训练 GPU 的排队状态。'
+  if (test.status === 'preparing') return '正在中心服务器准备并校验权重副本；远程模型首次使用需要传输。'
+  return null
+}
+
 export function hasExactModelVersion(test: Pick<ModelTest, 'artifact_id' | 'model_sha256' | 'model_size'>) {
   return typeof test.artifact_id === 'number'
     && typeof test.model_sha256 === 'string'
@@ -237,7 +250,7 @@ export function ModelStrip({ test, artifact, fallbackAttempt, fallbackTask, best
     <div><Box size={17} /><span>测试权重<strong>{name}{typeof size === 'number' ? ` · ${formatBytes(size)}` : ''}</strong></span></div>
     <div><FileArchive size={17} /><span>权重来源<strong>{attempt ? `Attempt ${String(attempt).padStart(3, '0')}` : '当前选中运行'}</strong></span></div>
     <div><Gauge size={17} /><span>{metricName}<strong>{metric ? `Epoch ${metric.epoch} · ${metric.value.toFixed(4)}` : '暂无指标记录'}</strong></span></div>
-    <div><Cpu size={17} /><span>执行环境<strong>{test?.model.device || 'CPU'} · {test?.model.imgsz || 640} px</strong></span></div>
+    <div><Cpu size={17} /><span>执行环境<strong>{modelTestExecutionLabel(test)}</strong></span></div>
   </section>
 }
 
@@ -279,6 +292,7 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
   const original = imageUrl(current, 'original')
   const result = imageUrl(current, 'result')
 
+  const waitingMessage = test ? modelTestWaitingMessage(test) : null
   return <div className="model-test-workspace">
     <aside className="model-test-thumbnails">
       {rows.map((file, index) => {
@@ -294,6 +308,7 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
       })}
     </aside>
     <div className="model-test-main">
+      {waitingMessage && <p className="model-test-help" role="status">{waitingMessage}</p>}
       {completed && <div className="model-test-summary">共 {rows.length} 张 {taskLabel}图片：{resultImages} 张有结果，{emptyImages} 张没有结果。</div>}
       <div className="model-test-comparison">
         {[{ url: original, title: '原图', kind: 'original' }, { url: result, title: taskType ? `${taskLabel}结果` : '预测结果', kind: 'result' }].map(({ url, title, kind }) => <section className="model-test-panel" key={title}>

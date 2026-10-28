@@ -51,6 +51,10 @@ PROCESS_ATTRIBUTION_AGENT_VERSION = "1.9.0"
 PROCESS_ATTRIBUTION_AGENT_VERSION_PARTS = (1, 9, 0)
 REMOTE_MODEL_TEST_AGENT_VERSION = "2.0.3"
 REMOTE_MODEL_TEST_AGENT_VERSION_PARTS = (2, 0, 3)
+MANUAL_REFRESH_AGENT_VERSION = "2.4.2"
+MANUAL_REFRESH_AGENT_VERSION_PARTS = (2, 4, 2)
+MANUAL_REFRESH_WAIT_SECONDS = 20
+LOCAL_REFRESH_WAIT_SECONDS = 12
 Nonnegative = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 Percentage = Annotated[float, Field(ge=0, le=100, allow_inf_nan=False)]
 
@@ -168,6 +172,7 @@ class AgentReport(BaseModel):
     agent_version: str = Field(default="1.0.0", max_length=40)
     boot_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     report_seq: int | None = Field(default=None, ge=1)
+    refresh_request_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     compute: ComputeReport
     training: TrainingCapability | None = None
 
@@ -187,6 +192,15 @@ class RemoteRunUpdate(BaseModel):
     stop_reason: str | None = Field(default=None, pattern=r"^(platform_stop|agent_shutdown)$")
     run_dir: str | None = Field(default=None, max_length=2000)
     command: list[str] = Field(default_factory=list, max_length=256)
+    dataset_snapshot: dict[str, Any] | None = Field(default=None, max_length=10)
+
+    @field_validator('dataset_snapshot')
+    @classmethod
+    def clean_dataset_snapshot(cls, value):
+        if value is None:
+            return None
+        from .dataset_provenance import clean
+        return clean(value)
 
     @field_validator("status")
     @classmethod
@@ -249,6 +263,7 @@ class RemoteTraceUpload(BaseModel):
 
 
 _local_lock = threading.Lock()
+_local_condition = threading.Condition(_local_lock)
 _logger = logging.getLogger("yolo-platform.compute")
 _local_cache: dict = {
     "available": False,
@@ -267,20 +282,27 @@ _local_cache: dict = {
 }
 _local_sampled = 0.0
 _local_refreshing = False
+_local_sample_sequence = 0
+_local_sample_error = False
 
 
 def _refresh_local_snapshot() -> None:
-    global _local_cache, _local_sampled, _local_refreshing
+    global _local_cache, _local_sampled, _local_refreshing, _local_sample_sequence, _local_sample_error
     try:
         snapshot = compute_inventory()
     except Exception:
         _logger.exception("local_compute_sampling_failed")
-        snapshot = {**_local_cache, "sampled_at": utcnow().isoformat(),
-                    "message": "本机算力信息采集失败，请稍后刷新"}
+        snapshot = None
     with _local_lock:
-        _local_cache = snapshot
+        if snapshot is not None:
+            _local_cache = snapshot
+            _local_sample_error = False
+        else:
+            _local_sample_error = True
         _local_sampled = time.monotonic()
+        _local_sample_sequence += 1
         _local_refreshing = False
+        _local_condition.notify_all()
 
 
 def local_snapshot() -> dict:
@@ -292,6 +314,21 @@ def local_snapshot() -> dict:
             _local_refreshing = True
             threading.Thread(target=_refresh_local_snapshot, name="local-compute-sampler", daemon=True).start()
         return _local_cache
+
+
+def refresh_local_snapshot(timeout: float = LOCAL_REFRESH_WAIT_SECONDS) -> tuple[str, str | None]:
+    """Wait for one new single-flight sample without blocking ordinary GETs."""
+    global _local_refreshing
+    with _local_condition:
+        previous = _local_cache.get("sampled_at")
+        sequence = _local_sample_sequence
+        if not _local_refreshing:
+            _local_refreshing = True
+            threading.Thread(target=_refresh_local_snapshot, name="local-compute-sampler", daemon=True).start()
+        _local_condition.wait_for(lambda: _local_sample_sequence != sequence, timeout)
+        if _local_sample_sequence == sequence:
+            return "timeout", previous
+        return ("error" if _local_sample_error else "fresh"), previous
 
 
 def ensure_local_node(db: Session) -> ComputeNode:
@@ -491,7 +528,7 @@ def _association_from_hint(hint: dict[str, Any] | None, *, node: ComputeNode,
 
 
 def _associate_snapshot(node: ComputeNode, snapshot: dict, db: Session, *, stale: bool = False) -> dict:
-    result = {**snapshot, "gpus": []}
+    result = {**{key: value for key, value in snapshot.items() if not key.startswith("_refresh_")}, "gpus": []}
     process_items = [process for gpu in snapshot.get("gpus", [])
                      for process in gpu.get("processes", []) if isinstance(process, dict)]
     hinted_run_ids = {process.get("owner_hint", {}).get("run_id") for process in process_items
@@ -615,6 +652,87 @@ def list_nodes(db: Session = Depends(get_db)):
     return [serialize_node(node) for node in nodes]
 
 
+def _request_remote_refresh(db: Session, node_id: str) -> str:
+    """Persist one node-scoped request so any API worker can answer its Agent."""
+    acquire_node_claim_lock(db, node_id)
+    node = node_or_404(db, node_id)
+    # Row locks do not refresh ORM objects loaded by the initial node listing.
+    db.refresh(node)
+    snapshot = node.snapshot or {}
+    existing = snapshot.get("_refresh_request_id")
+    requested_at = snapshot.get("_refresh_requested_at")
+    try:
+        recent = requested_at and (utcnow() - as_utc(datetime.fromisoformat(requested_at))).total_seconds() < 60
+    except (TypeError, ValueError):
+        recent = False
+    if existing and recent:
+        request_id = existing
+    else:
+        request_id = uuid.uuid4().hex
+        node.snapshot = {**snapshot, "_refresh_request_id": request_id,
+                         "_refresh_requested_at": utcnow().isoformat(), "_refresh_completed_id": None}
+    db.commit()
+    return request_id
+
+
+@router.post("/nodes/refresh")
+def refresh_nodes(db: Session = Depends(get_db)):
+    """Manual refresh waits briefly for new samples; routine GETs stay cached."""
+    nodes = db.scalars(select(ComputeNode).order_by(ComputeNode.kind.desc(), ComputeNode.created_at, ComputeNode.id)).all()
+    started = time.monotonic()
+    requests: dict[str, str] = {}
+    outcomes: dict[str, tuple[str, str | None, str | None]] = {}
+    for node in nodes:
+        if node.kind == "local":
+            continue
+        previous = (node.snapshot or {}).get("sampled_at")
+        timeout = max(30, node.report_interval_seconds * 3)
+        online = (node.enabled and node.last_seen_at is not None
+                  and (utcnow() - as_utc(node.last_seen_at)).total_seconds() <= timeout)
+        if not online:
+            outcomes[node.id] = ("unsupported", "远程 Agent 未在线，当前显示上次上报的数据", previous)
+        elif not agent_version_at_least(node.agent_version, MANUAL_REFRESH_AGENT_VERSION_PARTS):
+            outcomes[node.id] = ("unsupported", f"远程即时刷新需要 Agent {MANUAL_REFRESH_AGENT_VERSION} 或以上版本", previous)
+        else:
+            try:
+                requests[node.id] = _request_remote_refresh(db, node.id)
+                outcomes[node.id] = ("timeout", "等待远程 Agent 的下一次上报与即时采样", previous)
+            except Exception:
+                db.rollback()
+                _logger.exception("remote_compute_refresh_request_failed node_id=%s", node.id)
+                outcomes[node.id] = ("error", "发送远程刷新请求失败，当前显示上次上报的数据", previous)
+    if any(node.kind == "local" for node in nodes):
+        remaining = max(0.0, min(LOCAL_REFRESH_WAIT_SECONDS, MANUAL_REFRESH_WAIT_SECONDS - (time.monotonic() - started)))
+        result, previous = refresh_local_snapshot(remaining)
+        message = {"timeout": "本机采样超时，当前显示上次数据", "error": "本机采样失败，当前显示上次数据"}.get(result)
+        outcomes[LOCAL_ID] = (result, message, previous)
+    # Poll the durable record rather than a process-local event: reports may
+    # land in another API worker, and old Agents simply time out explicitly.
+    pending = set(requests)
+    while pending and time.monotonic() - started < MANUAL_REFRESH_WAIT_SECONDS:
+        db.rollback()
+        for node_id in tuple(pending):
+            node = db.get(ComputeNode, node_id)
+            if node and (node.snapshot or {}).get("_refresh_completed_id") == requests[node_id]:
+                previous = outcomes[node_id][2]
+                outcomes[node_id] = ("fresh", None, previous)
+                pending.remove(node_id)
+        if pending:
+            time.sleep(min(0.2, max(0.0, MANUAL_REFRESH_WAIT_SECONDS - (time.monotonic() - started))))
+    db.rollback()
+    result_nodes = []
+    for old_node in nodes:
+        node = db.get(ComputeNode, old_node.id)
+        if node is None:
+            continue
+        result, reason, previous = outcomes.get(node.id, ("unsupported", "无法刷新该服务器", None))
+        detail = serialize_node(node, detail=True, db=db)
+        result_nodes.append({"id": node.id, "result": result, "reason": reason,
+                             "previous_sampled_at": previous,
+                             "sampled_at": detail.get("sampled_at"), "node": detail})
+    return {"nodes": result_nodes}
+
+
 @router.post("/nodes", status_code=201)
 def create_node(payload: NodeSettings, db: Session = Depends(get_db)):
     node = ComputeNode(id=uuid.uuid4().hex, kind="agent", **payload.model_dump())
@@ -714,9 +832,16 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
         payload = AgentReport.model_validate_json(body)
     except ValidationError as exc:
         raise HTTPException(422, "采样数据格式错误：" + "; ".join(error["msg"] for error in exc.errors(include_input=False))) from exc
+    # Serialize writes with manual refresh requests across API workers. This
+    # prevents an in-flight heartbeat from overwriting a newly queued nonce.
+    acquire_node_claim_lock(db, node_id)
+    node = node_or_404(db, node_id)
+    # Authentication loaded this object before the lock was granted.
+    db.refresh(node)
     received_at = utcnow()
     previous_snapshot = node.snapshot or {}
     previous = previous_snapshot.get("sampled_at")
+    pending_request = previous_snapshot.get("_refresh_request_id")
     ordered_report = payload.boot_id is not None and payload.report_seq is not None
     stale_order = (
         ordered_report
@@ -734,15 +859,24 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
         # the newer hardware snapshot while recording this authenticated receipt.
         node.last_seen_at = received_at
         db.commit()
-        return {"status": "stale", "report_interval_seconds": node.report_interval_seconds}
+        return {"status": "stale", "report_interval_seconds": node.report_interval_seconds,
+                **({"refresh_request_id": pending_request} if pending_request else {})}
+    completed_request = (
+        pending_request if ordered_report and payload.refresh_request_id == pending_request else None
+    )
+    refresh_metadata = {"_refresh_completed_id": completed_request or previous_snapshot.get("_refresh_completed_id")}
+    if pending_request and not completed_request:
+        refresh_metadata.update(_refresh_request_id=pending_request,
+                                _refresh_requested_at=previous_snapshot.get("_refresh_requested_at"))
     node.snapshot = {**payload.compute.model_dump(mode="json"),
                      **({"training": payload.training.model_dump(mode="json")} if payload.training else {}),
                      **({"agent_boot_id": payload.boot_id, "agent_report_seq": payload.report_seq}
-                        if ordered_report else {})}
+                        if ordered_report else {}), **refresh_metadata}
     node.agent_version = payload.agent_version
     node.last_seen_at = received_at
     db.commit()
-    return {"status": "ok", "report_interval_seconds": node.report_interval_seconds}
+    return {"status": "ok", "report_interval_seconds": node.report_interval_seconds,
+            **({"refresh_request_id": pending_request} if pending_request and not completed_request else {})}
 
 
 @router.post("/nodes/{node_id}/agent/poll")
@@ -901,6 +1035,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
         return {"poll_interval_seconds": 5, "task": {
             "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
             "platform_instance_id": platform_instance_id(),
+            "dataset_provenance_version": 1,
             "task_type": task.task_type, "launch_mode": run.launch_mode,
             "model_path": run.model_path, "data_path": run.data_path,
             "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir, "claim_lease": lease,
@@ -968,9 +1103,18 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
     if not task:
         raise HTTPException(404, "训练任务不存在")
     prior_status = run.status
+    if payload.dataset_snapshot is not None and (
+        payload.dataset_snapshot['node_id'] != node_id
+        or payload.dataset_snapshot['task_type'] != task.task_type
+    ):
+        raise HTTPException(422, '数据集快照与训练节点或任务类型不一致')
     terminal = {"stopped", "completed", "failed", "interrupted"}
     if prior_status in terminal:
         return {"status": prior_status, "stop_requested": bool(run.stop_requested)}
+    if payload.dataset_snapshot is not None and 'dataset_snapshot' not in (run.parameter_snapshot or {}):
+        from .run_dataset_snapshot import enrich as enrich_dataset
+        run.parameter_snapshot = {**(run.parameter_snapshot or {}), 'dataset_snapshot':
+                                  enrich_dataset(db, payload.dataset_snapshot, run.data_path, launch_mode=run.launch_mode)}
     if payload.status not in {"starting", "running", "stopping", *terminal}:
         raise HTTPException(422, "非法状态")
     if payload.status == "completed" and (
@@ -999,9 +1143,14 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
             elapsed = float(point.get("elapsed", 0))
             if epoch < 0 or epoch > payload.completed_epochs or not isinstance(values, dict) or not math.isfinite(elapsed) or elapsed < 0:
                 continue
-            exists = db.scalar(select(MetricPoint.id).where(MetricPoint.run_id == run.id, MetricPoint.epoch == epoch))
-            if not exists:
+            existing_point = db.scalar(select(MetricPoint).where(
+                MetricPoint.run_id == run.id, MetricPoint.epoch == epoch,
+            ))
+            if existing_point is None:
                 db.add(MetricPoint(task_id=task.id, run_id=run.id, epoch=epoch, elapsed=elapsed, values=values))
+            else:
+                existing_point.elapsed = elapsed
+                existing_point.values = values
         except (KeyError, TypeError, ValueError, OverflowError):
             continue
     if effective_status in terminal:

@@ -36,10 +36,32 @@ function formatCreatedAt(value: string | null) {
   return Number.isNaN(date.getTime()) ? '时间未记录' : date.toLocaleString('zh-CN')
 }
 
+function refreshRequestId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID().replaceAll('-', '')
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('')
+}
+
+function pendingRefreshStorageKey(datasetId: string) {
+  return `dataset-refresh-request:${encodeURIComponent(datasetId)}`
+}
+
+function readPendingRefreshRequest(datasetId: string) {
+  try { return window.sessionStorage.getItem(pendingRefreshStorageKey(datasetId)) || null } catch { return null }
+}
+
+function savePendingRefreshRequest(datasetId: string, requestId: string | null) {
+  try {
+    const key = pendingRefreshStorageKey(datasetId)
+    if (requestId) window.sessionStorage.setItem(key, requestId)
+    else window.sessionStorage.removeItem(key)
+  } catch { /* Retry safety remains within this page when browser storage is unavailable. */ }
+}
+
 export function Datasets() {
   const [datasets, setDatasets] = useState<ManagedDataset[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
   const [notice, setNotice] = useState('')
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<DatasetFilter>('all')
@@ -48,6 +70,8 @@ export function Datasets() {
   const [deleting, setDeleting] = useState(false)
   const [refreshing, setRefreshing] = useState<string | null>(null)
   const refreshSubmitting = useRef(false)
+  // Keep uncertain submissions identifiable; retrying must not create a second job.
+  const pendingRefreshRequests = useRef(new Map<string, string>())
   const [actionTarget, setActionTarget] = useState<ManagedDataset | 'register' | null>(null)
   const [serverFilter, setServerFilter] = useState('all')
   const [discoveryOpen, setDiscoveryOpen] = useState(false)
@@ -60,6 +84,7 @@ export function Datasets() {
   const previousSignature = useRef('')
   const loadRequest = useRef<{ version: number; controller: AbortController } | null>(null)
   const loadVersion = useRef(0)
+  const catalogueLoaded = useRef(false)
   const deleteDialog = useRef<HTMLDivElement>(null)
   const deleteCancelButton = useRef<HTMLButtonElement>(null)
   const deleteOpener = useRef<HTMLButtonElement | null>(null)
@@ -70,13 +95,17 @@ export function Datasets() {
     const controller = new AbortController()
     loadRequest.current = { version, controller }
     setLoading(true)
-    setError('')
+    setLoadError('')
     try {
       const incoming = await api.datasetEntries(controller.signal)
-      if (version === loadVersion.current) setDatasets(incoming)
+      if (version !== loadVersion.current) return false
+      setDatasets(incoming)
+      catalogueLoaded.current = true
+      return true
     } catch (reason) {
-      if (controller.signal.aborted || version !== loadVersion.current) return
-      setError(reason instanceof Error ? reason.message : '数据集列表加载失败')
+      if (controller.signal.aborted || version !== loadVersion.current) return false
+      setLoadError(reason instanceof Error ? reason.message : '数据集列表加载失败')
+      return false
     } finally {
       if (loadRequest.current?.version === version) loadRequest.current = null
       if (version === loadVersion.current) setLoading(false)
@@ -96,6 +125,7 @@ export function Datasets() {
     let active = true; let running = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let controller: AbortController | null = null
+    let forceReload = false
     async function load() {
       if (!active || running || document.hidden) return
       running = true; controller = new AbortController()
@@ -105,17 +135,23 @@ export function Datasets() {
         if (history.status === 'fulfilled') {
           setOperationSummary(history.value); setHistoryError('')
           const signature = history.value.revision
-          if (previousSignature.current && signature !== previousSignature.current) void loadDatasets()
-          previousSignature.current = signature
-        } else setHistoryError(history.reason instanceof Error ? history.reason.message : '操作统计暂不可用')
-        if (compute.status === 'fulfilled') setNodes(compute.value)
+          if (forceReload || !catalogueLoaded.current && !loadRequest.current || previousSignature.current && signature !== previousSignature.current) {
+            // Advance the acknowledged revision only after the matching list loaded.
+            // Otherwise one failed request leaves references stale indefinitely.
+            if (await loadDatasets() && active) { previousSignature.current = signature; forceReload = false }
+          } else previousSignature.current = signature
+        } else {
+          setHistoryError(history.reason instanceof Error ? history.reason.message : '操作统计暂不可用')
+          if ((forceReload || !catalogueLoaded.current && !loadRequest.current) && await loadDatasets()) forceReload = false
+        }
+        if (active && compute.status === 'fulfilled') setNodes(compute.value)
       }
       running = false
       if (active) timer = setTimeout(load, 5000)
     }
-    function visible() { if (!document.hidden) { clearTimeout(timer); void load() } }
-    void load(); document.addEventListener('visibilitychange', visible)
-    return () => { active = false; controller?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
+    function visible() { if (!document.hidden) { forceReload = true; clearTimeout(timer); void load() } }
+    void load(); document.addEventListener('visibilitychange', visible); window.addEventListener('focus', visible)
+    return () => { active = false; controller?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible); window.removeEventListener('focus', visible) }
   }, [loadDatasets, summaryRefresh])
 
   const servers = useMemo(() => {
@@ -132,11 +168,32 @@ export function Datasets() {
     if (refreshSubmitting.current || dataset.blocking_operation_id) return
     refreshSubmitting.current = true
     setRefreshing(dataset.id); setError(''); setNotice('')
+    const requestId = pendingRefreshRequests.current.get(dataset.id) || readPendingRefreshRequest(dataset.id) || refreshRequestId()
+    pendingRefreshRequests.current.set(dataset.id, requestId)
+    savePendingRefreshRequest(dataset.id, requestId)
     try {
-      await api.refreshDatasetEntry(dataset.id)
-      setNotice(`“${dataset.name}”已提交重新加载，校验成功后更新图片、标签、类别、空间和警告；服务器训练中会等待。可在操作记录中查看进度。`)
+      let operation: Awaited<ReturnType<typeof api.refreshDatasetEntry>> | null = null
+      try { operation = await api.datasetOperation(requestId) } catch (reason) {
+        if ((reason as { status?: number } | null)?.status !== 404) throw reason
+      }
+      if (operation && (operation.kind !== 'refresh' || operation.node_id !== dataset.node_id)) {
+        throw new Error('重新加载请求标识与服务器已有操作不匹配，请查看操作记录后再试')
+      }
+      operation ||= await api.refreshDatasetEntry(dataset.id, requestId)
+      pendingRefreshRequests.current.delete(dataset.id)
+      savePendingRefreshRequest(dataset.id, null)
+      if (operation.status === 'failed' || operation.status === 'cancelled') {
+        setError(operation.error || '此前提交的重新加载已失败或取消，请在操作记录中查看，或重新发起加载。')
+      } else setNotice(operation.status === 'completed'
+        ? `“${dataset.name}”先前提交的重新加载已完成，已同步最新统计。`
+        : `“${dataset.name}”已提交重新加载，校验成功后更新图片、标签、类别、空间和警告；服务器训练中会等待。可在操作记录中查看进度。`)
       operationsChanged()
     } catch (reason) {
+      const status = (reason as { status?: number } | null)?.status
+      if (status !== undefined && status < 500 && status !== 408) {
+        pendingRefreshRequests.current.delete(dataset.id)
+        savePendingRefreshRequest(dataset.id, null)
+      }
       setError(reason instanceof Error ? reason.message : '重新加载提交失败')
       void loadDatasets()
     } finally {
@@ -252,7 +309,7 @@ export function Datasets() {
       <div>
         <span className="eyebrow">DATASET LIBRARY</span>
         <h1>数据集管理</h1>
-        <p>统一管理本机和远程数据集：保存位置、上传、已有目录登记、复制迁移及安全删除。</p>
+        <p>统一管理本机和远程数据集：保存位置、上传、已有目录登记、复制迁移及安全删除。当前托管校验支持 YOLO 目标检测。</p>
       </div>
       <div className="header-actions datasets-header-actions">
         <button type="button" className="button ghost" onClick={() => setStorageOpen(true)}><Settings2 size={16} />保存位置</button>
@@ -269,7 +326,7 @@ export function Datasets() {
     </header>
 
     {notice && <div className="dataset-feedback success" role="status"><CheckCircle2 size={17} />{notice}</div>}
-    {error && <div className="dataset-feedback error" role="alert"><AlertTriangle size={17} /><span>{error}</span><button type="button" onClick={() => setError('')} aria-label="关闭错误提示"><X size={15} /></button></div>}
+    {(error || loadError) && <div className="dataset-feedback error" role="alert"><AlertTriangle size={17} /><span>{error || loadError}</span><button type="button" onClick={() => { setError(''); setLoadError('') }} aria-label="关闭错误提示"><X size={15} /></button></div>}
 
     <section className="dataset-overview" aria-label="数据集概览">
       <article><Database size={19} /><div><strong>{summary.count}</strong><span>平台数据集</span></div></article>

@@ -587,6 +587,7 @@ def class_names(files_root: Path, supplied: list[str]) -> list[str]:
 
 def validate_contents(files_root: Path, manifest: dict, names: list[str], check=None) -> tuple[dict, list[str]]:
     images: dict[str, set[str]] = {"train": set(), "val": set()}
+    image_paths: dict[str, set[str]] = {"train": set(), "val": set()}
     labels: dict[str, set[str]] = {"train": set(), "val": set()}
     empty_labels: dict[str, set[str]] = {"train": set(), "val": set()}
     from .dataset_files import report_progress
@@ -608,7 +609,13 @@ def validate_contents(files_root: Path, manifest: dict, names: list[str], check=
                         image.load()
             except (OSError, UnidentifiedImageError, Image.DecompressionBombError, Image.DecompressionBombWarning, SyntaxError) as exc:
                 raise HTTPException(422, f"图片损坏或无法读取：{relative}") from exc
-            images[relative.parts[1]].add(str(PurePosixPath(*relative.parts[2:]).with_suffix("")))
+            split = relative.parts[1]
+            image_path = str(PurePosixPath(*relative.parts[2:]))
+            key = str(PurePosixPath(image_path).with_suffix(""))
+            if key in images[split]:
+                raise HTTPException(422, f"图片有同名但不同扩展名的文件，无法唯一匹配标签：{relative}")
+            image_paths[split].add(image_path)
+            images[split].add(key)
         elif relative.parts[0] == "labels":
             labels[relative.parts[1]].add(str(PurePosixPath(*relative.parts[2:]).with_suffix("")))
             targets = 0
@@ -639,7 +646,7 @@ def validate_contents(files_root: Path, manifest: dict, names: list[str], check=
         warnings.append(f"{empty_backgrounds} 张图片的标签文件为空，将作为背景图片。")
     if orphaned:
         warnings.append(f"{orphaned} 个标签没有对应图片，训练时不会使用。")
-    stats = {"train_images": len(images["train"]), "val_images": len(images["val"]),
+    stats = {"train_images": len(image_paths["train"]), "val_images": len(image_paths["val"]),
              "labels": sum(len(values) for values in labels.values()), "classes": len(names), "background_images": missing + empty_backgrounds}
     return stats, warnings
 

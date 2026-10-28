@@ -35,16 +35,16 @@ PLATFORM_VERSION = read_platform_version()
 
 
 def nonnegative_int_env(name: str, default: int) -> int:
-    """Read a byte-count setting and fail early on an unsafe deployment value."""
+    """Read a non-negative integer setting and fail early on unsafe values."""
     value = os.getenv(name)
     if value is None or not value.strip():
         return default
     try:
         parsed = int(value)
     except ValueError as exc:
-        raise RuntimeError(f"{name} 必须是非负整数（单位：字节）") from exc
+        raise RuntimeError(f"{name} 必须是非负整数") from exc
     if parsed < 0:
-        raise RuntimeError(f"{name} 必须是非负整数（单位：字节）")
+        raise RuntimeError(f"{name} 必须是非负整数")
     return parsed
 
 
@@ -183,3 +183,6 @@ DATASET_STORAGE_ALLOWED_ROOTS = project_path_list_env(
     "PLATFORM_DATASET_STORAGE_ALLOWED_ROOTS", str(PROJECT_ROOT), base=PROJECT_ROOT,
 )
 DATASET_STORAGE_QUOTA_BYTES = nonnegative_int_env("PLATFORM_DATASET_STORAGE_QUOTA_BYTES", 100 * 1024**3)
+# Zero disables reclamation for the corresponding snapshot class.
+DATASET_STORAGE_RETENTION_SECONDS = nonnegative_int_env("PLATFORM_DATASET_STORAGE_RETENTION_SECONDS", 24 * 3600)
+DATASET_FAILED_RETENTION_SECONDS = nonnegative_int_env("PLATFORM_DATASET_FAILED_RETENTION_SECONDS", 7 * 24 * 3600)

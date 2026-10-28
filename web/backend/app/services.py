@@ -51,11 +51,13 @@ from .gpu_reservations import (
 )
 from .models import Artifact, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .log_files import tail_log
+from .metric_files import MetricCsvReader
 from .parameter_catalog import training_parameter_keys
 from .training_outcome import classify_training_exit
 
 
 logger = logging.getLogger("yolo-platform.training-scheduler")
+_METRIC_CSV_READER = MetricCsvReader(maximum_files=16)
 
 
 TRAINING_KEYS = {
@@ -741,11 +743,9 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
     csv_path = Path(run.run_dir) / "results.csv"
     if not csv_path.exists():
         return
-    try:
-        with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-    except (OSError, csv.Error):
-        return
+    snapshot = _METRIC_CSV_READER.read(
+        csv_path, final=run.status in {"completed", "failed", "stopped", "interrupted"},
+    )
     existing = {
         point.epoch: point
         for point in db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()
@@ -765,19 +765,9 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
     latest: dict[str, Any] = {}
     latest_epoch = run.completed_epochs
     has_valid_epoch = False
-    for row in rows:
-        try:
-            epoch = int(float(row.get("epoch", "0")))
-        except (TypeError, ValueError, OverflowError):
-            continue
+    for metric in snapshot["metrics"]:
+        epoch, values, elapsed = metric["epoch"], metric["values"], metric["elapsed"]
         has_valid_epoch = True
-        values = {key.strip(): parse_number(value) for key, value in row.items() if key and key.strip() not in {"epoch", "time"}}
-        try:
-            elapsed = float(row.get("time") or 0)
-            if not math.isfinite(elapsed) or elapsed < 0:
-                elapsed = 0.0
-        except (TypeError, ValueError):
-            elapsed = 0.0
         if epoch not in existing:
             try:
                 with db.begin_nested():
@@ -789,6 +779,12 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
                     existing[epoch] = point
             except IntegrityError:
                 pass
+        else:
+            point = existing[epoch]
+            if point.values != values:
+                point.values = values
+            if point.elapsed != elapsed:
+                point.elapsed = elapsed
         latest, latest_epoch = values, max(latest_epoch, epoch)
     if has_valid_epoch:
         epochs = int(
@@ -1391,6 +1387,14 @@ class TrainingScheduler:
             self._fail_before_launch(db, run.id, message, message)
             return
         command = self._command(task, run, dataset_path)
+        from .dataset_provenance import capture as capture_dataset
+        from .run_dataset_snapshot import enrich as enrich_dataset
+        snapshot = dict(run.parameter_snapshot or {})
+        if 'dataset_snapshot' not in snapshot:
+            snapshot['dataset_snapshot'] = enrich_dataset(db, capture_dataset(
+                run.data_path, task_type=task.task_type, node_id='local',
+                runtime_path=dataset_path,
+            ), run.data_path, launch_mode=run.launch_mode)
         prepared_at = utcnow()
         prepared = db.execute(
             update(TrainingRun).where(
@@ -1400,6 +1404,7 @@ class TrainingScheduler:
             ).values(
                 command=command, run_dir=str(run_dir), log_path=str(log_path),
                 started_at=prepared_at, process_started_at=prepared_at,
+                parameter_snapshot=snapshot,
             )
         )
         if prepared.rowcount != 1:

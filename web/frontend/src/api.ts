@@ -1,4 +1,4 @@
-import type { DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeRefreshResponse, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -39,6 +39,7 @@ async function requestWithTimeout<T>(path: string, init?: RequestInit, timeoutMs
 }
 
 const deletionTimeout = '删除请求超时，后台可能已经受理。请关闭弹窗，查看任务列表或回收站确认状态后再操作。'
+const datasetSubmissionTimeout = '数据集操作提交超时，后台可能已经受理。请刷新数据集和操作记录确认状态，再决定是否重试。'
 
 export const api = {
   health: (signal?: AbortSignal) => requestWithTimeout<PlatformHealth>('/api/health', { signal }, 8_000, '健康检查超时'),
@@ -138,24 +139,24 @@ export const api = {
   registerDatasetBatch: (id: string, payload: DatasetBatchRequest) => requestWithTimeout<DatasetRegistrationBatch>(`/api/dataset-storage/discovery/scans/${id}/batches`, { method: 'POST', body: JSON.stringify(payload) }),
   cancelDatasetBatch: (id: string) => requestWithTimeout<DatasetRegistrationBatch>(`/api/dataset-storage/discovery/batches/${id}/cancel`, { method: 'POST' }),
   datasetLocations: (signal?: AbortSignal) => requestWithTimeout<DatasetLocation[]>('/api/dataset-storage/locations', { signal }),
-  createDatasetLocation: (payload: { node_id: string; name: string; path: string; create: boolean; is_default: boolean }) => request<{ id: string; operation_id: string }>('/api/dataset-storage/locations', { method: 'POST', body: JSON.stringify(payload) }),
-  updateDatasetLocation: (id: string, enabled: boolean, is_default: boolean) => request(`/api/dataset-storage/locations/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled, is_default }) }),
-  checkDatasetLocation: (id: string, create = false) => request<DatasetOperation>(`/api/dataset-storage/locations/${id}/check`, { method: 'POST', body: JSON.stringify({ create }) }),
-  forgetDatasetLocation: (id: string) => request<void>(`/api/dataset-storage/locations/${id}`, { method: 'DELETE' }),
-  datasetEntries: (signal?: AbortSignal) => request<ManagedDataset[]>('/api/dataset-storage/datasets', { signal }),
-  refreshDatasetEntry: (id: string) => request<DatasetOperation>(`/api/dataset-storage/datasets/${encodeURIComponent(id)}/refresh`, { method: 'POST' }),
-  registerDataset: (location_id: string, name: string, ownership: string, acknowledge: boolean) => request<DatasetOperation>('/api/dataset-storage/datasets/register', { method: 'POST', body: JSON.stringify({ location_id, name, ownership, acknowledge }) }),
-  migrateDataset: (id: string, location_id: string, name: string, remove_source: boolean) => request<DatasetOperation>(`/api/dataset-storage/datasets/${id}/migrate`, { method: 'POST', body: JSON.stringify({ location_id, name, remove_source }) }),
-  adoptDataset: (id: string, confirm_path: string) => request(`/api/dataset-storage/datasets/${id}/adopt`, { method: 'POST', body: JSON.stringify({ confirm_path }) }),
-  datasetDeletePreview: (id: string) => request<ManagedDataset & { can_delete: boolean }>(`/api/dataset-storage/datasets/${id}/delete-preview`),
-  deleteDatasetEntry: (id: string) => request<DatasetOperation>(`/api/dataset-storage/datasets/${id}`, { method: 'DELETE' }),
+  createDatasetLocation: (payload: { node_id: string; name: string; path: string; create: boolean; is_default: boolean }) => requestWithTimeout<{ id: string; operation_id: string }>('/api/dataset-storage/locations', { method: 'POST', body: JSON.stringify(payload) }, 15_000, datasetSubmissionTimeout),
+  updateDatasetLocation: (id: string, enabled: boolean, is_default: boolean) => requestWithTimeout(`/api/dataset-storage/locations/${id}`, { method: 'PATCH', body: JSON.stringify({ enabled, is_default }) }, 15_000, datasetSubmissionTimeout),
+  checkDatasetLocation: (id: string, create = false) => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/locations/${id}/check`, { method: 'POST', body: JSON.stringify({ create }) }, 15_000, datasetSubmissionTimeout),
+  forgetDatasetLocation: (id: string) => requestWithTimeout<void>(`/api/dataset-storage/locations/${id}`, { method: 'DELETE' }, 15_000, datasetSubmissionTimeout),
+  datasetEntries: (signal?: AbortSignal) => requestWithTimeout<ManagedDataset[]>('/api/dataset-storage/datasets', { signal }, 15_000, '数据集列表读取超时，请检查网络后刷新'),
+  refreshDatasetEntry: (id: string, request_id?: string) => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/datasets/${encodeURIComponent(id)}/refresh`, { method: 'POST', body: JSON.stringify({ request_id }) }, 15_000, datasetSubmissionTimeout),
+  registerDataset: (location_id: string, name: string, ownership: string, acknowledge: boolean) => requestWithTimeout<DatasetOperation>('/api/dataset-storage/datasets/register', { method: 'POST', body: JSON.stringify({ location_id, name, ownership, acknowledge }) }, 15_000, datasetSubmissionTimeout),
+  migrateDataset: (id: string, location_id: string, name: string, remove_source: boolean) => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/datasets/${id}/migrate`, { method: 'POST', body: JSON.stringify({ location_id, name, remove_source }) }, 15_000, datasetSubmissionTimeout),
+  adoptDataset: (id: string, confirm_path: string) => requestWithTimeout(`/api/dataset-storage/datasets/${id}/adopt`, { method: 'POST', body: JSON.stringify({ confirm_path }) }, 15_000, datasetSubmissionTimeout),
+  datasetDeletePreview: (id: string) => requestWithTimeout<ManagedDataset & { can_delete: boolean }>(`/api/dataset-storage/datasets/${id}/delete-preview`),
+  deleteDatasetEntry: (id: string) => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/datasets/${id}`, { method: 'DELETE' }, 30_000, datasetSubmissionTimeout),
   previewDatasetHistoryRemoval: (payload: DatasetHistoryRemoval, signal?: AbortSignal) => requestWithTimeout<DatasetHistoryRemovalPreview>('/api/dataset-storage/operations/history-removal-preview', { method: 'POST', body: JSON.stringify(payload), signal }),
   removeDatasetHistory: (payload: DatasetHistoryRemoval) => requestWithTimeout<{ removed: number }>('/api/dataset-storage/operations/history-removal', { method: 'POST', body: JSON.stringify(payload) }),
   datasetOperationSummary: (signal?: AbortSignal) => requestWithTimeout<DatasetOperationSummary>('/api/dataset-storage/operations/summary', { signal }),
   datasetOperationPage: (params: URLSearchParams, signal?: AbortSignal) => requestWithTimeout<DatasetOperationPage>(`/api/dataset-storage/operations/page?${params}`, { signal }),
-  datasetOperations: () => request<DatasetOperation[]>('/api/dataset-storage/operations'),
-  datasetOperation: (id: string, signal?: AbortSignal) => request<DatasetOperation>(`/api/dataset-storage/operations/${id}`, { signal }),
-  controlDatasetOperation: (id: string, action: 'retry' | 'cancel') => request<DatasetOperation>(`/api/dataset-storage/operations/${id}/${action}`, { method: 'POST' }),
+  datasetOperations: () => requestWithTimeout<DatasetOperation[]>('/api/dataset-storage/operations'),
+  datasetOperation: (id: string, signal?: AbortSignal) => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/operations/${id}`, { signal }),
+  controlDatasetOperation: (id: string, action: 'retry' | 'cancel') => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/operations/${id}/${action}`, { method: 'POST' }, 15_000, datasetSubmissionTimeout),
   managedDatasets: (signal?: AbortSignal) => requestWithTimeout<ManagedDataset[]>('/api/datasets/managed', { signal }),
   deleteManagedDataset: (name: string) => requestWithTimeout<void>(`/api/datasets/managed/${encodeURIComponent(name)}`, { method: 'DELETE' }, 30_000,
     '删除请求超时，请刷新数据集列表确认状态'),
@@ -224,6 +225,9 @@ export const api = {
   compute: () => request<ComputeResources>('/api/compute'),
   computeNodes: (signal?: AbortSignal) => requestWithTimeout<ComputeNode[]>('/api/compute/nodes', { signal }, 8_000, '算力节点状态读取超时'),
   computeNode: (id: string, signal?: AbortSignal) => request<ComputeNode>(`/api/compute/nodes/${id}`, { signal }),
+  refreshComputeNodes: (signal?: AbortSignal) => requestWithTimeout<ComputeNodeRefreshResponse>(
+    '/api/compute/nodes/refresh', { method: 'POST', signal }, 45_000, '等待新采样超时，请稍后查看各节点的采样时间',
+  ),
   createComputeNode: (payload: ComputeNodeSettings) => request<ComputeNodeCredential>('/api/compute/nodes', { method: 'POST', body: JSON.stringify(payload) }),
   updateComputeNode: (id: string, payload: ComputeNodeSettings) => request<ComputeNode>(`/api/compute/nodes/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
   rotateComputeToken: (id: string) => request<ComputeNodeCredential>(`/api/compute/nodes/${id}/token`, { method: 'POST' }),

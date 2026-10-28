@@ -27,7 +27,8 @@ from sqlalchemy.orm import Session
 
 from . import dataset_files as files
 from .dataset_progress import record_progress as record_work_progress, progress_reporter
-from .config import DATA_ROOT, DATASET_ROOTS, DATASET_STORAGE_ALLOWED_ROOTS, DATASET_STORAGE_QUOTA_BYTES, PROJECT_ROOT
+from .config import (DATA_ROOT, DATASET_ROOTS, DATASET_STORAGE_ALLOWED_ROOTS, DATASET_STORAGE_QUOTA_BYTES,
+                     DATASET_STORAGE_RETENTION_SECONDS, DATASET_FAILED_RETENTION_SECONDS, PROJECT_ROOT)
 from .database import SessionLocal, get_db
 from .models import ComputeNode, DatasetEntry, DatasetLocation, DatasetOperation, DatasetOperationHistoryRemoval, TrainingRun, TrainingTask, utcnow
 from .gpu_reservations import acquire_node_claim_lock
@@ -49,6 +50,34 @@ def job_dir(identity):
     if len(identity) != 32 or any(c not in '0123456789abcdef' for c in identity):
         raise ValueError('操作编号无效')
     return STORE_ROOT / identity
+
+
+def failed_snapshot_expired(op, now=None):
+    """Only disposable pre-commit snapshots may expire; receipts stay durable."""
+    now = now or utcnow()
+    return bool(DATASET_FAILED_RETENTION_SECONDS and op.status == 'failed'
+                and op.kind in ('upload', 'register', 'refresh', 'migrate')
+                and not op.payload.get('published') and not op.payload.get('commit_started')
+                and (not op.lease_until or operation_time(op.lease_until) <= now)
+                and (op.payload.get('snapshot_reclaimed') or
+                     (now - operation_time(op.updated_at)).total_seconds() >= DATASET_FAILED_RETENTION_SECONDS))
+
+
+def restart_snapshot(op):
+    """Rotate the token before rebuilding a discarded/changed source snapshot."""
+    for name in ('bundle.part', 'bundle.tar', 'bundle.tmp', 'manifest.json'):
+        (job_dir(op.id) / name).unlink(missing_ok=True)
+    payload = dict(op.payload)
+    for key in ('archive_size', 'archive_sha256', 'fingerprint', 'snapshot_reclaimed',
+                'cache_cleaned_at', 'progress', 'progress_steps', 'started_at', 'heartbeat_at'):
+        payload.pop(key, None)
+    if op.kind != 'upload':
+        for key in ('names', 'stats', 'warnings'):
+            payload.pop(key, None)
+    op.payload = payload
+    op.result = {}
+    set_phase(op, 'prepare_upload' if op.kind == 'upload' else 'export',
+              'local' if op.kind == 'upload' else payload['source_node'])
 
 
 def save_json(path, value):
@@ -449,9 +478,21 @@ def queue_registration(db, loc, relative, name, ownership, config_sha256=None, b
         'ownership': ownership, 'scan_config_sha256': config_sha256, 'batch_id': batch_id})
 
 
+class RefreshRequest(BaseModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=64, pattern=r'^[A-Za-z0-9_-]+$')
+
+
 @router.post('/datasets/{identity}/refresh', status_code=202)
-def refresh_entry(identity: str, db: Session = Depends(get_db)):
+def refresh_entry(identity: str, body: RefreshRequest | None = Body(default=None), db: Session = Depends(get_db)):
     with managed_dataset_mutation():
+        request_id = body.request_id if body else None
+        if request_id:
+            previous = db.scalar(select(DatasetOperation).where(
+                DatasetOperation.kind == 'refresh', DatasetOperation.payload['request_id'].as_string() == request_id))
+            if previous:
+                if previous.payload.get('entry_id') != identity:
+                    raise HTTPException(409, '重新加载请求编号已用于另一个数据集')
+                return operation_read(previous, db)
         entry = db.get(DatasetEntry, identity)
         if not entry or entry.status == 'deleted':
             raise HTTPException(404, '数据集不存在')
@@ -463,7 +504,7 @@ def refresh_entry(identity: str, db: Session = Depends(get_db)):
         # replace source files, change ownership, or create another catalogue row.
         op = new_operation(db, 'refresh', entry.node_id, {
             'phase': 'export', 'entry_id': entry.id, 'source_node': entry.node_id,
-            'source_path': entry.path, 'name': entry.name})
+            'source_path': entry.path, 'name': entry.name, 'request_id': request_id})
         db.commit()
         return operation_read(op, db)
 
@@ -577,10 +618,18 @@ def operation_summary(db: Session = Depends(get_db)):
     catalog_changed = db.scalar(select(func.max(DatasetEntry.updated_at)))
     finished_changed = db.scalar(select(func.max(DatasetOperation.updated_at)).where(
         DatasetOperation.status.in_((*TERMINAL, 'failed'))))
-    # Progress heartbeats do not force a full catalogue/reference reload.
-    revision = json.dumps([counts, str(catalog_changed), str(finished_changed)], sort_keys=True)
+    # Digest reference-visible fields, not progress heartbeat/metric timestamps.
+    reference_digest = hashlib.sha256()
+    for row in db.execute(select(TrainingTask.id, TrainingTask.name, TrainingTask.data_path,
+                                  TrainingTask.execution_node_id, TrainingTask.status, TrainingTask.deleted_at)
+                          .order_by(TrainingTask.id)):
+        reference_digest.update(json.dumps(tuple(row), default=str, ensure_ascii=False).encode())
+    run_reference_state = db.execute(select(func.count(TrainingRun.id), func.max(TrainingRun.created_at))).one()
+    reference_digest.update(json.dumps(tuple(run_reference_state), default=str).encode())
+    revision = json.dumps([counts, str(catalog_changed), str(finished_changed), reference_digest.hexdigest()], sort_keys=True)
     return {'total': sum(counts.values()), 'active': sum(counts.get(s, 0) for s in ACTIVE),
             'failed': counts.get('failed', 0), 'counts': counts, 'revision': revision,
+            'reference_revision': reference_digest.hexdigest(), 'managed_task_types': ['detect'],
             'latest_created_at': operation_time(db.scalar(select(func.max(DatasetOperation.created_at)).where(visible_operation()))),
             'snapshot': utcnow(),
             'nodes': [{'id': identity, 'name': nodes.get(identity, '本机' if identity == 'local' else identity)}
@@ -685,13 +734,10 @@ def control_operation(identity: str, action: str, db: Session = Depends(get_db))
         if not op:
             raise HTTPException(404, '操作记录不存在')
         if action == 'retry' and op.status == 'failed':
-            if op.kind == 'refresh':
+            if op.kind == 'refresh' or op.payload.get('snapshot_reclaimed') or failed_snapshot_expired(op):
                 # A corrected source must be exported again, with a new receipt
                 # token. Revalidating the cached failed snapshot cannot see fixes.
-                for name in ('bundle.part', 'bundle.tar', 'manifest.json'):
-                    (job_dir(op.id) / name).unlink(missing_ok=True)
-                op.payload = {key: op.payload[key] for key in ('entry_id', 'source_node', 'source_path', 'name')}
-                set_phase(op, 'export', op.payload['source_node'])
+                restart_snapshot(op)
             op.status, op.error, op.lease_until = 'pending', None, None
             op.payload = {**op.payload, 'progress_run_id': uid(), 'progress': None, 'queued_at': utcnow().isoformat()}
         elif action == 'cancel' and op.status in ('pending', 'running', 'failed') and not op.payload.get('published') and not op.payload.get('commit_started'):
@@ -941,12 +987,13 @@ def execute_local(db, op):
         result = files.check_root(p['path'], DATASET_STORAGE_ALLOWED_ROOTS, p.get('create', False))
     elif phase in ('export', 'prepare_upload'):
         source = p['staging'] if phase == 'prepare_upload' else str(files.inside(p['source_path'], DATASET_STORAGE_ALLOWED_ROOTS))
-        if DATASET_STORAGE_QUOTA_BYTES and sum(f.stat().st_size for f in STORE_ROOT.glob('*/bundle*')) + files.scan(source, check)['total_bytes'] * 2 > DATASET_STORAGE_QUOTA_BYTES:
+        manifest = files.scan(source, check)
+        if DATASET_STORAGE_QUOTA_BYTES and sum(f.stat().st_size for f in STORE_ROOT.glob('*/bundle*')) + manifest['total_bytes'] * 2 > DATASET_STORAGE_QUOTA_BYTES:
             raise ValueError('平台数据集中转配额不足，请先处理失败操作或增加 PLATFORM_DATASET_STORAGE_QUOTA_BYTES')
-        required = files.scan(source, check)['total_bytes'] * 2 + 100 * 1024**2
+        required = manifest['total_bytes'] * 2 + 100 * 1024**2
         if shutil.disk_usage(directory).free < required:
             raise ValueError('平台中转磁盘空间不足')
-        result = files.pack(source, directory / 'bundle.tar', check)
+        result = files.pack(source, directory / 'bundle.tar', check, manifest=manifest)
         save_json(directory / 'manifest.json', result)
     elif phase == 'validate':
         result = verify_snapshot(op, check)
@@ -975,6 +1022,19 @@ class DatasetWorker:
     def __init__(self):
         self.stop_event = threading.Event()
         self.thread = None
+        self.last_tick_at = None
+        self.last_error = None
+        self.last_error_at = None
+        self.active_error = None
+        self._last_cleanup = 0.0
+
+    def health_state(self):
+        alive = bool(self.thread and self.thread.is_alive())
+        return {'status': 'error' if alive and self.active_error else 'running' if alive else 'stopped',
+                'last_tick_at': self.last_tick_at.isoformat() if self.last_tick_at else None,
+                'last_error': self.last_error,
+                'last_error_at': self.last_error_at.isoformat() if self.last_error_at else None,
+                'active_error': self.active_error}
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -1008,20 +1068,69 @@ class DatasetWorker:
                     except Exception as exc:
                         mark_error(db, op, exc)
                         logger.warning('dataset_operation_failed id=%s error=%s', op.id, type(exc).__name__)
-                # Terminal bundle retention is bounded; journal rows stay durable.
-                for old in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_(TERMINAL))):
-                    age = (utcnow() - old.updated_at.replace(tzinfo=timezone.utc)).total_seconds()
-                    if age > 24 * 3600:
-                        shutil.rmtree(job_dir(old.id), ignore_errors=True)
-                        if old.kind == 'upload':
-                            from .dataset_uploads import UPLOAD_ROOT
-                            shutil.rmtree(UPLOAD_ROOT / old.id, ignore_errors=True)
+                self.cleanup(db)
+                self.last_tick_at = utcnow()
+
+    def cleanup(self, db):
+        # Filesystem directories bound the scan, not the ever-growing journal.
+        clock = time.monotonic()
+        if self.thread and self.thread.is_alive() and clock - self._last_cleanup < 60:
+            return
+        self._last_cleanup = clock
+        now = utcnow()
+        terminal_cutoff = now - timedelta(seconds=DATASET_STORAGE_RETENTION_SECONDS)
+        for directory in STORE_ROOT.iterdir():
+            if directory.name.startswith('.reclaimed-') and directory.is_dir() and not directory.is_symlink():
+                suffix = directory.name.removeprefix('.reclaimed-')
+                if len(suffix) == 32 and all(c in '0123456789abcdef' for c in suffix):
+                    shutil.rmtree(directory)
+                continue
+            if directory.is_symlink() or not directory.is_dir() or len(directory.name) != 32:
+                continue
+            try:
+                identity = directory.name
+                if job_dir(identity) != directory:
+                    continue
+            except ValueError:
+                continue
+            with managed_dataset_mutation():
+                db.expire_all()
+                op = db.get(DatasetOperation, identity)
+                if not op:
+                    try:
+                        orphan_age = time.time() - directory.stat().st_mtime
+                    except OSError:
+                        continue
+                    if not DATASET_FAILED_RETENTION_SECONDS or orphan_age < DATASET_FAILED_RETENTION_SECONDS:
+                        continue
+                    terminal = failed = False
+                else:
+                    terminal = bool(DATASET_STORAGE_RETENTION_SECONDS and op.status in TERMINAL
+                                    and operation_time(op.updated_at) <= terminal_cutoff)
+                    failed = failed_snapshot_expired(op, now)
+                if not terminal and not failed:
+                    if op:
+                        continue
+                if failed:
+                    # Persist restart requirement before deleting any cache bytes.
+                    # Upload staging remains available for a new pack.
+                    op.payload = {**op.payload, 'snapshot_reclaimed': True}
+                    db.commit()
+                quarantine = STORE_ROOT / ('.reclaimed-' + uid())
+                directory.rename(quarantine)
+            shutil.rmtree(quarantine)
+            if terminal and op and op.kind == 'upload':
+                from .dataset_uploads import UPLOAD_ROOT
+                shutil.rmtree(UPLOAD_ROOT / identity, ignore_errors=True)
 
     def run(self):
         while not self.stop_event.is_set():
             try:
                 self.tick()
-            except Exception:
+                self.active_error = None
+            except Exception as exc:
+                self.last_error = self.active_error = str(exc)[:600] or type(exc).__name__
+                self.last_error_at = utcnow()
                 logger.exception('dataset_worker_failed')
             self.stop_event.wait(1)
 
@@ -1032,6 +1141,32 @@ worker = DatasetWorker()
 def auth(node_id, request, db):
     from .compute_nodes import authenticated_agent
     return authenticated_agent(node_id, request, db)
+
+
+class DatasetReceipt(BaseModel):
+    id: str = Field(pattern=r'^[0-9a-f]{32}$')
+    token: str = Field(pattern=r'^[0-9a-f]{32}$')
+
+
+class ReconcileRequest(BaseModel):
+    receipts: list[DatasetReceipt] = Field(default_factory=list, max_length=128)
+
+
+@router.post('/agent/{node_id}/reconcile')
+def reconcile_agent_cache(node_id: str, body: ReconcileRequest, request: Request, db: Session = Depends(get_db)):
+    auth(node_id, request, db)
+    reclaimable = []
+    with managed_dataset_mutation():
+        for receipt in body.receipts:
+            op = db.get(DatasetOperation, receipt.id)
+            if op and node_id not in (op.node_id, op.payload.get('source_node'), op.payload.get('target_node')):
+                continue
+            # Every phase owns a new token. Old phase receipts are no longer
+            # needed by centre replay, including source export after migration.
+            if (not op or op.lease != receipt.token or op.status in TERMINAL
+                    or failed_snapshot_expired(op)):
+                reclaimable.append({'id': receipt.id, 'token': receipt.token})
+    return {'reclaimable': reclaimable}
 
 
 @router.post('/agent/{node_id}/poll')

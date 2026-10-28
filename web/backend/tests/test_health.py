@@ -30,6 +30,10 @@ def test_health_reports_each_core_worker(monkeypatch):
     ))
     monkeypatch.setattr(main_module, "local_deletion_worker", SimpleNamespace(is_alive=True))
     monkeypatch.setattr(main_module, "inference_worker", SimpleNamespace(is_alive=True))
+    monkeypatch.setattr(main_module.dataset_worker, "health_state", lambda: {
+        "status": "running", "last_tick_at": None, "last_error": None,
+        "last_error_at": None, "active_error": None,
+    })
 
     client = TestClient(main_module.app)
     try:
@@ -45,6 +49,7 @@ def test_health_reports_each_core_worker(monkeypatch):
     assert payload["scheduler"] == "running"
     assert payload["local_deletion_worker"] == "running"
     assert payload["inference_worker"] == "running"
+    assert payload["dataset_worker"] == "running"
     assert isinstance(payload["database_latency_ms"], (int, float))
     assert payload["instance"]
     assert payload["runs_root"]
@@ -57,6 +62,10 @@ def test_health_reports_degraded_when_a_worker_stops(monkeypatch):
     ))
     monkeypatch.setattr(main_module, "local_deletion_worker", SimpleNamespace(is_alive=True))
     monkeypatch.setattr(main_module, "inference_worker", SimpleNamespace(is_alive=False))
+    monkeypatch.setattr(main_module.dataset_worker, "health_state", lambda: {
+        "status": "running", "last_tick_at": None, "last_error": None,
+        "last_error_at": None, "active_error": None,
+    })
 
     client = TestClient(main_module.app)
     try:
@@ -80,6 +89,10 @@ def test_health_reports_active_scheduler_error(monkeypatch):
     ))
     monkeypatch.setattr(main_module, "local_deletion_worker", SimpleNamespace(is_alive=True))
     monkeypatch.setattr(main_module, "inference_worker", SimpleNamespace(is_alive=True))
+    monkeypatch.setattr(main_module.dataset_worker, "health_state", lambda: {
+        "status": "running", "last_tick_at": None, "last_error": None,
+        "last_error_at": None, "active_error": None,
+    })
 
     client = TestClient(main_module.app)
     try:

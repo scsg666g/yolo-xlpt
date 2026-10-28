@@ -1169,6 +1169,30 @@ def test_sync_metrics_repairs_nonfinite_existing_metric_point(tmp_path: Path):
     session.close()
 
 
+def test_sync_metrics_updates_existing_epoch_when_results_csv_is_rewritten(tmp_path: Path):
+    session = make_session(tmp_path)
+    run_dir = tmp_path / "attempt-rewrite"
+    run_dir.mkdir()
+    csv_path = run_dir / "results.csv"
+    csv_path.write_text("epoch,time,score\n1,1,0.1\n", encoding="utf-8")
+    task = make_task("task-rewritten-metrics", status="running", epochs=10)
+    run = TrainingRun(
+        id="run-rewritten-metrics", task=task, attempt_number=1, launch_mode="fresh", status="running",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={"epochs": 10},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+    sync_metrics(session, task, run)
+    session.commit()
+    csv_path.write_text("epoch,time,score\n1,2,0.9\n", encoding="utf-8")
+    sync_metrics(session, task, run)
+    session.commit()
+    point = session.scalar(select(MetricPoint).where(MetricPoint.run_id == run.id))
+    assert point.epoch == 1 and point.elapsed == 2.0 and point.values == {"score": 0.9}
+    session.close()
+
+
 def test_sync_metrics_invalid_epoch_rows_preserve_summary_and_clean_history(tmp_path: Path):
     session = make_session(tmp_path)
     run_dir = tmp_path / "attempt-001"

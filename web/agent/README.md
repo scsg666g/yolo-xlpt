@@ -1,5 +1,15 @@
 # 算力监控与可选远程训练 Agent
 
+## 算力按需刷新（Agent 2.4.2 起）
+
+新版中心在普通上报响应中发送刷新请求编号，Agent 在同一轮心跳中再次采集 GPU/主机状态并回传匹配编号。每轮心跳最多加采一次，不影响远程训练领取和原上报间隔；旧中心不返回命令时沿用原有协议。开发版脚本与两个独立远程分发包当前均为 2.5.0；保留各自实际节点配置与历史状态，使用版平台目录不修改。
+
+## Agent 2.5.0 增量进度与数据集缓存回收
+
+训练指标 CSV 使用有界缓存增量读取，检测文件替换、截断、同时间戳重写和未写完的末行；重启后的旧活动训练仍读取已有 `results.csv` 并补齐中心指标。日志尾部读取上限为 1 MiB。数据集转运缓存每五分钟轮转核对最多 1024 个历史 token，每批最多 128 个；必须匹配本中心与节点归属，并由认证中心确认已终止、失效或已过保留期且本机状态锁空闲后才会清理。断网、旧中心不支持、任务活跃、结果待确认或历史缓存无归属证据时均保留。归属文件只保存中心地址摘要和节点 ID，不保存 Token。
+
+新版中心通过领取响应协商后，Agent 在启动时记录 YAML 摘要并随状态更新上报；旧中心不会收到新增字段。续训可能优先采用检查点内配置，启动提交的摘要不代表实际输入已核验。保留训练状态目录和回执，替换脚本时不要清除 `.training-state/` 或 `.dataset-state/`。平台 1.10.0 的最低 Agent 版本仍为 1.8.0，Agent 2.5.0 可与旧中心协商使用基础能力。
+
 ## Agent 2.4.1 训练期间的轻量目录操作
 
 新增 `training.dataset_concurrent_reads=true` 能力：配合平台 1.8.1，保存位置检查与受限只读目录扫描不再等待训练全部结束，也不阻挡新的训练领取。Agent 训练忙或共享工作区锁被占用时，仅请求 `check` / `discover`；平台可跳过前面等待的重文件操作，但不绕过有效执行租约。打包、完整校验登记、导入、迁移及删除仍保留训练/数据集文件锁与引用保护。
@@ -97,7 +107,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-当前脚本为 **Agent 2.4.1**，配套开发平台为 **1.8.1**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
+当前脚本为 **Agent 2.5.0**，配套开发平台为 **1.10.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -231,7 +241,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `2.4.1`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
+确认输出为 `2.5.0`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -303,7 +313,7 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.0.8）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
+| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.5.0）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
 | 远程训练有进度但曲线缺少某些 Epoch | 检查 `results.csv` 的 `epoch` 和 `time`；Agent 2.0.7 会跳过非有限或无法解析的 Epoch，并将非有限或负耗时归零，其他有效指标仍会回传 |
 | 旧 Attempt 单独删除提示 Agent 版本过低 | 旧版平铺 Attempt 001 需要 Agent 2.0.1 才能精细清理；替换脚本并重启 Agent，确认页面报告 2.0.1 后重试 |
 | 远程指定模型无法测试 | 确认 Agent 为 2.0.3、`enable_training=true`，并用 `--check-config` 核对模型所在目录已加入 `model_test_roots`；模型必须是该范围内的非空普通 `.pt` 文件，路径不能包含符号链接。若只在最终校验阶段超时，调整 `model_transfer_finalize_timeout_seconds` |

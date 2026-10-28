@@ -24,14 +24,13 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
@@ -2079,53 +2078,42 @@ def run_operations(config: dict, operation: dict, stop: threading.Event) -> None
             return
 
 
-def read_remote_progress(run_dir: Path) -> tuple[int, dict, list[dict]]:
-    csv_path = run_dir / "results.csv"
-    if not csv_path.is_file():
-        return 0, {}, []
-    try:
-        with csv_path.open(encoding="utf-8-sig", newline="") as handle:
-            rows = list(csv.DictReader(handle))
-    except (OSError, csv.Error):
-        return 0, {}, []
-    metrics = []
-    latest = {}
-    completed = 0
-    for row in rows:
-        try:
-            epoch_number = float(row.get("epoch", "0"))
-            if not math.isfinite(epoch_number):
-                continue
-            epoch = int(epoch_number)
-        except (TypeError, ValueError, OverflowError, AttributeError):
-            continue
-        values = {}
-        for key, raw in row.items():
-            if not key or key.strip() in {"epoch", "time"} or raw is None:
-                continue
-            try:
-                value = float(raw.strip())
-                values[key.strip()] = value if math.isfinite(value) else None
-            except (ValueError, AttributeError):
-                values[key.strip()] = raw[:200]
-        try:
-            elapsed = float(row.get("time") or 0)
-            if not math.isfinite(elapsed) or elapsed < 0:
-                elapsed = 0.0
-        except (TypeError, ValueError, OverflowError):
-            elapsed = 0.0
-        completed = max(completed, epoch)
-        latest = values
-        metrics.append({"epoch": epoch, "elapsed": elapsed, "values": values})
-    return completed, latest, metrics
+# BEGIN PORTABLE METRIC CORE (generated from backend/app/metric_files.py)
+METRIC_FILES_SOURCE = '"""Incremental training CSV reads; standard library only for standalone Agents."""\nfrom __future__ import annotations\n\nimport csv\nimport math\nimport threading\nfrom collections import OrderedDict\nfrom pathlib import Path\n\n\nclass MetricCsvReader:\n    """Keep bounded per-file caches; incomplete trailing records wait for a newline."""\n\n    def __init__(self, maximum_files=128):\n        self.maximum_files = max(1, maximum_files)\n        self._files = OrderedDict()\n        self._lock = threading.RLock()\n\n    def read(self, path, *, final=False, incremental=False):\n        path = Path(path)\n        key = str(path.absolute())\n        with self._lock:\n            try:\n                info = path.stat()\n                signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)\n                state = self._files.pop(key, None)\n                with path.open(\'rb\') as stream:\n                    reset = state is None or state[\'signature\'][:2] != signature[:2]\n                    reset = reset or info.st_size < state[\'offset\']\n                    if state is not None and not reset:\n                        # An append must retain the already consumed suffix. Same-size\n                        # rewrites and resumed/truncated files start a fresh generation.\n                        reset = info.st_size <= state[\'signature\'][2] and signature != state[\'signature\']\n                        if not reset and state[\'anchor\']:\n                            stream.seek(state[\'offset\'] - len(state[\'anchor\']))\n                            reset = stream.read(len(state[\'anchor\'])) != state[\'anchor\']\n                        if not reset and state[\'signature\'] == signature and (not final or not state[\'partial\']):\n                            state[\'delta\'] = []\n                            self._files[key] = state\n                            return self._snapshot(state, incremental=incremental)\n                    if reset:\n                        state = {\'offset\': 0, \'header\': None, \'metrics\': [], \'completed\': 0,\n                                 \'latest\': {}, \'anchor\': b\'\', \'partial\': False, \'delta\': [],\n                                 \'generation\': (state[\'generation\'] + 1) if state else 1}\n                    state[\'delta\'] = []\n                    stream.seek(state[\'offset\'])\n                    state[\'partial\'] = False\n                    while True:\n                        start = stream.tell()\n                        line = stream.readline()\n                        if not line:\n                            break\n                        if not line.endswith(b\'\\n\') and not final:\n                            stream.seek(start)\n                            state[\'partial\'] = True\n                            break\n                        try:\n                            values = next(csv.reader([line.decode(\'utf-8-sig\', errors=\'replace\')]))\n                        except (csv.Error, StopIteration):\n                            continue\n                        if state[\'header\'] is None:\n                            state[\'header\'] = [value.strip() for value in values]\n                            continue\n                        # CSV output contains one numeric record per physical line.\n                        # Reject truncated/extra fields rather than publishing half an epoch.\n                        if len(values) != len(state[\'header\']):\n                            continue\n                        metric = self._metric(dict(zip(state[\'header\'], values)))\n                        if metric is not None:\n                            state[\'metrics\'].append(metric)\n                            state[\'delta\'].append(metric)\n                            state[\'completed\'] = max(state[\'completed\'], metric[\'epoch\'])\n                            state[\'latest\'] = metric[\'values\']\n                    state[\'offset\'] = stream.tell()\n                    stream.seek(max(0, state[\'offset\'] - 256))\n                    state[\'anchor\'] = stream.read(min(256, state[\'offset\']))\n                state[\'signature\'] = signature\n                self._files[key] = state\n                while len(self._files) > self.maximum_files:\n                    self._files.popitem(last=False)\n                return self._snapshot(state, incremental=incremental)\n            except (OSError, csv.Error):\n                # Missing files can be normal during trainer startup/rotation.\n                return {\'completed\': 0, \'latest\': {}, \'metrics\': [], \'generation\': 0}\n\n    @staticmethod\n    def _snapshot(state, *, incremental=False):\n        return {\'completed\': state[\'completed\'], \'latest\': dict(state[\'latest\']),\n                \'metrics\': list(state[\'delta\'] if incremental else state[\'metrics\']),\n                \'generation\': state[\'generation\']}\n\n    @staticmethod\n    def _metric(row):\n        try:\n            epoch_number = float(row.get(\'epoch\', \'\'))\n            if not math.isfinite(epoch_number):\n                return None\n            epoch = int(epoch_number)\n        except (ValueError, TypeError, OverflowError):\n            return None\n        values = {}\n        for key, raw in row.items():\n            if not key or key in {\'epoch\', \'time\'}:\n                continue\n            if raw is None or raw == \'\':\n                values[key] = None\n                continue\n            try:\n                number = float(raw)\n                values[key] = number if math.isfinite(number) else None\n            except (ValueError, TypeError, OverflowError):\n                values[key] = str(raw)[:200]\n        try:\n            elapsed = float(row.get(\'time\') or 0)\n            if not math.isfinite(elapsed) or elapsed < 0:\n                elapsed = 0.0\n        except (ValueError, TypeError, OverflowError):\n            elapsed = 0.0\n        return {\'epoch\': epoch, \'elapsed\': elapsed, \'values\': values}\n'
+METRIC_FILES = {}
+exec(compile(METRIC_FILES_SOURCE, "<metric_files>", "exec"), METRIC_FILES)
+_METRIC_CSV_READER = METRIC_FILES["MetricCsvReader"](maximum_files=4)
+_REMOTE_CSV_GENERATIONS = {}
+_REMOTE_CSV_GENERATION_LOCK = threading.Lock()
+# END PORTABLE METRIC CORE
+
+
+def read_remote_progress(run_dir: Path, *, final: bool = False,
+                         sent_epochs: set[int] | None = None,
+                         pending_metrics: dict[int, dict] | None = None) -> tuple[int, dict, list[dict]]:
+    # Monitoring consumes deltas; outcome/recovery readers need a non-consuming
+    # full snapshot even when progress was read earlier in this process.
+    snapshot = _METRIC_CSV_READER.read(run_dir / "results.csv", final=final,
+                                     incremental=sent_epochs is not None)
+    key = str((run_dir / "results.csv").absolute())
+    with _REMOTE_CSV_GENERATION_LOCK:
+        previous = _REMOTE_CSV_GENERATIONS.get(key)
+        _REMOTE_CSV_GENERATIONS[key] = snapshot['generation']
+    if previous is not None and previous != snapshot['generation'] and sent_epochs is not None:
+        sent_epochs.clear()
+        if pending_metrics is not None:
+            pending_metrics.clear()
+    if sent_epochs is not None:
+        # Appended records may correct an acknowledged epoch without replacing
+        # the file; each new physical record must be eligible for delivery.
+        sent_epochs.difference_update(item['epoch'] for item in snapshot['metrics'])
+    return snapshot["completed"], snapshot["latest"], snapshot["metrics"]
 
 
 def recent_log_lines(path: Path) -> list[str]:
-    try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            return [line.rstrip("\r\n")[:4000] for line in deque(handle, maxlen=100)]
-    except OSError:
-        return []
+    # Bound disk reads as well as payload size for verbose, long-running jobs.
+    text = recent_log_text(path, maximum_bytes=1024 * 1024)
+    return [line[:4000] for line in text.splitlines()[-100:]]
 
 
 def recent_log_text(path: Path, maximum_bytes: int = 2 * 1024 * 1024) -> str:
@@ -2283,9 +2271,17 @@ def confirm_remote_claim(config: dict, task: dict, stop: threading.Event) -> boo
 
 
 def _save_terminal_for_retry(config: dict, task: dict, payload: dict) -> Path:
+    payload = training_report_payload(task, payload)
     path = save_pending_final(config, task["run_id"], {"_claim_lease": task.get("claim_lease"), **payload})
     clear_active_run(config, task["run_id"])
     return path
+
+
+def training_report_payload(task: dict, payload: dict) -> dict:
+    """Old centers have strict schemas; only advertise negotiated additions."""
+    if task.get('dataset_provenance_version') == 1 and task.get('dataset_snapshot'):
+        return {**payload, 'dataset_snapshot': task['dataset_snapshot']}
+    return payload
 
 
 def _deliver_terminal_once(config: dict, path: Path) -> None:
@@ -2491,7 +2487,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             LOGGER.error("Run %s 的进程仍在运行，但 Agent 无法确认其完整资源锁；保留活动状态并拒绝重复启动",
                          task.get("run_id"))
             return
-        completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+        completed, latest, metrics = read_remote_progress(Path(task["run_dir"]), final=True)
         latest = latest or task.get("latest_metrics", {})
         path = _save_terminal_for_retry(config, task, {
             "status": "failed", "error_message": "恢复训练时 GPU 或工作区资源锁已被占用；为避免重复训练，未重新启动",
@@ -2562,6 +2558,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
         requested_stop = bool(control.get("stop"))
         stop_reason = "platform_stop" if requested_stop else None
         sent_epochs: set[int] = set()
+        pending_metrics: dict[int, dict] = {}
         sent_trace_images: set[str] = set()
         last_artifacts_at = 0.0
         while process_identity_matches(identity) and not stop.is_set():
@@ -2574,10 +2571,14 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                     _terminate_recovered_process(identity)
             except (OSError, ValueError, HTTPError, URLError):
                 pass
-            completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+            completed, latest, metrics = read_remote_progress(
+                Path(task["run_dir"]), sent_epochs=sent_epochs, pending_metrics=pending_metrics,
+            )
             completed = max(completed, task.get("completed_epochs", 0))
             latest = latest or task.get("latest_metrics", {})
-            new_metrics = [item for item in metrics if item["epoch"] not in sent_epochs][:256]
+            pending_metrics.update((item["epoch"], item) for item in metrics)
+            new_metrics = [pending_metrics[epoch] for epoch in sorted(pending_metrics)
+                           if epoch not in sent_epochs][:256]
             if time.monotonic() - last_artifacts_at >= 30:
                 try:
                     report_manifest(config, {**task, "output_root": task["parameters"]["remote_output_root"]})
@@ -2592,11 +2593,14 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                        "log_tail": recent_log_lines(Path(task["log_path"])), "run_dir": task["run_dir"]}
             if command:
                 payload["command"] = command
+            payload = training_report_payload(task, payload)
             try:
                 response = api_json(config, endpoint + "/update", "POST", payload,
                                     {"X-Training-Lease": task["claim_lease"]}) if task.get("claim_lease") else api_json(
                                         config, endpoint + "/update", "POST", payload)
                 sent_epochs.update(item["epoch"] for item in new_metrics)
+                for item in new_metrics:
+                    pending_metrics.pop(item["epoch"], None)
                 if response.get("stop_requested"):
                     requested_stop, stop_reason = True, "platform_stop"
             except (OSError, ValueError, HTTPError, URLError):
@@ -2621,7 +2625,10 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 time.sleep(0.1)
             if process_identity_matches(identity):
                 raise RuntimeError("强制停止后进程仍存活，保留活动记录以便重试")
-        completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+        completed, latest, metrics = read_remote_progress(
+            Path(task["run_dir"]), final=True, sent_epochs=sent_epochs, pending_metrics=pending_metrics,
+        )
+        pending_metrics.update((item["epoch"], item) for item in metrics)
         completed = max(completed, task.get("completed_epochs", 0))
         latest = latest or task.get("latest_metrics", {})
         log_lines = recent_log_lines(Path(task["log_path"]))
@@ -2639,7 +2646,8 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             "completion_info": {} if requested_stop else training_completion_info(task, completed, log_lines),
             "stop_reason": stop_reason, "completed_epochs": completed,
             "progress": 100 if status == "completed" else min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
-            "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in sent_epochs],
+            "latest_metrics": latest,
+            "metrics": [pending_metrics[epoch] for epoch in sorted(pending_metrics) if epoch not in sent_epochs],
             "log_tail": log_lines, "command": command,
             "run_dir": task["run_dir"]})
         _deliver_terminal_once(config, path)
@@ -2667,6 +2675,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
     stop_reason = None
     last_warning = 0.0
     last_metrics: set[int] = set()
+    pending_metrics: dict[int, dict] = {}
     command_reported = False
     sent_trace_images: set[str] = set()
     last_trace_at = 0.0
@@ -2685,6 +2694,10 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
 
     def report_progress(payload: dict) -> None:
         nonlocal command_reported, last_warning
+        pending_metrics.update((item["epoch"], item) for item in payload.get("metrics", []))
+        payload = dict(payload, metrics=[pending_metrics[epoch] for epoch in sorted(pending_metrics)
+                                         if epoch not in last_metrics][:256])
+        payload = training_report_payload(task, payload)
         if not command_reported:
             payload["command"] = command
         try:
@@ -2698,6 +2711,8 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             return
         command_reported = True
         last_metrics.update(item["epoch"] for item in payload.get("metrics", []))
+        for item in payload.get("metrics", []):
+            pending_metrics.pop(item["epoch"], None)
         if response.get("stop_requested"):
             request_stop("platform_stop")
 
@@ -2705,6 +2720,10 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
         command = build_training_command(config, task)
         command = training_command_for_assignment(command, task)
         command = prepare_trace_command(config, task, command)
+        if task.get('dataset_provenance_version') == 1:
+            task['dataset_snapshot'] = DATASET_PROVENANCE['capture'](
+                task['data_path'], task_type=task['task_type'], node_id=config['node_id'],
+            )
         save_active_run(config, task, "launching", command=command)
         log_path = Path(task["log_path"])
         with log_path.open("x", encoding="utf-8", buffering=1) as log_handle:
@@ -2732,7 +2751,9 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                     pass
                 if requested_stop:
                     break
-                completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+                completed, latest, metrics = read_remote_progress(
+                    Path(task["run_dir"]), sent_epochs=last_metrics, pending_metrics=pending_metrics,
+                )
                 completed = max(completed, task.get("completed_epochs", 0))
                 latest = latest or task.get("latest_metrics", {})
                 if time.monotonic() - last_manifest_at >= 30:
@@ -2741,7 +2762,9 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                         last_manifest_at = time.monotonic()
                     except (OSError, ValueError, HTTPError, URLError):
                         last_manifest_at = time.monotonic()
-                new_metrics = [item for item in metrics if item["epoch"] not in last_metrics][:256]
+                pending_metrics.update((item["epoch"], item) for item in metrics)
+                new_metrics = [pending_metrics[epoch] for epoch in sorted(pending_metrics)
+                               if epoch not in last_metrics][:256]
                 if time.monotonic() - last_trace_at >= 10:
                     try:
                         report_training_trace(config, task, sent_trace_images)
@@ -2766,7 +2789,10 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                 except ProcessLookupError:
                     pass
                 exit_code = process.wait()
-        completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
+        completed, latest, metrics = read_remote_progress(
+            Path(task["run_dir"]), final=True, sent_epochs=last_metrics, pending_metrics=pending_metrics,
+        )
+        pending_metrics.update((item["epoch"], item) for item in metrics)
         completed = max(completed, task.get("completed_epochs", 0))
         latest = latest or task.get("latest_metrics", {})
         try:
@@ -2793,7 +2819,9 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
         final_payload = {"_claim_lease": lease, "status": final_status, "completed_epochs": completed,
                          "completion_info": completion_info,
                          "progress": 100 if final_status == "completed" else min(99.99, completed / max(1, int(task['parameters']['epochs'])) * 100),
-                         "latest_metrics": latest, "metrics": [item for item in metrics if item["epoch"] not in last_metrics],
+                         "latest_metrics": latest,
+                         "metrics": [pending_metrics[epoch] for epoch in sorted(pending_metrics)
+                                     if epoch not in last_metrics],
                          "log_tail": log_lines, "exit_code": exit_code, "command": command,
                          "error_message": error, "stop_reason": stop_reason, "run_dir": task["run_dir"]}
         pending_path = _save_terminal_for_retry(config, task, final_payload)
@@ -2898,18 +2926,38 @@ def run_remote_task(config: dict, task: dict, stop: threading.Event, training_lo
         release_training_lock(lock)
 
 
-def send(config: dict, payload: dict) -> int:
+def send(config: dict, payload: dict) -> tuple[int, str | None]:
+    """Send an ordered sample; a new center may request one immediate resample."""
     request = Request(config["center_url"] + "/api/compute/nodes/" + config["node_id"] + "/report",
                       data=json.dumps(payload, ensure_ascii=False, allow_nan=False).encode(), method="POST",
                       headers={"Authorization": "Bearer " + config["token"], "Content-Type": "application/json"})
     with build_opener(NoRedirect()).open(request, timeout=15) as response:
         result = json.loads(response.read(65536))
     interval = result.get("report_interval_seconds", config["report_interval_seconds"])
-    return interval if type(interval) is int and 5 <= interval <= 300 else config["report_interval_seconds"]
+    if type(interval) is not int or not 5 <= interval <= 300:
+        interval = config["report_interval_seconds"]
+    request_id = result.get("refresh_request_id")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        request_id = None  # Older centers omit the command; malformed commands are ignored.
+    return interval, request_id
+
+
+def fulfill_refresh_request(config: dict, request_id: str, stop: threading.Event) -> dict | None:
+    """Publish a distinct sample after the command, then resume training polls."""
+    if stop.is_set():
+        return None
+    try:
+        payload = collect(config["nvidia_smi_bin"], config)
+        payload["refresh_request_id"] = request_id
+        send(config, payload)
+        return payload
+    except (HTTPError, URLError, OSError, ValueError, TypeError):
+        LOGGER.warning("按需算力采样未完成；保留常规上报与训练轮询，下次心跳重试")
+        return None
 
 
 # BEGIN PORTABLE DATASET CORE (generated from backend/app/dataset_files.py)
-DATASET_FILES_SOURCE = '"""Portable dataset file operations; embedded unchanged into the standalone Agent."""\nfrom __future__ import annotations\nimport hashlib\nimport json\nimport os\nimport re\nfrom pathlib import Path, PurePosixPath\nimport shutil\nimport tarfile\n\nMAX_BYTES = 50 * 1024**3\nMAX_FILES = 200_010\nMARKER = ".yolo-platform-dataset.json"\n\n\ndef report_progress(check, stage, processed=0, total=None, unit=\'files\', current_file=\'\'):\n    """Optional progress hook; legacy callers keep the same cancellation callback."""\n    report = getattr(check, \'progress\', None)\n    if report:\n        report({\'stage\': stage, \'processed\': processed, \'total\': total, \'unit\': unit,\n                \'current_file\': str(current_file)[-400:]})\n\n\ndef digest(path, check=None, stage=None):\n    value = hashlib.sha256()\n    processed = 0\n    total = Path(path).stat().st_size if stage else None\n    if stage:\n        report_progress(check, stage, 0, total, \'bytes\')\n    with Path(path).open("rb") as stream:\n        for chunk in iter(lambda: stream.read(1024 * 1024), b""):\n            if check:\n                check()\n            value.update(chunk)\n            processed += len(chunk)\n            if stage:\n                report_progress(check, stage, processed, total, \'bytes\')\n    return value.hexdigest()\n\n\ndef inside(path, roots, create=False):\n    raw = Path(path).expanduser()\n    resolved = raw.resolve()\n    if not raw.is_absolute() or raw != resolved:\n        raise ValueError("目录必须为可解析的绝对路径，不能包含符号链接")\n    allowed = [Path(root).resolve() for root in roots]\n    if not any(root == resolved or root in resolved.parents for root in allowed):\n        raise ValueError("目录不在数据集允许范围内，请核对服务器配置")\n    if create:\n        resolved.mkdir(parents=True, exist_ok=True)\n    return resolved\n\n\ndef check_root(path, roots, create=False):\n    root = inside(path, roots, create)\n    if not root.is_dir():\n        raise ValueError("目录不存在或不是文件夹")\n    # Exercise actual filesystem permissions, rather than only reporting os.access.\n    import tempfile\n    with tempfile.TemporaryFile(dir=root):\n        pass\n    usage = shutil.disk_usage(root)\n    return {"resolved_path": str(root), "free_bytes": usage.free, "total_bytes": usage.total,\n            "status": "ready"}\n\n\ndef scan(root, check=None, stage="scan"):\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError("数据集目录不存在或为符号链接")\n    files, total = [], 0\n    report_progress(check, stage)\n    for directory, dirs, names in os.walk(root, followlinks=False):\n        for name in dirs:\n            if (Path(directory) / name).is_symlink():\n                raise ValueError("数据集不能包含符号链接目录")\n        for name in sorted(names):\n            if name.endswith(\'.cache\') or name in {MARKER, \'.dataset-content.json\'}:\n                continue\n            path = Path(directory) / name\n            if path.is_symlink() or not path.is_file():\n                raise ValueError("数据集不能包含符号链接或特殊文件")\n            relative = path.relative_to(root).as_posix()\n            safe_member(relative)\n            size = path.stat().st_size\n            total += size\n            if total > MAX_BYTES or len(files) >= MAX_FILES:\n                raise ValueError("数据集超过 50 GB 或 20 万文件限制")\n            if check:\n                check()\n            report_progress(check, stage, len(files), current_file=relative)\n            before = path.stat()\n            sha = digest(path, check)\n            after = path.stat()\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise ValueError("数据集在校验中发生修改，请停止修改后重试")\n            files.append({"path": relative, "size": size, "sha256": sha})\n    report_progress(check, stage, len(files), len(files))\n    files.sort(key=lambda x: x[\'path\'])\n    signature = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()\n    return {"files": files, "total_bytes": total, "fingerprint": signature}\n\n\ndef safe_member(name):\n    p = PurePosixPath(name)\n    if not name or p.is_absolute() or \'\\\\\' in name or any(part in {\'\', \'.\', \'..\'} or part.startswith(\'.\') for part in name.split(\'/\')) or any(ord(c) < 32 for c in name):\n        raise ValueError("数据文件相对路径无效")\n    return p\n\n\ndef pack(root, archive, check=None):\n    manifest = scan(root, check)\n    archive = Path(archive)\n    archive.parent.mkdir(parents=True, exist_ok=True)\n    temporary = archive.with_suffix(\'.tmp\')\n    processed = 0\n    report_progress(check, \'pack\', 0, manifest[\'total_bytes\'], \'bytes\')\n    class Reader:\n        def __init__(self, stream, name):\n            self.stream, self.name = stream, name\n        def read(self, size=-1):\n            nonlocal processed\n            data = self.stream.read(size)\n            processed += len(data)\n            if check:\n                check()\n            report_progress(check, \'pack\', processed, manifest[\'total_bytes\'], \'bytes\', self.name)\n            return data\n    with tarfile.open(temporary, \'w\') as tar:\n        for file in manifest[\'files\']:\n            if check:\n                check()\n            path = Path(root) / file[\'path\']\n            info = tar.gettarinfo(str(path), arcname=file[\'path\'])\n            if not info.isfile():\n                raise ValueError(\'数据集不能包含符号链接或特殊文件\')\n            with path.open(\'rb\') as stream:\n                tar.addfile(info, Reader(stream, file[\'path\']))\n    # Reject concurrent source changes before handing a snapshot to another node.\n    if scan(root, check, stage=\'source_verify\')[\'fingerprint\'] != manifest[\'fingerprint\']:\n        temporary.unlink(missing_ok=True)\n        raise ValueError("源数据在导出期间发生修改")\n    temporary.replace(archive)\n    return {**manifest, \'archive_size\': archive.stat().st_size, \'archive_sha256\': digest(archive, check, stage=\'archive_hash\')}\n\n\ndef unpack(archive, target, manifest, check=None):\n    target = Path(target)\n    target.mkdir(parents=True, exist_ok=True)\n    entries = {item[\'path\']: item for item in manifest[\'files\']}\n    if len(entries) != len(manifest[\'files\']) or len(entries) > MAX_FILES or sum(i[\'size\'] for i in entries.values()) > MAX_BYTES:\n        raise ValueError("数据清单大小或路径无效")\n    seen = set()\n    processed = 0\n    total = sum(i[\'size\'] for i in entries.values())\n    report_progress(check, \'unpack\', 0, total, \'bytes\')\n    with tarfile.open(archive, \'r:\') as tar:\n        for item in tar:\n            if check:\n                check()\n            safe_member(item.name)\n            spec = entries.get(item.name)\n            if not item.isfile() or item.name in seen or not spec or item.size != spec[\'size\']:\n                raise ValueError("归档文件类型、大小或清单不匹配")\n            seen.add(item.name)\n            path = target / item.name\n            path.parent.mkdir(parents=True, exist_ok=True)\n            source = tar.extractfile(item)\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n            with path.open(\'xb\') as output:\n                for chunk in iter(lambda: source.read(1024 * 1024), b\'\'):\n                    output.write(chunk)\n                    if check:\n                        check()\n            if digest(path, check) != spec[\'sha256\']:\n                raise ValueError("数据文件 SHA-256 校验失败")\n            processed += item.size\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n    if seen != set(entries):\n        raise ValueError("归档缺少数据文件")\n\n\ndef publish(archive, root, name, manifest, identity, config_text, check=None):\n    if not name or name.startswith(\'.\') or \'/\' in name or \'\\\\\' in name:\n        raise ValueError("数据集名称无效")\n    if not re.fullmatch(r\'[0-9a-f]{32}\', identity):\n        raise ValueError(\'操作编号无效\')\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError(\'目标根目录不可用\')\n    destination = root / name\n    if destination.exists() or destination.is_symlink():\n        try:\n            metadata = json.loads((destination / MARKER).read_text())\n        except (OSError, ValueError):\n            metadata = {}\n        if metadata.get(\'operation_id\') == identity:\n            actual = scan(destination, check)\n            if actual[\'fingerprint\'] != metadata.get(\'fingerprint\'):\n                raise ValueError(\'已发布的目录内容发生变化，请人工核对\')\n            return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\'), \'already_published\': True}\n        raise ValueError("目标存在同名目录，不允许覆盖")\n    work = root / (\'.dataset-publish-\' + identity)\n    if work.is_symlink():\n        raise ValueError(\'临时目录不能是符号链接\')\n    if work.exists():\n        shutil.rmtree(work)\n    required = manifest[\'total_bytes\'] + 100 * 1024**2\n    if shutil.disk_usage(root).free < required:\n        raise ValueError("目标磁盘空间不足")\n    try:\n        unpack(archive, work, manifest, check)\n        if config_text is not None:\n            (work / \'data.yaml\').write_text(config_text, encoding=\'utf-8\')\n        actual = scan(work, check, stage=\'target_verify\')\n        (work / MARKER).write_text(json.dumps({\'version\': 1, \'name\': name, \'operation_id\': identity,\n                                               \'fingerprint\': actual[\'fingerprint\']}, ensure_ascii=False), encoding=\'utf-8\')\n        if check:\n            check(\'committing\')\n        if destination.exists() or destination.is_symlink():\n            raise ValueError("目标目录已出现，拒绝覆盖")\n        work.rename(destination)\n        return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\')}\n    finally:\n        if work.exists():\n            shutil.rmtree(work)\n\n\ndef remove_dataset(path, roots, expected_fingerprint, check=None):\n    path = inside(path, roots)\n    allowed = [Path(root).resolve() for root in roots]\n    if any(path == root or path in root.parents for root in allowed) or not path.parent.is_dir():\n        raise ValueError("不能删除根目录或离线磁盘上的数据")\n    if not expected_fingerprint:\n        raise ValueError("缺少内容指纹，拒绝删除")\n    quarantine = path.parent / (\'.dataset-delete-\' + hashlib.sha256(\n        (str(path) + expected_fingerprint).encode()).hexdigest()[:32])\n    if quarantine.is_symlink():\n        raise ValueError("删除暂存目录不能为符号链接")\n    if quarantine.exists():\n        # A crash may have interrupted rmtree. Only this path+snapshot\'s private\n        # quarantine may be resumed; a newly created source is never removed.\n        if check:\n            check(\'committing\')\n        shutil.rmtree(quarantine)\n        return {\'deleted\': True, \'recovered\': True}\n    if not path.exists():\n        return {\'already_missing\': True}\n    if scan(path, check, stage=\'delete_verify\')[\'fingerprint\'] != expected_fingerprint:\n        raise ValueError("数据集内容已变化，拒绝删除，请重新校验")\n    if check:\n        check(\'committing\')\n    report_progress(check, \'remove\')\n    path.rename(quarantine)\n    shutil.rmtree(quarantine)\n    return {\'deleted\': True}\n'
+DATASET_FILES_SOURCE = '"""Portable dataset file operations; embedded unchanged into the standalone Agent."""\nfrom __future__ import annotations\nimport hashlib\nimport json\nimport os\nimport re\nfrom pathlib import Path, PurePosixPath\nimport shutil\nimport tarfile\n\nMAX_BYTES = 50 * 1024**3\nMAX_FILES = 200_010\nMARKER = ".yolo-platform-dataset.json"\n\n\ndef report_progress(check, stage, processed=0, total=None, unit=\'files\', current_file=\'\'):\n    """Optional progress hook; legacy callers keep the same cancellation callback."""\n    report = getattr(check, \'progress\', None)\n    if report:\n        report({\'stage\': stage, \'processed\': processed, \'total\': total, \'unit\': unit,\n                \'current_file\': str(current_file)[-400:]})\n\n\ndef digest(path, check=None, stage=None):\n    value = hashlib.sha256()\n    processed = 0\n    total = Path(path).stat().st_size if stage else None\n    if stage:\n        report_progress(check, stage, 0, total, \'bytes\')\n    with Path(path).open("rb") as stream:\n        for chunk in iter(lambda: stream.read(1024 * 1024), b""):\n            if check:\n                check()\n            value.update(chunk)\n            processed += len(chunk)\n            if stage:\n                report_progress(check, stage, processed, total, \'bytes\')\n    return value.hexdigest()\n\n\ndef inside(path, roots, create=False):\n    raw = Path(path).expanduser()\n    resolved = raw.resolve()\n    if not raw.is_absolute() or raw != resolved:\n        raise ValueError("目录必须为可解析的绝对路径，不能包含符号链接")\n    allowed = [Path(root).resolve() for root in roots]\n    if not any(root == resolved or root in resolved.parents for root in allowed):\n        raise ValueError("目录不在数据集允许范围内，请核对服务器配置")\n    if create:\n        resolved.mkdir(parents=True, exist_ok=True)\n    return resolved\n\n\ndef check_root(path, roots, create=False):\n    root = inside(path, roots, create)\n    if not root.is_dir():\n        raise ValueError("目录不存在或不是文件夹")\n    # Exercise actual filesystem permissions, rather than only reporting os.access.\n    import tempfile\n    with tempfile.TemporaryFile(dir=root):\n        pass\n    usage = shutil.disk_usage(root)\n    return {"resolved_path": str(root), "free_bytes": usage.free, "total_bytes": usage.total,\n            "status": "ready"}\n\n\ndef scan(root, check=None, stage="scan"):\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError("数据集目录不存在或为符号链接")\n    files, total = [], 0\n    report_progress(check, stage)\n    for directory, dirs, names in os.walk(root, followlinks=False):\n        for name in dirs:\n            if (Path(directory) / name).is_symlink():\n                raise ValueError("数据集不能包含符号链接目录")\n        for name in sorted(names):\n            if name.endswith(\'.cache\') or name in {MARKER, \'.dataset-content.json\'}:\n                continue\n            path = Path(directory) / name\n            if path.is_symlink() or not path.is_file():\n                raise ValueError("数据集不能包含符号链接或特殊文件")\n            relative = path.relative_to(root).as_posix()\n            safe_member(relative)\n            size = path.stat().st_size\n            total += size\n            if total > MAX_BYTES or len(files) >= MAX_FILES:\n                raise ValueError("数据集超过 50 GB 或 20 万文件限制")\n            if check:\n                check()\n            report_progress(check, stage, len(files), current_file=relative)\n            before = path.stat()\n            sha = digest(path, check)\n            after = path.stat()\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise ValueError("数据集在校验中发生修改，请停止修改后重试")\n            files.append({"path": relative, "size": size, "sha256": sha})\n    report_progress(check, stage, len(files), len(files))\n    files.sort(key=lambda x: x[\'path\'])\n    signature = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()\n    return {"files": files, "total_bytes": total, "fingerprint": signature}\n\n\ndef safe_member(name):\n    p = PurePosixPath(name)\n    if not name or p.is_absolute() or \'\\\\\' in name or any(part in {\'\', \'.\', \'..\'} or part.startswith(\'.\') for part in name.split(\'/\')) or any(ord(c) < 32 for c in name):\n        raise ValueError("数据文件相对路径无效")\n    return p\n\n\ndef pack(root, archive, check=None, *, manifest=None):\n    # Reuse quota/archive planning while retaining full source verification.\n    manifest = manifest if manifest is not None else scan(root, check)\n    archive = Path(archive)\n    archive.parent.mkdir(parents=True, exist_ok=True)\n    temporary = archive.with_suffix(\'.tmp\')\n    processed = 0\n    report_progress(check, \'pack\', 0, manifest[\'total_bytes\'], \'bytes\')\n    class Reader:\n        def __init__(self, stream, name):\n            self.stream, self.name = stream, name\n        def read(self, size=-1):\n            nonlocal processed\n            data = self.stream.read(size)\n            processed += len(data)\n            if check:\n                check()\n            report_progress(check, \'pack\', processed, manifest[\'total_bytes\'], \'bytes\', self.name)\n            return data\n    with tarfile.open(temporary, \'w\') as tar:\n        for file in manifest[\'files\']:\n            if check:\n                check()\n            path = Path(root) / file[\'path\']\n            info = tar.gettarinfo(str(path), arcname=file[\'path\'])\n            if not info.isfile():\n                raise ValueError(\'数据集不能包含符号链接或特殊文件\')\n            with path.open(\'rb\') as stream:\n                tar.addfile(info, Reader(stream, file[\'path\']))\n    # Reject concurrent source changes before handing a snapshot to another node.\n    if scan(root, check, stage=\'source_verify\')[\'fingerprint\'] != manifest[\'fingerprint\']:\n        temporary.unlink(missing_ok=True)\n        raise ValueError("源数据在导出期间发生修改")\n    temporary.replace(archive)\n    return {**manifest, \'archive_size\': archive.stat().st_size, \'archive_sha256\': digest(archive, check, stage=\'archive_hash\')}\n\n\ndef unpack(archive, target, manifest, check=None):\n    target = Path(target)\n    target.mkdir(parents=True, exist_ok=True)\n    entries = {item[\'path\']: item for item in manifest[\'files\']}\n    if len(entries) != len(manifest[\'files\']) or len(entries) > MAX_FILES or sum(i[\'size\'] for i in entries.values()) > MAX_BYTES:\n        raise ValueError("数据清单大小或路径无效")\n    seen = set()\n    processed = 0\n    total = sum(i[\'size\'] for i in entries.values())\n    report_progress(check, \'unpack\', 0, total, \'bytes\')\n    with tarfile.open(archive, \'r:\') as tar:\n        for item in tar:\n            if check:\n                check()\n            safe_member(item.name)\n            spec = entries.get(item.name)\n            if not item.isfile() or item.name in seen or not spec or item.size != spec[\'size\']:\n                raise ValueError("归档文件类型、大小或清单不匹配")\n            seen.add(item.name)\n            path = target / item.name\n            path.parent.mkdir(parents=True, exist_ok=True)\n            source = tar.extractfile(item)\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n            with path.open(\'xb\') as output:\n                for chunk in iter(lambda: source.read(1024 * 1024), b\'\'):\n                    output.write(chunk)\n                    if check:\n                        check()\n            if digest(path, check) != spec[\'sha256\']:\n                raise ValueError("数据文件 SHA-256 校验失败")\n            processed += item.size\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n    if seen != set(entries):\n        raise ValueError("归档缺少数据文件")\n\n\ndef publish(archive, root, name, manifest, identity, config_text, check=None):\n    if not name or name.startswith(\'.\') or \'/\' in name or \'\\\\\' in name:\n        raise ValueError("数据集名称无效")\n    if not re.fullmatch(r\'[0-9a-f]{32}\', identity):\n        raise ValueError(\'操作编号无效\')\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError(\'目标根目录不可用\')\n    destination = root / name\n    if destination.exists() or destination.is_symlink():\n        try:\n            metadata = json.loads((destination / MARKER).read_text())\n        except (OSError, ValueError):\n            metadata = {}\n        if metadata.get(\'operation_id\') == identity:\n            actual = scan(destination, check)\n            if actual[\'fingerprint\'] != metadata.get(\'fingerprint\'):\n                raise ValueError(\'已发布的目录内容发生变化，请人工核对\')\n            return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\'), \'already_published\': True}\n        raise ValueError("目标存在同名目录，不允许覆盖")\n    work = root / (\'.dataset-publish-\' + identity)\n    if work.is_symlink():\n        raise ValueError(\'临时目录不能是符号链接\')\n    if work.exists():\n        shutil.rmtree(work)\n    required = manifest[\'total_bytes\'] + 100 * 1024**2\n    if shutil.disk_usage(root).free < required:\n        raise ValueError("目标磁盘空间不足")\n    try:\n        unpack(archive, work, manifest, check)\n        if config_text is not None:\n            (work / \'data.yaml\').write_text(config_text, encoding=\'utf-8\')\n        actual = scan(work, check, stage=\'target_verify\')\n        (work / MARKER).write_text(json.dumps({\'version\': 1, \'name\': name, \'operation_id\': identity,\n                                               \'fingerprint\': actual[\'fingerprint\']}, ensure_ascii=False), encoding=\'utf-8\')\n        if check:\n            check(\'committing\')\n        if destination.exists() or destination.is_symlink():\n            raise ValueError("目标目录已出现，拒绝覆盖")\n        work.rename(destination)\n        return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\')}\n    finally:\n        if work.exists():\n            shutil.rmtree(work)\n\n\ndef remove_dataset(path, roots, expected_fingerprint, check=None):\n    path = inside(path, roots)\n    allowed = [Path(root).resolve() for root in roots]\n    if any(path == root or path in root.parents for root in allowed) or not path.parent.is_dir():\n        raise ValueError("不能删除根目录或离线磁盘上的数据")\n    if not expected_fingerprint:\n        raise ValueError("缺少内容指纹，拒绝删除")\n    quarantine = path.parent / (\'.dataset-delete-\' + hashlib.sha256(\n        (str(path) + expected_fingerprint).encode()).hexdigest()[:32])\n    if quarantine.is_symlink():\n        raise ValueError("删除暂存目录不能为符号链接")\n    if quarantine.exists():\n        # A crash may have interrupted rmtree. Only this path+snapshot\'s private\n        # quarantine may be resumed; a newly created source is never removed.\n        if check:\n            check(\'committing\')\n        shutil.rmtree(quarantine)\n        return {\'deleted\': True, \'recovered\': True}\n    if not path.exists():\n        return {\'already_missing\': True}\n    if scan(path, check, stage=\'delete_verify\')[\'fingerprint\'] != expected_fingerprint:\n        raise ValueError("数据集内容已变化，拒绝删除，请重新校验")\n    if check:\n        check(\'committing\')\n    report_progress(check, \'remove\')\n    path.rename(quarantine)\n    shutil.rmtree(quarantine)\n    return {\'deleted\': True}\n'
 DATASET_FILES = {}
 exec(compile(DATASET_FILES_SOURCE, "<dataset_files>", "exec"), DATASET_FILES)
 # END PORTABLE DATASET CORE
@@ -2939,6 +2987,103 @@ def dataset_atomic_json(path, payload):
         handle.flush()
         os.fsync(handle.fileno())
     temp.replace(path)
+
+
+def dataset_staging_owner(config):
+    """Identify the authenticated owner without persisting credentials."""
+    center = config.get('center_url')
+    node_id = config.get('node_id')
+    if not isinstance(center, str) or not center or not isinstance(node_id, str):
+        return None
+    return {'version': 1, 'node_id': node_id,
+            'center_sha256': hashlib.sha256(center.rstrip('/').encode('utf-8')).hexdigest()}
+
+
+def dataset_staging_owned_by(state, owner):
+    """Legacy/unknown receipts remain replayable but are never auto-reclaimed."""
+    if owner is None:
+        return False
+    path = state / 'owner.json'
+    try:
+        if path.is_symlink():
+            return False
+        with path.open('rb') as stream:
+            data = stream.read(4097)
+        return len(data) <= 4096 and json.loads(data) == owner
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def reclaim_dataset_staging(config, *, now=None):
+    """Reclaim only center-approved receipts; offline/unknown work stays resumable."""
+    now = time.time() if now is None else now
+    previous = config.get('_dataset_reconcile_at', 0)
+    if previous and now - previous < 300:
+        return 0
+    config['_dataset_reconcile_at'] = now
+    owner = dataset_staging_owner(config)
+    if owner is None:
+        return 0
+    root = Path(config['training_state_dir']).parent / '.dataset-state'
+    if not root.is_dir():
+        return 0
+    candidates = []
+    # Age is only a scheduling hint. The authenticated center decides safety.
+    for identity in list(root.iterdir()):
+        if not identity.is_dir() or identity.is_symlink() or not re.fullmatch(r'[0-9a-f]{32}', identity.name):
+            continue
+        for state in identity.iterdir():
+            if not state.is_dir() or state.is_symlink() or not re.fullmatch(r'[0-9a-f]{32}', state.name):
+                continue
+            try:
+                if now - state.stat().st_mtime < 3600 or not dataset_staging_owned_by(state, owner):
+                    continue
+            except OSError:
+                continue
+            candidates.append(state)
+    candidates.sort(key=lambda path: str(path))
+    # Protected receipts must not permanently hide later completed work.
+    cursor = config.get('_dataset_reconcile_cursor', '')
+    start = next((index for index, state in enumerate(candidates) if str(state) > cursor), 0)
+    candidates = (candidates[start:] + candidates[:start])[:1024]
+    removed = 0
+    # Keep each background pass bounded; a large historical backlog is drained
+    # gradually without monopolizing network requests or blocking shutdown.
+    for index in range(0, len(candidates), 128):
+        batch = candidates[index:index + 128]
+        receipts = [{'id': state.parent.name, 'token': state.name} for state in batch]
+        try:
+            response = dataset_api(config, f"/api/dataset-storage/agent/{config['node_id']}/reconcile",
+                                   'POST', {'receipts': receipts}, timeout=20)
+            approved = {(item['id'], item['token']) for item in response.get('reclaimable', [])}
+        except (HTTPError, URLError, OSError, ValueError, KeyError, TypeError):
+            # Old centers do not implement reconciliation. Never infer terminal
+            # state from a failed request or expire unfinished transfers by age.
+            break
+        config['_dataset_reconcile_cursor'] = str(batch[-1])
+        for state in batch:
+            if (state.parent.name, state.name) not in approved:
+                continue
+            try:
+                with (state / '.lock').open('a') as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    if not dataset_staging_owned_by(state, owner):
+                        continue
+                    shutil.rmtree(state)
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+def run_dataset_reclamation(config):
+    try:
+        reclaim_dataset_staging(config)
+    except (OSError, ValueError, TypeError):
+        LOGGER.warning('数据集中转清理暂未完成，现有断点已保留')
 
 
 def poll_dataset_operation(config, busy):
@@ -2998,11 +3143,21 @@ def run_dataset_operation(config, work, stop):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        owner = dataset_staging_owner(config)
+        owner_path = state / 'owner.json'
+        if owner_path.exists() or owner_path.is_symlink():
+            if not dataset_staging_owned_by(state, owner):
+                LOGGER.warning('数据集操作缓存属于其他中心或节点，保留现有回执：%s', identity)
+                return
         receipt = state / 'result.json'
         if receipt.is_file():
             result = json.loads(receipt.read_text(encoding='utf-8'))
         else:
             check()
+            # Only a successful authenticated lease check may claim a new or
+            # partial legacy cache. Old completed receipts keep their identity.
+            if owner is not None and not owner_path.exists():
+                dataset_atomic_json(owner_path, owner)
             report_progress({'stage': phase})
             if phase not in LIGHTWEIGHT_DATASET_PHASES:
                 training_lock = acquire_training_lock(config)
@@ -3108,10 +3263,8 @@ def run_dataset_operation(config, work, stop):
                     timeout=config.get('model_transfer_finalize_timeout_seconds', 1800))
         (state / 'acked').touch()
         (state / 'bundle.tar').unlink(missing_ok=True)
-        # Leave tiny receipts for safe retries; reclaim only acknowledged data.
-        for previous in state.parents[1].glob('*/*/acked'):
-            if time.time() - previous.stat().st_mtime > 86400:
-                shutil.rmtree(previous.parent, ignore_errors=True)
+        # Cleanup runs independently in the heartbeat loop, after center
+        # reconciliation and acquiring each receipt's cross-process lock.
     except (HTTPError, URLError):
         LOGGER.warning('数据集操作连接中断，将保留断点等待重试：%s', identity)
     except OSError as exc:
@@ -3249,6 +3402,7 @@ def main() -> int:
     active_operation: threading.Thread | None = None
     active_dataset_operation: threading.Thread | None = None
     active_dataset_phase: str | None = None
+    dataset_reclamation: threading.Thread | None = None
     last_unready_reason: str | None = None
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
                 "已启用" if config["enable_training"] else "未启用")
@@ -3264,7 +3418,11 @@ def main() -> int:
             break
         try:
             payload = collect(config["nvidia_smi_bin"], config)
-            interval = send(config, payload)
+            interval, refresh_request_id = send(config, payload)
+            if refresh_request_id and not args.once:
+                refreshed = fulfill_refresh_request(config, refresh_request_id, stop)
+                if refreshed is not None:
+                    payload = refreshed
             capability = payload.get("training") or {}
             training_ready = bool(capability.get("ready"))
             if failures or args.once:
@@ -3272,6 +3430,12 @@ def main() -> int:
                             sum(len(gpu["processes"]) for gpu in payload["compute"]["gpus"]))
             failures = 0
             delay = interval
+            if (config.get('dataset_roots') and not args.once
+                    and (dataset_reclamation is None or not dataset_reclamation.is_alive())
+                    and time.time() - config.get('_dataset_reconcile_at', 0) >= 300):
+                dataset_reclamation = threading.Thread(target=run_dataset_reclamation, args=(config,),
+                                                      name='dataset-reclamation', daemon=True)
+                dataset_reclamation.start()
             if config.get('dataset_roots') and not args.once and (active_dataset_operation is None or not active_dataset_operation.is_alive()):
                 try:
                     busy = not recovery_ready or bool(active_training or load_active_runs(config)) or bool(capability.get('lock_occupied'))
@@ -3384,6 +3548,11 @@ def main() -> int:
             return finish(1)
     return finish(0)
 
+
+
+DATASET_PROVENANCE_SOURCE = '"""Small, portable evidence of the dataset configuration used by a run.\n\nA catalogue fingerprint describes the last completed validation, not an\nimmutable copy of the training images. Never scan a large dataset at launch.\n"""\nfrom __future__ import annotations\n\nimport hashlib\nimport re\nfrom datetime import datetime, timezone\nfrom pathlib import Path\n\n\nMAX_CONFIG_BYTES = 1024 * 1024\n\n\ndef capture(raw, *, task_type=\'detect\', node_id=\'local\', runtime_path=None):\n    snapshot = {\n        \'version\': 1, \'node_id\': str(node_id), \'task_type\': str(task_type),\n        \'source\': \'runtime_config\', \'verification\': \'path_only\' if task_type == \'classify\' else \'config_only\',\n        \'captured_at\': datetime.now(timezone.utc).isoformat(),\n    }\n    if task_type == \'classify\':\n        return snapshot\n    try:\n        with Path(raw).open(\'rb\') as handle:\n            content = handle.read(MAX_CONFIG_BYTES + 1)\n        if len(content) <= MAX_CONFIG_BYTES:\n            snapshot[\'config_sha256\'] = hashlib.sha256(content).hexdigest()\n        else:\n            snapshot[\'verification\'] = \'unavailable\'\n    except OSError:\n        snapshot[\'verification\'] = \'unavailable\'\n    if runtime_path is not None:\n        try:\n            with Path(runtime_path).open(\'rb\') as handle:\n                content = handle.read(MAX_CONFIG_BYTES + 1)\n            if len(content) <= MAX_CONFIG_BYTES:\n                snapshot[\'runtime_config_sha256\'] = hashlib.sha256(content).hexdigest()\n        except OSError:\n            pass\n    return snapshot\n\n\ndef clean(snapshot):\n    """Accept only bounded configuration evidence from an authenticated Agent."""\n    if not isinstance(snapshot, dict) or snapshot.get(\'version\') != 1:\n        raise ValueError(\'数据集快照版本无效\')\n    result = {\'version\': 1, \'source\': \'runtime_config\'}\n    for key in (\'node_id\', \'task_type\', \'captured_at\'):\n        value = snapshot.get(key)\n        if not isinstance(value, str) or not value or len(value) > 100:\n            raise ValueError(\'数据集快照字段无效\')\n        result[key] = value\n    try:\n        stamp = datetime.fromisoformat(result[\'captured_at\'].replace(\'Z\', \'+00:00\'))\n        if stamp.tzinfo is None:\n            raise ValueError()\n    except ValueError:\n        raise ValueError(\'数据集快照时间无效\') from None\n    verification = snapshot.get(\'verification\')\n    if verification not in (\'config_only\', \'path_only\', \'unavailable\'):\n        raise ValueError(\'数据集快照验证类型无效\')\n    result[\'verification\'] = verification\n    for key in (\'config_sha256\', \'runtime_config_sha256\'):\n        digest = snapshot.get(key)\n        if digest is not None:\n            if not isinstance(digest, str) or not re.fullmatch(r\'[0-9a-f]{64}\', digest):\n                raise ValueError(\'数据集配置摘要无效\')\n            result[key] = digest\n    return result\n'
+DATASET_PROVENANCE = {}
+exec(compile(DATASET_PROVENANCE_SOURCE, "<dataset_provenance>", "exec"), DATASET_PROVENANCE)
 
 if __name__ == "__main__":
     raise SystemExit(main())

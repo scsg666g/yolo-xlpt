@@ -41,6 +41,12 @@ body:has(.compute-page) { min-width: 0; }
 .node-status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; color: #a5b7c4; font-size: 11px; }
 .node-status i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .node-status.online { color: #76e9ba; }.node-status.offline { color: #f2b76b; }.node-status.disabled { color: #97a1ab; }
+.node-refresh-message { margin: 0 0 14px; padding: 10px 13px; border: 1px solid #3f6054; border-radius: 8px; color: #a5d4c8; background: #20352f; font-size: 12px; }
+.node-refresh-badge { flex-shrink: 0; padding: 4px 7px; border-radius: 5px; color: #f2c586; background: #352a1f; font-size: 10px; white-space: nowrap; }
+.node-refresh-badge.fresh { color: #8de0bd; background: #172d2a; }
+.node-refresh-result { margin: -4px 0 14px; padding: 9px 12px; border: 1px solid #655039; border-radius: 7px; color: #f2c586; background: #352a1f; font-size: 11px; line-height: 1.6; }
+.node-refresh-result.fresh { border-color: #39705f; color: #8de0bd; background: #172d2a; }
+.node-refresh-result span { overflow-wrap: anywhere; }
 .node-brief { min-width: 210px; text-align: right; color: #abbcca; font: 11px "DM Mono", monospace; }
 .node-controls { display: flex; gap: 3px; padding-left: 8px; border-left: 1px solid #344652; }
 .node-controls .icon-button { border-radius: 7px; transition: color .18s, background .18s; }.node-controls .icon-button:hover { color: #76e9ba; background: #223a34; }.node-controls .icon-button:last-child:hover { color: #f2b76b; }
@@ -71,6 +77,11 @@ body:has(.compute-page) { min-width: 0; }
 :root[data-theme='light'] .node-toolbar > select.node-status-filter option { color: #294758; background: #fff; }
 :root[data-theme='light'] .node-content, :root[data-theme='light'] .node-controls { border-color: #dce6eb; }
 :root[data-theme='light'] .node-status.offline { color: #a66819; }
+:root[data-theme='light'] .node-refresh-message { color: #287c67; border-color: #bdded2; background: #edf8f3; }
+:root[data-theme='light'] .node-refresh-badge { color: #8c5e20; background: #fff1d9; }
+:root[data-theme='light'] .node-refresh-badge.fresh { color: #23765e; background: #e1f4ee; }
+:root[data-theme='light'] .node-refresh-result { color: #8c5e20; border-color: #ead4b3; background: #fff7eb; }
+:root[data-theme='light'] .node-refresh-result.fresh { color: #23765e; border-color: #abd8c8; background: #effaf5; }
 :root[data-theme='light'] .node-warning { color: #8c5e20; border-color: #ead4b3; background: #fff7eb; }
 :root[data-theme='light'] .node-info { color: #287c67; border-color: #bdded2; background: #edf8f3; }
 :root[data-theme='light'] .node-training-state { color: #526b75; border-color: #cad9de; background: #f4f8f9; }

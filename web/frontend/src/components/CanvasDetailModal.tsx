@@ -6,6 +6,7 @@ import { finiteMetricValue, hasAnyMetricValue, metricPointCount, metricSeriesDis
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
+import { datasetTrainingSnapshot } from '../datasetSnapshot'
 import { LineChartView } from './LineChart'
 
 export type CanvasDetailKind = 'runtime' | 'status' | 'metrics' | 'artifacts' | 'weights'
@@ -179,6 +180,17 @@ function metricOption(metrics: MetricPoint[], keys: Array<{ key: string; name: s
 }
 
 function RuntimeDetails({ task, run }: Pick<Props, 'task' | 'run'>) {
+  const dataset = datasetTrainingSnapshot(run?.parameter_snapshot)
+  const resumeConfiguration = run?.launch_mode === 'resume' || dataset?.configuration_scope === 'resume_request'
+  const verificationLabel = resumeConfiguration
+    ? '续训启动提交配置（实际输入待核对）'
+    : dataset?.verification === 'catalog_snapshot'
+    ? '启动时保存的最近登记校验记录'
+    : dataset?.verification === 'config_only'
+      ? '启动时保存的数据配置摘要'
+      : dataset?.verification === 'path_only'
+        ? '仅记录数据路径（分类数据集）'
+        : '配置读取失败，仅保留运行记录'
   return <div className="canvas-detail-sections">
     <section className="canvas-detail-section">
       <h3>进程与设备</h3>
@@ -202,6 +214,23 @@ function RuntimeDetails({ task, run }: Pick<Props, 'task' | 'run'>) {
         {run?.checkpoint_source?.source_deleted && <DetailField label="续训来源" value={`Attempt ${run.checkpoint_source.attempt_number} · 源文件已清理，来源信息保留`} wide />}
         {task.status === 'queued' && task.queue_reason && <DetailField label="排队原因" value={task.queue_reason} wide />}
       </div>
+    </section>
+    <section className="canvas-detail-section">
+      <h3>本次训练的数据集依据</h3>
+      {dataset ? <>
+        <div className="canvas-detail-grid">
+          <DetailField label="记录方式" value={verificationLabel} wide />
+          <DetailField label="记录时间" value={formatDate(dataset.captured_at)} />
+          <DetailField label="最近完整校验" value={formatDate(dataset.checked_at)} />
+          <DetailField label="配置 SHA-256" value={dataset.config_sha256 || '未记录'} wide mono />
+          <DetailField label="数据集指纹" value={dataset.fingerprint || '未记录完整内容指纹'} wide mono />
+          {Object.keys(dataset.stats).length > 0 && <DetailField label="登记时统计" value={`训练图片 ${dataset.stats.train_images ?? '未记录'} · 验证图片 ${dataset.stats.val_images ?? '未记录'} · 类别 ${dataset.stats.classes ?? dataset.classes.length}`} wide />}
+          {dataset.classes.length > 0 && <DetailField label="登记时类别" value={dataset.classes.join('、')} wide />}
+        </div>
+        <p>{resumeConfiguration
+          ? '续训可能优先读取检查点内的数据配置。此处仅保存启动提交的配置依据，不代表实际输入已核验，不能用当前登记信息推断检查点使用的数据。'
+          : '此信息固定于本次训练记录。登记指纹来自标注的最近校验时间，不保证目录中的文件之后未被修改，也不代表保留了完整数据副本。'}</p>
+      </> : <p>此历史运行未记录数据集版本依据，无法用当前登记信息推断当时的图片和标签内容。</p>}
     </section>
     <section className="canvas-detail-section">
       <h3>启动命令</h3>

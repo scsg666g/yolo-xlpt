@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session, defer, selectinload, sessionmaker
 from starlette.requests import ClientDisconnect
 
 from .config import ULTRALYTICS_ROOT, YOLO_BIN
+from .config import nonnegative_int_env
 from .database import SessionLocal, get_db
 from .model_assets import (
     LOCAL_NODE_ID,
@@ -73,6 +74,7 @@ router = APIRouter(tags=["model-tests"])
 logger = logging.getLogger("yolo-platform.inference")
 MAX_IMAGE_BYTES = 20 * 1024**2
 MAX_TOTAL_BYTES = 100 * 1024**2
+INFERENCE_TIMEOUT_SECONDS = max(1, nonnegative_int_env('PLATFORM_MODEL_TEST_TIMEOUT_SECONDS', 300))
 UPLOAD_TTL = 24 * 60 * 60
 ACTIVE_STATUSES = {"uploading", "preparing", "queued", "running", "cancel_requested"}
 SUPPORTED_MODEL_TASKS = {"detect", "segment", "classify", "pose", "obb"}
@@ -650,6 +652,12 @@ def record_public(record: ModelTest) -> dict:
         "attempt_number": record.attempt_number,
         "source_attempt_number": record.source_attempt_number,
         "status": record.status,
+        "status_message": (
+            "等待中心服务器 CPU 单通道执行；该队列独立于训练任务和 GPU。"
+            if record.status == "queued" else None
+        ),
+        "execution": {"node_id": LOCAL_NODE_ID, "device": "cpu", "location": "center",
+                      "timeout_seconds": INFERENCE_TIMEOUT_SECONDS},
         "error": record.error,
         "confidence": record.confidence,
         "iou": record.iou,
@@ -689,6 +697,12 @@ def record_summary(record: ModelTest) -> dict:
         "attempt_number": record.attempt_number,
         "source_attempt_number": record.source_attempt_number,
         "status": record.status,
+        "status_message": (
+            "等待中心服务器 CPU 单通道执行；该队列独立于训练任务和 GPU。"
+            if record.status == "queued" else None
+        ),
+        "execution": {"node_id": LOCAL_NODE_ID, "device": "cpu", "location": "center",
+                      "timeout_seconds": INFERENCE_TIMEOUT_SECONDS},
         "error": record.error,
         "confidence": record.confidence,
         "iou": record.iou,
@@ -1018,11 +1032,11 @@ class InferenceWorker:
                     )
                     process = self._process
                 try:
-                    code = process.wait(timeout=300)
+                    code = process.wait(timeout=INFERENCE_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-                    raise RuntimeError("推理超过 5 分钟，请减少图片数量或尺寸后重试") from None
+                    raise RuntimeError(f"推理超过 {INFERENCE_TIMEOUT_SECONDS} 秒，请减少图片数量或尺寸后重试") from None
             if self._stop.is_set():
                 raise _WorkerRestart()
             with self.lock:

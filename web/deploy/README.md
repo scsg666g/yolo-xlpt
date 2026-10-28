@@ -1,5 +1,11 @@
 # 双实例部署与维护
 
+## 1.10.0 数据与运行可靠性配置
+
+本版保留已有数据库、任务目录、数据集和 Agent 状态目录；训练 Attempt 的数据集快照是新增的可选参数字段，旧记录继续显示“未记录”，不做回填或强制迁移。指标读取会识别 CSV 替换、截断和同 Epoch 更正，本机与 Agent 端均适用。执行中心模型测试仍使用 CPU 单通道，耗时较长的模型可通过 `PLATFORM_MODEL_TEST_TIMEOUT_SECONDS` 调整超时（默认 300 秒）。
+
+数据集操作快照与失败缓存的自动清理由 `PLATFORM_DATASET_STORAGE_RETENTION_SECONDS`（默认 86400 秒）和 `PLATFORM_DATASET_FAILED_RETENTION_SECONDS`（默认 604800 秒）控制；设为 `0` 可关闭相应清理。远程 Agent 2.5.0 可在新旧中心之间能力协商，更新脚本时保留节点原配置、`.training-state/` 与 `.dataset-state/`。仅维护者更新开发版服务和两个独立 Agent 分发包；不要覆盖生产使用版平台或服务器私有配置。
+
 ## 1.7.0 Agent 保留训练重载与进度接管
 
 配套 Agent **2.3.0**：默认退出保留已启动的训练进程、原 Run/Attempt、日志和资源锁；再次启动核验原进程后接管指标、产物与训练采样。支持 `SIGHUP` 原进程重载，systemd 使用 `systemctl reload`，不要在训练中用默认控制组配置的 `systemctl restart/stop`。需要退出时同时停止训练，启动 Agent 时指定 `--shutdown-policy stop`；平台停止按钮仍始终有效。新 Agent 在监控上报之前恢复活动任务，采样上报失败不阻断已有训练的进度回传。
@@ -154,7 +160,7 @@ sudo journalctl -u yolo-platform-dev -n 100 --no-pager
 curl --fail http://127.0.0.1:18088/api/health
 ```
 
-使用版将服务名替换为 `yolo-platform-prod`，端口替换为 `18089`。健康接口包含 `status`、`instance`、`version`、`scheduler`、`scheduler_error`、`scheduler_last_error`、`scheduler_last_error_at`、`database`、数据库查询耗时和 `runs_root`。数据库失败返回 503；调度循环当前一轮失败时记录异常并返回 `scheduler=error`，后续一轮成功后回到 `running`，最近错误和时间仍保留供排查。这能识别持续报错的调度循环，但仍需结合队列状态和实际进程判断单个训练的进展。耗时至少 1 秒的 `/api/` 请求会输出 `slow_request`，本机删除线程也记录清理情况。
+使用版将服务名替换为 `yolo-platform-prod`，端口替换为 `18089`。健康接口包含 `status`、`instance`、`version`、`scheduler`、`scheduler_error`、`scheduler_last_error`、`scheduler_last_error_at`、`dataset_worker`、`dataset_worker_health`、`database`、数据库查询耗时和 `runs_root`。数据库失败返回 503；调度或数据集循环当前一轮失败时记录异常并返回 `error`，后续一轮成功后回到 `running`，最近错误和时间仍保留供排查。这能识别持续报错的后台循环，但仍需结合队列状态和实际进程判断单个训练的进展。耗时至少 1 秒的 `/api/` 请求会输出 `slow_request`，本机删除线程也记录清理情况。
 
 | 现象 | 核查重点 |
 | --- | --- |

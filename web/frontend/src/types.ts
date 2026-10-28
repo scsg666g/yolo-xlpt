@@ -344,6 +344,19 @@ export interface ComputeNodeCredential {
   token: string
 }
 
+export interface ComputeNodeRefreshResult {
+  id: string
+  result: 'fresh' | 'stale' | 'timeout' | 'unsupported' | 'error'
+  reason?: string | null
+  previous_sampled_at?: string | null
+  sampled_at?: string | null
+  node: ComputeNode
+}
+
+export interface ComputeNodeRefreshResponse {
+  nodes: ComputeNodeRefreshResult[]
+}
+
 export interface Resources {
   gpus: GpuInfo[]
   models: ResourceFile[]
@@ -473,6 +486,10 @@ export interface ModelAssetPage {
 export interface ModelTest {
   id: string
   status: 'uploading' | 'preparing' | 'queued' | 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled'
+  /** Execution service is distinct from the server that supplied the weights. */
+  execution?: { node_id: string; device: string; location: 'center'; timeout_seconds: number }
+  queue_ahead?: number | null
+  status_message?: string | null
   task_id?: string | null
   run_id?: string | null
   source_run_id?: string | null
@@ -577,6 +594,8 @@ export interface DatasetOperation {
 
 export interface DatasetOperationSummary {
   total: number; active: number; failed: number; revision: string; counts: Record<string, number>
+  reference_revision?: string
+  managed_task_types?: string[]
   latest_created_at: string | null; snapshot: string; nodes: Array<{ id: string; name: string }>
 }
 export interface DatasetOperationPage {

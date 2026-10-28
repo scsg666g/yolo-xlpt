@@ -11,7 +11,7 @@ import type {
 } from '../types'
 import {
   activeModelTestStatuses, createModelTestRequestId, createOrRecoverModelTest, modelTestDate, modelTestParameterText,
-  modelTestRequestMayHaveReachedServer, modelTestResultLabel, modelTestStatusLabels, modelTestTaskLabel, modelTestTaskType, modelTestWeightName,
+  modelTestExecutionLabel, modelTestRequestMayHaveReachedServer, modelTestResultLabel, modelTestStatusLabels, modelTestTaskLabel, modelTestTaskType, modelTestWeightName,
   startOrRecoverModelTest, type SelectedImage, TestWorkspace, uploadPendingModelTestImages,
 } from './ModelTestShared'
 import { RegisteredModelLibrary, TrainingTaskLibrary } from './ModelLibrary'
@@ -1009,7 +1009,7 @@ export function ModelTests() {
       </aside>
 
       <main className="model-test-run-panel">
-        <div className="model-tests-section-heading"><div><span>02</span><h2>上传图片并测试</h2></div><p>测试任务由中心服务执行，关闭页面不会删除已提交任务。</p></div>
+        <div className="model-tests-section-heading"><div><span>02</span><h2>上传图片并测试</h2></div><p>本机和远程模型均由中心服务器 CPU 执行测试；远程模型首次使用需传输权重。关闭页面不会删除已提交任务。</p></div>
         <section className={`model-test-run-source${modelReady ? ' ready' : ''}`}>
           {displayedSourceType === 'remote_path' ? <Server size={19} /> : displayedSourceType === 'training_artifact' ? <Box size={19} /> : <HardDrive size={19} />}
           <div><span>{sourceLabels[displayedSourceType]} · {modelTestTaskLabel(currentTaskType)}</span><strong>{displayedModelName}</strong><small>{displayedSource ? `当前结果固定于 SHA-256 ${displayedSource.model_sha256?.slice(0, 12) || '待记录'}…` : modelReady ? '模型来源已确认，可以提交测试' : '请先在左侧完成模型选择与校验'}</small></div>
@@ -1080,7 +1080,7 @@ export function ModelTests() {
               <div><Box size={17} /><span>模型<strong>{selectedHistory.model_source_name || modelTestWeightName(selectedHistory)}</strong></span></div>
               <div><Server size={17} /><span>来源<strong>{sourceDescription(selectedHistory)}</strong></span></div>
               <div><HardDrive size={17} /><span>模型版本<strong>{selectedHistory.model_sha256 ? `${selectedHistory.model_sha256.slice(0, 12)}…` : '旧记录未保存摘要'}{typeof selectedHistory.model_size === 'number' ? ` · ${formatBytes(selectedHistory.model_size)}` : ''}</strong></span></div>
-              <div><Cpu size={17} /><span>执行环境<strong>{selectedHistory.model.device || 'CPU'} · {selectedHistory.model.imgsz || 640} px</strong></span></div>
+              <div><Cpu size={17} /><span>执行环境<strong>{modelTestExecutionLabel(selectedHistory)}</strong></span></div>
             </div>
             {selectedHistory.error && <div className="model-test-error" role="alert">{selectedHistory.error}</div>}
             {selectedHistory.status === 'completed' && !testHasExactModel(selectedHistory) && <div className="model-test-parameter-notice"><Info size={15} />这是旧版测试记录，没有完整模型摘要；现有结果仍可查看和下载，但不能按原模型重测。</div>}

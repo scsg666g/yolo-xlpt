@@ -307,8 +307,10 @@ def health():
         scheduler_last_error_at = scheduler_last_error_at.isoformat()
     deletion_status = "running" if local_deletion_worker.is_alive else "stopped"
     inference_status = "running" if inference_worker.is_alive else "stopped"
+    dataset_health = dataset_worker.health_state()
+    dataset_status = dataset_health['status']
     return {"status": "ok" if all(status == "running" for status in (
-                scheduler_status, deletion_status, inference_status,
+                scheduler_status, deletion_status, inference_status, dataset_status,
             )) else "degraded",
             "instance": PLATFORM_INSTANCE_NAME,
             "version": PLATFORM_VERSION,
@@ -318,6 +320,8 @@ def health():
             "scheduler_last_error_at": scheduler_last_error_at,
             "local_deletion_worker": deletion_status,
             "inference_worker": inference_status,
+            "dataset_worker": dataset_status,
+            "dataset_worker_health": dataset_health,
             "database": "ok", "database_latency_ms": round((time.perf_counter() - started) * 1000, 2),
             "runs_root": str(RUNS_ROOT)}
 

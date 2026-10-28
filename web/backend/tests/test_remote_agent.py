@@ -46,8 +46,11 @@ def training(tmp_path):
     return config, task
 
 
-def test_real_directory_cleanup_keeps_external_log(agent, training, monkeypatch):
+@pytest.mark.parametrize('provenance_version', [None, 1])
+def test_real_directory_cleanup_keeps_external_log(agent, training, monkeypatch, provenance_version):
     config, task = training
+    if provenance_version is not None:
+        task['dataset_provenance_version'] = provenance_version
     build = agent.build_training_command
 
     def dummy_command(config, task):
@@ -74,6 +77,12 @@ def test_real_directory_cleanup_keeps_external_log(agent, training, monkeypatch)
     assert "DDP output after directory cleanup" in Path(task["log_path"]).read_text()
     assert updates[-1]["status"] == "completed" and updates[-1]["exit_code"] == 0
     assert updates[-1]["command"]
+    if provenance_version == 1:
+        assert updates[-1]['dataset_snapshot']['node_id'] == config['node_id']
+        assert updates[-1]['dataset_snapshot']['config_sha256'] == hashlib.sha256(
+            Path(task['data_path']).read_bytes()).hexdigest()
+    else:
+        assert 'dataset_snapshot' not in updates[-1]
     assert not list(Path(config["training_state_dir"]).glob("*.json"))
 
 
@@ -103,6 +112,51 @@ def test_remote_progress_skips_invalid_epochs_and_normalizes_elapsed(agent, tmp_
         {"epoch": 2, "elapsed": 0.0, "values": {"score": None, "note": "running"}},
         {"epoch": 3, "elapsed": 0.0, "values": {"score": 0.8, "note": "done"}},
     ]
+
+
+def test_remote_progress_payload_resends_appended_epoch_correction(agent, training, monkeypatch):
+    config, task = training
+    csv_path = Path(task['run_dir']) / 'results.csv'
+    class Process:
+        pid = 123456
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+    process = Process()
+    class Stop:
+        def __init__(self):
+            self.ticks = 0
+        def is_set(self):
+            return False
+        def wait(self, seconds):
+            if seconds == 2:
+                self.ticks += 1
+                if self.ticks == 2:
+                    with csv_path.open('a') as stream:
+                        stream.write('1,2,0.9\n')
+                elif self.ticks == 3:
+                    process.returncode = 0
+            return False
+    def popen(*args, **kwargs):
+        csv_path.write_text('epoch,time,score\n1,1,0.1\n')
+        return process
+    updates = []
+    def api(_config, path, method='GET', payload=None, *args):
+        if path.endswith('/update'):
+            updates.append(dict(payload))
+        return {}
+    monkeypatch.setattr(agent.subprocess, 'Popen', popen)
+    monkeypatch.setattr(agent, 'api_json', api)
+    agent.run_remote_task(config, task, Stop())
+    delivered = [point for update in updates for point in update.get('metrics', [])]
+    assert delivered == [
+        {'epoch': 1, 'elapsed': 1.0, 'values': {'score': 0.1}},
+        {'epoch': 1, 'elapsed': 2.0, 'values': {'score': 0.9}},
+    ]
+    assert updates[-1]['status'] == 'completed'
 
 
 def test_remote_detect_command_includes_training_trace_runner(agent, training, tmp_path):
@@ -1154,7 +1208,7 @@ def test_pending_final_acknowledgment_blocks_new_task_claims(agent, tmp_path, mo
     monkeypatch.setattr(agent, "register_workspace", lambda _config: None)
     monkeypatch.setattr(agent, "collect", lambda *_args: {
         "training": {"ready": True}, "compute": {"gpus": []}})
-    monkeypatch.setattr(agent, "send", lambda *_args: 5)
+    monkeypatch.setattr(agent, "send", lambda *_args: (5, None))
     monkeypatch.setattr(agent, "retry_pending_finals", lambda _config: False)
     monkeypatch.setattr(agent, "load_active_runs", lambda _config: [])
 
@@ -1383,6 +1437,10 @@ def test_remote_legacy_resume_summary_counts_only_new_epochs(agent, training):
     log = Path(task["log_path"])
     log.parent.mkdir(parents=True)
     log.write_text(f"2 epochs completed in 0.5 hours.\nValidating best.pt\nResults saved to {run_dir}\n")
+    consumed = set()
+    assert len(agent.read_remote_progress(run_dir, sent_epochs=consumed)[2]) == 2
+    consumed.update((55, 56))
+    assert agent.read_remote_progress(run_dir, sent_epochs=consumed)[2] == []
     assert agent.recovered_natural_exit(task, 56, []) == ("completed", None, None)
 
 
@@ -1680,7 +1738,7 @@ def test_main_polls_light_work_during_training_and_keeps_training_claims(agent, 
     monkeypatch.setattr(agent, 'recover_active_workers', lambda *_args: None)
     monkeypatch.setattr(agent, 'collect', lambda *_args: {
         'training': {'ready': True, 'lock_occupied': training_active}, 'compute': {'gpus': []}})
-    monkeypatch.setattr(agent, 'send', lambda *_args: 5)
+    monkeypatch.setattr(agent, 'send', lambda *_args: (5, None))
     monkeypatch.setattr(agent, 'retry_pending_finals', lambda _config: True)
     monkeypatch.setattr(agent, 'load_active_runs', lambda _config:
                         [{'task': {'gpu_assignment': ['gpu']}}] if training_active else [])
