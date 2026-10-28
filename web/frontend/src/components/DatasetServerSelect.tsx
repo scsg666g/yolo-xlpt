@@ -1,11 +1,12 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
-import { Check, ChevronDown, Search, Server } from 'lucide-react'
+import { Check, ChevronDown, FolderOpen, Search, Server } from 'lucide-react'
 
-export interface DatasetServerOption { id: string; name: string; count?: number; status?: string }
+export interface DatasetServerOption { id: string; name: string; count?: number; status?: string; description?: string; badge?: string }
 
 /** Keep the popup in the dialog DOM so keyboard focus remains inside its focus trap. */
-export function DatasetServerSelect({ value, onChange, options, label = '按服务器筛选', disabled = false }: {
+export function DatasetServerSelect({ value, onChange, options, label = '按服务器筛选', disabled = false, icon = 'server', placeholder = '选择服务器', searchLabel = '搜索服务器', emptyMessage = '没有匹配的服务器' }: {
   value: string; onChange: (value: string) => void; options: DatasetServerOption[]; label?: string; disabled?: boolean
+  icon?: 'server' | 'folder'; placeholder?: string; searchLabel?: string; emptyMessage?: string
 }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -15,7 +16,7 @@ export function DatasetServerSelect({ value, onChange, options, label = '按服�
   const trigger = useRef<HTMLButtonElement>(null)
   const popup = useRef<HTMLDivElement>(null)
   const id = useId()
-  const filtered = options.filter(o => `${o.name} ${o.id}`.toLowerCase().includes(query.trim().toLowerCase()))
+  const filtered = options.filter(o => `${o.name} ${o.id} ${o.description || ''}`.toLowerCase().includes(query.trim().toLowerCase()))
   const index = Math.min(highlight, Math.max(filtered.length - 1, 0))
   const selected = options.find(o => o.id === value)
   function close(restore = false) { setOpen(false); if (restore) trigger.current?.focus() }
@@ -65,16 +66,16 @@ export function DatasetServerSelect({ value, onChange, options, label = '按服�
     }
   }
   return <div ref={root} className="dataset-server-select" onKeyDown={e => { if (open) keyboard(e) }} onBlur={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOpen(false) }}>
-    <button ref={trigger} type="button" className={`dataset-server-trigger ${open ? 'open' : ''}`} disabled={disabled} title={selected?.name} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => open ? close() : show()} onKeyDown={e => { if (!open && ['ArrowDown', 'ArrowUp'].includes(e.key)) { e.preventDefault(); show() } }}>
-      <Server size={15} /><span>{selected?.name || '选择服务器'}</span><ChevronDown size={14} />
+    <button ref={trigger} type="button" className={`dataset-server-trigger ${open ? 'open' : ''}`} disabled={disabled} title={selected ? [selected.name, selected.description].filter(Boolean).join(' · ') : placeholder} aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => open ? close() : show()} onKeyDown={e => { if (!open && ['ArrowDown', 'ArrowUp'].includes(e.key)) { e.preventDefault(); show() } }}>
+      {icon === 'folder' ? <FolderOpen size={16} /> : <Server size={15} />}<span>{selected?.name || placeholder}</span>{selected?.badge && <small className="dataset-select-badge">{selected.badge}</small>}<ChevronDown size={14} />
     </button>
     {open && <div ref={popup} className="dataset-server-popup" style={position} tabIndex={-1}>
-      {options.length > 6 && <label className="dataset-server-search"><Search size={14} /><input role="combobox" aria-expanded="true" aria-controls={id} aria-activedescendant={filtered[index] ? `${id}-${index}` : undefined} aria-autocomplete="list" aria-label="搜索服务器" value={query} placeholder="搜索服务器" onChange={e => { setQuery(e.target.value); setHighlight(0) }} /></label>}
+      {options.length > 6 && <label className="dataset-server-search"><Search size={14} /><input role="combobox" aria-expanded="true" aria-controls={id} aria-activedescendant={filtered[index] ? `${id}-${index}` : undefined} aria-autocomplete="list" aria-label={searchLabel} value={query} placeholder={searchLabel} onChange={e => { setQuery(e.target.value); setHighlight(0) }} /></label>}
       <div id={id} tabIndex={-1} role="listbox" aria-label={label} aria-activedescendant={filtered[index] ? `${id}-${index}` : undefined}>
         {filtered.map((o, i) => <button type="button" tabIndex={-1} id={`${id}-${i}`} role="option" aria-selected={value === o.id} className={index === i ? 'highlight' : ''} key={o.id} title={o.name} onMouseEnter={() => setHighlight(i)} onClick={() => choose(o.id)}>
-          <span><strong>{o.name}</strong>{o.status && <small>{o.status}</small>}</span>{o.count != null && <small>{o.count}</small>}{value === o.id && <Check size={15} />}
+          <span><strong>{o.name}</strong>{o.description && <small className="dataset-select-description">{o.description}</small>}{o.status && <small>{o.status}</small>}</span>{o.badge && <small className="dataset-select-badge">{o.badge}</small>}{o.count != null && <small>{o.count}</small>}{value === o.id && <Check size={15} />}
         </button>)}
-        {!filtered.length && <p>没有匹配的服务器</p>}
+        {!filtered.length && <p>{emptyMessage}</p>}
       </div>
     </div>}
   </div>

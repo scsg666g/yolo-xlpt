@@ -6,6 +6,7 @@ import { FolderOpen, LoaderCircle, Upload, X } from 'lucide-react'
 import { api, formatBytes, uploadDatasetFile } from '../api'
 import type { DatasetUploadResult } from '../types'
 import { useModalFocus } from '../useModalFocus'
+import { DatasetServerSelect } from './DatasetServerSelect'
 import '../upload.css'
 
 interface Props {
@@ -33,6 +34,7 @@ export function UploadDatasetModal({ onClose, onUploaded, initialNode = 'local' 
   const [destination, setDestination] = useState('')
   const [locations, setLocations] = useState<DatasetLocation[]>([])
   const [locationId, setLocationId] = useState('')
+  const [locationsLoading, setLocationsLoading] = useState(true)
   const sessionKey = useRef('')
   const inputRef = useRef<HTMLInputElement>(null)
   const uploadId = useRef<string | null>(null)
@@ -54,12 +56,14 @@ export function UploadDatasetModal({ onClose, onUploaded, initialNode = 'local' 
 
   useEffect(() => {
     let mounted = true
+    setLocationsLoading(true)
     void api.datasetLocations().then(ls => {
       if (!mounted) return
       const valid = ls.filter(l => l.enabled && l.status === 'ready')
       setLocations(valid)
       setLocationId(valid.find(l => l.node_id === initialNode && l.is_default)?.id || valid.find(l => l.node_id === initialNode)?.id || '')
     }).catch((e: Error) => { if (mounted) setError(e.message) })
+      .finally(() => { if (mounted) setLocationsLoading(false) })
     return () => { mounted = false }
   }, [initialNode])
 
@@ -75,6 +79,9 @@ export function UploadDatasetModal({ onClose, onUploaded, initialNode = 'local' 
   }, [files, folderName])
   const names = namesText.split(/\r?\n/).map((name) => name.trim()).filter(Boolean)
   const percentage = totalBytes ? Math.min(100, Math.round(bytes / totalBytes * 100)) : 0
+  const selectedLocation = locations.find(l => l.id === locationId)
+  const locationRoot = selectedLocation?.resolved_path || selectedLocation?.path
+  const destinationPreview = locationRoot ? `${locationRoot.replace(/\/+$/, '')}/${folderName || '文件夹原名'}` : ''
 
   async function selectFolder(list: FileList | null) {
     if (!list?.length) return
@@ -205,8 +212,10 @@ export function UploadDatasetModal({ onClose, onUploaded, initialNode = 'local' 
       <header><div><span className="eyebrow">UPLOAD DATASET</span><h2 id="dataset-upload-title">上传数据集文件夹</h2></div><button type="button" className="icon-button" disabled={busy} onClick={onClose} aria-label="关闭上传窗口"><X size={20} /></button></header>
       <div className="modal-body">
         <p className="upload-intro">保留你选择的文件夹原名，上传后自动生成 data.yaml 并选中该数据集。</p>
-        <label className="upload-classes">保存位置<select required value={locationId} disabled={busy || !!uploadId.current} onChange={e => { setLocationId(e.target.value); setDestination('') }}><option value="">请选择已校验的保存位置</option>{locations.map(l => <option key={l.id} value={l.id}>{l.node_name || (l.node_id === 'local' ? '本机' : '远程服务器')} · {l.name}{l.is_default ? ' · 默认' : ''}</option>)}</select></label>
-        <p className="upload-destination">最终目录：<code>{locations.find(l => l.id === locationId)?.resolved_path || '请先在设置或数据集管理中添加并检查保存位置'}/{folderName || '文件夹原名'}</code></p>
+        <div className="upload-location-field"><span>保存位置</span><DatasetServerSelect label="上传数据集保存位置" icon="folder" value={locationId} options={locations.map(l => ({ id: l.id, name: `${l.node_name || (l.node_id === 'local' ? '本机服务器' : '远程服务器')} · ${l.name}`, description: l.resolved_path || l.path, badge: l.is_default ? '默认' : undefined }))} placeholder={locationsLoading ? '正在读取保存位置…' : locations.length ? '请选择已校验的保存位置' : '暂无可用保存位置'} searchLabel="搜索服务器、位置或路径" emptyMessage="没有匹配的保存位置" disabled={busy || !!uploadId.current || locationsLoading || !locations.length} onChange={id => { setLocationId(id); setDestination('') }} />
+          {locationsLoading ? <small role="status">正在读取本机及远程服务器的已校验目录…</small> : !locations.length ? <small>请先在“保存位置”中添加并校验本机或远程目录。</small> : (busy || !!uploadId.current) ? <small>当前上传的保存位置已锁定，避免续传到其他目录。</small> : <small>选择本机或远程服务器上已校验的目录。</small>}
+        </div>
+        <div className="upload-destination upload-destination-preview"><span>最终保存目录</span>{destinationPreview ? <code>{destinationPreview}</code> : <small>选择保存位置后显示完整目录。</small>}</div>
         <p className="upload-help">关闭窗口会保留已上传文件。重新选择同一文件夹时，逐文件 SHA-256 一致才会复用断点；后台传输可在数据集管理查看。</p>
         <div className="upload-format">
           <strong>目录格式要求 · YOLO 目标检测</strong>

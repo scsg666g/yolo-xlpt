@@ -18,6 +18,11 @@
 .upload-folder-picker:disabled { opacity: .6; cursor: wait; }
 .upload-destination { padding: 10px 12px; margin: 0 0 15px; border-radius: 7px; border: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 .upload-destination code { color: var(--text); }
+.upload-location-field { min-width: 0; display: grid; gap: 8px; margin-bottom: 12px; color: var(--text); font-size: 11px; }
+.upload-location-field .dataset-server-trigger { width: 100%; min-height: 44px; font-size: 12px; }
+.upload-location-field > small { color: var(--muted); line-height: 1.7; }
+.upload-destination-preview { display: grid; gap: 5px; background: var(--panel-2); }
+.upload-destination-preview code { display: block; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
 .upload-classes { display: grid; gap: 8px; margin-bottom: 14px; color: var(--text); font-size: 11px; }
 .upload-classes textarea { padding: 10px 12px; resize: vertical; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--panel); font: inherit; line-height: 1.7; }
 .upload-classes textarea:focus { outline: 1px solid var(--green); }
