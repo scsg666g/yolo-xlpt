@@ -386,3 +386,16 @@ body:has(.datasets-page) { min-width: 0; }
   .dataset-discovery-drawer > footer > span { width: 100%; }
   .dataset-discovery-navigation label { width: 100%; flex-basis: 100%; }
 }
+
+/* Dataset progress uses measured phase totals, never a fabricated overall percentage. */
+.dataset-operation-progress { margin: 0 12px 12px 28px; font-size: 12px; line-height: 1.6; min-width: 0; }
+.dataset-operation-progress.detailed { margin: 0 0 12px; }
+.dataset-progress-heading { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.dataset-progress-heading strong { color: var(--text); font-weight: 500; }
+.dataset-progress-heading span, .dataset-operation-progress small, .dataset-progress-meta { color: var(--muted); }
+.dataset-operation-progress progress { display: block; width: 100%; height: 7px; margin: 6px 0; accent-color: var(--green); }
+.dataset-operation-progress small { display: block; font-size: 12px; }
+.dataset-progress-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 8px 0; }
+.dataset-progress-steps { list-style: none; padding: 0; margin: 8px 0; display: grid; gap: 3px; color: var(--muted); }
+.dataset-operation-progress code { display: block; max-width: 100%; overflow-wrap: anywhere; font-size: 12px; }
+.dataset-operation-progress .dataset-progress-stale { color: #b58435; }

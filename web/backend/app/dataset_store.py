@@ -26,6 +26,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import dataset_files as files
+from .dataset_progress import record_progress as record_work_progress, progress_reporter
 from .config import DATA_ROOT, DATASET_ROOTS, DATASET_STORAGE_ALLOWED_ROOTS, DATASET_STORAGE_QUOTA_BYTES, PROJECT_ROOT
 from .database import SessionLocal, get_db
 from .models import ComputeNode, DatasetEntry, DatasetLocation, DatasetOperation, DatasetOperationHistoryRemoval, TrainingRun, TrainingTask, utcnow
@@ -105,11 +106,26 @@ def operation_read(op, db=None):
         if not value['name'] and op.payload.get('location_id'):
             location = db.get(DatasetLocation, op.payload['location_id'])
             value['name'] = location.name if location else ''
+    progress = (op.payload.get('progress') or {}).copy()
+    if progress:
+        for private in ('run_id', 'baseline'):
+            progress.pop(private, None)
+    value.update(progress=progress or None, progress_steps=op.payload.get('progress_steps', []),
+                 heartbeat_at=op.payload.get('heartbeat_at'),
+                 started_at=op.payload.get('started_at'), queued_at=op.payload.get('queued_at'), queue_ahead=0,
+                 waiting_lock=bool(progress and progress.get('stage') == 'waiting_lock' and op.status in ACTIVE))
+    if db and op.status == 'pending':
+        value['queue_ahead'] = db.scalar(select(func.count()).select_from(DatasetOperation).where(
+            DatasetOperation.node_id == op.node_id, DatasetOperation.status.in_(ACTIVE),
+            or_(DatasetOperation.created_at < op.created_at,
+                (DatasetOperation.created_at == op.created_at) & (DatasetOperation.id < op.id)))) or 0
     if db and op.node_id != 'local' and op.status in ACTIVE:
         node = db.get(ComputeNode, op.node_id)
         seen = node.last_seen_at if node else None
         value['waiting_offline'] = not seen or (utcnow() - seen.replace(tzinfo=timezone.utc)).total_seconds() > 90
-        value['waiting_training'] = bool(db.scalar(select(TrainingRun.id).where(TrainingRun.execution_node_id == op.node_id, TrainingRun.status.in_(('starting', 'running', 'stopping')))))
+        value['waiting_training'] = op.status == 'pending' and bool(db.scalar(select(TrainingRun.id).where(TrainingRun.execution_node_id == op.node_id, TrainingRun.status.in_(('starting', 'running', 'stopping')))))
+        capability = ((node.snapshot or {}).get('training') or {}) if node else {}
+        value['waiting_lock'] = value['waiting_lock'] or (op.status == 'pending' and not value['waiting_training'] and bool(capability.get('lock_occupied')))
     return value
 
 
@@ -219,6 +235,7 @@ def reject_training_mutation(db, node_id):
 
 
 def new_operation(db, kind, node_id, payload):
+    payload = {**payload, 'queued_at': utcnow().isoformat()}
     op = DatasetOperation(id=uid(), kind=kind, node_id=node_id, status='pending',
                           payload=payload, result={}, lease=uid())
     db.add(op)
@@ -227,9 +244,16 @@ def new_operation(db, kind, node_id, payload):
 
 
 def set_phase(op, phase, node_id):
-    op.payload = {**op.payload, 'phase': phase, 'commit_started': False}
+    op.payload = {**op.payload, 'phase': phase, 'commit_started': False, 'queued_at': utcnow().isoformat()}
     op.node_id, op.status, op.lease, op.lease_until = node_id, 'pending', uid(), None
     op.transferred = 0
+    payload = dict(op.payload)
+    previous = payload.pop('progress', None)
+    if previous:
+        payload['progress_steps'] = [*payload.get('progress_steps', []),
+            {k: previous.get(k) for k in ('stage', 'phase', 'executor')}][-16:]
+    payload['progress_run_id'] = uid()
+    op.payload = payload
 
 
 def location_get(db, identity, *, ready=False):
@@ -598,6 +622,7 @@ def control_operation(identity: str, action: str, db: Session = Depends(get_db))
             raise HTTPException(404, '操作记录不存在')
         if action == 'retry' and op.status == 'failed':
             op.status, op.error, op.lease_until = 'pending', None, None
+            op.payload = {**op.payload, 'progress_run_id': uid(), 'progress': None, 'queued_at': utcnow().isoformat()}
         elif action == 'cancel' and op.status in ('pending', 'running', 'failed') and not op.payload.get('published') and not op.payload.get('commit_started'):
             op.status = 'cancelled'
         else:
@@ -624,23 +649,23 @@ def queue_upload(db, upload_id, directory, manifest, names, stats, warnings):
     return operation_read(op)
 
 
-def verify_snapshot(op):
+def verify_snapshot(op, check=None):
     from .dataset_uploads import class_names, validate_contents, validate_file_path, MAX_FILE_BYTES, MAX_TEXT_BYTES
     directory = job_dir(op.id)
     manifest = json.loads((directory / 'manifest.json').read_text())
-    if files.digest(directory / 'bundle.tar') != manifest['archive_sha256']:
+    if files.digest(directory / 'bundle.tar', check, stage='archive_hash') != manifest['archive_sha256']:
         raise ValueError('归档 SHA-256 校验失败')
     target = directory / 'validate'
     if target.exists():
         shutil.rmtree(target)
     try:
-        files.unpack(directory / 'bundle.tar', target, manifest)
+        files.unpack(directory / 'bundle.tar', target, manifest, check)
         for item in manifest['files']:
             relative = validate_file_path(item['path'])
             if item['size'] > (MAX_FILE_BYTES if relative.parts[0] == 'images' else MAX_TEXT_BYTES):
                 raise ValueError('已有数据集单文件超过上传大小限制')
         names = class_names(target, op.payload.get('names', []))
-        stats, warnings = validate_contents(target, manifest, names)
+        stats, warnings = validate_contents(target, manifest, names, check)
         if op.payload.get('scan_config_sha256') and files.digest(target / 'data.yaml') != op.payload['scan_config_sha256']:
             raise ValueError('data.yaml 在扫描后发生变化，请取消本次登记并重新扫描确认')
         if op.kind in ('register', 'migrate'):
@@ -658,7 +683,7 @@ def verify_snapshot(op):
 
 def action_payload(op):
     p, phase = op.payload, op.payload['phase']
-    common = {'id': op.id, 'token': op.lease, 'phase': phase}
+    common = {'id': op.id, 'token': op.lease, 'phase': phase, 'progress_run_id': p.get('progress_run_id')}
     if phase == 'discover':
         return {**common, 'path': p['source_path'], 'limits': p['limits']}
     if phase == 'check':
@@ -789,18 +814,33 @@ def lease_check(db, identity, token, phase=None, committing=False):
         op.status = 'committing'
         op.payload = {**op.payload, 'commit_started': True}
     op.lease_until = utcnow() + timedelta(seconds=120)
+    op.payload = {**op.payload, 'heartbeat_at': utcnow().isoformat()}
     db.commit()
     return op
 
 
 def execute_local(db, op):
     identity, token, phase = op.id, op.lease, op.payload['phase']
+    run_id = uid()
+    with managed_dataset_mutation():
+        lease_check(db, identity, token, phase)
+        op.status = 'running' if op.status != 'committing' else 'committing'
+        op.payload = {**op.payload, 'progress_run_id': run_id,
+                      'started_at': op.payload.get('started_at') or utcnow().isoformat()}
+        db.commit()
     last = [0.0]
     def check(stage=None):
         if stage or time.monotonic() - last[0] > 4:
             with managed_dataset_mutation():
                 lease_check(db, identity, token, phase, committing=stage == 'committing')
             last[0] = time.monotonic()
+    def persist(value):
+        with managed_dataset_mutation():
+            current = lease_check(db, identity, token, phase)
+            if record_work_progress(current, value, run_id, 'local'):
+                db.commit()
+    check.progress = progress_reporter(persist)
+    check.progress({'stage': phase})
     check()
     p = op.payload
     directory = job_dir(op.id)
@@ -813,6 +853,8 @@ def execute_local(db, op):
                 current = lease_check(db, identity, token, phase)
                 record_progress(db, current, progress)
                 db.commit()
+            check.progress({'stage': 'discover', 'processed': progress['visited'],
+                            'unit': 'directories', 'current_file': progress.get('current_path', '')})
         result = discover(p['source_path'], DATASET_STORAGE_ALLOWED_ROOTS, p['limits'], report, check)
     elif phase == 'check':
         result = files.check_root(p['path'], DATASET_STORAGE_ALLOWED_ROOTS, p.get('create', False))
@@ -826,7 +868,7 @@ def execute_local(db, op):
         result = files.pack(source, directory / 'bundle.tar', check)
         save_json(directory / 'manifest.json', result)
     elif phase == 'validate':
-        result = verify_snapshot(op)
+        result = verify_snapshot(op, check)
     elif phase == 'import':
         action = action_payload(op)
         root = files.inside(action['root'], DATASET_STORAGE_ALLOWED_ROOTS)
@@ -873,7 +915,7 @@ class DatasetWorker:
             except BlockingIOError:
                 return
             with SessionLocal() as db:
-                op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == 'local', DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at))
+                op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == 'local', DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at, DatasetOperation.id))
                 if op:
                     try:
                         execute_local(db, op)
@@ -911,7 +953,7 @@ def agent_poll(node_id: str, request: Request, db: Session = Depends(get_db)):
     auth(node_id, request, db)
     with managed_dataset_mutation():
         acquire_node_claim_lock(db, node_id)
-        op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at))
+        op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at, DatasetOperation.id))
         if not op:
             return {'operation': None}
         if op.payload['phase'] == 'discover':
@@ -931,6 +973,9 @@ def agent_poll(node_id: str, request: Request, db: Session = Depends(get_db)):
             except ValueError as exc:
                 mark_error(db, op, exc)
                 return {'operation': None}
+        op.payload = {**op.payload, 'progress_run_id': uid(),
+                      'started_at': op.payload.get('started_at') or utcnow().isoformat(),
+                      'heartbeat_at': utcnow().isoformat()}
         op.lease_until, op.status = utcnow() + timedelta(seconds=120), 'running' if op.status != 'committing' else 'committing'
         db.commit()
         return {'operation': action_payload(op)}
@@ -942,6 +987,8 @@ class AgentMessage(BaseModel):
     committing: bool = False
     error: str | None = Field(default=None, max_length=1200)
     result: dict = Field(default_factory=dict)
+    progress: dict | None = None
+    progress_run_id: str | None = Field(default=None, max_length=32)
 
 
 @router.post('/agent/{node_id}/{identity}/heartbeat')
@@ -952,6 +999,12 @@ def agent_heartbeat(node_id: str, identity: str, body: AgentMessage, request: Re
         if not op or op.node_id != node_id:
             raise HTTPException(404, '操作不存在')
         lease_check(db, identity, body.token, body.phase, body.committing)
+        if body.progress is not None:
+            try:
+                if record_work_progress(op, body.progress, body.progress_run_id, node_id):
+                    db.commit()
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(422, str(exc)) from exc
         if body.phase == 'discover' and body.result:
             from .dataset_discovery import record_progress
             try:
@@ -995,7 +1048,13 @@ def agent_finish(node_id: str, identity: str, body: AgentMessage, request: Reque
                     with managed_dataset_mutation():
                         op = lease_check(db, identity, body.token, body.phase)
                     check.last = time.monotonic()
-            if not archive.is_file() or archive.stat().st_size != manifest['archive_size'] or files.digest(archive, check) != manifest['archive_sha256']:
+            def persist(value):
+                with managed_dataset_mutation():
+                    current = lease_check(db, identity, body.token, body.phase)
+                    if record_work_progress(current, value, current.payload.get('progress_run_id'), 'local'):
+                        db.commit()
+            check.progress = progress_reporter(persist, start_sequence=(op.payload.get('progress') or {}).get('sequence') or 0)
+            if not archive.is_file() or archive.stat().st_size != manifest['archive_size'] or files.digest(archive, check, stage='archive_hash') != manifest['archive_sha256']:
                 raise ValueError('远程数据包大小或 SHA-256 不匹配')
             with managed_dataset_mutation():
                 op = lease_check(db, identity, body.token, body.phase)

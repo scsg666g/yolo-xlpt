@@ -585,11 +585,17 @@ def class_names(files_root: Path, supplied: list[str]) -> list[str]:
     return names
 
 
-def validate_contents(files_root: Path, manifest: dict, names: list[str]) -> tuple[dict, list[str]]:
+def validate_contents(files_root: Path, manifest: dict, names: list[str], check=None) -> tuple[dict, list[str]]:
     images: dict[str, set[str]] = {"train": set(), "val": set()}
     labels: dict[str, set[str]] = {"train": set(), "val": set()}
     empty_labels: dict[str, set[str]] = {"train": set(), "val": set()}
-    for spec in manifest["files"]:
+    from .dataset_files import report_progress
+    total_files = len(manifest['files'])
+    report_progress(check, 'content_validate', 0, total_files)
+    for index, spec in enumerate(manifest["files"]):
+        if check:
+            check()
+        report_progress(check, 'content_validate', index, total_files, current_file=spec['path'])
         relative = PurePosixPath(spec["path"])
         path = files_root / relative
         if relative.parts[0] == "images":
@@ -622,6 +628,7 @@ def validate_contents(files_root: Path, manifest: dict, names: list[str]) -> tup
                 raise HTTPException(422, f"标签格式错误：{relative}，{exc}") from exc
             if not targets:
                 empty_labels[relative.parts[1]].add(str(PurePosixPath(*relative.parts[2:]).with_suffix("")))
+    report_progress(check, 'content_validate', total_files, total_files)
     missing = sum(len(images[split] - labels[split]) for split in images)
     orphaned = sum(len(labels[split] - images[split]) for split in labels)
     empty_backgrounds = sum(len(images[split] & empty_labels[split]) for split in images)

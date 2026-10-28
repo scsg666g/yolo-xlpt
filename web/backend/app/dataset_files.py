@@ -13,13 +13,28 @@ MAX_FILES = 200_010
 MARKER = ".yolo-platform-dataset.json"
 
 
-def digest(path, check=None):
+def report_progress(check, stage, processed=0, total=None, unit='files', current_file=''):
+    """Optional progress hook; legacy callers keep the same cancellation callback."""
+    report = getattr(check, 'progress', None)
+    if report:
+        report({'stage': stage, 'processed': processed, 'total': total, 'unit': unit,
+                'current_file': str(current_file)[-400:]})
+
+
+def digest(path, check=None, stage=None):
     value = hashlib.sha256()
+    processed = 0
+    total = Path(path).stat().st_size if stage else None
+    if stage:
+        report_progress(check, stage, 0, total, 'bytes')
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             if check:
                 check()
             value.update(chunk)
+            processed += len(chunk)
+            if stage:
+                report_progress(check, stage, processed, total, 'bytes')
     return value.hexdigest()
 
 
@@ -49,11 +64,12 @@ def check_root(path, roots, create=False):
             "status": "ready"}
 
 
-def scan(root, check=None):
+def scan(root, check=None, stage="scan"):
     root = Path(root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("数据集目录不存在或为符号链接")
     files, total = [], 0
+    report_progress(check, stage)
     for directory, dirs, names in os.walk(root, followlinks=False):
         for name in dirs:
             if (Path(directory) / name).is_symlink():
@@ -72,12 +88,14 @@ def scan(root, check=None):
                 raise ValueError("数据集超过 50 GB 或 20 万文件限制")
             if check:
                 check()
+            report_progress(check, stage, len(files), current_file=relative)
             before = path.stat()
             sha = digest(path, check)
             after = path.stat()
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ValueError("数据集在校验中发生修改，请停止修改后重试")
             files.append({"path": relative, "size": size, "sha256": sha})
+    report_progress(check, stage, len(files), len(files))
     files.sort(key=lambda x: x['path'])
     signature = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
     return {"files": files, "total_bytes": total, "fingerprint": signature}
@@ -95,17 +113,35 @@ def pack(root, archive, check=None):
     archive = Path(archive)
     archive.parent.mkdir(parents=True, exist_ok=True)
     temporary = archive.with_suffix('.tmp')
+    processed = 0
+    report_progress(check, 'pack', 0, manifest['total_bytes'], 'bytes')
+    class Reader:
+        def __init__(self, stream, name):
+            self.stream, self.name = stream, name
+        def read(self, size=-1):
+            nonlocal processed
+            data = self.stream.read(size)
+            processed += len(data)
+            if check:
+                check()
+            report_progress(check, 'pack', processed, manifest['total_bytes'], 'bytes', self.name)
+            return data
     with tarfile.open(temporary, 'w') as tar:
         for file in manifest['files']:
             if check:
                 check()
-            tar.add(Path(root) / file['path'], arcname=file['path'], recursive=False)
+            path = Path(root) / file['path']
+            info = tar.gettarinfo(str(path), arcname=file['path'])
+            if not info.isfile():
+                raise ValueError('数据集不能包含符号链接或特殊文件')
+            with path.open('rb') as stream:
+                tar.addfile(info, Reader(stream, file['path']))
     # Reject concurrent source changes before handing a snapshot to another node.
-    if scan(root, check)['fingerprint'] != manifest['fingerprint']:
+    if scan(root, check, stage='source_verify')['fingerprint'] != manifest['fingerprint']:
         temporary.unlink(missing_ok=True)
         raise ValueError("源数据在导出期间发生修改")
     temporary.replace(archive)
-    return {**manifest, 'archive_size': archive.stat().st_size, 'archive_sha256': digest(archive, check)}
+    return {**manifest, 'archive_size': archive.stat().st_size, 'archive_sha256': digest(archive, check, stage='archive_hash')}
 
 
 def unpack(archive, target, manifest, check=None):
@@ -115,6 +151,9 @@ def unpack(archive, target, manifest, check=None):
     if len(entries) != len(manifest['files']) or len(entries) > MAX_FILES or sum(i['size'] for i in entries.values()) > MAX_BYTES:
         raise ValueError("数据清单大小或路径无效")
     seen = set()
+    processed = 0
+    total = sum(i['size'] for i in entries.values())
+    report_progress(check, 'unpack', 0, total, 'bytes')
     with tarfile.open(archive, 'r:') as tar:
         for item in tar:
             if check:
@@ -127,10 +166,16 @@ def unpack(archive, target, manifest, check=None):
             path = target / item.name
             path.parent.mkdir(parents=True, exist_ok=True)
             source = tar.extractfile(item)
+            report_progress(check, 'unpack', processed, total, 'bytes', item.name)
             with path.open('xb') as output:
-                shutil.copyfileobj(source, output, 1024 * 1024)
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    output.write(chunk)
+                    if check:
+                        check()
             if digest(path, check) != spec['sha256']:
                 raise ValueError("数据文件 SHA-256 校验失败")
+            processed += item.size
+            report_progress(check, 'unpack', processed, total, 'bytes', item.name)
     if seen != set(entries):
         raise ValueError("归档缺少数据文件")
 
@@ -167,7 +212,7 @@ def publish(archive, root, name, manifest, identity, config_text, check=None):
         unpack(archive, work, manifest, check)
         if config_text is not None:
             (work / 'data.yaml').write_text(config_text, encoding='utf-8')
-        actual = scan(work, check)
+        actual = scan(work, check, stage='target_verify')
         (work / MARKER).write_text(json.dumps({'version': 1, 'name': name, 'operation_id': identity,
                                                'fingerprint': actual['fingerprint']}, ensure_ascii=False), encoding='utf-8')
         if check:
@@ -201,10 +246,11 @@ def remove_dataset(path, roots, expected_fingerprint, check=None):
         return {'deleted': True, 'recovered': True}
     if not path.exists():
         return {'already_missing': True}
-    if scan(path, check)['fingerprint'] != expected_fingerprint:
+    if scan(path, check, stage='delete_verify')['fingerprint'] != expected_fingerprint:
         raise ValueError("数据集内容已变化，拒绝删除，请重新校验")
     if check:
         check('committing')
+    report_progress(check, 'remove')
     path.rename(quarantine)
     shutil.rmtree(quarantine)
     return {'deleted': True}

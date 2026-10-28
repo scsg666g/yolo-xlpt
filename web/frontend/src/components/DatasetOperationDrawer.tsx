@@ -1,8 +1,8 @@
+import { DatasetOperationProgress } from './DatasetOperationProgress'
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { api, formatBytes } from '../api'
 import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationPage, DatasetOperationSummary } from '../types'
-import { datasetPhaseLabel } from '../datasetUploadSession'
 import { useModalFocus } from '../useModalFocus'
 import { DatasetServerSelect, type DatasetServerOption } from './DatasetServerSelect'
 
@@ -65,7 +65,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
           if (result.page !== page) setPage(result.page)
         }
       } catch (e) { if (active && !controller.signal.aborted) { setError(e instanceof Error ? e.message : '操作记录加载失败'); setLoading(false) } }
-      finally { running = false; if (active) timer = setTimeout(load, 5000) }
+      finally { running = false; if (active) timer = setTimeout(load, 2000) }
     }
     function visible() { if (!document.hidden) { clearTimeout(timer); void load() } }
     setLoading(true); void load(); document.addEventListener('visibilitychange', visible)
@@ -124,8 +124,9 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
             {detail === j.id ? <ChevronDown size={16} /> : <ChevronRight size={16} />}<span><strong title={j.name}>{j.name || '保存位置检查'}</strong><small>{kinds[j.kind] || j.kind} · {j.source_node_name || j.node_name || j.node_id}{j.target_node && j.target_node !== j.source_node ? ` → ${j.target_node_name || j.target_node}` : ''}</small></span>
             <span className={`dataset-job-state ${j.status}`}>{statuses[j.status] || j.status}</span><time>{new Date(j.created_at).toLocaleString('zh-CN')}</time>
           </button><button type="button" className="dataset-history-delete" aria-label={`删除记录：${j.name || j.id}`} title={j.can_delete_history ? '删除操作记录，保留数据集文件' : '仅已完成或已取消的记录可删除；失败操作请先重试或取消'} disabled={!j.can_delete_history || !!busy || loading} onClick={() => askRemoval([j.id])}><Trash2 size={15} /></button></div>
+          <DatasetOperationProgress operation={j} />
           {detail === j.id && <div id={`operation-${j.id}`} className="dataset-history-detail">
-            <p>{j.waiting_offline ? '等待远程节点上线' : j.waiting_training ? '等待训练任务结束' : datasetPhaseLabel[j.phase] || j.phase}</p>
+            <DatasetOperationProgress operation={j} detailed />
             <small>更新于 {new Date(j.updated_at).toLocaleString('zh-CN')} · 编号 {j.id}</small>
             {(j.source_path || j.destination) && <code>{j.source_path || '浏览器上传'}{j.destination ? ` → ${j.destination}` : ''}</code>}
             {j.phase === 'discover' && <p>已检查 {j.result.visited || 0} 个目录 · 发现 {j.result.found || 0} 个候选{j.result.limited ? ` · 扫描达到限制：${j.result.limit_reason}` : ''}。候选与批次详情请打开“扫描已有数据集”。</p>}

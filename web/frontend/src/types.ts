@@ -560,6 +560,9 @@ export interface DatasetLocation {
   details: { free_bytes?: number; total_bytes?: number; message?: string; checked_at?: string }
 }
 export interface DatasetOperation {
+  progress?: { stage: string; phase: string; executor: string; processed: number; total: number | null; unit: 'files' | 'bytes' | 'directories'; current_file: string; sampled_at: string; changed_at: string; started_at: string; rate: number | null; eta_seconds: number | null } | null
+  progress_steps?: Array<{ stage: string; phase: string; executor: string }>
+  queued_at?: string | null; heartbeat_at?: string | null; started_at?: string | null; queue_ahead?: number; waiting_lock?: boolean
   can_delete_history?: boolean
   node_name?: string; source_node?: string; source_node_name?: string; target_node?: string; target_node_name?: string
   id: string; kind: string; status: string; phase: string; name: string; node_id: string
