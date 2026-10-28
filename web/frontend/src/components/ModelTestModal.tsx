@@ -1,3 +1,4 @@
+import { applyHistoryRefresh, bridgeHistoryHead, historyNeedsDetailRefresh, refreshActiveHistoryTail, retainedHistorySelection } from '../modelTestHistory'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertCircle, Download, FileArchive, HardDrive, History, Info, LoaderCircle, Play,
@@ -56,6 +57,8 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
   const pendingUploadId = useRef<string | null>(null)
   const historyDetailController = useRef<AbortController | null>(null)
   const reuseController = useRef<AbortController | null>(null)
+  const historyItemsRef = useRef<ModelTestSummary[]>([])
+  const historyTailCursor = useRef(0)
   const historyRefreshVersion = useRef(0)
   const historyLoadingVersion = useRef(0)
   const dialog = useRef<HTMLDivElement>(null)
@@ -67,6 +70,8 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
   const files = images.map(({ file }) => file)
   const historyRunId = historyScope === 'current' ? runId : undefined
 
+  historyItemsRef.current = history
+
   const refreshHistory = useCallback(async (signal?: AbortSignal, quiet = false) => {
     const version = ++historyRefreshVersion.current
     const loadingVersion = quiet ? null : ++historyLoadingVersion.current
@@ -76,15 +81,19 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
     }
     try {
       const page = await api.modelTests(taskId, signal, undefined, 50, historyRunId)
+      const head = quiet ? await bridgeHistoryHead(historyItemsRef.current, page, (cursor) => api.modelTests(taskId, signal, cursor, 50, historyRunId)) : page.items
+      const tail = quiet ? await refreshActiveHistoryTail(historyItemsRef.current, head,
+        activeModelTestStatuses, (id) => api.taskModelTest(taskId, id, signal), historyTailCursor.current)
+        : { updates: [], removed: [], next: 0 }
       if (signal?.aborted || version !== historyRefreshVersion.current) return
+      historyTailCursor.current = tail.next
       if (quiet) {
-        const refreshedIds = new Set(page.items.map((item) => item.id))
-        setHistory((current) => [...page.items, ...current.filter((item) => !refreshedIds.has(item.id))])
+        setHistory((current) => applyHistoryRefresh(current, head, tail))
         setHistorySelectedId((current) => current || page.items[0]?.id || null)
       } else {
         setHistory(page.items)
         setHistoryNextCursor(page.next_cursor)
-        setHistorySelectedId((current) => current && page.items.some((item) => item.id === current) ? current : page.items[0]?.id || null)
+        setHistorySelectedId((current) => retainedHistorySelection(current, page.items))
       }
       setHistoryError('')
     } catch (reason) {
@@ -102,7 +111,10 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
     setHistoryError('')
     try {
       const detail = await api.taskModelTest(taskId, testId, abort.signal)
-      if (!abort.signal.aborted) setHistoryDetails((current) => ({ ...current, [detail.id]: detail }))
+      if (!abort.signal.aborted) {
+        setHistoryDetails((current) => ({ ...current, [detail.id]: detail }))
+        setHistory((current) => current.flatMap((item) => item.id !== detail.id ? [item] : [{ ...item, ...detail }]))
+      }
     } catch (reason) {
       if (!abort.signal.aborted) setHistoryError(reason instanceof Error ? reason.message : '加载测试详情失败')
     } finally {
@@ -442,19 +454,25 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
   }, [selectedSummary?.id])
 
   useEffect(() => {
-    if (selectedSummary && !selectedHistory) void loadHistoryDetail(selectedSummary.id)
+    if (selectedSummary && historyNeedsDetailRefresh(selectedSummary, selectedHistory)) void loadHistoryDetail(selectedSummary.id)
   }, [loadHistoryDetail, selectedHistory, selectedSummary])
 
+  useEffect(() => () => historyDetailController.current?.abort(), [selectedSummary?.id])
+
+  const selectedHistoryId = selectedSummary?.id
+  const selectedHistoryActive = !!selectedSummary && (activeModelTestStatuses.has(selectedSummary.status)
+    || !!selectedHistory && activeModelTestStatuses.has(selectedHistory.status))
   useEffect(() => {
-    if (selectedSummary && selectedHistory && activeModelTestStatuses.has(selectedHistory.status)
-      && !activeModelTestStatuses.has(selectedSummary.status)) {
-      setHistoryDetails((current) => {
-        const next = { ...current }
-        delete next[selectedSummary.id]
-        return next
-      })
+    if (!selectedHistoryId || !selectedHistoryActive) return
+    let cancelled = false
+    let timer = 0
+    const poll = async () => {
+      await loadHistoryDetail(selectedHistoryId)
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 3000)
     }
-  }, [selectedHistory, selectedSummary])
+    timer = window.setTimeout(() => void poll(), 3000)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [loadHistoryDetail, selectedHistoryActive, selectedHistoryId])
 
   function openHistory(item: ModelTestSummary) {
     setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError('')

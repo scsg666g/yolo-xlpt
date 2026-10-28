@@ -40,6 +40,16 @@ def _tensor_stats(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _loss_stats(trainer: Any) -> dict[str, float]:
+    values = getattr(trainer, "loss_items", None)
+    if values is None:
+        return {}
+    if not hasattr(values, "items"):
+        labeler = getattr(trainer, "label_loss_items", None)
+        values = labeler(values) if callable(labeler) else {f"loss_{index}": item for index, item in enumerate(values)}
+    return {str(key): round(float(value), 7) for key, value in values.items()}
+
+
 class TraceCollector:
     def __init__(self, directory: Path, maximum: int = 24, interval: int = 10) -> None:
         self.directory = directory
@@ -57,6 +67,34 @@ class TraceCollector:
         self.started_at = time.time()
         self.disabled = False
         self.error: str | None = None
+        self._trainer: Any = None
+        self._original_preprocess: Any = None
+        self._preprocess_wrapper: Any = None
+
+    def _sample_due(self) -> bool:
+        return (not self.disabled and self._is_primary_rank() and self.step >= 0
+                and self.step % self.interval == 0 and len(self.samples) < self.maximum)
+
+    def _release_hooks(self) -> None:
+        """Detach outside optimizer callbacks: modifying their hook map mid-step can raise."""
+        for hook in [*self.hooks, *self.optimizer_hooks]:
+            try:
+                hook.remove()
+            except Exception:
+                pass
+        self.hooks.clear()
+        self.optimizer_hooks.clear()
+        try:
+            if self._trainer is not None and self._trainer.preprocess_batch is self._preprocess_wrapper:
+                self._trainer.preprocess_batch = self._original_preprocess
+        except Exception:
+            pass
+        self._trainer = self._original_preprocess = self._preprocess_wrapper = None
+        self.last_batch = {}
+        self.before_update.clear()
+        self.update_stats.clear()
+        self.layer_stats.clear()
+        self.input_stats = None
 
     @staticmethod
     def _is_primary_rank() -> bool:
@@ -85,7 +123,7 @@ class TraceCollector:
 
     def _hook(self, name: str):
         def capture(_module, _inputs, output):
-            if self.disabled or not self._is_primary_rank() or self.step < 0 or self.step % self.interval or len(self.samples) >= self.maximum:
+            if not self._sample_due():
                 return
             try:
                 value = output
@@ -100,16 +138,20 @@ class TraceCollector:
         return capture
 
     def on_train_start(self, trainer) -> None:
-        if not self._is_primary_rank():
+        if not self._is_primary_rank() or self.maximum <= 0 or self.disabled:
             return
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             original_preprocess = trainer.preprocess_batch
 
             def capture_batch(batch):
-                self.last_batch = original_preprocess(batch)
-                return self.last_batch
+                processed = original_preprocess(batch)
+                if self._sample_due():
+                    self.last_batch = processed
+                return processed
 
+            self._trainer, self._original_preprocess = trainer, original_preprocess
+            self._preprocess_wrapper = capture_batch
             trainer.preprocess_batch = capture_batch
             # Keep a representative layer trace instead of retaining full feature maps.
             for index, (name, module) in enumerate(trainer.model.named_modules()):
@@ -123,6 +165,7 @@ class TraceCollector:
                 self.optimizer_hooks.append(optimizer.register_step_post_hook(self._guarded_after_optimizer))
         except Exception as exc:
             self._disable(exc)
+            self._release_hooks()
 
     def _guarded_before_optimizer(self, optimizer, args, kwargs) -> None:
         try:
@@ -137,9 +180,9 @@ class TraceCollector:
             self._disable(exc)
 
     def _before_optimizer(self, optimizer, _args, _kwargs) -> None:
-        if self.disabled or not self._is_primary_rank():
-            return
         self.before_update = {}
+        if not self._sample_due():
+            return
         for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
             if parameter.grad is None or index >= 12:
                 continue
@@ -152,27 +195,34 @@ class TraceCollector:
             }
 
     def _after_optimizer(self, _optimizer, _args, _kwargs) -> None:
-        if self.disabled or not self._is_primary_rank():
-            return
         self.update_stats = {}
+        if not self._sample_due():
+            return
         for index, parameter in enumerate(_optimizer.param_groups[0].get("params", [])):
             before = self.before_update.get(str(index))
             if before is None or index >= 12:
                 continue
             values = parameter.detach().float()
+            after = float(values.mean().cpu())
             self.update_stats[str(index)] = {
                 **before,
-                "weight_mean_after": round(float(values.mean().cpu()), 8),
-                "weight_delta_mean": round(abs(float(values.mean().cpu()) - before["weight_mean_before"]), 8),
+                "weight_mean_after": round(after, 8),
+                "weight_delta_mean": round(abs(after - before["weight_mean_before"]), 8),
             }
 
     def on_train_batch_start(self, _trainer) -> None:
         if self.disabled or not self._is_primary_rank():
             return
         self.step += 1
+        self.layer_stats.clear()
+        self.before_update.clear()
+        self.update_stats.clear()
 
     def on_train_batch_end(self, trainer) -> None:
-        if self.disabled or not self._is_primary_rank() or self.step % self.interval or len(self.samples) >= self.maximum:
+        if self.disabled or len(self.samples) >= self.maximum:
+            self._release_hooks()
+            return
+        if not self._sample_due():
             return
         try:
             batch = self.last_batch
@@ -183,7 +233,7 @@ class TraceCollector:
                 "batch": self.step,
                 "images": self.input_stats,
                 "labels": int(batch.get("cls").shape[0]) if isinstance(batch, dict) and hasattr(batch.get("cls"), "shape") else None,
-                "loss": {key: round(float(value), 7) for key, value in (getattr(trainer, "loss_items", {}) or {}).items()},
+                "loss": _loss_stats(trainer),
                 "learning_rate": [round(float(group.get("lr", 0.0)), 10) for group in getattr(trainer, "optimizer", None).param_groups] if getattr(trainer, "optimizer", None) else [],
                 "layers": dict(self.layer_stats),
                 "updates": dict(self.update_stats),
@@ -204,13 +254,12 @@ class TraceCollector:
         except Exception as exc:
             # Observability must never terminate the actual training process.
             self._disable(exc)
+        finally:
+            if self.disabled or len(self.samples) >= self.maximum:
+                self._release_hooks()
 
     def on_train_end(self, _trainer) -> None:
-        for hook in [*self.hooks, *self.optimizer_hooks]:
-            try:
-                hook.remove()
-            except (AttributeError, RuntimeError):
-                pass
+        self._release_hooks()
         if self._is_primary_rank() and not self.disabled:
             try:
                 self._write()

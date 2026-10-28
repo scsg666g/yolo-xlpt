@@ -268,7 +268,7 @@ export function Datasets() {
     setNotice('')
     deleteOpener.current = opener
     void api.datasetDeletePreview(dataset.id).then(preview => {
-      if (!preview.can_delete) { setError('该数据集仍被引用、未接管或正在处理，请刷新后检查'); return }
+      if (!preview.can_delete) { setError(preview.delete_block_reason || '该数据集仍被引用、未接管或正在处理，请刷新后检查'); return }
       setDeleteTarget(preview)
     }).catch((e: Error) => setError(e.message))
   }
@@ -399,7 +399,7 @@ export function Datasets() {
               <span>{valueOrZero(dataset.stats.labels).toLocaleString('zh-CN')} 个标签文件{valueOrZero(dataset.stats.background_images) > 0 ? ` · ${dataset.stats.background_images} 张背景图` : ''}</span>
               <button type="button" className="button ghost compact" disabled={!!dataset.blocking_operation_id} onClick={() => setActionTarget(dataset)}>复制 / 迁移</button>
               {dataset.ownership === 'external' && <button type="button" className="button ghost compact" disabled={!!dataset.blocking_operation_id} onClick={() => { const path = window.prompt(`接管后平台将有权删除文件，请输入完整目录确认：\n${dataset.directory}`); if (path) void api.adoptDataset(dataset.id, path).then(loadDatasets).catch((e: Error) => setError(e.message)) }}>接管文件</button>}
-              <button type="button" className="button danger compact" disabled={!dataset.can_delete || deleting} title={dataset.blocking_operation_id ? '请先完成或取消该数据集的未完成操作' : referenced ? '请先更换或永久删除引用该数据集的任务' : '永久删除数据集'} onClick={(event) => openDeleteDialog(dataset, event.currentTarget)}>
+              <button type="button" className="button danger compact" disabled={!dataset.can_delete || deleting} title={dataset.delete_block_reason || (dataset.blocking_operation_id ? '请先完成或取消该数据集的未完成操作' : referenced ? '请先更换或永久删除引用该数据集的任务' : '永久删除数据集')} onClick={(event) => openDeleteDialog(dataset, event.currentTarget)}>
                 <Trash2 size={14} />{dataset.blocking_operation_id ? '操作未完成' : referenced ? '仍被引用' : '删除'}
               </button>
             </footer>

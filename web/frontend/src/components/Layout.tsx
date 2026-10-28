@@ -45,6 +45,9 @@ function healthIssues(details: PlatformHealth): string[] {
   else if (details.scheduler === 'stopped') issues.push('训练调度器未运行')
   if (details.local_deletion_worker !== 'running') issues.push('文件清理服务未运行')
   if (details.inference_worker !== 'running') issues.push('模型测试服务未运行')
+  if (details.dataset_worker && details.dataset_worker !== 'running') issues.push('数据集处理服务未运行')
+  if (details.dataset_worker_health?.active_error) issues.push(`数据集处理：${details.dataset_worker_health.active_error}`)
+  if (details.dataset_worker_health?.refresh_active_error) issues.push(`数据集状态刷新：${details.dataset_worker_health.refresh_active_error}`)
   return issues
 }
 
@@ -250,6 +253,8 @@ export function Layout() {
         scheduler: health.details.scheduler,
         local_deletion_worker: health.details.local_deletion_worker,
         inference_worker: health.details.inference_worker,
+        dataset_worker: health.details.dataset_worker,
+        dataset_worker_health: health.details.dataset_worker_health,
         database_latency_ms: health.details.database_latency_ms,
       } : null,
       agent_nodes: computeNodes.map((node) => ({
@@ -443,6 +448,7 @@ export function Layout() {
                     <div><span>训练调度器</span><strong>{workerLabel(health.details?.scheduler)}</strong></div>
                     <div><span>文件清理</span><strong>{workerLabel(health.details?.local_deletion_worker)}</strong></div>
                     <div><span>模型测试</span><strong>{workerLabel(health.details?.inference_worker)}</strong></div>
+                    <div><span>数据集处理</span><strong>{workerLabel(health.details?.dataset_worker)}</strong></div>
                   </div>
                   <div className="form-grid settings-service-details">
                     <label>数据库延迟<input readOnly value={health.details ? `${health.details.database_latency_ms.toFixed(2)} ms` : '—'} /></label>

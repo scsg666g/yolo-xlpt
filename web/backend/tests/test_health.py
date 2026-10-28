@@ -6,6 +6,17 @@ from fastapi.testclient import TestClient
 import app.main as main_module
 
 
+def test_unknown_api_paths_return_json_404_instead_of_spa_html():
+    client = TestClient(main_module.app)
+    try:
+        for path in ['/api/unknown-route-for-test', '/api']:
+            response = client.get(path)
+            assert response.status_code == 404
+            assert response.headers['content-type'].startswith('application/json')
+    finally:
+        client.close()
+
+
 class _Connection:
     def __enter__(self):
         return self

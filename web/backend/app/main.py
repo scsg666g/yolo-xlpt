@@ -1375,6 +1375,8 @@ if assets_dir.exists():
 @app.get("/{full_path:path}", include_in_schema=False)
 def frontend_app(full_path: str):
     """Serve built frontend files and fall back to index.html for client-side routes."""
+    if full_path == 'api' or full_path.startswith('api/'):
+        raise HTTPException(404, '接口不存在')
     if not frontend_dist.exists():
         raise HTTPException(404, "前端尚未构建")
     candidate = (frontend_dist / full_path).resolve()

@@ -1,10 +1,20 @@
 # YOLO 模型训练平台
 
+## 1.12.0 指标、历史与数据管理一致性
+
+任务中心、画布、指标详情与实验对比统一使用任务类型对应的指标，支持 detect、segment、classify、pose 和 obb。对比表继续展示历史数值与曲线；只有历史数据集校验证据匹配时才显示最优、改善和基准差值，未记录快照、续训配置或证据不一致会说明原因，不用今天的目录信息回填历史。
+
+模型测试静默刷新保留已加载的历史分页，活动记录和打开的详情继续刷新；筛选条件不再匹配时从列表移出。接口有明确超时，写操作超时提示先核对结果，不自动重复提交。平台设置显示数据集工作线程异常；未知 API 地址返回 JSON 404。
+
+数据集上传、登记与重新加载统一检查训练和验证图片非空；接管和清理均保护保存位置根目录。任务改变执行服务器后，历史 Run 对原服务器数据集的引用仍受保护。删除按钮优先显示具体阻止原因。历史已删除数据集不再占用可移除的非默认保存位置，路径快照继续留在历史记录中。
+
+当前平台 **1.12.0**，Agent **2.6.0**。过程采样故障隔离、本机 GPU UUID 绑定与远程回执恢复详见 [Agent 说明](agent/README.md) 和 [部署说明](deploy/README.md)。本次不改变已有配置与历史数据。
+
 ## 1.11.0 训练期间数据集操作
 
 本机数据集“重新加载”由独立后台通道执行，和常规目录操作分开；支持新能力的远程 Agent 也可在训练时只读导出。校验前后核对源内容，确认完整后才更新统计，源文件变化或校验失败保留上次有效结果。训练期间限制读取速率、检查剩余空间并按磁盘压力暂停；同一路径的导入、迁移及删除仍受锁保护。操作记录显示资源暂停、路径锁、离线和旧 Agent 等待训练的不同原因。历史数据无需迁移。
 
-本机可用 `PLATFORM_DATASET_REFRESH_READ_BYTES_PER_SECOND`（默认 32 MiB/s，`0` 关闭限速）、`PLATFORM_DATASET_REFRESH_IO_PRESSURE_PCT`（默认 25，`0` 关闭压力暂停）和 `PLATFORM_DATASET_REFRESH_MIN_FREE_BYTES`（默认 512 MiB）调节资源预算。Linux PSI 不可用时仅使用读取速率限制；远程 Agent 的可选配置见 [Agent 说明](agent/README.md)。当前平台为 **1.11.0**，配套 Agent 为 **2.5.3**。
+本机可用 `PLATFORM_DATASET_REFRESH_READ_BYTES_PER_SECOND`（默认 32 MiB/s，`0` 关闭限速）、`PLATFORM_DATASET_REFRESH_IO_PRESSURE_PCT`（默认 25，`0` 关闭压力暂停）和 `PLATFORM_DATASET_REFRESH_MIN_FREE_BYTES`（默认 512 MiB）调节资源预算。Linux PSI 不可用时仅使用读取速率限制；远程 Agent 的可选配置见 [Agent 说明](agent/README.md)。该版本平台为 **1.11.0**，配套 Agent 为 **2.5.3**。
 
 ## 1.10.0 数据集与训练记录可靠性
 
@@ -80,7 +90,7 @@
 
 独立于 Ultralytics 源码的训练任务控制台。平台通过受控参数调用现有 `yolo` CLI，并读取 `args.yaml`、`results.csv` 和权重文件。平台业务集中在 `web/`，训练行为仍取决于实际执行服务器上的 Ultralytics 版本与依赖环境。
 
-本说明面向页面使用和平台开发；首次安装见 [项目首页](../README.md)，远程配置见 [Agent 说明](agent/README.md)，服务维护见 [部署说明](deploy/README.md)，架构和当前缺陷见 [项目分析](../docs/project-analysis.md)。当前平台版本为 **1.11.0**，配套远程 Agent 为 **2.5.3**。
+本说明面向页面使用和平台开发；首次安装见 [项目首页](../README.md)，远程配置见 [Agent 说明](agent/README.md)，服务维护见 [部署说明](deploy/README.md)，架构和当前缺陷见 [项目分析](../docs/project-analysis.md)。当前平台版本为 **1.12.0**，配套远程 Agent 为 **2.6.0**。
 
 
 ## 1.4.11 训练生命周期与清理预检查

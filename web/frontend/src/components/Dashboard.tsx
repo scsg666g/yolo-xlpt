@@ -1,3 +1,4 @@
+import { metricProfile, primaryMetric } from '../metricProfiles'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Copy, Cpu, Folder, FolderInput, FolderPlus, GitCompareArrows, GripVertical, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
@@ -115,7 +116,8 @@ function taskMetric(task: TrainingTask, keys: string[]): { key: string; value: n
 
 function groupMapSummary(tasks: TrainingTask[]) {
   const candidates = tasks.flatMap((task) => {
-    const metric = taskMetric(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])
+    const primary = primaryMetric(task.task_type)
+    const metric = primary ? taskMetric(task, [primary.key]) : null
     return metric ? [{ task, ...metric }] : []
   })
   const highest = candidates.reduce<(typeof candidates)[number] | null>(
@@ -127,8 +129,11 @@ function groupMapSummary(tasks: TrainingTask[]) {
   const sources = new Set(candidates.map(({ task, key }) => JSON.stringify([
     task.execution_node_id || 'local', task.data_path, task.task_type, key,
   ])))
+  const mixedMetrics = new Set(candidates.map((item) => `${item.task.task_type}:${item.key}`)).size > 1
   return {
-    highest,
+    highest: mixedMetrics ? null : highest,
+    label: mixedMetrics ? '多种任务指标' : primaryMetric(highest?.task.task_type)?.name || '主指标',
+    mixedMetrics,
     count: candidates.length,
     mixedSources: sources.size > 1 || candidates.some(({ task }) => !task.data_path?.trim()),
   }
@@ -512,7 +517,11 @@ export function Dashboard() {
     taskActionRequests.current.add(taskId)
     setTaskActionIds((current) => new Set(current).add(taskId))
     setError('')
-    try { await action(); await refresh() } catch (reason) { setError(reason instanceof Error ? reason.message : '操作失败') } finally {
+    try { await action(); await refresh() } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '操作失败')
+      // A lost response can still have started training; reconcile before allowing another click.
+      await refresh()
+    } finally {
       taskActionRequests.current.delete(taskId)
       setTaskActionIds((current) => {
         const next = new Set(current)
@@ -777,7 +786,7 @@ export function Dashboard() {
       <div className="progress-heading"><span>Epoch {task.completed_epochs} / {trainingEpochTarget(task)}</span><strong title="实际完成轮数占目标轮数的比例">轮数进度 {Math.round(epochProgress)}%</strong></div>
       <div className="progress"><i style={{ width: `${epochProgress}%` }} /></div>
       {completionNote && <p className="training-completion-note">{completionNote}</p>}
-      <div className="metric-strip" title={`最新 Epoch ${task.completed_epochs} 指标`}><div><span>mAP50</span><strong>{metricValue(task, ['metrics/mAP50(B)', 'metrics/mAP50(M)'])}</strong></div><div><span>Box loss</span><strong>{metricValue(task, ['train/box_loss'])}</strong></div><div><span>设备</span><strong>{task.device === 'cpu' ? 'CPU' : `GPU ${task.device}`}</strong></div></div>
+      <div className="metric-strip" title={`最新 Epoch ${task.completed_epochs} 指标`}><div><span>{metricProfile(task.task_type)?.scoreSeries[0]?.name || '验证指标'}</span><strong>{metricValue(task, [metricProfile(task.task_type)?.scoreSeries[0]?.key || ''])}</strong></div><div><span>{metricProfile(task.task_type)?.lossSeries[0]?.name || '训练损失'}</span><strong>{metricValue(task, [metricProfile(task.task_type)?.lossSeries[0]?.key || ''])}</strong></div><div><span>设备</span><strong>{task.device === 'cpu' ? 'CPU' : `GPU ${task.device}`}</strong></div></div>
       {task.status === 'queued' && task.queue_reason && <div className="task-warning">{task.queue_reason}</div>}
       {task.error_message && <div className="task-warning"><AlertTriangle size={14} />{task.error_message}</div>}
       <footer><span>{task.source === 'imported' ? '历史导入' : new Date(task.created_at).toLocaleString('zh-CN')}</span><div>
@@ -825,8 +834,8 @@ export function Dashboard() {
           const attentionCount = view.allTasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
           const mapSummary = groupMapSummary(view.allTasks)
           const mapDescription = mapSummary.highest
-            ? `取本组 ${mapSummary.count} 个有有效 mAP50 的任务各自最新指标中的最大值，不代表历史最佳。来源：${mapSummary.highest.task.name}；${mapSummary.highest.task.execution_node_id ? nodeNames[mapSummary.highest.task.execution_node_id] || '远程服务器' : '本机服务器'}；${mapSummary.highest.key === 'metrics/mAP50(M)' ? '掩码 mAP50' : '框 mAP50'}。路径相同也不保证数据内容或版本相同。`
-            : '组内尚无有效 mAP50；未产生验证指标的任务不参与统计，分类准确率不作为 mAP50。'
+            ? `取本组 ${mapSummary.count} 个有有效主指标的任务各自最新指标中的最大值，不代表历史最佳。来源：${mapSummary.highest.task.name}；${mapSummary.highest.task.execution_node_id ? nodeNames[mapSummary.highest.task.execution_node_id] || '远程服务器' : '本机服务器'}；${mapSummary.label}。路径相同也不保证数据内容或版本相同。`
+            : mapSummary.mixedMetrics ? '组内包含不同任务指标，不能将分类准确率、框、掩码和姿态指标混合排名。' : '组内尚无有效主指标；未产生验证指标的任务不参与统计。'
           return <section className={`task-group ${isCollapsed ? 'is-collapsed' : ''}`} key={view.key}>
             <header className="task-group-header">
               <div className="task-group-heading">
@@ -838,7 +847,7 @@ export function Dashboard() {
                   {view.group && <button type="button" className="icon-button delete" title="删除分组" aria-label={`删除分组：${view.name}`} onClick={() => setGroupEditor({ group: view.group, initialDelete: true })}><Trash2 size={14} /></button>}
                 </div>
               </div>
-              <div className="task-group-summary"><span className={activeCount ? 'active' : ''}>进行中 <strong>{activeCount}</strong></span><span>已完成 <strong>{completedCount}</strong></span>{attentionCount > 0 && <span className="attention">需关注 <strong>{attentionCount}</strong></span>}<span title={mapDescription}>当前最高 mAP50 <strong>{mapSummary.highest ? mapSummary.highest.value.toFixed(4) : '—'}</strong></span>{mapSummary.mixedSources && <span title="有指标的任务来自不同服务器、数据集路径或指标类型，数值汇总仅供参考，不作为模型优劣排名。">多来源，仅供参考</span>}{!mapSummary.highest && <span>暂无有效指标</span>}</div>
+              <div className="task-group-summary"><span className={activeCount ? 'active' : ''}>进行中 <strong>{activeCount}</strong></span><span>已完成 <strong>{completedCount}</strong></span>{attentionCount > 0 && <span className="attention">需关注 <strong>{attentionCount}</strong></span>}<span title={mapDescription}>{mapSummary.mixedMetrics ? mapSummary.label : `当前最高 ${mapSummary.label}`} <strong>{mapSummary.highest ? mapSummary.highest.value.toFixed(4) : '—'}</strong></span>{mapSummary.mixedSources && <span title="有指标的任务来自不同服务器、数据集路径或指标类型，数值汇总仅供参考，不作为模型优劣排名。">多来源，仅供参考</span>}{!mapSummary.highest && !mapSummary.mixedMetrics && <span>暂无有效指标</span>}</div>
             </header>
             {!isCollapsed && <div id={`task-group-${view.key}`} className="task-group-body">{view.tasks.length ? <div className="task-grid">{view.tasks.map(renderTaskCard)}</div> : <div className="task-group-empty">分组中还没有任务，可在新建任务时选择该分组。</div>}</div>}
           </section>

@@ -130,7 +130,14 @@ test('an uncertain reload submission retries with the same request identity', as
 test('model tests distinguish a weight source from central execution with old API fallbacks', () => {
   const module = { exports: {} }
   vm.runInNewContext(compiled('../src/components/ModelTestShared.tsx'), {
-    exports: module.exports, require: () => new Proxy({}, { get: (_target, key) => String(key) }),
+    exports: module.exports, require: (name) => {
+      if (name === '../metricProfiles') {
+        const profiles = { exports: {} }
+        vm.runInNewContext(compiled('../src/metricProfiles.ts'), { exports: profiles.exports })
+        return profiles.exports
+      }
+      return new Proxy({}, { get: (_target, key) => String(key) })
+    },
   })
   const { modelTestExecutionLabel, modelTestWaitingMessage } = module.exports
   assert.equal(modelTestExecutionLabel({ model: { device: 'cpu', imgsz: 320 } }), '中心服务器 · CPU · 320 px')

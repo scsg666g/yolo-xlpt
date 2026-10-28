@@ -1,5 +1,13 @@
 # 算力监控与可选远程训练 Agent
 
+## Agent 2.6.0 采样隔离与终态回执恢复
+
+本机和远程过程采样按间隔读取参数/梯度，并在达到采样上限后释放 hook、预处理包装与张量引用。诊断采样错误只关闭采样，不抛入训练优化器；Tensor 形式的损失项可正常记录。该逻辑只作用于升级后新启动的训练，历史已运行命令保持原样。
+
+终态上报得到 404 时，Agent 向支持的新中心查询已完成的删除记录，核对节点、Run、随机请求标识、操作编号、路径及已有租约证明，确认后把原回执完整归档到 `.training-state/archived/` 并恢复领取。历史异常回执缺少路径时，只有可信租约摘要匹配才允许确认。未知记录、未完成删除、证明不匹配或旧中心不支持时继续保留回执，不把“找不到”当作删除成功。
+
+当前 Agent **2.6.0**，配套平台 **1.12.0**。没有新增必填配置或机器固定路径；保留原 `agent-config.json`、`.training-state/`、`.dataset-state/` 和输出目录。两个独立包更新相同脚本，各自实际配置保持原样。旧中心仍可使用既有训练协议，但不能提供新增的删除回执核验。
+
 ## Agent 2.5.3 训练期间的数据集重新加载
 
 Agent 上报 `training.dataset_concurrent_refresh=true` 后，新版中心只会为“重新加载”的只读 `export` 阶段下发 `kind=refresh` 和 `read_only_during_training=true`。此阶段可与训练并行，也不阻挡新训练领取；登记、导入、迁移和删除继续遵守原有训练工作区锁、数据集文件锁与引用保护。旧中心或缺少能力位的 Agent 继续按旧规则执行，历史数据、断点和回执不需要迁移。重新加载仅读取源目录，在独立 `.dataset-state` 中打包；源文件在扫描或打包中变化时拒绝更新，归档内容逐文件校验并在提交前再次扫描源目录。
@@ -8,7 +16,7 @@ Agent 上报 `training.dataset_concurrent_refresh=true` 后，新版中心只会
 
 ## 算力按需刷新（Agent 2.4.2 起）
 
-新版中心在普通上报响应中发送刷新请求编号，Agent 在同一轮心跳中再次采集 GPU/主机状态并回传匹配编号。每轮心跳最多加采一次，不影响远程训练领取和原上报间隔；旧中心不返回命令时沿用原有协议。开发版脚本与两个独立远程分发包当前均为 2.5.3；保留各自实际节点配置与历史状态，使用版平台目录不修改。
+新版中心在普通上报响应中发送刷新请求编号，Agent 在同一轮心跳中再次采集 GPU/主机状态并回传匹配编号。每轮心跳最多加采一次，不影响远程训练领取和原上报间隔；旧中心不返回命令时沿用原有协议。开发版脚本与两个独立远程分发包当前均为 2.6.0；保留各自实际节点配置与历史状态，使用版平台目录不修改。
 
 ## Agent 2.5.3 实时与历史 Batch 调整记录
 
@@ -117,7 +125,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-当前脚本为 **Agent 2.5.3**，配套开发平台为 **1.11.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
+当前脚本为 **Agent 2.6.0**，配套开发平台为 **1.12.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -251,7 +259,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `2.5.3`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
+确认输出为 `2.6.0`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -323,7 +331,7 @@ sudo journalctl -u yolo-monitor-agent -f
 | 节点在线但没有 GPU | 使用同一个运行用户执行 `nvidia-smi`；检查驱动、执行权限和 `nvidia_smi_bin`，CPU 主机仍可正常在线 |
 | 节点显示离线 | 查看 Agent 是否退出、网络是否中断及双方时钟是否一致；页面保留的旧采样不代表当前负载 |
 | 关闭终端后停止更新 | 前台 Agent 已退出；使用上面的 systemd 服务配置实现长期运行 |
-| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.5.3）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
+| 节点在线但任务一直“启动中” | 确认 Agent 达到最低版本 1.8.0（当前为 2.6.0）；异卡并行还要看到 `training.gpu_parallelism=true`。再检查 `training.ready`、中心 GPU 预约、Agent 日志与 `.training-state/active/` |
 | 远程训练有进度但曲线缺少某些 Epoch | 检查 `results.csv` 的 `epoch` 和 `time`；Agent 2.0.7 会跳过非有限或无法解析的 Epoch，并将非有限或负耗时归零，其他有效指标仍会回传 |
 | 旧 Attempt 单独删除提示 Agent 版本过低 | 旧版平铺 Attempt 001 需要 Agent 2.0.1 才能精细清理；替换脚本并重启 Agent，确认页面报告 2.0.1 后重试 |
 | 远程指定模型无法测试 | 确认 Agent 为 2.0.3、`enable_training=true`，并用 `--check-config` 核对模型所在目录已加入 `model_test_roots`；模型必须是该范围内的非空普通 `.pt` 文件，路径不能包含符号链接。若只在最终校验阶段超时，调整 `model_transfer_finalize_timeout_seconds` |

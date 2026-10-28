@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.5.3"
+VERSION = "2.6.0"
 LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
 DEFAULT_DATASET_REFRESH_READ_RATE = 32 * 1024**2
 DEFAULT_DATASET_REFRESH_MIN_FREE = 512 * 1024**2
@@ -66,12 +66,41 @@ def stats(value):
             "std": round(float(value.std().cpu()), 7) if value.numel() > 1 else 0.0,
             "min": round(float(value.min().cpu()), 7), "max": round(float(value.max().cpu()), 7)}
 
+def loss_stats(trainer):
+    values = getattr(trainer, "loss_items", None)
+    if values is None: return {}
+    if not hasattr(values, "items"):
+        labeler = getattr(trainer, "label_loss_items", None)
+        values = labeler(values) if callable(labeler) else {"loss_%s" % index: item for index, item in enumerate(values)}
+    return {str(key): round(float(value), 7) for key, value in values.items()}
+
 class Collector:
     def __init__(self, root, maximum, interval):
         self.root, self.maximum, self.interval = Path(root), maximum, max(1, interval)
         self.samples, self.step, self.layers, self.before, self.updates = [], -1, {}, {}, {}
         self.last_batch, self.disabled = {}, False
+        self.hooks, self.optimizer_hooks = [], []
+        self.trainer = self.original_preprocess = self.preprocess_wrapper = None
+        self.error = None
     def primary(self): return os.getenv("RANK", "-1") in {"-1", "0"}
+    def sample_due(self):
+        return not self.disabled and self.primary() and self.step >= 0 and not self.step % self.interval and len(self.samples) < self.maximum
+    def disable(self, error):
+        self.disabled = True
+        self.error = type(error).__name__ + ": " + str(error)
+        print("[training-trace] collection disabled: " + self.error, file=sys.stderr, flush=True)
+    def release_hooks(self):
+        # Optimizer hook maps must not be modified during their own iteration.
+        for handle in [*self.hooks, *self.optimizer_hooks]:
+            try: handle.remove()
+            except Exception: pass
+        self.hooks.clear(); self.optimizer_hooks.clear()
+        try:
+            if self.trainer is not None and self.trainer.preprocess_batch is self.preprocess_wrapper:
+                self.trainer.preprocess_batch = self.original_preprocess
+        except Exception: pass
+        self.trainer = self.original_preprocess = self.preprocess_wrapper = None
+        self.last_batch = {}; self.layers.clear(); self.before.clear(); self.updates.clear()
     def write(self):
         self.root.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "available": bool(self.samples), "source": "remote training callback",
@@ -82,49 +111,64 @@ class Collector:
         tmp.replace(self.root / "trace.json")
     def hook(self, name):
         def capture(_module, _inputs, output):
-            if self.disabled or not self.primary() or self.step < 0 or self.step % self.interval or len(self.samples) >= self.maximum: return
+            if not self.sample_due(): return
             try:
                 if isinstance(output, (list, tuple)): output = next((x for x in output if hasattr(x, "detach")), None)
                 value = stats(output)
                 if value: self.layers[name] = value
-            except Exception: self.disabled = True
+            except Exception as exc: self.disable(exc)
         return capture
     def start(self, trainer):
-        if not self.primary(): return
+        if not self.primary() or self.maximum <= 0 or self.disabled: return
         try:
+            self.root.mkdir(parents=True, exist_ok=True)
             original = trainer.preprocess_batch
             def preprocess(batch):
-                self.last_batch = original(batch); return self.last_batch
+                processed = original(batch)
+                if self.sample_due(): self.last_batch = processed
+                return processed
+            self.trainer, self.original_preprocess, self.preprocess_wrapper = trainer, original, preprocess
             trainer.preprocess_batch = preprocess
             for index, (name, module) in enumerate(trainer.model.named_modules()):
                 if index > 40 or not name or list(module.children()): continue
-                module.register_forward_hook(self.hook(name))
+                self.hooks.append(module.register_forward_hook(self.hook(name)))
             optimizer = getattr(trainer, "optimizer", None)
             if optimizer is not None and hasattr(optimizer, "register_step_pre_hook"):
-                optimizer.register_step_pre_hook(self.before_step); optimizer.register_step_post_hook(self.after_step)
-        except Exception: self.disabled = True
+                self.optimizer_hooks.append(optimizer.register_step_pre_hook(self.before_step))
+                self.optimizer_hooks.append(optimizer.register_step_post_hook(self.after_step))
+        except Exception as exc:
+            self.disable(exc); self.release_hooks()
     def before_step(self, optimizer, _args, _kwargs):
         self.before = {}
-        for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
-            if index >= 12 or parameter.grad is None: continue
-            gradient, value = parameter.grad.detach().float(), parameter.detach().float()
-            self.before[str(index)] = {"gradient_mean": round(float(gradient.abs().mean().cpu()), 8), "gradient_max": round(float(gradient.abs().max().cpu()), 8), "weight_mean_before": round(float(value.mean().cpu()), 8)}
+        if not self.sample_due(): return
+        try:
+            for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
+                if index >= 12 or parameter.grad is None: continue
+                gradient, value = parameter.grad.detach().float(), parameter.detach().float()
+                self.before[str(index)] = {"gradient_mean": round(float(gradient.abs().mean().cpu()), 8), "gradient_max": round(float(gradient.abs().max().cpu()), 8), "weight_mean_before": round(float(value.mean().cpu()), 8)}
+        except Exception as exc: self.disable(exc)
     def after_step(self, optimizer, _args, _kwargs):
         self.updates = {}
-        for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
-            before = self.before.get(str(index))
-            if index >= 12 or before is None: continue
-            after = float(parameter.detach().float().mean().cpu())
-            self.updates[str(index)] = {**before, "weight_mean_after": round(after, 8), "weight_delta_mean": round(abs(after - before["weight_mean_before"]), 8)}
+        if not self.sample_due(): return
+        try:
+            for index, parameter in enumerate(optimizer.param_groups[0].get("params", [])):
+                before = self.before.get(str(index))
+                if index >= 12 or before is None: continue
+                after = float(parameter.detach().float().mean().cpu())
+                self.updates[str(index)] = {**before, "weight_mean_after": round(after, 8), "weight_delta_mean": round(abs(after - before["weight_mean_before"]), 8)}
+        except Exception as exc: self.disable(exc)
     def batch_start(self, _trainer):
-        if self.primary() and not self.disabled: self.step += 1
+        if self.primary() and not self.disabled:
+            self.step += 1; self.layers.clear(); self.before.clear(); self.updates.clear()
     def batch_end(self, trainer):
-        if self.disabled or not self.primary() or self.step % self.interval or len(self.samples) >= self.maximum: return
+        if self.disabled or len(self.samples) >= self.maximum:
+            self.release_hooks(); return
+        if not self.sample_due(): return
         try:
             batch = self.last_batch; image = batch.get("img") if isinstance(batch, dict) else None
             sample = {"epoch": int(getattr(trainer, "epoch", 0)) + 1, "batch": self.step,
                       "images": stats(image), "labels": int(batch.get("cls").shape[0]) if isinstance(batch, dict) and hasattr(batch.get("cls"), "shape") else None,
-                      "loss": {k: round(float(v), 7) for k, v in (getattr(trainer, "loss_items", {}) or {}).items()},
+                      "loss": loss_stats(trainer),
                       "learning_rate": [round(float(g.get("lr", 0)), 10) for g in getattr(trainer, "optimizer", None).param_groups] if getattr(trainer, "optimizer", None) else [],
                       "layers": dict(self.layers), "updates": dict(self.updates)}
             if hasattr(image, "detach") and getattr(image, "ndim", 0) == 4:
@@ -135,8 +179,11 @@ class Collector:
                     Image.fromarray(pixels).save(self.root / name, quality=88); sample["image"] = name
                 except Exception: pass
             self.samples.append(sample); self.write()
-        except Exception: self.disabled = True
+        except Exception as exc: self.disable(exc)
+        finally:
+            if self.disabled or len(self.samples) >= self.maximum: self.release_hooks()
     def end(self, _trainer):
+        self.release_hooks()
         if self.primary() and not self.disabled:
             try: self.write()
             except Exception: pass
@@ -2249,13 +2296,53 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
     endpoint = f"/api/compute/nodes/{config['node_id']}/agent/runs/{run_id}/update"
     lease = payload.get("_claim_lease")
     batch.pop("_claim_lease", None)
-    response = (api_json(config, endpoint, "POST", batch, {"X-Training-Lease": lease})
-                if lease else api_json(config, endpoint, "POST", batch))
+    try:
+        response = (api_json(config, endpoint, "POST", batch, {"X-Training-Lease": lease})
+                    if lease else api_json(config, endpoint, "POST", batch))
+    except HTTPError as exc:
+        if exc.code != 404:
+            raise
+        # A 404 alone can mean a wrong center, node, or an old deployment. Only
+        # an authenticated, identity-checked deletion tombstone may retire it.
+        return reconcile_deleted_final(config, path, payload)
     if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed", "interrupted"}:
         save_pending_final(config, run_id, dict(payload, metrics=metrics[256:]))
         return False
     clear_active_run(config, run_id)
     path.unlink()
+    return True
+
+
+def reconcile_deleted_final(config: dict, path: Path, payload: dict) -> bool:
+    run_id, node_id, nonce = path.stem, config["node_id"], uuid.uuid4().hex
+    proof = api_json(config, f"/api/compute/nodes/{node_id}/agent/runs/{run_id}/reconcile", "POST", {
+        "version": 1, "run_id": run_id, "node_id": node_id, "nonce": nonce,
+        "claim_lease": payload.get("_claim_lease"), "run_dir": payload.get("run_dir"),
+    })
+    if (not isinstance(proof, dict) or type(proof.get("version")) is not int or proof["version"] != 1
+            or proof.get("disposition") != "deleted" or proof.get("run_id") != run_id
+            or proof.get("node_id") != node_id or proof.get("nonce") != nonce
+            or not isinstance(proof.get("operation_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", proof["operation_id"])):
+        raise ValueError("平台未返回可验证的训练删除回执，已保留本地最终状态")
+    archive = path.parent / "archived"
+    archive.mkdir(mode=0o700, parents=True, exist_ok=True)
+    evidence = archive / f"{run_id}.deletion-proof.json"
+    temporary = evidence.with_suffix(".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            os.chmod(temporary, 0o600)
+            json.dump(proof, handle, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(evidence)
+    finally:
+        temporary.unlink(missing_ok=True)
+    # Preserve the entire historical receipt for diagnosis, including unsent
+    # metrics; an acknowledged deletion never claims those metrics were saved.
+    path.replace(archive / f"{run_id}.deleted.json")
+    clear_active_run(config, run_id)
+    LOGGER.info("平台已验证训练删除记录，最终状态已归档：%s", run_id)
     return True
 
 
@@ -2359,6 +2446,10 @@ def confirm_remote_claim(config: dict, task: dict, stop: threading.Event) -> boo
 
 
 def _save_terminal_for_retry(config: dict, task: dict, payload: dict) -> Path:
+    # Early launch/inspection errors may never emit a running update. Retain
+    # their assigned path too, so deletion ACKs can reconcile after an outage.
+    if payload.get("run_dir") is None and task.get("run_dir") is not None:
+        payload = {**payload, "run_dir": task["run_dir"]}
     payload = training_report_payload(task, payload)
     path = save_pending_final(config, task["run_id"], {"_claim_lease": task.get("claim_lease"), **payload})
     clear_active_run(config, task["run_id"])

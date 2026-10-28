@@ -786,6 +786,7 @@ def build_remote_task_delete_plan(
 
     targets = deletion_plan_targets(plans)
     test_ids = sorted(db.scalars(select(ModelTest.id).where(ModelTest.task_id == task.id)).all())
+    from .final_receipts import receipt_proofs
     return {
         "scope": "task",
         "phase": "stopping_tests",
@@ -793,6 +794,7 @@ def build_remote_task_delete_plan(
         "node_name": node.name,
         "test_ids": test_ids,
         "runs": plans,
+        "final_receipt_proofs": receipt_proofs(task.runs),
         "protected_paths": protected,
         "receipt_required": True,
         "receipt_version": DELETE_RECEIPT_VERSION,
@@ -896,12 +898,14 @@ def prepare_attempt_delete_payload(db: Session, task: TrainingTask, run: Trainin
     releases = checkpoint_releases(db, task, run)
     if releases and not agent_version_at_least(node.agent_version, (2, 0, 8)):
         raise ValueError("释放历史续训检查点依赖需要 Agent 2.0.8 或以上版本")
+    from .final_receipts import receipt_proofs
     payload = {
         "required_files": [file for release in releases for file in release["required_files"]],
         "scope": "attempt",
         "run_id": run.id,
         "attempt_number": run.attempt_number,
         "runs": [payload_run],
+        "final_receipt_proofs": receipt_proofs([run]),
         "protected_paths": live_protected_paths(db, task.execution_node_id, task.id, deleting_run_id=run.id),
     }
     return payload

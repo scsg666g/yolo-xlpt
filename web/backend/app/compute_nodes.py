@@ -39,6 +39,7 @@ from .models import ComputeNode, MetricPoint, RemoteOperation, TaskEvent, Traini
 from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
 from .batch_history import append_reductions
 from .process_attribution import inspect_process_owner
+from .final_receipts import ReceiptReconciliation, reconcile_deleted_run
 
 router = APIRouter(prefix="/api/compute", tags=["compute nodes"])
 MAX_REPORT_BYTES = 1024 * 1024
@@ -1101,6 +1102,13 @@ def confirm_remote_claim(node_id: str, run_id: str, payload: ClaimConfirmation,
             and run.claim_expires_at and as_utc(run.claim_expires_at) < now):
         raise HTTPException(409, "训练领取已过期，请等待下一次任务轮询")
     raise HTTPException(409, "训练领取已失效，请等待下一次任务轮询")
+
+
+@router.post('/nodes/{node_id}/agent/runs/{run_id}/reconcile')
+def reconcile_final_receipt(node_id: str, run_id: str, payload: ReceiptReconciliation,
+                            request: Request, db: Session = Depends(get_db)):
+    authenticated_agent(node_id, request, db)
+    return reconcile_deleted_run(db, node_id, run_id, payload)
 
 
 @router.post("/nodes/{node_id}/agent/runs/{run_id}/update")

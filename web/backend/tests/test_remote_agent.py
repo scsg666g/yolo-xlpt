@@ -677,6 +677,110 @@ def test_terminal_backlog_survives_outage_and_retries_all_epochs(agent, training
     assert agent.load_active_run(config) is None
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("missing_run_dir", [False, True])
+def test_deleted_terminal_receipt_is_archived_only_after_verified_reconciliation(
+    agent, training, monkeypatch, legacy, missing_run_dir,
+):
+    config, task = training
+    payload = {"status": "completed", "exit_code": 0, "metrics": [{"epoch": 1, "values": {"score": 0.5}}],
+               "run_dir": task["run_dir"]}
+    if not legacy:
+        payload["_claim_lease"] = "c" * 32
+    if missing_run_dir:
+        payload.pop("run_dir")
+    path = agent.save_pending_final(config, task["run_id"], payload)
+    active_path = agent.save_active_run(config, task, "running")
+    original_receipt = path.read_bytes()
+    calls = []
+
+    def api(_config, endpoint, method, body, *headers):
+        calls.append(endpoint)
+        if endpoint.endswith("/update"):
+            raise HTTPError(endpoint, 404, "deleted", None, None)
+        assert endpoint.endswith("/reconcile") and method == "POST"
+        assert body["claim_lease"] == payload.get("_claim_lease")
+        assert body["run_dir"] == payload.get("run_dir")
+        return {"version": 1, "disposition": "deleted", "run_id": body["run_id"],
+                "node_id": body["node_id"], "nonce": body["nonce"], "operation_id": "d" * 32}
+
+    monkeypatch.setattr(agent, "api_json", api)
+    assert agent.retry_pending_finals(config) is True
+    archive = path.parent / "archived"
+    assert not path.exists() and not active_path.exists()
+    assert (archive / f"{task['run_id']}.deleted.json").read_bytes() == original_receipt
+    assert json.loads((archive / f"{task['run_id']}.deletion-proof.json").read_text())["operation_id"] == "d" * 32
+    assert agent.retry_pending_finals(config) is True
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("initial_path", [None, "missing", "explicit-path"])
+def test_early_failure_terminal_receipt_retains_assigned_path_without_changing_explicit_path(
+    agent, training, initial_path,
+):
+    config, task = training
+    task["claim_lease"] = "c" * 32
+    payload = {"status": "failed", "exit_code": 1, "error_message": "Launch failed"}
+    if initial_path != "missing":
+        payload["run_dir"] = initial_path
+    original = dict(payload)
+    path = agent._save_terminal_for_retry(config, task, payload)
+    receipt = json.loads(path.read_text())
+    expected = task["run_dir"] if initial_path in {None, "missing"} else initial_path
+    assert receipt["run_dir"] == expected
+    assert receipt["_claim_lease"] == task["claim_lease"]
+    assert payload == original
+
+
+@pytest.mark.parametrize("invalid", ["old_center", "wrong_run", "wrong_node", "wrong_nonce", "missing_operation",
+                                         "unknown", "html_response", "bool_version", "wrong_operation"])
+def test_missing_or_unverifiable_terminal_deletion_keeps_receipt_and_blocks_claims(
+    agent, training, monkeypatch, invalid,
+):
+    config, task = training
+    payload = {"status": "completed", "exit_code": 0, "metrics": [], "run_dir": task["run_dir"]}
+    path = agent.save_pending_final(config, task["run_id"], payload)
+    original = path.read_bytes()
+
+    def api(_config, endpoint, method, body):
+        if endpoint.endswith("/update") or invalid == "old_center":
+            raise HTTPError(endpoint, 404, "missing", None, None)
+        proof = {"version": 1, "disposition": "deleted", "run_id": body["run_id"],
+                 "node_id": body["node_id"], "nonce": body["nonce"], "operation_id": "d" * 32}
+        if invalid == "html_response":
+            return "<html>old frontend fallback</html>"
+        field, replacement = {
+            "wrong_run": ("run_id", "e" * 32), "wrong_node": ("node_id", "e" * 32),
+            "wrong_nonce": ("nonce", "e" * 32), "missing_operation": ("operation_id", None),
+            "unknown": ("disposition", "unknown"), "bool_version": ("version", True),
+            "wrong_operation": ("operation_id", "not-a-deletion-operation"),
+        }[invalid]
+        proof[field] = replacement
+        return proof
+
+    monkeypatch.setattr(agent, "api_json", api)
+    assert agent.retry_pending_finals(config) is False
+    assert path.read_bytes() == original
+    assert not (path.parent / "archived").exists()
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 500])
+def test_terminal_update_other_errors_do_not_attempt_deletion_reconciliation(
+    agent, training, monkeypatch, status,
+):
+    config, task = training
+    path = agent.save_pending_final(config, task["run_id"], {"status": "completed", "metrics": []})
+    calls = []
+
+    def api(_config, endpoint, method, body):
+        calls.append(endpoint)
+        raise HTTPError(endpoint, status, "unavailable", None, None)
+
+    monkeypatch.setattr(agent, "api_json", api)
+    assert agent.retry_pending_finals(config) is False
+    assert path.exists() and len(calls) == 1 and calls[0].endswith("/update")
+
+
 def test_external_log_symlink_cannot_escape_allowed_root(agent, training, tmp_path):
     config, task = training
     outside = tmp_path / "outside"

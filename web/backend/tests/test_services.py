@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 import app.config as config_module
 import app.database as database_module
 import app.local_deletions as local_deletions_module
+import app.local_devices as local_devices_module
 import app.model_test_storage as model_test_storage
 import app.services as services_module
 from app.database import Base, configure_sqlite_connection
@@ -202,6 +204,93 @@ def test_popen_happens_after_durable_claim_and_final_db_failure_is_recoverable(t
         db.commit()
         assert db.get(TrainingRun, "run-launch-recovery").status == "running"
         assert db.get(TrainingRun, "run-launch-recovery").pid == FakeProcess.pid
+
+
+def test_local_gpu_binding_is_durable_before_launch_and_survives_completion(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'gpu-binding.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False)
+    run_id, task_id = 'run-gpu-binding', 'task-gpu-binding'
+    run_dir = tmp_path / 'runs/attempt-001'
+    log_path = tmp_path / 'logs/attempt-001.log'
+    inventory = [{'index': 0, 'uuid': 'GPU-A'}, {'index': 1, 'uuid': 'GPU-B'}]
+    expected = {
+        'version': 1, 'requested_device': '0', 'cuda_visible_devices': 'GPU-A',
+        'cuda_device_order': 'FASTEST_FIRST',
+        'devices': [{'physical_index': 0, 'logical_index': 0, 'uuid': 'GPU-A'}],
+    }
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '1,0')
+    monkeypatch.setenv('CUDA_DEVICE_ORDER', 'FASTEST_FIRST')
+    monkeypatch.setattr(local_devices_module, '_visible_cuda_uuids',
+                        lambda *_args: ('GPU-B', 'GPU-A'))
+    monkeypatch.setattr(services_module, 'gpu_inventory', lambda: inventory)
+    monkeypatch.setattr(services_module, 'RUNTIME_ROOT', tmp_path / 'runtime')
+    monkeypatch.setattr(services_module, 'prepare_dataset_config', lambda _raw, destination: destination)
+    process = None
+
+    class FakeProcess:
+        pid = 8123
+        exit_code = None
+
+        def __init__(self, command, *, env, **_kwargs):
+            nonlocal process
+            process = self
+            assert env['CUDA_VISIBLE_DEVICES'] == 'GPU-A'
+            assert env['CUDA_DEVICE_ORDER'] == 'FASTEST_FIRST'
+            assert [item for item in command if item.startswith('device=')] == ['device=0']
+            original = json.loads(command[command.index('--command-json') + 1])
+            assert [item for item in original if item.startswith('device=')] == ['device=0']
+            # Observe from another connection while Popen has not returned.
+            with session_factory() as observer:
+                persisted = observer.get(TrainingRun, run_id)
+                assert persisted.status == 'starting' and persisted.command == command
+                assert persisted.parameter_snapshot['local_device_binding'] == expected
+                reservation = observer.scalar(select(GpuReservation).where(GpuReservation.run_id == run_id))
+                assert reservation.gpu_uuid == 'GPU-A' and reservation.gpu_index == 0
+
+        def poll(self):
+            return self.exit_code
+
+    monkeypatch.setattr(services_module.subprocess, 'Popen', FakeProcess)
+    scheduler = TrainingScheduler(session_factory=session_factory)
+    try:
+        with session_factory() as db:
+            task = make_task(task_id, status='queued', device='0')
+            run = TrainingRun(id=run_id, task=task, attempt_number=1, launch_mode='fresh',
+                              status='queued', model_path=task.model_path, data_path=task.data_path,
+                              run_dir=str(run_dir), log_path=str(log_path),
+                              parameter_snapshot={'device': '0', 'epochs': 1, 'config': {}})
+            task.current_run_id = run.id
+            db.add_all([task, run])
+            db.commit()
+        with session_factory() as db:
+            assert scheduler._claim_queued_run(db, run_id)
+        with session_factory() as db:
+            scheduler._launch(db, db.get(TrainingTask, task_id), db.get(TrainingRun, run_id))
+        assert process is not None
+        assert 'DEVICE_BINDING ' + json.dumps(expected, ensure_ascii=False) in log_path.read_text()
+        with session_factory() as db:
+            persisted = db.get(TrainingRun, run_id)
+            assert persisted.status == 'running'
+            command = list(persisted.command)
+            completed_at = utcnow().isoformat()
+            (run_dir / 'training-result.json').write_text(json.dumps({
+                'schema_version': 1, 'run_id': run_id, 'task_id': task_id,
+                'status': 'completed', 'exit_code': 0, 'reason': 'epochs_completed',
+                'completed_epochs': 1, 'expected_epochs': 1, 'finished_at': completed_at,
+            }))
+        process.exit_code = 0
+        with session_factory() as db:
+            scheduler._poll_processes(db)
+            db.commit()
+        with session_factory() as observer:
+            finished = observer.get(TrainingRun, run_id)
+            assert finished.status == 'completed'
+            assert observer.scalar(select(GpuReservation).where(GpuReservation.run_id == run_id)) is None
+            assert finished.parameter_snapshot['local_device_binding'] == expected
+            assert finished.command == command and finished.parameter_snapshot['device'] == '0'
+    finally:
+        engine.dispose()
 
 
 def test_stop_winning_between_prepared_commit_and_popen_return_terminates_process(tmp_path, monkeypatch):

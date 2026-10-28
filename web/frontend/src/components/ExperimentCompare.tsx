@@ -1,3 +1,5 @@
+import { comparisonEvidence } from '../comparisonEvidence'
+import { bestMetricPoint, metricProfile, primaryMetric } from '../metricProfiles'
 import type { RunDeletionPreview } from '../types'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Activity, AlertCircle, ArrowDown, ArrowUp, BarChart3, Check, ChevronDown, Folder, Info, Layers3, LoaderCircle, Minus, Search, Trash2, Trophy, X } from 'lucide-react'
@@ -36,16 +38,6 @@ function deletionStatusLabel(status: TrainingRun['deletion_status']): string {
   return ''
 }
 
-const metricOptions = [
-  { key: 'metrics/mAP50(B)', label: 'mAP50', group: 'accuracy' },
-  { key: 'metrics/mAP50-95(B)', label: 'mAP50-95', group: 'accuracy' },
-  { key: 'metrics/precision(B)', label: 'Precision', group: 'accuracy' },
-  { key: 'metrics/recall(B)', label: 'Recall', group: 'accuracy' },
-  { key: 'train/box_loss', label: 'Train Box Loss', group: 'loss' },
-  { key: 'val/box_loss', label: 'Val Box Loss', group: 'loss' },
-  { key: 'train/cls_loss', label: 'Train Cls Loss', group: 'loss' },
-  { key: 'val/cls_loss', label: 'Val Cls Loss', group: 'loss' },
-]
 
 const parameterRows: Array<{ label: string; value: (task: TrainingTask) => string | number }> = [
   { label: '任务类型', value: (task) => task.task_type },
@@ -73,14 +65,6 @@ interface SummaryMetric {
   unit: 'points' | 'value'
 }
 
-const summaryMetricRows: SummaryMetric[] = [
-  { key: 'metrics/mAP50(B)', label: 'mAP50', direction: 'higher', unit: 'points' },
-  { key: 'metrics/mAP50-95(B)', label: 'mAP50-95', direction: 'higher', unit: 'points' },
-  { key: 'metrics/precision(B)', label: 'Precision', direction: 'higher', unit: 'points' },
-  { key: 'metrics/recall(B)', label: 'Recall', direction: 'higher', unit: 'points' },
-  { key: 'val/box_loss', label: '验证 Box Loss', direction: 'lower', unit: 'value' },
-  { key: 'train/box_loss', label: '训练 Box Loss', direction: 'neutral', unit: 'value' },
-]
 
 function displayedMetric(values: MetricPoint['values'] | undefined, key: string): number | null {
   const value = values?.[key]
@@ -88,15 +72,6 @@ function displayedMetric(values: MetricPoint['values'] | undefined, key: string)
   return typeof value === 'number' && Number.isFinite(value) ? Number(value.toFixed(4)) : null
 }
 
-function bestEvaluationPoint(points: MetricPoint[] | undefined): MetricPoint | undefined {
-  let best: MetricPoint | undefined
-  let bestValue = -Infinity
-  for (const point of points || []) {
-    const value = point.values['metrics/mAP50-95(B)']
-    if (typeof value === 'number' && Number.isFinite(value) && value > bestValue) { best = point; bestValue = value }
-  }
-  return best
-}
 
 function MetricComparisonCell({ value, baselineValue, baseline, baselineComplete, complete, best, tied, row, comparisonEnabled }: {
   value: number | null
@@ -121,13 +96,10 @@ function MetricComparisonCell({ value, baselineValue, baseline, baselineComplete
   </td>
 }
 
-function bestMapLabel(points: MetricPoint[] | undefined): string {
-  let best: { value: number; epoch: number } | undefined
-  for (const point of points || []) {
-    const value = point.values['metrics/mAP50(B)']
-    if (typeof value === 'number' && Number.isFinite(value) && (!best || value > best.value)) best = { value, epoch: point.epoch }
-  }
-  return best ? `${best.value.toFixed(4)} · 第 ${best.epoch} 轮` : '暂无数据'
+function bestMapLabel(points: MetricPoint[] | undefined, taskType: string): string {
+  const best = bestMetricPoint(points, taskType)
+  const metric = primaryMetric(taskType)
+  return best && metric ? `${metric.name} ${Number(best.values[metric.key]).toFixed(4)} · 第 ${best.epoch} 轮` : '暂无数据'
 }
 
 function elapsedLabel(seconds: number | undefined): string {
@@ -142,6 +114,8 @@ function runView(task: TrainingTask, run: TrainingRun): TrainingTask {
   const snapshot = run.parameter_snapshot || {}
   return {
     ...task,
+    task_type: typeof snapshot.task_type === 'string' ? snapshot.task_type : task.task_type,
+    execution_node_id: run.execution_node_id,
     status: run.status,
     model_path: run.model_path,
     data_path: run.data_path,
@@ -176,6 +150,8 @@ export function ExperimentCompare() {
   const [detailRunId, setDetailRunId] = useState<string | null>(null)
   const [runDetails, setRunDetails] = useState<Record<string, CompareRunDetails>>({})
   const detailRequest = useRef<AbortController | null>(null)
+  const detailRevisions = useRef(new Map<string, string>())
+  const detailLiveItem = useRef<ComparisonRun | undefined>(undefined)
   const requestVersion = useRef(0)
   const activeRequest = useRef<AbortController | null>(null)
   const catalog = useRef<ComparisonRun[]>([])
@@ -202,6 +178,19 @@ export function ExperimentCompare() {
   })
   const lastSelectionUrl = useRef(params.toString())
   const selected = useMemo(() => selectedIds.map((id) => experiments.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[], [experiments, selectedIds])
+  const selectedProfiles = useMemo(() => [...new Set(selected.map((item) => item.view.task_type))]
+    .flatMap((taskType) => metricProfile(taskType) || []), [selected])
+  const metricOptions = useMemo(() => [...new Map(selectedProfiles.flatMap((profile) => [
+    ...profile.scoreSeries.map((item) => ({ key: item.key, label: item.name })),
+    ...profile.lossSeries.map((item) => ({ key: item.key, label: item.name })),
+  ]).map((item) => [item.key, item])).values()], [selectedProfiles])
+  const effectiveMetricKey = metricOptions.some((item) => item.key === metricKey) ? metricKey : metricOptions[0]?.key || metricKey
+  const summaryMetricRows = useMemo(() => [...new Map(selectedProfiles.flatMap((profile) => [
+    ...profile.scoreSeries.map((item): SummaryMetric => ({ key: item.key, label: item.name, direction: 'higher', unit: 'points' })),
+    ...profile.lossSeries.filter((item) => profile.summaryKeys.includes(item.key)).map((item): SummaryMetric => ({ key: item.key, label: item.name, direction: item.key.startsWith('val/') ? 'lower' : 'neutral', unit: 'value' })),
+  ]).map((item) => [item.key, item])).values()], [selectedProfiles])
+  const primaryMetricKeys = new Set(selected.map((item) => primaryMetric(item.view.task_type)?.key))
+
 
   useEffect(() => {
     if (lastSelectionUrl.current !== params.toString()) {
@@ -446,10 +435,11 @@ export function ExperimentCompare() {
     })
   }
 
-  async function loadRunDetails(item: ComparisonRun, refresh = false) {
+  const loadRunDetails = useCallback(async (item: ComparisonRun, refresh = false) => {
     detailRequest.current?.abort()
     detailRequest.current = null
-    if (!refresh && runDetails[item.id]?.loaded) return
+    const revision = `${item.run.updated_at}:${item.run.status}:${item.run.completed_epochs}`
+    if (!refresh && detailRevisions.current.get(item.id) === revision) return
     const controller = new AbortController()
     detailRequest.current = controller
     setRunDetails((current) => ({ ...current, [item.id]: { ...current[item.id], loading: true, loaded: current[item.id]?.loaded || false, errors: [] } }))
@@ -462,6 +452,7 @@ export function ExperimentCompare() {
     ])
     if (controller.signal.aborted) return
     const [metricsResult, artifactsResult, weightResult, eventsResult, logsResult] = results
+    if (results.every((result) => result.status === 'fulfilled')) detailRevisions.current.set(item.id, revision)
     const errors = results.flatMap((result) => result.status === 'rejected'
       ? [result.reason instanceof Error ? result.reason.message : '部分运行详情加载失败'] : [])
     setRunDetails((current) => ({
@@ -478,11 +469,10 @@ export function ExperimentCompare() {
       },
     }))
     if (detailRequest.current === controller) detailRequest.current = null
-  }
+  }, [])
 
   function openRunDetails(item: ComparisonRun) {
     setDetailRunId(item.id)
-    void loadRunDetails(item)
   }
 
   function closeRunDetails() {
@@ -491,12 +481,14 @@ export function ExperimentCompare() {
     setDetailRunId(null)
   }
 
-  const differentDatasets = new Set(selected.map((item) => item.view.data_path)).size > 1
-  const differentTaskTypes = new Set(selected.map((item) => item.view.task_type)).size > 1
-  const comparisonEnabled = selected.length > 1 && !differentDatasets && !differentTaskTypes && selected.every((item) => !!item.view.data_path)
+  const datasetComparison = comparisonEvidence(selected.map((item) => ({
+    taskType: item.view.task_type, nodeId: item.run.execution_node_id,
+    dataPath: item.run.data_path, parameters: item.run.parameter_snapshot || {},
+  })))
+  const comparisonEnabled = datasetComparison.comparable
   const lossComparable = new Set(selected.map((item) => item.view.model_path)).size === 1 && new Set(selected.map((item) => item.view.imgsz)).size === 1
   const baselineRun = selected.find((item) => item.id === baselineId) || selected[0]
-  const evaluationPoints = useMemo(() => Object.fromEntries(selected.map((item) => [item.id, bestEvaluationPoint(metrics[item.id])])), [selected, metrics])
+  const evaluationPoints = useMemo(() => Object.fromEntries(selected.map((item) => [item.id, bestMetricPoint(metrics[item.id], item.view.task_type)])), [selected, metrics])
   const latestRunValues = (item: ComparisonRun) => {
     const latestPoint = metrics[item.id]?.at(-1)
     if (latestPoint) return latestPoint.values
@@ -516,7 +508,7 @@ export function ExperimentCompare() {
     xAxis: { type: 'value', name: 'Epoch', nameTextStyle: { color: '#728692' }, axisLabel: { color: '#718692' }, axisLine: { lineStyle: { color: '#bccdd5' } }, splitLine: { show: false } },
     yAxis: { type: 'value', axisLabel: { color: '#718692' }, axisLine: { show: false }, splitLine: { lineStyle: { color: '#dbe6eb', type: 'dashed' } } },
     series: selected.map((item, index) => {
-      const data = (metrics[item.id] || []).map((point) => [point.epoch, finiteMetricValue(point.values[metricKey]) ? point.values[metricKey] : null])
+      const data = (metrics[item.id] || []).map((point) => [point.epoch, finiteMetricValue(point.values[effectiveMetricKey]) ? point.values[effectiveMetricKey] : null])
       return {
         name: `${item.task.name} · A${String(item.run.attempt_number).padStart(3, '0')}`, type: 'line', smooth: true,
         ...metricSeriesDisplay(data.map((point) => point[1])),
@@ -525,15 +517,15 @@ export function ExperimentCompare() {
         data,
       }
     }),
-  }), [selected, metrics, metricKey])
+  }), [selected, metrics, effectiveMetricKey])
 
-  const chartPointCounts = selected.map((item) => (metrics[item.id] || []).reduce((count, point) => count + (finiteMetricValue(point.values[metricKey]) ? 1 : 0), 0))
+  const chartPointCounts = selected.map((item) => (metrics[item.id] || []).reduce((count, point) => count + (finiteMetricValue(point.values[effectiveMetricKey]) ? 1 : 0), 0))
   const chartPointCount = chartPointCounts.reduce((total, count) => total + count, 0)
   const chartRunsLoading = selected.filter((item) => metrics[item.id] === undefined && !metricErrors[item.id]).length
   const chartRunsWithErrors = selected.filter((item) => Boolean(metricErrors[item.id])).length
   const chartRunsWithoutData = chartPointCounts.filter((count, index) => count === 0 && metrics[selected[index].id] !== undefined && !metricErrors[selected[index].id]).length
   const chartRunsWithSinglePoint = chartPointCounts.filter((count) => count === 1).length
-  const selectedMetricLabel = metricOptions.find((option) => option.key === metricKey)?.label || metricKey
+  const selectedMetricLabel = metricOptions.find((option) => option.key === effectiveMetricKey)?.label || effectiveMetricKey
   const chartContextNote = [
     chartRunsLoading && chartPointCount > 0 ? `${chartRunsLoading} 个运行的曲线数据仍在加载，当前先显示已加载结果` : '',
     chartRunsWithSinglePoint ? `${chartRunsWithSinglePoint} 个运行目前只有 1 个验证点，下一轮完成后将形成趋势线` : '',
@@ -572,6 +564,22 @@ export function ExperimentCompare() {
   }, [groups, visibleExperiments])
   const hasIncompleteSelected = selected.some((item) => item.run.status !== 'completed')
   const detailItem = detailRunId ? experiments.find((item) => item.id === detailRunId) : undefined
+  detailLiveItem.current = detailItem
+  const detailRevision = detailItem ? `${detailItem.id}:${detailItem.run.updated_at}:${detailItem.run.status}:${detailItem.run.completed_epochs}` : ''
+  useEffect(() => {
+    if (!detailRunId || !detailRevision) return
+    let cancelled = false
+    let timer = 0
+    const poll = async (refresh = false) => {
+      const item = detailLiveItem.current
+      if (!item || item.id !== detailRunId) return
+      await loadRunDetails(item, refresh)
+      if (!cancelled && activeRunStatuses.has(item.run.status)) timer = window.setTimeout(() => void poll(true), 5000)
+    }
+    void poll()
+    return () => { cancelled = true; window.clearTimeout(timer); detailRequest.current?.abort() }
+  }, [detailRunId, detailRevision, loadRunDetails])
+
   const experimentCount = Math.max(selected.length, 1)
   const experimentLayout = {
     '--experiment-count': experimentCount,
@@ -628,16 +636,15 @@ export function ExperimentCompare() {
     {error && <div className="alert error">{error}</div>}
     {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练运行</strong><span>{compareLimit === 2 ? '请选择 2 个运行' : `可同时选择 2～${compareLimit} 个运行`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练运行</button></div> : <>
       {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个训练运行才能对比</strong><span>当前只有一个运行，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}
-      <section className={`selected-experiments${selected.length > 4 ? ' many' : ''}`}>{selected.map((item, index) => <article key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><button onClick={() => setSelection(selectedIds.filter((id) => id !== item.id))}><X size={14} /></button><span>ATTEMPT {String(item.run.attempt_number).padStart(3, '0')} · {item.run.launch_mode.toUpperCase()}</span><h3>{item.task.name}</h3><p>{item.view.model_path.split('/').pop()} · {item.view.task_type}</p><div className="selected-run-status"><span className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</span>{item.run.status !== 'completed' && <small>阶段性数据</small>}</div><div className="selected-run-progress"><i style={{ width: `${item.view.progress}%` }} /></div><footer><strong>{metricValue({ ...item.view, latest_metrics: latestRunValues(item) }, ['metrics/mAP50(B)'])}</strong><small>mAP50</small><strong>{Math.round(item.view.progress)}%</strong><small>进度</small></footer></article>)}</section>
+      <section className={`selected-experiments${selected.length > 4 ? ' many' : ''}`}>{selected.map((item, index) => <article key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><button onClick={() => setSelection(selectedIds.filter((id) => id !== item.id))}><X size={14} /></button><span>ATTEMPT {String(item.run.attempt_number).padStart(3, '0')} · {item.run.launch_mode.toUpperCase()}</span><h3>{item.task.name}</h3><p>{item.view.model_path.split('/').pop()} · {item.view.task_type}</p><div className="selected-run-status"><span className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</span>{item.run.status !== 'completed' && <small>阶段性数据</small>}</div><div className="selected-run-progress"><i style={{ width: `${item.view.progress}%` }} /></div><footer><strong>{metricValue({ ...item.view, latest_metrics: latestRunValues(item) }, [primaryMetric(item.view.task_type)?.key || ''])}</strong><small>{primaryMetric(item.view.task_type)?.name || '主指标'}</small><strong>{Math.round(item.view.progress)}%</strong><small>进度</small></footer></article>)}</section>
       {selected.length >= 2 && <>
       <section className="compare-panel metric-summary-panel">
         <header><div><Activity size={17} /><div><h2>实验指标对比</h2><span>每列对应一个已选 Attempt，颜色与下方曲线一致</span></div></div><div className="metric-summary-controls"><label>指标口径<select aria-label="指标口径" value={evaluationMode} onChange={(event) => setEvaluationMode(event.target.value as 'latest' | 'best')}><option value="latest">最新指标</option><option value="best">最佳轮次指标</option></select></label><span className="metric-run-count">{selected.length} 个运行</span></div></header>
         <div className="metric-summary-notes">
-          <p>{evaluationMode === 'latest' ? '最新指标截至各实验已记录的训练轮次。' : '最佳轮次按各实验历史最高 mAP50-95 选取，以下六项指标均来自该轮；缺少 mAP50-95 时显示暂无数据。'} mAP50-95 为主要效果参考；训练 Loss 和累计耗时不参与效果排名。</p>
+          <p>{evaluationMode === 'latest' ? '最新指标截至各实验已记录的训练轮次。' : '最佳轮次按各自任务的主指标选取：分类使用 Top-1，其余任务使用对应框、掩码或姿态 mAP50-95。各项指标均来自该轮；主指标缺失时显示暂无数据。'} 训练 Loss 和累计耗时不参与效果排名。</p>
           {hasIncompleteSelected && <p className="dataset-comparison-note"><AlertCircle size={14} />排队、训练中、停止中、失败、停止和中断的运行只展示已记录阶段指标，不参与“最优”排名；差值标为阶段参考。续训 Attempt 尚无本次指标时不会沿用上次 Attempt 的指标。</p>}
-          {comparisonEnabled && <><p>差值相对于基准实验；同数据集配置仍需确认验证集版本、类别与评估条件一致。颜色表示数值差异，小幅变化不代表显著改善。</p><div className="metric-comparison-legend"><span className="improved"><ArrowUp size={12} />改善</span><span className="regressed"><ArrowDown size={12} />下降</span><span><Minus size={12} />持平 / 仅展示差值</span><span><Trophy size={12} />{hasIncompleteSelected ? '已完成运行中最优' : '本行有效数据最优'}</span></div></>}
-          {differentDatasets && <p className="dataset-comparison-note"><AlertCircle size={14} />数据集配置路径不同，仅展示指标，不进行优劣高亮或基准差值比较。</p>}
-          {differentTaskTypes && <p className="dataset-comparison-note"><AlertCircle size={14} />任务类型不同，仅展示指标，不进行优劣排名。</p>}
+          {comparisonEnabled && <><p>{datasetComparison.reason} 差值相对于基准实验，颜色表示数值差异，小幅变化不代表显著改善。</p><div className="metric-comparison-legend"><span className="improved"><ArrowUp size={12} />改善</span><span className="regressed"><ArrowDown size={12} />下降</span><span><Minus size={12} />持平 / 仅展示差值</span><span><Trophy size={12} />{hasIncompleteSelected ? '已完成运行中最优' : '本行有效数据最优'}</span></div></>}
+          {!comparisonEnabled && selected.length > 1 && <p className="dataset-comparison-note"><AlertCircle size={14} />{datasetComparison.reason}</p>}
           {comparisonEnabled && !lossComparable && <p>模型配置或输入尺寸不同，验证 Loss 仅展示数值差异，不标记最优。</p>}
         </div>
         <div className="comparison-table metric-comparison-table"><table style={{ minWidth: 170 + selected.length * 220 }}>
@@ -658,15 +665,15 @@ export function ExperimentCompare() {
               const tied = best !== null && valid.filter((value) => value === best).length > 1
               const baselineValue = baselineRun ? displayedMetric(evaluationValues(baselineRun), row.key) : null
               const label = `${evaluationMode === 'latest' ? '最新' : '最佳轮次'}${row.unit === 'points' ? ' ' : ''}${row.label}`
-              return <tr key={row.key}><th scope="row"><span>{label}</span><small className="metric-direction">{row.key === 'metrics/mAP50-95(B)' ? '主指标 · ' : ''}{direction === 'higher' ? '↑ 越高越好' : direction === 'lower' ? '↓ 越低越好 · 辅助参考' : '仅展示差值'}{hasIncompleteSelected ? ' · 最优仅比较已完成运行' : ''}</small></th>{selected.map((item, index) => <MetricComparisonCell key={item.id} value={values[index]} baselineValue={baselineValue} baseline={item.id === baselineRun?.id} baselineComplete={baselineRun?.run.status === 'completed'} complete={item.run.status === 'completed'} best={best !== null && item.run.status === 'completed' && values[index] === best} tied={tied} row={{ ...row, direction }} comparisonEnabled={comparisonEnabled} />)}</tr>
+              return <tr key={row.key}><th scope="row"><span>{label}</span><small className="metric-direction">{primaryMetricKeys.has(row.key) ? '主指标 · ' : ''}{direction === 'higher' ? '↑ 越高越好' : direction === 'lower' ? '↓ 越低越好 · 辅助参考' : '仅展示差值'}{hasIncompleteSelected ? ' · 最优仅比较已完成运行' : ''}</small></th>{selected.map((item, index) => <MetricComparisonCell key={item.id} value={values[index]} baselineValue={baselineValue} baseline={item.id === baselineRun?.id} baselineComplete={baselineRun?.run.status === 'completed'} complete={item.run.status === 'completed'} best={best !== null && item.run.status === 'completed' && values[index] === best} tied={tied} row={{ ...row, direction }} comparisonEnabled={comparisonEnabled} />)}</tr>
             })}
-            <tr><th scope="row">历史最佳 mAP50</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : bestMapLabel(metrics[item.id])}</td>)}</tr>
+            <tr><th scope="row">历史最佳主指标</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : bestMapLabel(metrics[item.id], item.view.task_type)}</td>)}</tr>
             <tr><th scope="row">累计训练耗时</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : elapsedLabel(metrics[item.id]?.at(-1)?.elapsed)}</td>)}</tr>
             <tr className="metric-dataset-row"><th scope="row">数据集配置</th>{selected.map((item) => <td key={item.id} title={item.view.data_path}>{item.view.data_path}</td>)}</tr>
           </tbody>
         </table></div>
       </section>
-      <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={metricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header>{chartPointCount ? <LineChartView option={chart} style={{ height: 390 }} /> : <div className="compare-chart-empty">{chartEmptyMessage}</div>}{chartContextNote && <p className="compare-chart-note">{chartContextNote}。</p>}</section>
+      <section className="compare-panel chart-panel"><header><div><BarChart3 size={17} /><div><h2>训练指标趋势</h2><span>按 Epoch 对齐叠加曲线</span></div></div><select value={effectiveMetricKey} onChange={(event) => setMetricKey(event.target.value)}>{metricOptions.map((option) => <option key={option.key} value={option.key}>{option.label}</option>)}</select></header>{chartPointCount ? <LineChartView option={chart} style={{ height: 390 }} /> : <div className="compare-chart-empty">{chartEmptyMessage}</div>}{chartContextNote && <p className="compare-chart-note">{chartContextNote}。</p>}</section>
       <section className="compare-panel parameter-panel"><header><div><Layers3 size={17} /><div><h2>训练参数差异</h2><span>来自每次运行的固化参数快照</span></div></div></header><div className="comparison-table"><table style={{ minWidth: 170 + selected.length * 200 }}><thead><tr><th>参数</th>{selected.map((item, index) => <th key={item.id}><i style={{ background: palette[index] }} />{item.task.name} · A{String(item.run.attempt_number).padStart(3, '0')}</th>)}</tr></thead><tbody>{parameterRows.map((parameter) => { const values = selected.map((item) => parameter.value(item.view)); const different = new Set(values.map(String)).size > 1; return <tr className={different ? 'different' : ''} key={parameter.label}><td>{parameter.label}{different && <em>不同</em>}</td>{values.map((value, index) => <td key={`${parameter.label}-${selected[index].id}`}>{value}</td>)}</tr> })}</tbody></table></div></section>
       </>}
     </>}

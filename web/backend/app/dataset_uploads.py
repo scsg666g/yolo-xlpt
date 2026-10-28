@@ -21,7 +21,7 @@ import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 from starlette.requests import ClientDisconnect
 
@@ -102,7 +102,9 @@ def managed_dataset_mutation():
 
 def local_tasks_by_reference_priority(db: Session) -> list[TrainingTask]:
     return list(db.scalars(select(TrainingTask).where(
-        TrainingTask.execution_node_id.is_(None),
+        or_(TrainingTask.execution_node_id.is_(None), TrainingTask.execution_node_id == 'local',
+            TrainingTask.id.in_(select(TrainingRun.task_id).where(
+                or_(TrainingRun.execution_node_id.is_(None), TrainingRun.execution_node_id == 'local')))),
     ).order_by(
         TrainingTask.deleted_at.is_not(None), TrainingTask.created_at.desc(), TrainingTask.id,
     )).all())
@@ -184,21 +186,26 @@ def _dataset_config_references_directory(config_path: Path, target_directory: Pa
 
 
 def dataset_references(db: Session, config_path: str,
-                       local_tasks: list[TrainingTask] | None = None) -> list[TrainingTask]:
+                       local_tasks: list[TrainingTask] | None = None,
+                       historical: dict[str, list[str]] | None = None) -> list[TrainingTask]:
     target = canonical_path(config_path)
     target_directory = target.parent
     tasks = local_tasks if local_tasks is not None else local_tasks_by_reference_priority(db)
     task_ids = [task.id for task in tasks]
-    historical: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
-    if task_ids:
-        for run in db.scalars(select(TrainingRun).where(TrainingRun.task_id.in_(task_ids))):
-            if run.data_path:
-                historical[run.task_id].append(run.data_path)
+    if historical is None:
+        historical = {task_id: [] for task_id in task_ids}
+        if task_ids:
+            for task_id, data_path in db.execute(select(TrainingRun.task_id, TrainingRun.data_path).where(
+                    TrainingRun.task_id.in_(task_ids),
+                    or_(TrainingRun.execution_node_id.is_(None), TrainingRun.execution_node_id == 'local'))):
+                if data_path:
+                    historical[task_id].append(data_path)
 
     reference_cache: dict[str, bool] = {}
     references: list[TrainingTask] = []
     for task in tasks:
-        paths = [task.data_path, *historical.get(task.id, [])]
+        paths = [task.data_path if task.execution_node_id in (None, 'local') else None,
+                 *historical.get(task.id, [])]
         referenced = False
         for raw_path in dict.fromkeys(path for path in paths if path):
             candidate = canonical_path(raw_path)
@@ -641,6 +648,9 @@ def validate_contents(files_root: Path, manifest: dict, names: list[str], check=
             if not targets:
                 empty_labels[relative.parts[1]].add(str(PurePosixPath(*relative.parts[2:]).with_suffix("")))
     report_progress(check, 'content_validate', total_files, total_files)
+    for split in ('train', 'val'):
+        if not images[split]:
+            raise HTTPException(422, f"数据集 images/{split} 至少需要一张有效图片，请补齐后重新加载。")
     missing = sum(len(images[split] - labels[split]) for split in images)
     orphaned = sum(len(labels[split] - images[split]) for split in labels)
     empty_backgrounds = sum(len(images[split] & empty_labels[split]) for split in images)

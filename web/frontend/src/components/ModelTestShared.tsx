@@ -1,3 +1,4 @@
+import { primaryMetric } from '../metricProfiles'
 /* eslint-disable react-refresh/only-export-components -- Shared UI helpers are consumed by both model-test views. */
 import {
   AlertCircle, Box, CheckCircle2, Clock3, Cpu, FileArchive, Gauge, Images, Info,
@@ -146,13 +147,12 @@ export function modelTestDetectionLabel(count: number | null) {
   return count === null ? '结果未就绪' : count > 0 ? `检测到 ${count} 个目标` : '未检测到目标'
 }
 
-export const modelTestMetrics = {
-  detect: { key: 'metrics/mAP50-95(B)', label: 'mAP50-95' },
-  segment: { key: 'metrics/mAP50-95(M)', label: 'Mask mAP50-95' },
-  classify: { key: 'metrics/accuracy_top1', label: 'Top-1 accuracy' },
-  pose: { key: 'metrics/mAP50-95(P)', label: 'Pose mAP50-95' },
-  obb: { key: 'metrics/mAP50-95(B)', label: 'OBB mAP50-95' },
-} as const
+export const modelTestMetrics = Object.fromEntries(
+  (['detect', 'segment', 'classify', 'pose', 'obb'] as const).map((task) => {
+    const metric = primaryMetric(task)!
+    return [task, { key: metric.key, label: metric.name }]
+  }),
+) as Record<YoloTaskType, { key: string; label: string }>
 
 export function isSupportedModelTestTask(task: string | null | undefined): task is YoloTaskType {
   return !!task && Object.prototype.hasOwnProperty.call(modelTestMetrics, task)

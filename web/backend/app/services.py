@@ -55,6 +55,7 @@ from .metric_files import MetricCsvReader
 from .parameter_catalog import training_parameter_keys
 from .training_outcome import classify_training_exit
 from .batch_history import BatchLogReader, append_reductions, scan_batch_log
+from .local_devices import bind_command as bind_local_gpu_command, visible_inventory
 
 
 logger = logging.getLogger("yolo-platform.training-scheduler")
@@ -1372,7 +1373,7 @@ class TrainingScheduler:
             if device in {"cpu", "mps"}:
                 assignments = [non_gpu_assignment("local", candidate.id, device)]
             elif device and all(part.strip().isdigit() for part in device.split(",")):
-                assignments = resolve_gpu_assignments(device, gpu_inventory(), node_id="local")
+                assignments = resolve_gpu_assignments(device, visible_inventory(gpu_inventory()), node_id="local")
                 if assignments is None:
                     db.rollback()
                     return False
@@ -1474,9 +1475,37 @@ class TrainingScheduler:
             self._fail_before_launch(db, run.id, message, message)
             return
         command = self._command(task, run, dataset_path)
+        environment = training_environment(task_id=task.id, run_id=run.id)
+        device = str((run.parameter_snapshot or {}).get('device', task.device) or '').strip().lower()
+        try:
+            assignments = [{'index': item.gpu_index, 'uuid': item.gpu_uuid}
+                           for item in run.gpu_reservations]
+            command, environment = bind_local_gpu_command(
+                command, device, assignments,
+                gpu_inventory() if any(item.startswith('device=') for item in command)
+                and device and all(part.strip().isdigit() for part in device.split(',')) else [],
+                environment,
+            )
+        except (ValueError, TypeError) as exc:
+            self._fail_before_launch(db, run.id, str(exc), f'本机 GPU 绑定失败：{exc}')
+            return
         from .dataset_provenance import capture as capture_dataset
         from .run_dataset_snapshot import enrich as enrich_dataset
         snapshot = dict(run.parameter_snapshot or {})
+        if device and all(part.strip().isdigit() for part in device.split(',')) and any(
+            item.startswith('device=') for item in command
+        ):
+            snapshot['local_device_binding'] = {
+                'version': 1, 'requested_device': device,
+                'cuda_visible_devices': environment.get('CUDA_VISIBLE_DEVICES'),
+                'cuda_device_order': environment.get('CUDA_DEVICE_ORDER'),
+                'devices': [
+                    {'physical_index': int(part), 'logical_index': logical, 'uuid': identity}
+                    for logical, (part, identity) in enumerate(zip(
+                        device.split(','), environment['CUDA_VISIBLE_DEVICES'].split(','), strict=True,
+                    ))
+                ],
+            }
         if 'dataset_snapshot' not in snapshot:
             snapshot['dataset_snapshot'] = enrich_dataset(db, capture_dataset(
                 run.data_path, task_type=task.task_type, node_id='local',
@@ -1510,10 +1539,12 @@ class TrainingScheduler:
             log_handle = log_path.open("a", encoding="utf-8", buffering=1)
             log_handle.write(f"\n[{utcnow().isoformat()}] COMMAND {json.dumps(command, ensure_ascii=False)}\n")
             log_handle.write(f"[{utcnow().isoformat()}] ENV MKL_THREADING_LAYER={TRAINING_MKL_THREADING_LAYER}\n")
+            if snapshot.get('local_device_binding'):
+                log_handle.write(f"[{utcnow().isoformat()}] DEVICE_BINDING {json.dumps(snapshot['local_device_binding'], ensure_ascii=False)}\n")
             process = subprocess.Popen(
                 command,
                 cwd=ULTRALYTICS_ROOT,
-                env=training_environment(task_id=task.id, run_id=run.id),
+                env=environment,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1735,7 +1766,7 @@ class TrainingScheduler:
             queued_ids = db.scalars(select(TrainingRun.id).where(
                 TrainingRun.status == "queued", TrainingRun.execution_node_id.is_(None),
             ).order_by(TrainingRun.queued_at)).all()
-            local_gpus = gpu_inventory()
+            local_gpus = visible_inventory(gpu_inventory())
             for run_id in queued_ids:
                 db.expire_all()
                 run = db.get(TrainingRun, run_id)
@@ -1752,7 +1783,7 @@ class TrainingScheduler:
                 elif device and all(part.strip().isdigit() for part in device.split(",")):
                     assignments = resolve_gpu_assignments(device, local_gpus, node_id="local")
                     if assignments is None:
-                        set_queue_reason(db, run, "所选 GPU 不在本地设备清单中，请检查设备编号及驱动")
+                        set_queue_reason(db, run, "所选 GPU 不在本地设备清单或 CUDA_VISIBLE_DEVICES 可核验范围中，请检查驱动；可使用 GPU UUID 配置可见设备")
                         db.commit()
                         continue
                 else:

@@ -28,6 +28,8 @@ export interface PlatformHealth {
   scheduler_last_error_at?: string | null
   local_deletion_worker: 'running' | 'stopped'
   inference_worker: 'running' | 'stopped'
+  dataset_worker?: 'running' | 'stopped' | 'error'
+  dataset_worker_health?: { status?: string; active_error?: string | null; refresh_active_error?: string | null; last_error?: string | null; last_error_at?: string | null; refresh_error?: string | null; refresh_error_at?: string | null }
   database: 'ok'
   database_latency_ms: number
   runs_root: string
@@ -392,6 +394,7 @@ export interface ManagedDataset {
   refresh_error?: string | null
   blocking_operation_kind?: string | null
   can_delete?: boolean
+  delete_block_reason?: string | null
   blocking_operation_id?: string | null
   node_name?: string
   id: string
