@@ -87,7 +87,7 @@ def test_scheduler_claim_is_atomic_across_scheduler_instances(tmp_path: Path):
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     with session_factory() as db:
-        task = make_task("task-atomic-claim", status="queued")
+        task = make_task("task-atomic-claim", status="queued", device="cpu")
         run = TrainingRun(
             id="run-atomic-claim", task=task, attempt_number=1, launch_mode="fresh", status="queued",
             model_path=task.model_path, data_path=task.data_path, parameter_snapshot={"epochs": 10},
@@ -210,7 +210,7 @@ def test_stop_winning_between_prepared_commit_and_popen_return_terminates_proces
     session_factory = sessionmaker(bind=engine, expire_on_commit=False)
     run_dir = tmp_path / "runs" / "attempt-001"
     with session_factory() as db:
-        task = make_task("task-stop-launch-race", status="queued")
+        task = make_task("task-stop-launch-race", status="queued", device="cpu")
         run = TrainingRun(
             id="run-stop-launch-race", task=task, attempt_number=1, launch_mode="fresh", status="queued",
             model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir),

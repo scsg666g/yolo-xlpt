@@ -208,6 +208,8 @@ class RunRead(BaseModel):
     launch_mode: str
     status: str
     execution_node_id: str | None = None
+    monitoring_status: Literal["local", "online", "reconnecting", "unavailable"] | None = None
+    monitoring_last_seen_at: datetime | None = None
     pid: int | None
     process_started_at: datetime | None
     command: list[Any]

@@ -221,9 +221,25 @@ def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
 
 
 def serialize_run(db: Session, run: TrainingRun) -> RunRead:
-    """Add durable deletion operation state without changing the run table."""
+    """Derive monitoring/deletion state without migrating historical run rows."""
     status, error, operation = attempt_deletion_state(db, run)
+    monitoring_status = None
+    last_seen = None
+    if run.status in {"starting", "running", "stopping"}:
+        if not run.execution_node_id:
+            monitoring_status = "local"
+        else:
+            node = db.get(ComputeNode, run.execution_node_id)
+            last_seen = node.last_seen_at if node else None
+            if not node or not node.enabled:
+                monitoring_status = "unavailable"
+            elif last_seen is None or (utcnow() - as_utc(last_seen)).total_seconds() > max(30, node.report_interval_seconds * 3):
+                monitoring_status = "reconnecting"
+            else:
+                monitoring_status = "online"
     return RunRead.model_validate(run).model_copy(update={
+        "monitoring_status": monitoring_status,
+        "monitoring_last_seen_at": last_seen,
         "deletion_status": status,
         "deletion_error": error,
         "deletion_requested_at": operation.created_at if operation else None,

@@ -277,6 +277,9 @@ def test_recovered_agent_process_ignoring_term_is_stopped(agent, training, monke
     import json
     import subprocess
     config, task = training
+    # This test owns Popen and checks its OS exit code. Real exec adoption has
+    # no Popen handle; its separate reaping regression covers waitpid cleanup.
+    monkeypatch.setattr(agent, "reap_finished_training", lambda _identity: None)
     config["training_stop_timeout_seconds"] = 1
     ready = tmp_path / "child-ready"
     command = [sys.executable, "-c", "import pathlib,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path(sys.argv[1]).touch(); time.sleep(60)", str(ready)]

@@ -31,7 +31,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -587,6 +587,23 @@ class LockBundle:
         for handle in reversed(self.handles):
             handle.close()
         self.handles.clear()
+
+
+class TrainingDetached(Exception):
+    """The live training process retains ownership until the next Agent adopts it."""
+
+
+def detach_training(config: dict, task: dict, command: list, identity: dict | None) -> None:
+    # Never publish a terminal result or unlock a live child's inherited flock.
+    # A previous launching/running record remains useful if this refresh fails.
+    try:
+        if not process_identity_matches(identity):
+            raise ValueError("无法重新确认训练进程身份，保留原活动记录等待核验")
+        save_active_run(config, task, "running", command=command, identity=identity)
+    except (OSError, ValueError, TypeError):
+        LOGGER.exception("训练交接记录刷新失败；保留原记录，不停止进程、不释放其资源锁")
+    LOGGER.info("Agent 退出，训练 %s 继续运行；下次启动将核验并接管", task["run_id"])
+    raise TrainingDetached()
 
 
 def _release_lock_handles(handles: list) -> None:
@@ -2286,6 +2303,21 @@ def _terminate_recovered_process(identity: dict, *, force: bool = False) -> None
         pass
 
 
+def reap_finished_training(identity: dict | None) -> None:
+    """Exec retains parenthood, so reap only this verified, already-dead child."""
+    if not isinstance(identity, dict) or type(identity.get("pid")) is not int:
+        return
+    try:
+        fields = Path(f"/proc/{identity['pid']}/stat").read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        if (fields[0] != "Z" or int(fields[1]) != os.getpid()
+                or int(fields[19]) != identity.get("start_ticks")
+                or Path("/proc/sys/kernel/random/boot_id").read_text().strip() != identity.get("boot_id")):
+            return
+        os.waitpid(identity["pid"], os.WNOHANG)
+    except (OSError, ValueError, IndexError, ChildProcessError):
+        pass
+
+
 def _recovery_identity(state: dict) -> dict | None:
     identity = state.get("process")
     if process_identity_matches(identity):
@@ -2507,6 +2539,11 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 status, error, exit_code = "stopped", None, None
             else:
                 status, error, exit_code = recovered_natural_exit(task, completed, log_lines)
+            try:
+                report_manifest(config, {**task, "output_root": task["parameters"]["remote_output_root"]})
+                report_training_trace(config, task, set())
+            except (OSError, ValueError, HTTPError, URLError):
+                LOGGER.warning("离线期间结束的任务产物暂未同步，可由平台重新请求扫描")
             path = _save_terminal_for_retry(config, task, {
                 "status": status, "error_message": error, "exit_code": exit_code,
                 "completion_info": {} if requested_stop else training_completion_info(task, completed, log_lines),
@@ -2524,6 +2561,8 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
         requested_stop = bool(control.get("stop"))
         stop_reason = "platform_stop" if requested_stop else None
         sent_epochs: set[int] = set()
+        sent_trace_images: set[str] = set()
+        last_artifacts_at = 0.0
         while process_identity_matches(identity) and not stop.is_set():
             if requested_stop:
                 _terminate_recovered_process(identity)
@@ -2538,6 +2577,13 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             completed = max(completed, task.get("completed_epochs", 0))
             latest = latest or task.get("latest_metrics", {})
             new_metrics = [item for item in metrics if item["epoch"] not in sent_epochs][:256]
+            if time.monotonic() - last_artifacts_at >= 30:
+                try:
+                    report_manifest(config, {**task, "output_root": task["parameters"]["remote_output_root"]})
+                    report_training_trace(config, task, sent_trace_images)
+                except (OSError, ValueError, HTTPError, URLError):
+                    pass
+                last_artifacts_at = time.monotonic()
             payload = {"status": "stopping" if requested_stop else "running", "pid": identity["pid"],
                        "completed_epochs": completed,
                        "progress": min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
@@ -2557,7 +2603,9 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             if requested_stop:
                 break
             stop.wait(2)
-        if stop.is_set() and process_identity_matches(identity):
+        if stop.is_set() and not requested_stop and getattr(stop, "preserve_training", False) and process_identity_matches(identity):
+            detach_training(config, task, command, identity)
+        if stop.is_set() and not requested_stop and process_identity_matches(identity):
             requested_stop, stop_reason = True, "agent_shutdown"
             _terminate_recovered_process(identity)
         if requested_stop:
@@ -2580,6 +2628,11 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             status, error, exit_code = "stopped", None, None
         else:
             status, error, exit_code = recovered_natural_exit(task, completed, log_lines)
+        try:
+            report_manifest(config, {**task, "output_root": task["parameters"]["remote_output_root"]})
+            report_training_trace(config, task, sent_trace_images)
+        except (OSError, ValueError, HTTPError, URLError):
+            LOGGER.warning("接管任务产物暂未同步，可由平台重新请求扫描")
         path = _save_terminal_for_retry(config, task, {
             "status": status, "error_message": error, "exit_code": exit_code,
             "completion_info": {} if requested_stop else training_completion_info(task, completed, log_lines),
@@ -2589,9 +2642,14 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             "log_tail": log_lines, "command": command,
             "run_dir": task["run_dir"]})
         _deliver_terminal_once(config, path)
+    except TrainingDetached:
+        if lock is not None:
+            lock.close()  # Close our copy only; the training child keeps its locks.
+        release_lock = False
     except Exception:
         LOGGER.exception("恢复远程训练监控失败，活动状态已保留")
     finally:
+        reap_finished_training(state.get("process"))
         if release_lock:
             release_training_lock(lock)
 
@@ -2690,11 +2748,13 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                         pass
                     last_trace_at = time.monotonic()
                 log_lines = recent_log_lines(log_path)
-                status = "stopping" if stop.is_set() or requested_stop else "running"
+                status = "stopping" if requested_stop else "running"
                 report_progress({"status": status, "pid": process.pid,
                              "completed_epochs": completed, "progress": min(99.99, completed / max(1, int(task['parameters']['epochs'])) * 100),
                              "latest_metrics": latest, "metrics": new_metrics, "log_tail": log_lines,
                              "run_dir": task["run_dir"]})
+            if stop.is_set() and not requested_stop and getattr(stop, "preserve_training", False) and process.poll() is None:
+                detach_training(config, task, command, identity)
             if stop.is_set() and process.poll() is None:
                 request_stop("agent_shutdown")
             try:
@@ -2750,6 +2810,8 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             if stop.is_set():
                 break
             stop.wait(10)
+    except TrainingDetached:
+        raise
     except Exception as exc:
         if process and process.poll() is None:
             try:
@@ -2825,7 +2887,12 @@ def run_remote_task(config: dict, task: dict, stop: threading.Event, training_lo
                 "log_tail": recent_log_lines(Path(task["log_path"])), "run_dir": task.get("run_dir")})
             _deliver_terminal_once(config, path)
             return
+        if stop.is_set() and getattr(stop, "preserve_training", False):
+            return  # Keep the confirmed lease; do not launch new work during exit.
         _run_remote_task(config, task, stop, lock)
+    except TrainingDetached:
+        lock.close()  # No LOCK_UN while the child is still training.
+        lock = None
     finally:
         release_training_lock(lock)
 
@@ -3027,12 +3094,55 @@ def run_dataset_operation(config, work, stop):
             handle.close()
 
 
+def recover_active_workers(config: dict, active_training: dict) -> None:
+    """Reconcile durable runs before telemetry or fresh claims; never spawn duplicates."""
+    active_states = load_active_runs(config)
+    for run_id, (worker, _worker_stop) in list(active_training.items()):
+        if not worker.is_alive():
+            active_training.pop(run_id, None)
+    known = set(active_training)
+    for active_state in active_states:
+        task = active_state["task"]
+        run_id = active_state["run_id"]
+        if run_id in known:
+            continue
+        worker_stop = threading.Event()
+        identity = (_recovery_identity(active_state)
+                    if active_state["phase"] in {"launching", "running"} else None)
+        process_lock = False
+        if identity:
+            try:
+                process_lock = process_holds_task_locks(config, task, identity["pid"])
+            except (OSError, ValueError, TypeError):
+                process_lock = False
+        if process_lock:
+            worker = threading.Thread(
+                target=recover_remote_task,
+                args=(config, active_state, worker_stop, None, True),
+                name=f"remote-training-{run_id[:8]}", daemon=True)
+            LOGGER.info("已识别并接管训练进程 %s（持有其 GPU 与输出目录锁）", run_id)
+        elif active_state["phase"] in {"claimed", "confirmed"}:
+            worker = threading.Thread(target=run_remote_task,
+                                      args=(config, task, worker_stop),
+                                      name=f"remote-training-{run_id[:8]}", daemon=True)
+            LOGGER.info("正在恢复尚未启动的远程任务 %s", run_id)
+        else:
+            worker = threading.Thread(target=recover_remote_task,
+                                      args=(config, active_state, worker_stop),
+                                      name=f"remote-training-{run_id[:8]}", daemon=True)
+            LOGGER.info("正在恢复远程任务 %s", run_id)
+        active_training[run_id] = (worker, worker_stop)
+        worker.start()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="YOLO Forge 算力监控与可选远程训练 Agent")
     parser.add_argument("--config", required=True, type=Path, help="平台下载的 JSON 配置")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="采集并上报一次后退出，用于验证连接")
     mode.add_argument("--check-config", action="store_true", help="仅在本机检查配置和训练环境，不连接中心")
+    parser.add_argument("--shutdown-policy", choices=("preserve", "stop"), default="preserve",
+                        help="退出策略：preserve 保留训练（默认），stop 同时停止训练；平台停止按钮始终有效")
     parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -3083,8 +3193,16 @@ def main() -> int:
         LOGGER.error("Agent 实例与共享训练工作区登记失败，已停止启动：%s", exc)
         return finish(2)
     stop = threading.Event()
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, lambda *_: stop.set())
+    reload_requested = False
+
+    def shutdown(signum, _frame):
+        nonlocal reload_requested
+        if signum == signal.SIGHUP:
+            reload_requested = True
+        stop.set()
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, shutdown)
     failures = 0
     interval = config["report_interval_seconds"]
     active_training: dict[str, tuple[threading.Thread, threading.Event]] = {}
@@ -3094,6 +3212,15 @@ def main() -> int:
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
                 "已启用" if config["enable_training"] else "未启用")
     while not stop.is_set():
+        recovery_ready = True
+        if config["enable_training"] and not args.once:
+            try:
+                recover_active_workers(config, active_training)
+            except (OSError, ValueError, TypeError, KeyError):
+                recovery_ready = False
+                LOGGER.exception("活动训练核验失败；暂停领取新任务，保留进程和记录")
+        if stop.is_set():
+            break
         try:
             payload = collect(config["nvidia_smi_bin"], config)
             interval = send(config, payload)
@@ -3130,44 +3257,6 @@ def main() -> int:
                     if not pending_finals_ready:
                         delay = max(delay, interval)
                     active_states = load_active_runs(config)
-                    for run_id, (worker, _worker_stop) in list(active_training.items()):
-                        if not worker.is_alive():
-                            active_training.pop(run_id, None)
-                    known = set(active_training)
-                    for active_state in active_states:
-                        task = active_state["task"]
-                        run_id = active_state["run_id"]
-                        if run_id in known:
-                            continue
-                        worker_stop = threading.Event()
-                        identity = (_recovery_identity(active_state)
-                                    if active_state["phase"] in {"launching", "running"} else None)
-                        process_lock = False
-                        if identity:
-                            try:
-                                process_lock = process_holds_task_locks(config, task, identity["pid"])
-                            except (OSError, ValueError, TypeError):
-                                process_lock = False
-                        if process_lock:
-                            worker = threading.Thread(
-                                target=recover_remote_task,
-                                args=(config, active_state, worker_stop, None, True),
-                                name=f"remote-training-{run_id[:8]}", daemon=True)
-                            LOGGER.info("已识别并接管训练进程 %s（持有其 GPU 与输出目录锁）", run_id)
-                        elif active_state["phase"] in {"claimed", "confirmed"}:
-                            worker = threading.Thread(target=run_remote_task,
-                                                      args=(config, task, worker_stop),
-                                                      name=f"remote-training-{run_id[:8]}", daemon=True)
-                            LOGGER.info("正在恢复尚未启动的远程任务 %s", run_id)
-                        else:
-                            worker = threading.Thread(target=recover_remote_task,
-                                                      args=(config, active_state, worker_stop),
-                                                      name=f"remote-training-{run_id[:8]}", daemon=True)
-                            LOGGER.info("正在恢复远程任务 %s", run_id)
-                        active_training[run_id] = (worker, worker_stop)
-                        worker.start()
-
-                    active_states = load_active_runs(config)
                     legacy_active = any(not (state["task"].get("gpu_assignment") or [])
                                         for state in active_states)
                     if active_dataset_operation is not None and active_dataset_operation.is_alive():
@@ -3175,6 +3264,8 @@ def main() -> int:
                     elif legacy_active:
                         # Old centers and CPU runs keep the node-wide serial contract.
                         pass
+                    elif not recovery_ready:
+                        pass  # Do not claim while an existing run cannot be verified.
                     elif not pending_finals_ready:
                         # Keep retrying terminal acknowledgments before asking the
                         # center for more work, so local state cannot grow unbounded.
@@ -3189,6 +3280,8 @@ def main() -> int:
                         # The center arbitrates each GPU UUID reservation. Continue
                         # claiming while it has independently schedulable work.
                         for _ in range(16):
+                            if stop.is_set():
+                                break
                             response = api_json(config, f"/api/compute/nodes/{config['node_id']}/agent/poll", "POST", {})
                             task = response.get("task")
                             if not task:
@@ -3226,12 +3319,26 @@ def main() -> int:
             return finish(0)
         stop.wait(delay + (random.random() if failures else 0))
     for _worker, worker_stop in active_training.values():
+        worker_stop.preserve_training = reload_requested or args.shutdown_policy == "preserve"
         worker_stop.set()
     for worker, _worker_stop in active_training.values():
         worker.join()
     if active_operation and active_operation.is_alive():
         active_operation.join()
-    LOGGER.info("Agent 已停止")
+    if active_dataset_operation and active_dataset_operation.is_alive():
+        active_dataset_operation.join()
+    LOGGER.info("Agent 已停止；训练退出策略：%s",
+                "保留训练" if reload_requested or args.shutdown_policy == "preserve" else "停止训练")
+    if reload_requested:
+        # Exec keeps MAINPID and the service cgroup intact. Do not release the
+        # instance flock before exec: its non-inheritable FD closes atomically.
+        # All training workers have saved state and closed only their lock copies.
+        LOGGER.info("正在重载 Agent；训练进程保持运行")
+        try:
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+        except OSError:
+            LOGGER.exception("Agent 重载失败；训练仍保留，请重新启动 Agent")
+            return finish(1)
     return finish(0)
 
 

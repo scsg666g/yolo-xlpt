@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -257,6 +258,176 @@ def test_recovery_recognizes_legacy_process_holding_only_workspace_lock(agent, t
     recovered = agent.acquire_training_lock(config)
     assert recovered is not None
     agent.release_training_lock(recovered)
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_preserved_training_survives_repeated_adoption_and_keeps_locks(agent, training, monkeypatch, assigned):
+    config, task = training
+    if assigned:
+        task["parameters"]["device"] = "0"
+        task["gpu_assignment"] = [{"index": 0, "uuid": "GPU-SIMULATED"}]
+        monkeypatch.setattr(agent, "query", lambda *_args: "0, GPU-SIMULATED\n")
+    build = agent.build_training_command
+    processes, updates = [], []
+    real_popen = subprocess.Popen
+    stop = threading.Event()
+    stop.preserve_training = True
+
+    def command(config, task):
+        build(config, task)
+        return [sys.executable, "-c",
+                "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
+                "(p/'results.csv').write_text('epoch,time,score\\n1,1,0.5\\n'); "
+                "print('simulation running',flush=True); time.sleep(60)", task["run_dir"], "device=0"]
+
+    def launch(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    def api(_config, path, method="GET", payload=None, extra_headers=None):
+        if path.endswith("/control"):
+            return {"status": "running", "stop": False}
+        if path.endswith("/update"):
+            updates.append(payload)
+            stop.set()
+        return {}
+
+    monkeypatch.setattr(agent, "build_training_command", command)
+    monkeypatch.setattr(agent.subprocess, "Popen", launch)
+    monkeypatch.setattr(agent, "api_json", api)
+    try:
+        agent.run_remote_task(config, task, stop)
+        assert len(processes) == 1
+        process = processes[0]
+        assert process.poll() is None
+        identity = agent.load_active_run(config)["process"]
+        deadline = time.monotonic() + 5
+        while not Path(task["run_dir"], "results.csv").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert agent.process_holds_task_locks(config, task, process.pid)
+        assert agent.acquire_task_training_lock(config, task) is None
+        for _ in range(2):
+            state = agent.load_active_run(config)
+            stop.clear()
+            agent.recover_remote_task(config, state, stop, process_holds_lock=True)
+            assert process.poll() is None
+            assert agent.load_active_run(config)["process"] == identity
+            assert agent.acquire_task_training_lock(config, task) is None
+            assert updates[-1]["completed_epochs"] == 1
+        assert all(update["status"] == "running" for update in updates)
+        assert not list(Path(config["training_state_dir"]).glob("*.json"))
+        assert "simulation running" in Path(task["log_path"]).read_text()
+        # Explicit platform stop still wins over a simultaneous preserve exit.
+        stop.set()
+        def request_stop(_config, path, method="GET", payload=None, extra_headers=None):
+            if path.endswith("/control"):
+                return {"status": "stopping", "stop": True}
+            if path.endswith("/update"):
+                updates.append(payload)
+            return {}
+        monkeypatch.setattr(agent, "api_json", request_stop)
+        agent.recover_remote_task(config, agent.load_active_run(config), stop, process_holds_lock=True)
+        process.wait(timeout=5)
+        assert updates[-1]["status"] == "stopped"
+        assert updates[-1]["stop_reason"] == "platform_stop"
+        assert agent.load_active_run(config) is None
+        lock = agent.acquire_task_training_lock(config, task)
+        assert lock is not None
+        agent.release_training_lock(lock)
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+
+
+def test_preserve_exit_before_launch_keeps_confirmed_lease(agent, training, monkeypatch):
+    config, task = training
+    stop = threading.Event()
+    stop.preserve_training = True
+    stop.set()
+    monkeypatch.setattr(agent, "_run_remote_task", lambda *_: pytest.fail("must not launch while exiting"))
+    agent.run_remote_task(config, task, stop)
+    assert agent.load_active_run(config)["phase"] == "confirmed"
+    lock = agent.acquire_task_training_lock(config, task)
+    assert lock is not None
+    agent.release_training_lock(lock)
+
+
+def test_handoff_write_failure_never_reports_failure_or_unlocks_child(agent, training, monkeypatch):
+    config, task = training
+    agent.save_active_run(config, task, "running")
+    monkeypatch.setattr(agent, "process_identity_matches", lambda _: True)
+    monkeypatch.setattr(agent, "save_active_run", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(agent.TrainingDetached):
+        agent.detach_training(config, task, ["dummy"], {"pid": 1})
+    assert agent.load_active_run(config)["phase"] == "running"
+
+
+def test_exec_reload_reaps_only_its_own_exited_training_child(agent):
+    process = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(.1)"])
+    try:
+        identity = agent.process_identity(process.pid)
+        assert identity
+        path = Path(f"/proc/{process.pid}/stat")
+        deadline = time.monotonic() + 5
+        while path.read_text().rsplit(")", 1)[1].split()[0] != "Z" and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert path.exists()
+        agent.reap_finished_training({**identity, "start_ticks": -1})
+        assert path.exists()
+        agent.reap_finished_training(identity)
+        assert not path.exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+def test_restart_adopts_two_gpu_runs_without_releasing_either_reservation(agent, training, monkeypatch):
+    config, original = training
+    monkeypatch.setattr(agent, "query", lambda *_args: "0, GPU-A\n1, GPU-B\n")
+    processes, identities, tasks, workers = [], [], [], {}
+    for index in range(2):
+        task = {**original, "run_id": str(index + 1) * 32,
+                "parameters": {**original["parameters"], "device": str(index)},
+                "gpu_assignment": [{"index": index, "uuid": f"GPU-{'AB'[index]}"}]}
+        tasks.append(task)
+    try:
+        for task in tasks:
+            lock = agent.acquire_task_training_lock(config, task)
+            assert lock is not None
+            command = [sys.executable, "-c", "import time; time.sleep(60)", task["run_id"]]
+            process = subprocess.Popen(command, start_new_session=True, pass_fds=lock.filenos())
+            processes.append(process)
+            identity = agent.process_identity(process.pid)
+            identities.append(identity)
+            agent.save_active_run(config, task, "running", command=command, identity=identity)
+            lock.close()
+        monkeypatch.setattr(agent, "api_json", lambda *_a, **_k: {})
+        agent.recover_active_workers(config, workers)
+        assert set(workers) == {task["run_id"] for task in tasks}
+        for _worker, stop in workers.values():
+            stop.preserve_training = True
+            stop.set()
+        for worker, _stop in workers.values():
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+        assert len(agent.load_active_runs(config)) == 2
+        for task, identity in zip(tasks, identities):
+            assert agent.process_identity_matches(identity)
+            assert agent.acquire_task_training_lock(config, task) is None
+    finally:
+        for _worker, stop in workers.values():
+            stop.preserve_training = True
+            stop.set()
+        for worker, _stop in workers.values():
+            worker.join(timeout=5)
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
 
 
 def test_gpu_assignment_rejects_malformed_or_unverified_payload(agent, training, monkeypatch):
@@ -1102,6 +1273,8 @@ def test_recovery_stops_only_identity_verified_process(agent, training, monkeypa
         def api(_config, path, method="GET", payload=None, extra_headers=None):
             if path.endswith("/control"):
                 return {"status": "stopping", "stop": True}
+            if path.endswith("/artifacts") or path.endswith("/trace"):
+                return {}
             updates.append((payload, extra_headers))
             return {"status": payload["status"], "stop_requested": True}
 
@@ -1167,6 +1340,8 @@ def test_recovery_classifies_process_that_exited_before_agent_restart(
     def api(_config, path, method="GET", payload=None, extra_headers=None):
         if path.endswith("/control"):
             return {"status": "running", "stop": False}
+        if path.endswith("/artifacts") or path.endswith("/trace"):
+            return {}
         updates.append(payload)
         return {"status": payload["status"]}
 

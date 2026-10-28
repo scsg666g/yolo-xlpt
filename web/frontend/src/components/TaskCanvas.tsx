@@ -328,7 +328,8 @@ function TaskCanvasInner() {
   const syncDelayed = pageVisible && syncAge > 15
   const currentIsActive = isCurrentRun && ['queued', 'starting', 'running', 'stopping'].includes(viewTask?.status || '')
   const outputWaiting = isCurrentRun && viewTask?.status === 'running' && outputAge > 120
-  const motionAllowed = isCurrentRun && effectsEnabled && pageVisible && !reduceMotion && !syncDelayed && !outputWaiting
+  const agentReconnecting = isCurrentRun && ['reconnecting', 'unavailable'].includes(selectedRun?.monitoring_status || '')
+  const motionAllowed = isCurrentRun && effectsEnabled && pageVisible && !reduceMotion && !syncDelayed && !outputWaiting && !agentReconnecting
   const nodeActivity = useMemo<PanelNodeData['activity']>(() => {
     if (!viewTask || !isCurrentRun) return undefined
     if (['queued', 'starting', 'running', 'stopping', 'stopped', 'interrupted', 'failed', 'completed'].includes(viewTask.status)) return viewTask.status as PanelNodeData['activity']
@@ -490,12 +491,12 @@ function TaskCanvasInner() {
     && Number.isFinite(stopRequestedAt) && clock - stopRequestedAt >= 30_000)
   const canRetry = ['failed', 'stopped', 'interrupted', 'completed'].includes(task.status)
   const launchModeLabel = { fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[selectedRun?.launch_mode || 'fresh']
-  const heartbeatLabel = !isCurrentRun ? '历史快照' : syncDelayed ? '同步延迟' : outputWaiting ? '等待新输出' : currentIsActive ? '实时同步' : '数据已同步'
+  const heartbeatLabel = !isCurrentRun ? '历史快照' : agentReconnecting ? '等待 Agent 重连' : syncDelayed ? '同步延迟' : outputWaiting ? '等待新输出' : currentIsActive ? '实时同步' : '数据已同步'
   const flowLabels: Partial<Record<TrainingTask['status'], string>> = {
     queued: '排队等待算力', starting: '正在启动训练', running: '训练流程运行中', stopping: '正在停止训练',
     stopped: '训练已停止', interrupted: '训练已中断', failed: '训练失败 · 请查看日志', completed: trainingStatusLabel(viewTask),
   }
-  const flowLabel = !isCurrentRun ? '历史运行快照' : syncDelayed ? '同步延迟 · 动效暂停' : outputWaiting ? '暂未收到新输出' : flowLabels[viewTask.status] || '当前训练流程'
+  const flowLabel = !isCurrentRun ? '历史运行快照' : agentReconnecting ? 'Agent 连接中断 · 保留最后进度' : syncDelayed ? '同步延迟 · 动效暂停' : outputWaiting ? '暂未收到新输出' : flowLabels[viewTask.status] || '当前训练流程'
 
   return <div className={`canvas-page ${motionAllowed ? '' : 'motion-paused'}`}>
     <header className="canvas-toolbar">
@@ -503,12 +504,13 @@ function TaskCanvasInner() {
       <div className="canvas-title"><span className={`status-dot ${viewTask.status}`} /><div><strong>{task.name}</strong><span>{task.task_type} · {viewTask.model_path.split('/').pop()}</span></div></div>
       {runs.length > 0 && <label className="attempt-picker"><History size={15} /><select value={selectedRunId} onChange={(event) => setSelectedRunId(event.target.value)}>{runs.map((run) => <option key={run.id} value={run.id}>Attempt {String(run.attempt_number).padStart(3, '0')} · {{ fresh: '首次训练', resume: '继续训练', retry: '重新训练' }[run.launch_mode]} · {run.deletion_status ? ({ pending: '等待清理', running: '清理中', failed: '清理失败', succeeded: '已清理' }[run.deletion_status]) : trainingStatusLabel(run)}</option>)}</select></label>}
       <div className="canvas-state" title={earlyStoppingExplanation(viewTask) || undefined}><Clock3 size={14} />{selectedRun ? `Attempt ${String(selectedRun.attempt_number).padStart(3, '0')} · ${launchModeLabel} · ` : ''}{trainingStatusLabel(viewTask)} · Epoch {viewTask.completed_epochs}/{trainingEpochTarget(viewTask)}</div>
-      <div className={`canvas-heartbeat ${currentIsActive ? 'active' : ''} ${syncDelayed || outputWaiting ? 'delayed' : ''}`} title={syncError || `接口响应：${syncAge} 秒前；本次查看中最近观察到输出变化：${outputAge} 秒前。无新输出不代表训练失败。`}><Radio size={13} /><i /><span>{heartbeatLabel}</span><strong>{syncAge}秒前</strong></div>
+      <div className={`canvas-heartbeat ${currentIsActive && !agentReconnecting ? 'active' : ''} ${syncDelayed || outputWaiting || agentReconnecting ? 'delayed' : ''}`} title={syncError || `接口响应：${syncAge} 秒前；本次查看中最近观察到输出变化：${outputAge} 秒前。无新输出不代表训练失败。`}><Radio size={13} /><i /><span>{heartbeatLabel}</span><strong>{syncAge}秒前</strong></div>
       <div className="canvas-actions">
         <AttemptDeletionHistory taskId={task.id} />
         {notice && <span className="toast"><Check size={14} />{notice}</span>}
         {layoutFeedback && <span className={`toast ${layoutFeedback.kind}`} role={layoutFeedback.kind === 'error' ? 'alert' : 'status'} title={layoutFeedback.message}>{layoutFeedback.kind === 'saving' ? <LoaderCircle className="spin" size={14} /> : layoutFeedback.kind === 'error' ? <AlertCircle size={14} /> : <Check size={14} />}{layoutFeedback.message}</span>}
         {syncError && <span className="canvas-sync-error" role="alert" title={syncError}>同步失败：{syncError}</span>}
+        {agentReconnecting && <span className="canvas-sync-error" role="status">Agent 暂时不可用，训练状态待确认；保留最后进度，重连后自动更新。最后接收：{selectedRun?.monitoring_last_seen_at ? new Date(selectedRun.monitoring_last_seen_at).toLocaleString() : '尚无记录'}</span>}
         <button className="button ghost compact effects-toggle" aria-pressed={effectsEnabled} title={reduceMotion ? '系统已启用减少动态效果，动画保持关闭' : '仅控制画布动画，不影响训练'} onClick={() => setEffectsEnabled((enabled) => !enabled)}><Activity size={15} />动效{effectsEnabled ? '开' : '关'}</button>
         <button className="button ghost compact" onClick={() => fitView({ padding: 0.16, duration: reduceMotion ? 0 : 500 })}><Maximize size={15} />适应画布</button>
         <button className="button ghost compact" disabled={savingLayout} aria-busy={savingLayout} onClick={() => void saveLayout()}>{savingLayout ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{savingLayout ? '保存中' : '保存布局'}</button>
@@ -525,7 +527,7 @@ function TaskCanvasInner() {
         <MiniMap pannable zoomable nodeColor={(node) => node.id === 'status' ? (resolvedTheme === 'light' ? '#159a78' : '#70f0bd') : (resolvedTheme === 'light' ? '#b7cad6' : '#344657')} maskColor={resolvedTheme === 'light' ? 'rgba(225,235,242,.72)' : 'rgba(5,9,13,.72)'} />
         <Controls showInteractive={false} />
       </ReactFlow>
-      <div className="canvas-legend"><span><i className={currentIsActive && !syncDelayed && !outputWaiting ? 'green live' : 'green'} />{flowLabel}</span><span>{events.length} 条任务事件</span><span>拖拽节点 · 滚轮缩放 · 空白处平移</span></div>
+      <div className="canvas-legend"><span><i className={currentIsActive && !syncDelayed && !outputWaiting && !agentReconnecting ? 'green live' : 'green'} />{flowLabel}</span><span>{events.length} 条任务事件</span><span>拖拽节点 · 滚轮缩放 · 空白处平移</span></div>
     </div>
     <EditParametersModal task={task} open={editingParameters} onClose={() => setEditingParameters(false)} onSaved={(updated) => { setTask(updated); setEditingParameters(false); setNotice('训练参数已保存'); window.setTimeout(() => setNotice(''), 1800) }} />
     <EditResourceModal task={task} mode={editingResource} onClose={() => setEditingResource(null)} onSave={saveResource} />

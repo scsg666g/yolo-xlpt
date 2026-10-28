@@ -142,6 +142,8 @@ export interface TaskGroup {
 }
 
 export interface TrainingRun {
+  monitoring_status?: 'local' | 'online' | 'reconnecting' | 'unavailable' | null
+  monitoring_last_seen_at?: string | null
   id: string
   task_id: string
   attempt_number: number

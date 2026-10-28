@@ -1,5 +1,23 @@
 # 算力监控与可选远程训练 Agent
 
+## Agent 2.3.0 保留训练重启与重载
+
+默认退出策略改为 `--shutdown-policy preserve`：Ctrl+C 或只发送给 Agent 主进程的 SIGTERM 会停止监控并保留已启动的训练。原 Run、Attempt、日志、CSV、GPU/工作区锁和活动记录继续使用；再次以相同用户、节点配置、工作目录和状态目录启动时，先验证原进程身份与锁，再恢复监控，不重新启动训练、不增加 Attempt。未开始的已确认领取记录留待下次恢复；正常退出不再把保留的训练回传为 stopped。
+
+- 平台“停止训练”仍会终止对应训练，并按宽限时间升级为强制停止。需要关闭 Agent 时同时停止全部受管训练，可在启动命令中指定 `--shutdown-policy stop`；该策略不影响显式重载保留训练。
+- **推荐热升级入口：SIGHUP**。完成脚本语法和 `--check-config` 核验后，以同一位置原子替换脚本，再只向 Agent 主 PID 发送 `kill -HUP <Agent_PID>`。Agent 停止领取，交接训练、等待文件操作退出，使用 exec 重载脚本，主 PID 保持不变。systemd 配好下方 `ExecReload` 后使用 `systemctl reload <实际服务名>`。
+- **systemd 默认的 `restart/stop` 不是保留训练操作**：服务管理器可能结束整个控制组，包括独立会话的训练子进程。容器整体重启、服务器重启或断电也不能靠本功能保留内存中的训练。不要通过 kill -9 或修改 KillMode 绕过交接。
+- Agent 离线时页面保留最后进度，显示连接中断、状态待确认；离线不等于训练失败。接管后补传完成轮数、指标、日志、产物与训练采样。断开期间完成的任务按结束记录或旧日志证据判定，未知退出码仍保留未知。旧 Agent/历史 Run 不需要迁移；平台最低训练兼容版本不变。
+- 保留 `agent-config.json`、`.training-state/`、`.dataset-state/`、训练目录和锁文件；不可更换节点身份、移动状态目录或删除锁文件。首次从 2.2.x 或更旧 Agent 升级请等待训练空闲，覆盖脚本无法改变旧进程已经加载的停止逻辑。
+
+```bash
+# Agent 已运行 2.3.0+，且已完成新脚本/配置检查
+sudo systemctl reload YOUR_AGENT_SERVICE
+# 前台/自管进程：将下方 PID 替换为 Agent 主 PID，而非训练 PID
+kill -HUP <Agent_PID>
+```
+
+
 ## Agent 2.2.0 目录发现
 
 为平台 1.6.0 提供 `training.dataset_discovery=true` 能力上报和只读目录扫描。沿用 `dataset_roots`，不增加必填配置；路径相对 `training_cwd` 解析。扫描等待训练空闲，按中心下发的深度、目录数、候选数和时间限制运行，每次最多回传 20 个候选，不传图片。连接中断后保留中心结果，重启重扫使用新代次排除旧的部分结果。正式登记仍执行完整导出与校验，并核对扫描时的 YAML 指纹。
@@ -25,7 +43,7 @@ Agent 默认仅采集 GPU、计算进程和主机信息。只有在远程配置�
 
 修复平台请求停止后，训练忽略 SIGTERM 导致监控循环一直不退出的问题。新进程与恢复接管进程均在宽限期后强制停止；恢复时仍检查进程身份。新增可选配置 `training_stop_timeout_seconds`（整数 1～300 秒，默认 15），中文说明放在 JSON 的 `_comments` 中。旧配置省略此字段仍能使用。
 
-升级时保留节点 ID、Token、中心地址、目录配置和 `.training-state/`，在训练空闲时替换脚本并重启 Agent。此升级不提供无中断热升级。
+升级时保留节点 ID、Token、中心地址、目录配置和 `.training-state/`，在训练空闲时替换脚本并重启 Agent。该历史版本不提供无中断热升级；2.3.0 起支持上文的保留训练重载。
 
 ## 验证与启动
 
@@ -38,7 +56,7 @@ python3 monitor_agent.py --config agent-config.json --once
 python3 monitor_agent.py --config agent-config.json
 ```
 
-`--check-config` 只在本机检查配置、YOLO 程序、输出写入、状态目录和共享锁，并显示解析后的工作目录、访问目录和输出目录，不连接中心、不打印 Token。`--once` 执行一次算力采样与上报，不领取训练任务；成功返回 0，失败返回非零退出码。持续运行时连接失败会退避重试；网络恢复后上报新采样。Agent 不会补传过期算力数据。终端关闭会结束前台 Agent，长期使用建议配置 systemd。
+`--check-config` 只在本机检查配置、YOLO 程序、输出写入、状态目录和共享锁，并显示解析后的工作目录、访问目录和输出目录，不连接中心、不打印 Token。`--once` 执行一次算力采样与上报，不领取训练任务；成功返回 0，失败返回非零退出码。持续运行时连接失败会退避重试；网络恢复后上报新采样。Agent 不会补传过期算力数据。终端关闭行为受会话管理影响，长期使用建议配置 systemd，并通过 reload 进行保留训练重载。
 
 配置示例（真实 Token 只在创建或重置时提供一次）：
 
@@ -64,7 +82,7 @@ python3 monitor_agent.py --config agent-config.json
 
 ## 启用远程训练
 
-当前脚本为 **Agent 2.2.0**，配套开发平台为 **1.6.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
+当前脚本为 **Agent 2.3.0**，配套开发平台为 **1.7.0**，并要求 `center_url` 能从远程机器访问。中心仍将 1.8.0 作为新远程训练的最低版本；进程关联另需 Agent 1.9.0。官方 Agent 从 2.0.0 开始上报 GPU 并行能力，但中心实际以 `training.gpu_parallelism=true` 为调度开关，版本号本身不会代替能力上报。以下表格保留协议能力的版本演进，不表示更旧 Agent 仍具备当前版本的全部调度能力：
 
 | 能力 | 最低 Agent 版本 | 补充条件 |
 | --- | --- | --- |
@@ -171,9 +189,9 @@ Agent 1.8.0 保留 1.7.0 的同租约确认重试与确认前停止保护。网�
 
 训练结束时先将最终状态、日志尾部及未确认指标写到 **Agent 配置文件旁的 `.training-state/<运行 ID>.json`**，收到中台确认后才删除。Agent 重启后会按运行分别重试这些文件。此目录不含 Token，但含训练日志，应保持私有权限，并在升级时保留；认证或路径错误需修正后才能补传。
 
-平台停止指令和 Agent 退出会分别显示对应原因，不再统一标记为用户停止。平台停止事件记录请求时间、运行 ID 和连接来源 IP；经网关访问时可能记录网关地址，来源 IP 不能直接代表具体操作者。网络失联不自动判定训练失败或停止。
+平台停止指令和显式停止策略下的 Agent 退出会分别显示对应原因；默认保留训练退出不生成停止结果。平台停止事件记录请求时间、运行 ID 和连接来源 IP；经网关访问时可能记录网关地址，来源 IP 不能直接代表具体操作者。网络失联不自动判定训练失败或停止。
 
-Agent 将每个活动任务的启动命令、PID、Linux 进程启动时刻、命令行哈希、boot ID 和 GPU 分配写入 `.training-state/active/`，不写入 Token。强制结束 Agent 后多个训练进程仍存活时，Agent 2.0.0 会逐项校验身份并恢复所有匹配的 Run；身份不完整或冲突的记录不会被接管，也不会触发重复训练。正常收到 SIGINT/SIGTERM 时 Agent 会向所有受管训练发送停止信号，等待各线程收尾并分别回传状态。
+Agent 将每个活动任务的启动命令、PID、Linux 进程启动时刻、命令行哈希、boot ID 和 GPU 分配写入 `.training-state/active/`，不写入 Token。强制结束 Agent 后多个训练进程仍存活时，Agent 2.0.0 会逐项校验身份并恢复所有匹配的 Run；身份不完整或冲突的记录不会被接管，也不会触发重复训练。Agent 2.3.0 默认收到 SIGINT/SIGTERM 时保留训练并交接监控；仅显式指定 `--shutdown-policy stop` 才会停止全部受管训练。更旧 Agent 仍按历史行为停止训练。
 
 Agent 2.0.5 对新领取的标准 YOLO 训练使用独立结束记录包装器，在完整 `model.train()`（包括最佳模型最终验证）正常返回后，原子写入当前 Attempt 的 `training-result.json`；异常会写失败记录后继续向上抛出。记录包含 Run/任务身份、实际退出码、结束原因、完成轮数、总轮数和最终验证指标。只有明确的训练结束结果才视为成功；出现 `EarlyStopping` 提示或已写满 `results.csv` 不表示最终验证一定成功。过程采集关闭时仍写结束记录，检测、分割、分类、姿态和 OBB 使用相同机制，不新增必填配置。
 
@@ -185,7 +203,7 @@ Agent 2.0.5 对新领取的标准 YOLO 训练使用独立结束记录包装器�
 
 ### 更新 Agent
 
-先确认没有训练运行，然后停止原 Agent，备份脚本和配置，保留 `.training-state/`。升级时保留该节点现有的 `center_url`、`node_id`、`token`、目录和其他私有设置；替换脚本后通过 `--check-config` 核对解析结果。只有原配置确实存在目录不匹配时，才按目标服务器的实际布局调整路径；示例配置中的中文说明可以按需合并，但不是启用 2.0.0 GPU 并行或 2.0.1 旧 Attempt 清理的必填项。Agent 2.0.3 在旧配置中默认使用 `pt` 和 1800 秒最终校验超时；若远程模型存放在其他位置，应只将必要的最小目录加入 `model_test_roots`。不要用开发版、使用版或另一节点的配置覆盖当前节点。
+首次升级旧 Agent，先确认没有训练运行，然后停止原 Agent，备份脚本和配置，保留 `.training-state/`；已经运行 2.3.0+ 时可按上文执行保留训练重载。升级时保留该节点现有的 `center_url`、`node_id`、`token`、目录和其他私有设置；替换脚本后通过 `--check-config` 核对解析结果。只有原配置确实存在目录不匹配时，才按目标服务器的实际布局调整路径；示例配置中的中文说明可以按需合并，但不是启用 2.0.0 GPU 并行或 2.0.1 旧 Attempt 清理的必填项。Agent 2.0.3 在旧配置中默认使用 `pt` 和 1800 秒最终校验超时；若远程模型存放在其他位置，应只将必要的最小目录加入 `model_test_roots`。不要用开发版、使用版或另一节点的配置覆盖当前节点。
 
 从平台「算力资源」接入窗口下载最新脚本，或从远程可访问的中心地址下载到临时文件：
 
@@ -198,7 +216,7 @@ curl --fail --show-error --connect-timeout 5 --max-time 30 \
 python3 monitor_agent.new.py --version
 ```
 
-确认输出为 `2.1.0`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
+确认输出为 `2.3.0`，核对现有配置、输出目录、`model_test_roots` 和最终校验超时后，再替换并验证连接：
 
 ```bash
 mv monitor_agent.new.py monitor_agent.py
@@ -228,6 +246,7 @@ Wants=network-online.target
 User=YOUR_USER
 WorkingDirectory=/opt/yolo-monitor-agent
 ExecStart=/usr/bin/python3 /opt/yolo-monitor-agent/monitor_agent.py --config /opt/yolo-monitor-agent/agent-config.json
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 UMask=0077
