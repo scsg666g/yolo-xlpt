@@ -1187,3 +1187,31 @@ def test_active_remote_run_blocks_node_disabling_and_token_rotation(monitoring_c
     assert client.post(f"/api/compute/nodes/{node_id}/token").status_code == 409
     assert client.patch(f"/api/compute/nodes/{node_id}", json={"name": "remote", "enabled": False}).status_code == 409
     assert client.delete(f"/api/compute/nodes/{node_id}").status_code == 409
+
+
+@pytest.mark.parametrize('concurrent', [None, False, True])
+@pytest.mark.parametrize('phase', ['check', 'discover', 'export'])
+def test_reported_dataset_capability_controls_training_claim_barrier(monitoring_client, concurrent, phase):
+    from app import dataset_store
+    client, factory = monitoring_client
+    credential = create(client)
+    identity = credential['node']['id']
+    report = sample()
+    report['agent_version'] = '2.4.1'
+    report['training'].update(dataset_roots=['/remote/data'], dataset_discovery=True, dataset_progress=True)
+    if concurrent is not None:
+        report['training']['dataset_concurrent_reads'] = concurrent
+    response = client.post(f'/api/compute/nodes/{identity}/report', headers=headers(credential), json=report)
+    assert response.status_code == 200, response.text
+    with factory() as db:
+        capability = db.get(ComputeNode, identity).snapshot['training']
+        assert capability['dataset_concurrent_reads'] == bool(concurrent)
+        assert capability['dataset_progress'] is True
+        run = _queue_remote_run(db, identity, 'directory-concurrency', 'cpu')
+        dataset_store.new_operation(db, 'scan' if phase == 'discover' else 'register', identity,
+                                    {'phase': phase, 'source_path': '/remote/data'})
+        db.commit()
+    result = client.post(f'/api/compute/nodes/{identity}/agent/poll', headers=headers(credential))
+    assert result.status_code == 200, result.text
+    allowed = phase == 'check' or (phase == 'discover' and concurrent is True)
+    assert (result.json()['task'] is not None) == allowed

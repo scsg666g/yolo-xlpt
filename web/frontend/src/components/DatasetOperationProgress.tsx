@@ -25,7 +25,8 @@ export function DatasetOperationProgress({ operation: job, detailed = false }: {
   const waiting = active && (job.waiting_offline ? '等待远程节点上线' : job.waiting_training ? '等待训练任务结束' : job.waiting_lock ? '等待文件或训练工作区锁' : null)
   const progress = job.progress
   const stage = progress && progress.phase === job.phase ? progress : null
-  const label = waiting || (job.status === 'pending' ? `排队中${job.queue_ahead ? ` · 前面还有 ${job.queue_ahead} 个操作` : ''}` : stages[stage?.stage || ''] || datasetPhaseLabel[job.phase] || job.phase)
+  const pendingLabel = job.queue_ahead ? `排队中 · 前面还有 ${job.queue_ahead} 个操作` : job.node_id === 'local' ? '等待本机执行' : '等待远程 Agent 领取'
+  const label = waiting || (job.status === 'pending' ? pendingLabel : stages[stage?.stage || ''] || datasetPhaseLabel[job.phase] || job.phase)
   const unitLabel = stage?.unit === 'directories' ? '个目录' : '个文件'
   const measured = stage && (stage.total != null || ['scan', 'source_verify', 'target_verify', 'delete_verify', 'discover'].includes(stage.stage))
   const count = stage ? stage.unit === 'bytes' ? formatBytes(stage.processed) : `${stage.processed.toLocaleString()} ${unitLabel}` : ''

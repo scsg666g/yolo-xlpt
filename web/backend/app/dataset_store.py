@@ -36,6 +36,7 @@ from .dataset_uploads import managed_dataset_mutation, dataset_references, manag
 router = APIRouter(prefix='/api/dataset-storage', tags=['dataset storage'])
 STORE_ROOT = DATA_ROOT / 'dataset_storage'
 ACTIVE = ('pending', 'running', 'committing')
+LIGHTWEIGHT_PHASES = ('check', 'discover')
 TERMINAL = ('completed', 'cancelled')
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,23 @@ def operation_time(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def training_active(db, node_id):
+    return bool(db.scalar(select(TrainingRun.id).where(
+        TrainingRun.execution_node_id == node_id,
+        TrainingRun.status.in_(('starting', 'running', 'stopping'))).limit(1)))
+
+
+def concurrent_dataset_reads(db, node_id):
+    if node_id == 'local':
+        return True
+    node = db.get(ComputeNode, node_id)
+    return bool(node and ((node.snapshot or {}).get('training') or {}).get('dataset_concurrent_reads') is True)
+
+
+def lightweight_operation(op):
+    return op.payload.get('phase') in LIGHTWEIGHT_PHASES
+
+
 def operation_read(op, db=None):
     value = {'id': op.id, 'kind': op.kind, 'status': op.status, 'phase': op.payload.get('phase'),
              'node_id': op.node_id, 'name': op.payload.get('name', ''), 'error': op.error,
@@ -123,9 +141,22 @@ def operation_read(op, db=None):
         node = db.get(ComputeNode, op.node_id)
         seen = node.last_seen_at if node else None
         value['waiting_offline'] = not seen or (utcnow() - seen.replace(tzinfo=timezone.utc)).total_seconds() > 90
-        value['waiting_training'] = op.status == 'pending' and bool(db.scalar(select(TrainingRun.id).where(TrainingRun.execution_node_id == op.node_id, TrainingRun.status.in_(('starting', 'running', 'stopping')))))
         capability = ((node.snapshot or {}).get('training') or {}) if node else {}
-        value['waiting_lock'] = value['waiting_lock'] or (op.status == 'pending' and not value['waiting_training'] and bool(capability.get('lock_occupied')))
+        concurrent = concurrent_dataset_reads(db, op.node_id)
+        busy = training_active(db, op.node_id)
+        lightweight = lightweight_operation(op) and concurrent
+        value['waiting_training'] = op.status == 'pending' and busy and not lightweight
+        value['waiting_lock'] = value['waiting_lock'] or (op.status == 'pending' and not lightweight and not value['waiting_training'] and bool(capability.get('lock_occupied')))
+        if op.status == 'pending' and lightweight:
+            value['waiting_lock'] = False  # Discard a pre-upgrade lock-wait sample.
+        if op.status == 'pending' and lightweight and (busy or capability.get('lock_occupied')):
+            # A blocked pack/import does not precede a runnable directory check.
+            earlier = db.scalars(select(DatasetOperation).where(
+                DatasetOperation.node_id == op.node_id, DatasetOperation.status.in_(ACTIVE),
+                or_(DatasetOperation.created_at < op.created_at,
+                    (DatasetOperation.created_at == op.created_at) & (DatasetOperation.id < op.id))))
+            value['queue_ahead'] = sum(lightweight_operation(item) or bool(
+                item.lease_until and operation_time(item.lease_until) > utcnow()) for item in earlier)
     return value
 
 
@@ -225,7 +256,9 @@ def mutation_pending(db, node_id):
 
 
 def node_dataset_file_work(db, node_id):
-    return any(op.payload.get('phase') in ('export', 'import', 'remove', 'discover') for op in db.scalars(
+    concurrent = concurrent_dataset_reads(db, node_id)
+    return any(op.payload.get('phase') in ('export', 'import', 'remove', 'discover')
+               and not (concurrent and lightweight_operation(op)) for op in db.scalars(
         select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE))))
 
 
@@ -949,23 +982,31 @@ def auth(node_id, request, db):
 
 
 @router.post('/agent/{node_id}/poll')
-def agent_poll(node_id: str, request: Request, db: Session = Depends(get_db)):
+def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, db: Session = Depends(get_db)):
     auth(node_id, request, db)
     with managed_dataset_mutation():
         acquire_node_claim_lock(db, node_id)
-        op = db.scalar(select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE)).order_by(DatasetOperation.created_at, DatasetOperation.id))
+        operations = list(db.scalars(select(DatasetOperation).where(
+            DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE))
+            .order_by(DatasetOperation.created_at, DatasetOperation.id)))
+        # Never bypass a live executor, including one running a heavier phase.
+        if any(item.lease_until and operation_time(item.lease_until) > utcnow() for item in operations):
+            return {'operation': None}
+        node = db.get(ComputeNode, node_id)
+        capability = ((node.snapshot or {}).get('training') or {}) if node else {}
+        busy = training_active(db, node_id)
+        concurrent = concurrent_dataset_reads(db, node_id)
+        reads_only = lightweight_only or (concurrent and (busy or capability.get('lock_occupied')))
+        op = next((item for item in operations if not reads_only or (
+            lightweight_operation(item) and (item.payload.get('phase') == 'check' or concurrent))), None)
         if not op:
             return {'operation': None}
         if op.payload['phase'] == 'discover':
             from .dataset_discovery import supports_discovery
             if not supports_discovery(db, node_id):
                 return {'operation': None, 'message': '目录扫描需要 Agent 2.2.0 及 dataset_discovery 能力'}
-        # One Agent process executes a token at a time using its private flock.
-        # An expired lease reuses that token, so a saved commit receipt is replayed.
-        if op.lease_until and op.lease_until.replace(tzinfo=timezone.utc) > utcnow():
-            return {'operation': None}
-        if op.payload['phase'] in ('export', 'import', 'discover') and db.scalar(select(TrainingRun.id).where(
-                TrainingRun.execution_node_id == node_id, TrainingRun.status.in_(('starting', 'running', 'stopping')))):
+        # An expired lease reuses its token, so a saved commit receipt is replayed.
+        if busy and not (op.payload['phase'] == 'check' or (concurrent and lightweight_operation(op))):
             return {'operation': None}
         if op.payload['phase'] == 'remove':
             try:

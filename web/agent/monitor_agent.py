@@ -31,7 +31,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.4.0"
+VERSION = "2.4.1"
+LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -350,7 +351,7 @@ def training_capability(config: dict) -> dict:
                 "python_version": platform.python_version(), "output_writable": False,
                 "lock_occupied": False, "output_roots": [], "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True, "dataset_concurrent_reads": True}
     reported_roots = []
     try:
         reported_roots = [str(root) for root in configured_output_roots(config)]
@@ -390,7 +391,7 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": occupied,
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True, "dataset_concurrent_reads": True}
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
@@ -398,7 +399,7 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": False,
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True, "dataset_concurrent_reads": True}
 
 
 def next_report_sequence() -> int:
@@ -2940,6 +2941,21 @@ def dataset_atomic_json(path, payload):
     temp.replace(path)
 
 
+def poll_dataset_operation(config, busy):
+    """Old centres may ignore the filter; never execute their heavy work while busy."""
+    path = f"/api/dataset-storage/agent/{config['node_id']}/poll"
+    if busy:
+        path += '?lightweight_only=true'
+    work = dataset_api(config, path, 'POST', {}).get('operation')
+    if work and busy and work.get('phase') not in LIGHTWEIGHT_DATASET_PHASES:
+        return None
+    return work
+
+
+def dataset_blocks_training(thread, phase):
+    return thread is not None and thread.is_alive() and phase not in LIGHTWEIGHT_DATASET_PHASES
+
+
 def run_dataset_operation(config, work, stop):
     """Execute a phase with restart receipts and resumable chunk offsets."""
     identity, token, phase = work['id'], work['token'], work['phase']
@@ -2988,7 +3004,7 @@ def run_dataset_operation(config, work, stop):
         else:
             check()
             report_progress({'stage': phase})
-            if phase != 'check':
+            if phase not in LIGHTWEIGHT_DATASET_PHASES:
                 training_lock = acquire_training_lock(config)
                 if training_lock is None:
                     report_progress({'stage': 'waiting_lock'})
@@ -3232,6 +3248,7 @@ def main() -> int:
     active_training: dict[str, tuple[threading.Thread, threading.Event]] = {}
     active_operation: threading.Thread | None = None
     active_dataset_operation: threading.Thread | None = None
+    active_dataset_phase: str | None = None
     last_unready_reason: str | None = None
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
                 "已启用" if config["enable_training"] else "未启用")
@@ -3255,10 +3272,12 @@ def main() -> int:
                             sum(len(gpu["processes"]) for gpu in payload["compute"]["gpus"]))
             failures = 0
             delay = interval
-            if config.get('dataset_roots') and not args.once and not active_training and not load_active_runs(config) and (active_dataset_operation is None or not active_dataset_operation.is_alive()):
+            if config.get('dataset_roots') and not args.once and (active_dataset_operation is None or not active_dataset_operation.is_alive()):
                 try:
-                    work = dataset_api(config, f"/api/dataset-storage/agent/{config['node_id']}/poll", 'POST', {}).get('operation')
+                    busy = not recovery_ready or bool(active_training or load_active_runs(config)) or bool(capability.get('lock_occupied'))
+                    work = poll_dataset_operation(config, busy)
                     if work:
+                        active_dataset_phase = work['phase']
                         active_dataset_operation = threading.Thread(target=run_dataset_operation, args=(config, work, stop), name='dataset-operation', daemon=True)
                         active_dataset_operation.start()
                 except HTTPError as exc:
@@ -3283,7 +3302,7 @@ def main() -> int:
                     active_states = load_active_runs(config)
                     legacy_active = any(not (state["task"].get("gpu_assignment") or [])
                                         for state in active_states)
-                    if active_dataset_operation is not None and active_dataset_operation.is_alive():
+                    if dataset_blocks_training(active_dataset_operation, active_dataset_phase):
                         pass  # Finish file work before claiming a fresh training run.
                     elif legacy_active:
                         # Old centers and CPU runs keep the node-wide serial contract.

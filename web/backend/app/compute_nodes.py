@@ -153,6 +153,8 @@ class TrainingCapability(BaseModel):
 
     dataset_roots: list[Annotated[str, Field(min_length=1, max_length=4096)]] = Field(default_factory=list, max_length=128)
     dataset_discovery: bool = False
+    dataset_progress: bool = False
+    dataset_concurrent_reads: bool = False
 
     @field_validator("output_roots", "model_test_roots", "dataset_roots")
     @classmethod

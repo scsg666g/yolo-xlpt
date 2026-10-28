@@ -1642,3 +1642,62 @@ def test_broken_output_link_reports_unavailable_without_crashing_monitor(agent, 
     assert capability["reason"]
     with pytest.raises(ValueError, match="路径无法解析"):
         agent.load_config(path)
+
+
+@pytest.mark.parametrize('phase', ['check', 'discover', 'export'])
+@pytest.mark.parametrize('training_active', [False, True])
+def test_main_polls_light_work_during_training_and_keeps_training_claims(agent, tmp_path, monkeypatch, phase, training_active):
+    calls = []
+    config = {'enable_training': True, 'node_id': 'b' * 32, 'dataset_roots': [str(tmp_path)],
+              'nvidia_smi_bin': 'nvidia-smi', 'report_interval_seconds': 5,
+              'training_state_dir': str(tmp_path / 'state')}
+
+    class StopEvent:
+        def __init__(self):
+            self.stopped = False
+        def is_set(self):
+            return self.stopped
+        def set(self):
+            self.stopped = True
+        def wait(self, _seconds):
+            self.stopped = True
+            return True
+
+    class Worker:
+        def __init__(self, **kwargs):
+            self.running = False
+        def start(self):
+            self.running = True
+        def is_alive(self):
+            return self.running
+        def join(self):
+            self.running = False
+
+    monkeypatch.setattr(agent, 'load_config', lambda _path: config)
+    monkeypatch.setattr(agent, 'acquire_agent_instance_lock', lambda _config: object())
+    monkeypatch.setattr(agent, 'release_training_lock', lambda _lock: None)
+    monkeypatch.setattr(agent, 'register_workspace', lambda _config: None)
+    monkeypatch.setattr(agent, 'recover_active_workers', lambda *_args: None)
+    monkeypatch.setattr(agent, 'collect', lambda *_args: {
+        'training': {'ready': True, 'lock_occupied': training_active}, 'compute': {'gpus': []}})
+    monkeypatch.setattr(agent, 'send', lambda *_args: 5)
+    monkeypatch.setattr(agent, 'retry_pending_finals', lambda _config: True)
+    monkeypatch.setattr(agent, 'load_active_runs', lambda _config:
+                        [{'task': {'gpu_assignment': ['gpu']}}] if training_active else [])
+    def dataset_api(_config, path, *_args):
+        calls.append(path)
+        # Simulate an old centre that may ignore the lightweight filter.
+        return {'operation': {'phase': phase}}
+    def training_api(_config, path, *_args):
+        calls.append(path)
+        return {'operation': None} if path.endswith('/operations/poll') else {'task': None}
+    monkeypatch.setattr(agent, 'dataset_api', dataset_api)
+    monkeypatch.setattr(agent, 'api_json', training_api)
+    monkeypatch.setattr(agent.threading, 'Event', StopEvent)
+    monkeypatch.setattr(agent.threading, 'Thread', Worker)
+    monkeypatch.setattr(sys, 'argv', ['monitor_agent.py', '--config', 'unused.json'])
+    assert agent.main() == 0
+    assert any('/dataset-storage/' in path for path in calls)
+    assert any('lightweight_only=true' in path for path in calls) == training_active
+    # Heavy work received during training is rejected before starting a worker.
+    assert any(path.endswith('/agent/poll') for path in calls) == (phase != 'export' or training_active)
