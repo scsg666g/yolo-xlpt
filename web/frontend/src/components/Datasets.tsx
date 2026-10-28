@@ -186,7 +186,7 @@ export function Datasets() {
         setError(operation.error || '此前提交的重新加载已失败或取消，请在操作记录中查看，或重新发起加载。')
       } else setNotice(operation.status === 'completed'
         ? `“${dataset.name}”先前提交的重新加载已完成，已同步最新统计。`
-        : `“${dataset.name}”已提交重新加载，校验成功后更新图片、标签、类别、空间和警告；服务器训练中会等待。可在操作记录中查看进度。`)
+        : `“${dataset.name}”已提交重新加载，校验成功后更新图片、标签、类别、空间和警告。支持并行读取的节点可在训练期间校验；请在操作记录中查看执行或等待原因。`)
       operationsChanged()
     } catch (reason) {
       const status = (reason as { status?: number } | null)?.status
@@ -365,7 +365,7 @@ export function Datasets() {
             </header>
 
             <div className="dataset-check-status"><small>{dataset.checked_at ? `最近完整校验：${formatCreatedAt(dataset.checked_at)}` : '统计来自登记记录，完整校验时间未记录'}</small>
-              {dataset.blocking_operation_kind === 'refresh' && <button type="button" onClick={() => setHistoryOpen(true)}>{dataset.refresh_status === 'failed' ? '重新加载失败，保留上次统计；查看处理' : '重新加载中，保留上次统计；查看进度'}</button>}
+              {dataset.blocking_operation_kind === 'refresh' && <button type="button" onClick={() => setHistoryOpen(true)}>{dataset.refresh_status === 'failed' ? '重新加载失败，保留上次统计；查看处理' : dataset.refresh_status === 'pending' ? '重新加载已提交，保留上次统计；查看等待原因' : '重新加载校验中，保留上次统计；查看进度'}</button>}
               {dataset.refresh_status === 'cancelled' && <small>上次重新加载已取消，保留上次统计</small>}
               {dataset.refresh_error && dataset.refresh_status === 'failed' && <small role="alert">{dataset.refresh_error}</small>}
             </div>

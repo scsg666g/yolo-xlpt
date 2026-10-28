@@ -54,10 +54,12 @@ from .log_files import tail_log
 from .metric_files import MetricCsvReader
 from .parameter_catalog import training_parameter_keys
 from .training_outcome import classify_training_exit
+from .batch_history import BatchLogReader, append_reductions, scan_batch_log
 
 
 logger = logging.getLogger("yolo-platform.training-scheduler")
 _METRIC_CSV_READER = MetricCsvReader(maximum_files=16)
+_BATCH_LOG_READER = BatchLogReader()
 
 
 TRAINING_KEYS = {
@@ -209,9 +211,93 @@ def mirror_run_to_task(task: TrainingTask, run: TrainingRun) -> None:
     task.error_message = run.error_message
     task.completion_info = dict(run.completion_info or {})
     task.latest_metrics = dict(run.latest_metrics or {})
+    task.batch_history = list(run.batch_history or [])
     task.queued_at = run.queued_at
     task.started_at = run.started_at
     task.finished_at = run.finished_at
+
+
+def sync_local_batch_history(task: TrainingTask, run: TrainingRun, *, final: bool = False) -> None:
+    """Publish each confirmed reduction without rescanning the whole active log."""
+    if run.execution_node_id:
+        return
+    try:
+        snapshot = run.parameter_snapshot if isinstance(run.parameter_snapshot, dict) else {}
+        configured = int(snapshot.get("batch") or task.batch)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not 1 <= configured <= 1024:
+        return
+    history, found = (scan_batch_log(run.log_path, configured) if final else
+                      (_BATCH_LOG_READER.read(run.log_path, configured), False))
+    known = list(run.batch_history or [])
+    if history and len(history) > len(known) and history[:len(known)] == known:
+        run.batch_history = history
+        if task.current_run_id == run.id:
+            task.batch_history = list(history)
+    if final and found:
+        run.batch_history_scanned = True
+
+
+def backfill_batch_histories() -> int:
+    """Scan legacy local logs and any cached remote log snapshot once at startup."""
+    recovered = 0
+    with SessionLocal() as db:
+        snapshots_by_run: dict[str, list[RemoteOperation]] = {}
+        for operation in db.scalars(select(RemoteOperation).where(
+            RemoteOperation.kind == "fetch_log", RemoteOperation.status == "succeeded",
+        )):
+            run_id = (operation.payload or {}).get("run_id")
+            if isinstance(run_id, str):
+                snapshots_by_run.setdefault(run_id, []).append(operation)
+        run_ids = db.scalars(select(TrainingRun.id).order_by(TrainingRun.task_id, TrainingRun.attempt_number)).all()
+        for index, run_id in enumerate(run_ids, 1):
+            run = db.get(TrainingRun, run_id)
+            if not run:
+                continue
+            task = db.get(TrainingTask, run.task_id)
+            if not task:
+                continue
+            try:
+                snapshot = run.parameter_snapshot if isinstance(run.parameter_snapshot, dict) else {}
+                configured = int(snapshot.get("batch") or task.batch)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not 1 <= configured <= 1024:
+                continue
+            found_complete = False
+            if run.execution_node_id:
+                history = append_reductions(list(run.batch_history or []), run.remote_log_tail or [], configured)
+                if not run.batch_history_scanned and run.status not in {"queued", "starting", "running", "stopping"}:
+                    from .remote_operations import operation_file
+                    for operation in snapshots_by_run.get(run.id, []):
+                        cached, found = scan_batch_log(operation_file(operation), configured)
+                        if found:
+                            history = cached
+                            found_complete = run.status not in {"queued", "starting", "running", "stopping"}
+                            break
+            elif not run.batch_history_scanned and run.status not in {"queued", "starting", "running", "stopping"}:
+                history, found = scan_batch_log(run.log_path, configured)
+                found_complete = found
+            else:
+                history = list(run.batch_history or [])
+            # The scheduler or a remote result may have advanced while a large
+            # historical file was read. Never overwrite a newer live chain.
+            db.refresh(run)
+            db.refresh(task)
+            if found_complete:
+                run.batch_history_scanned = True
+            known = list(run.batch_history or [])
+            if history and len(history) > len(known) and history[:len(known)] == known:
+                run.batch_history = history
+                recovered += 1
+            if task.current_run_id == run.id and task.batch_history != run.batch_history:
+                task.batch_history = list(run.batch_history or [])
+            if index % 32 == 0:
+                db.commit()
+                db.expunge_all()
+        db.commit()
+    return recovered
 
 
 def log_path_for_run(task_id: str, attempt_number: int, when: datetime | None = None) -> Path:
@@ -1168,6 +1254,7 @@ class TrainingScheduler:
                             pass
                     continue
                 sync_metrics(db, task, run)
+                sync_local_batch_history(task, run, final=True)
                 stopped_during_start = run.status == "stopping" and run.stop_requested
                 if stopped_during_start:
                     run.status = "stopped"
@@ -1596,6 +1683,7 @@ class TrainingScheduler:
                 run.process_started_at = managed.started_at
                 mirror_run_to_task(task, run)
             sync_metrics(db, task, run)
+            sync_local_batch_history(task, run)
             code = managed.poll()
             if code is None:
                 if run.status == "stopping" or run.stop_requested:
@@ -1618,6 +1706,7 @@ class TrainingScheduler:
                 )
             if task.current_run_id == run.id:
                 mirror_run_to_task(task, run)
+            sync_local_batch_history(task, run, final=True)
             sync_artifacts(db, task, run)
             self._last_artifact_scan.pop(run_id, None)
             add_event(db, task.id, run.status, message, level,

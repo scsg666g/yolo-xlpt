@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, update
+from sqlalchemy import and_, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -610,6 +610,48 @@ def enqueue(db: Session, node_id: str, task_id: str, kind: str, payload: dict) -
     return operation
 
 
+def queue_batch_history_scan(db: Session, node: ComputeNode) -> bool:
+    """Queue one small read-only historical scan per heartbeat after Agent upgrade."""
+    if not agent_version_at_least(node.agent_version, (2, 5, 3)):
+        return False
+    if db.scalar(select(RemoteOperation.id).where(
+        RemoteOperation.node_id == node.id,
+        RemoteOperation.status.in_(["pending", "running", "finalizing"]),
+    ).limit(1)) is not None:
+        return False
+    scannable = {"running", "stopping", "completed", "failed", "stopped", "interrupted"}
+    existing = select(RemoteOperation.id).where(
+        RemoteOperation.kind == "batch_history",
+        RemoteOperation.payload["run_id"].as_string() == TrainingRun.id,
+    ).correlate(TrainingRun).exists()
+    candidates = db.execute(select(TrainingRun, TrainingTask).join(
+        TrainingTask, TrainingTask.id == TrainingRun.task_id,
+    ).where(
+        or_(TrainingRun.execution_node_id == node.id,
+            and_(TrainingRun.execution_node_id.is_(None), TrainingTask.execution_node_id == node.id)),
+        TrainingTask.deleted_at.is_(None), TrainingRun.status.in_(scannable),
+        TrainingRun.batch_history_scanned.is_(False), TrainingRun.log_path.is_not(None),
+        ~existing,
+    ).order_by(TrainingRun.created_at, TrainingRun.id).limit(16)).all()
+    from .run_deletions import remote_attempt_layout
+    for run, task in candidates:
+        try:
+            remote_attempt_layout(task, run)
+            snapshot = run.parameter_snapshot if isinstance(run.parameter_snapshot, dict) else {}
+            payload = {**run_payload(run, task), "batch": int(snapshot.get("batch") or task.batch)}
+            if not 1 <= payload["batch"] <= 1024:
+                raise ValueError("Batch 配置无效")
+        except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+            # A durable failed receipt keeps malformed legacy rows from blocking
+            # every later Attempt on this node. The UI continues to show unknown.
+            operation = enqueue(db, node.id, task.id, "batch_history", {"run_id": run.id})
+            operation.status, operation.error = "failed", f"历史 Batch 扫描不可用：{exc}"[:2000]
+            continue
+        enqueue(db, node.id, task.id, "batch_history", payload)
+        return True
+    return False
+
+
 def queue_scan(db: Session, task: TrainingTask, run: TrainingRun) -> None:
     if not run.execution_node_id or not run.run_dir or task.deleted_at:
         return
@@ -996,11 +1038,17 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
         return {"operation": None, "required_agent_version": REQUIRED_AGENT_VERSION,
                 "message": f"请将远程 Agent 升级到 {REQUIRED_AGENT_VERSION} 或以上版本"}
     cutoff = utcnow() - OPERATION_LEASE_TIMEOUT
-    operation = db.scalar(select(RemoteOperation).where(
+    query = select(RemoteOperation).where(
         RemoteOperation.node_id == node_id,
         (RemoteOperation.status == "pending") |
         ((RemoteOperation.status.in_(["running", "finalizing"])) & (RemoteOperation.updated_at < cutoff)),
-    ).order_by(RemoteOperation.created_at).limit(1))
+    )
+    if not agent_version_at_least(node.agent_version, (2, 5, 3)):
+        query = query.where(RemoteOperation.kind != "batch_history")
+    operation = db.scalar(query.order_by(
+        case((RemoteOperation.kind == "batch_history", 1), else_=0),
+        RemoteOperation.created_at,
+    ).limit(1))
     if not operation:
         return {"operation": None}
     operation_payload = operation.payload
@@ -1190,6 +1238,7 @@ class OperationResult(BaseModel):
     success: bool
     error: str | None = Field(default=None, max_length=2000)
     receipt: DeleteReceipt | None = None
+    batch_history: list[int] | None = Field(default=None, max_length=8)
 
 
 def _verified_delete_receipt(operation: RemoteOperation, receipt: DeleteReceipt | None) -> dict:
@@ -1510,6 +1559,25 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
     if operation.kind in {"fetch", "fetch_model", "fetch_log"} and payload.success:
         raise HTTPException(409, "文件传输必须通过分块接口完成")
     task = db.get(TrainingTask, operation.task_id)
+    if operation.kind == "batch_history" and payload.success:
+        run = db.get(TrainingRun, (operation.payload or {}).get("run_id"))
+        configured = (operation.payload or {}).get("batch")
+        history = payload.batch_history
+        if (not task or task.deleted_at or not run or run.task_id != task.id
+                or (run.execution_node_id or task.execution_node_id) != node_id
+                or run.log_path != (operation.payload or {}).get("log_path")
+                or history is None or (history and (len(history) < 2 or history[0] != configured))
+                or any(type(value) is not int or not 1 <= value <= 1024 for value in history)
+                or any(a <= b for a, b in zip(history, history[1:]))):
+            raise HTTPException(422, "历史 Batch 扫描结果无效")
+        known = list(run.batch_history or [])
+        if history[:len(known)] == known and len(history) > len(known):
+            run.batch_history = list(history)
+        # A running log can still grow after this one-time scan. A terminal
+        # Run needs no repeat scan, even when no reduction was found.
+        run.batch_history_scanned = run.status in {"completed", "failed", "stopped", "interrupted"}
+        if task.current_run_id == run.id:
+            task.batch_history = list(run.batch_history or [])
     if task_scope:
         if (
             task is None or task.execution_node_id != node_id or task.status in ACTIVE

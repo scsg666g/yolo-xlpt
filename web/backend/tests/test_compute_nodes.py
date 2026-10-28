@@ -1401,11 +1401,13 @@ def test_reported_dataset_capability_controls_training_claim_barrier(monitoring_
     report['training'].update(dataset_roots=['/remote/data'], dataset_discovery=True, dataset_progress=True)
     if concurrent is not None:
         report['training']['dataset_concurrent_reads'] = concurrent
+        report['training']['dataset_concurrent_refresh'] = concurrent
     response = client.post(f'/api/compute/nodes/{identity}/report', headers=headers(credential), json=report)
     assert response.status_code == 200, response.text
     with factory() as db:
         capability = db.get(ComputeNode, identity).snapshot['training']
         assert capability['dataset_concurrent_reads'] == bool(concurrent)
+        assert capability['dataset_concurrent_refresh'] == bool(concurrent)
         assert capability['dataset_progress'] is True
         run = _queue_remote_run(db, identity, 'directory-concurrency', 'cpu')
         dataset_store.new_operation(db, 'scan' if phase == 'discover' else 'register', identity,

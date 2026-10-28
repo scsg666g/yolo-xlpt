@@ -63,6 +63,9 @@ def test_lifespan_cleans_managed_dataset_workdirs_before_run_import_and_workers(
     monkeypatch.setattr(main_module, "import_existing_runs", lambda: calls.append("import_existing_runs"))
     monkeypatch.setattr(main_module, "backfill_training_runs", lambda: calls.append("backfill_training_runs"))
     monkeypatch.setattr(main_module, "migrate_training_logs", lambda: calls.append("migrate_training_logs"))
+    # Schema creation is mocked here, so the real background backfill must not
+    # query the still-unmigrated test database after this lifespan exits.
+    monkeypatch.setattr(main_module, "backfill_batch_histories", lambda: None)
     monkeypatch.setattr(main_module, "scheduler", Worker("scheduler"))
     monkeypatch.setattr(main_module, "local_deletion_worker", Worker("local_deletion_worker"))
     monkeypatch.setattr(main_module, "inference_worker", Worker("inference_worker"))

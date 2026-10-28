@@ -596,6 +596,11 @@ def validate_contents(files_root: Path, manifest: dict, names: list[str], check=
     for index, spec in enumerate(manifest["files"]):
         if check:
             check()
+            # Reloads can provide a byte budget for image decoding as well as
+            # archive I/O. Other callers have no hook and keep their behavior.
+            throttle = getattr(check, 'throttle_bytes', None)
+            if throttle:
+                throttle(spec['size'] * (2 if spec['path'].startswith('images/') else 1))
         report_progress(check, 'content_validate', index, total_files, current_file=spec['path'])
         relative = PurePosixPath(spec["path"])
         path = files_root / relative

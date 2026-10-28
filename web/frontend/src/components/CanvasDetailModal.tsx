@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import { ArtifactDownload, ArtifactPreview } from './ArtifactDownload'
 import { Activity, Cpu, Download, FileArchive, FileText, Gauge, HardDrive, History, Save, ScanEye, Terminal, Trophy, X } from 'lucide-react'
 import { formatBytes } from '../api'
+import { batchPath } from '../batchHistory'
 import { finiteMetricValue, hasAnyMetricValue, metricPointCount, metricSeriesDisplay } from '../chartMetrics'
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { Artifact, EffectiveBestWeight, MetricPoint, TaskEvent, TrainingRun, TrainingTask } from '../types'
@@ -244,6 +245,7 @@ function StatusDetails({ task, run, events }: Pick<Props, 'task' | 'run' | 'even
   const finalMetricEntries = task.status === 'completed' ? Object.entries(task.completion_info?.final_metrics || {}) : []
   const completionNote = earlyStoppingExplanation(task)
   const epochProgress = trainingEpochProgress(task)
+  const batch = batchPath(task.batch, task.batch_history)
   return <div className="canvas-detail-sections">
     <div className="run-summary-strip">
       <div><span>当前状态</span><strong className={`detail-status ${task.status}`}>{trainingStatusLabel(task)}</strong></div>
@@ -255,6 +257,10 @@ function StatusDetails({ task, run, events }: Pick<Props, 'task' | 'run' | 'even
       <div className="detail-progress-heading"><h3>实际训练 Epoch {task.completed_epochs} / {trainingEpochTarget(task)}</h3><span>{epochProgress.toFixed(2)}%</span></div>
       <div className="detail-progress"><i style={{ width: `${epochProgress}%` }} /></div>
       {completionNote && <p className="training-completion-note">{completionNote}</p>}
+    </section>
+    <section className="canvas-detail-section">
+      <h3>Batch 使用情况</h3>
+      <div className="canvas-detail-grid"><DetailField label="本次设置" value={batch.submittedBatch} /><DetailField label="自动调整路径" value={batch.detailLabel} wide mono /></div>
     </section>
     {task.error_message && <div className="canvas-detail-error"><strong>本次运行错误</strong><pre>{task.error_message}</pre></div>}
     <section className="canvas-detail-section">

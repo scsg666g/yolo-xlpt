@@ -31,8 +31,16 @@ MESSAGES = {
     "center_cleanup": "正在清理中心缓存、测试文件及任务记录",
     "completed": "文件清理完成，任务记录已删除",
     "failed": "清理未完成，请查看原因后重试",
+    "workspace_busy": "训练工作区正被其他训练占用，本次未执行远程文件清理。请等待工作区内的训练结束后重试。",
     "agent_upgrade_required": "请升级远程 Agent 后重试",
 }
+
+
+def _workspace_busy_failure(operation: RemoteOperation) -> bool:
+    """Recognize the Agent's safe lock rejection in current and old records."""
+    error = operation.error or ""
+    return (operation.kind == "delete" and operation.status == "failed"
+            and "训练工作区正在使用" in error and "拒绝远程删除" in error)
 
 
 def reject_local_task_cleanup(db: Session) -> None:
@@ -90,13 +98,15 @@ def serialize_deletion_job(operation: RemoteOperation, task: TrainingTask | None
     if status == "succeeded":
         phase = "completed"
     elif status in {"failed", "cancelled"}:
-        phase = "failed"
+        phase = "workspace_busy" if _workspace_busy_failure(operation) else "failed"
     elif phase == "waiting_agent" and status == "running":
         phase = "deleting_files"
     if status == "center_cleaning" or status in ACTIVE and phase == "center_cleanup":
         status = "finalizing"
     message = MESSAGES.get(phase, "正在处理文件清理")
-    if status in {"failed", "cancelled"}:
+    if phase == "workspace_busy":
+        message = MESSAGES[phase]
+    elif status in {"failed", "cancelled"}:
         message = operation.error or message
     elif remote and phase in {"waiting_agent", "deleting_files"}:
         if not agent_version_at_least(node.agent_version if node else None, required_agent_parts):

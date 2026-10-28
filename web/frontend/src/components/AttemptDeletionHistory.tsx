@@ -61,10 +61,10 @@ function HistoryModal({ taskId, onClose }: { taskId?: string; onClose: () => voi
       {error && <p className="alert error" role="alert">{error}</p>}
       {loading && <p role="status">正在加载清理记录…</p>}
       {!loading && !visible.length && <div className="empty">暂无单次训练清理记录</div>}
-      {visible.map((job) => <article className={`trash-item deletion-history ${job.status === 'succeeded' ? 'completed' : job.status === 'failed' ? 'failed' : 'active'}`} key={job.id}>
+      {visible.map((job) => <article className={`trash-item deletion-history ${job.status === 'succeeded' ? 'completed' : job.phase === 'workspace_busy' && job.status === 'failed' ? 'workspace-busy' : job.status === 'failed' ? 'failed' : 'active'}`} key={job.id}>
         <div className="trash-item-copy"><strong>{job.task_name} · Attempt {String(job.attempt_number).padStart(3, '0')}</strong>
           <p>{job.executor === 'remote' ? job.node_name || '远程服务器' : '本机服务器'} · {job.message}</p>
-          {job.error && <p className="alert error">{job.error}</p>}
+          {job.error && job.phase !== 'workspace_busy' && <p className="alert error">{job.error}</p>}
           <small>提交：{new Date(job.created_at).toLocaleString('zh-CN')} · 更新：{new Date(job.updated_at).toLocaleString('zh-CN')}</small>
           {job.receipt && <details><summary>查看清理回执</summary><pre className="cleanup-receipt">{JSON.stringify(job.receipt, null, 2)}</pre></details>}
         </div>

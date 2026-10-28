@@ -175,6 +175,7 @@ class TaskRead(BaseModel):
     epochs: int
     completed_epochs: int
     batch: int
+    batch_history: list[int] = Field(default_factory=list)
     imgsz: int
     device: str
     workers: int
@@ -214,6 +215,7 @@ class RunRead(BaseModel):
     process_started_at: datetime | None
     command: list[Any]
     parameter_snapshot: dict[str, Any]
+    batch_history: list[int] = Field(default_factory=list)
     model_path: str
     data_path: str
     checkpoint_source: dict[str, Any] = Field(default_factory=dict)

@@ -1,5 +1,11 @@
 # YOLO 模型训练平台
 
+## 1.11.0 训练期间数据集操作
+
+本机数据集“重新加载”由独立后台通道执行，和常规目录操作分开；支持新能力的远程 Agent 也可在训练时只读导出。校验前后核对源内容，确认完整后才更新统计，源文件变化或校验失败保留上次有效结果。训练期间限制读取速率、检查剩余空间并按磁盘压力暂停；同一路径的导入、迁移及删除仍受锁保护。操作记录显示资源暂停、路径锁、离线和旧 Agent 等待训练的不同原因。历史数据无需迁移。
+
+本机可用 `PLATFORM_DATASET_REFRESH_READ_BYTES_PER_SECOND`（默认 32 MiB/s，`0` 关闭限速）、`PLATFORM_DATASET_REFRESH_IO_PRESSURE_PCT`（默认 25，`0` 关闭压力暂停）和 `PLATFORM_DATASET_REFRESH_MIN_FREE_BYTES`（默认 512 MiB）调节资源预算。Linux PSI 不可用时仅使用读取速率限制；远程 Agent 的可选配置见 [Agent 说明](agent/README.md)。当前平台为 **1.11.0**，配套 Agent 为 **2.5.3**。
+
 ## 1.10.0 数据集与训练记录可靠性
 
 数据集卡片的任务引用跟随训练任务变化；重复图片 stem 检查、重新加载请求幂等、临时文件保留与远程缓存对账清理均覆盖本机和 Agent 节点。重新加载仍走完整 SHA 校验流程，使用先前扫描计划减少一次重复扫描，不跳过源数据变化校验。训练 Attempt 新增可选的数据集配置摘要和最近一次目录校验快照；旧 Attempt 不回填。指标 CSV 增量同步会识别截断/替换并更新重写 Epoch。中心模型测试固定使用 CPU，按中心单通道顺序执行。
@@ -74,7 +80,7 @@
 
 独立于 Ultralytics 源码的训练任务控制台。平台通过受控参数调用现有 `yolo` CLI，并读取 `args.yaml`、`results.csv` 和权重文件。平台业务集中在 `web/`，训练行为仍取决于实际执行服务器上的 Ultralytics 版本与依赖环境。
 
-本说明面向页面使用和平台开发；首次安装见 [项目首页](../README.md)，远程配置见 [Agent 说明](agent/README.md)，服务维护见 [部署说明](deploy/README.md)，架构和当前缺陷见 [项目分析](../docs/project-analysis.md)。当前平台版本为 **1.10.0**，配套远程 Agent 为 **2.5.0**。
+本说明面向页面使用和平台开发；首次安装见 [项目首页](../README.md)，远程配置见 [Agent 说明](agent/README.md)，服务维护见 [部署说明](deploy/README.md)，架构和当前缺陷见 [项目分析](../docs/project-analysis.md)。当前平台版本为 **1.11.0**，配套远程 Agent 为 **2.5.3**。
 
 
 ## 1.4.11 训练生命周期与清理预检查

@@ -55,6 +55,8 @@ export interface TrainingTask {
   epochs: number
   completed_epochs: number
   batch: number
+  /** 当前 Attempt 的自动降批路径；旧数据或未识别日志可能缺失。 */
+  batch_history?: number[]
   imgsz: number
   device: string
   workers: number
@@ -92,6 +94,7 @@ export type DeletionJobPhase =
   | 'center_cleanup'
   | 'completed'
   | 'failed'
+  | 'workspace_busy'
 
 export interface DeletionJob {
   id: string
@@ -162,6 +165,8 @@ export interface TrainingRun {
   log_path: string | null
   completed_epochs: number
   progress: number
+  /** 仅属于此 Attempt 的自动降批路径。 */
+  batch_history?: number[]
   latest_metrics: Record<string, number | string | null>
   exit_code: number | null
   queue_reason?: string | null
@@ -581,9 +586,9 @@ export interface DatasetLocation {
   details: { free_bytes?: number; total_bytes?: number; message?: string; checked_at?: string }
 }
 export interface DatasetOperation {
-  progress?: { stage: string; phase: string; executor: string; processed: number; total: number | null; unit: 'files' | 'bytes' | 'directories'; current_file: string; sampled_at: string; changed_at: string; started_at: string; rate: number | null; eta_seconds: number | null } | null
+  progress?: { stage: string; phase: string; executor: string; processed: number; total: number | null; unit: 'files' | 'bytes' | 'directories'; current_file: string; sampled_at: string; changed_at: string; started_at: string; rate: number | null; eta_seconds: number | null; resource_reason?: string | null } | null
   progress_steps?: Array<{ stage: string; phase: string; executor: string }>
-  queued_at?: string | null; heartbeat_at?: string | null; started_at?: string | null; queue_ahead?: number; waiting_lock?: boolean
+  queued_at?: string | null; heartbeat_at?: string | null; started_at?: string | null; queue_ahead?: number; waiting_lock?: boolean; waiting_path_lock?: boolean; waiting_resource?: boolean
   can_delete_history?: boolean
   node_name?: string; source_node?: string; source_node_name?: string; target_node?: string; target_node_name?: string
   id: string; kind: string; status: string; phase: string; name: string; node_id: string

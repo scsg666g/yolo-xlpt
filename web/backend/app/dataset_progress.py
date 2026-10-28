@@ -5,7 +5,8 @@ import time
 
 STAGES = {'scan', 'source_verify', 'pack', 'archive_hash', 'transfer', 'unpack',
           'content_validate', 'target_verify', 'delete_verify', 'remove', 'check',
-          'discover', 'prepare_upload', 'export', 'validate', 'import', 'waiting_lock'}
+          'discover', 'prepare_upload', 'export', 'validate', 'import', 'waiting_lock',
+          'paused_resource'}
 
 
 def clean_progress(value):
@@ -13,6 +14,11 @@ def clean_progress(value):
         raise ValueError('进度阶段无效')
     result = {'stage': value['stage'], 'unit': value.get('unit', 'files'),
               'current_file': str(value.get('current_file', ''))[-400:]}
+    if result['stage'] == 'paused_resource':
+        reason = value.get('resource_reason')
+        if reason not in ('disk_pressure', 'low_disk_space'):
+            raise ValueError('资源暂停原因无效')
+        result['resource_reason'] = reason
     if result['unit'] not in ('files', 'bytes', 'directories'):
         raise ValueError('进度单位无效')
     for key in ('processed', 'total'):
@@ -46,6 +52,8 @@ def record_progress(op, value, run_id, executor):
     steps = list(payload.get('progress_steps', []))[-15:]
     if (previous and not same and previous.get('run_id') == run_id
             and previous.get('stage') != value['stage']
+            and previous.get('stage') != 'paused_resource'
+            and value['stage'] != 'paused_resource'
             and previous.get('stage') not in {'export', 'prepare_upload', 'validate', 'import'}):
         steps.append({k: previous.get(k) for k in ('stage', 'phase', 'executor')})
     changed = not same or previous.get('processed') != value['processed']

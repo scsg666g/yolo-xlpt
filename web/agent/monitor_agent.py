@@ -30,8 +30,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.5.0"
+VERSION = "2.5.3"
 LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
+DEFAULT_DATASET_REFRESH_READ_RATE = 32 * 1024**2
+DEFAULT_DATASET_REFRESH_MIN_FREE = 512 * 1024**2
+DEFAULT_DATASET_REFRESH_IO_PRESSURE_PCT = 25
 DELETE_RECEIPT_VERSION = 1
 TRACE_VERSION = 1
 TRACE_MAXIMUM = 24
@@ -350,7 +353,8 @@ def training_capability(config: dict) -> dict:
                 "python_version": platform.python_version(), "output_writable": False,
                 "lock_occupied": False, "output_roots": [], "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True, "dataset_concurrent_reads": True}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True,
+                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True}
     reported_roots = []
     try:
         reported_roots = [str(root) for root in configured_output_roots(config)]
@@ -390,7 +394,8 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": occupied,
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True, "dataset_concurrent_reads": True}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True,
+                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True}
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
@@ -398,7 +403,8 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": False,
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
-                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True, "dataset_concurrent_reads": True}
+                "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True,
+                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True}
 
 
 def next_report_sequence() -> int:
@@ -552,6 +558,15 @@ def load_config(path: Path) -> dict:
     quota = config.get('dataset_staging_quota_bytes', 100 * 1024**3)
     if type(quota) is not int or quota <= 0:
         raise ValueError('dataset_staging_quota_bytes 必须为正整数字节数')
+    refresh_rate = config.get('dataset_refresh_read_rate_bytes_per_second', DEFAULT_DATASET_REFRESH_READ_RATE)
+    if type(refresh_rate) is not int or not 1024**2 <= refresh_rate <= 1024**3:
+        raise ValueError('dataset_refresh_read_rate_bytes_per_second 必须为 1 MiB/s～1 GiB/s 的整数')
+    refresh_min_free = config.get('dataset_refresh_min_free_bytes', DEFAULT_DATASET_REFRESH_MIN_FREE)
+    if type(refresh_min_free) is not int or not 0 <= refresh_min_free <= 1024**4:
+        raise ValueError('dataset_refresh_min_free_bytes 必须为 0～1 TiB 的整数字节数')
+    refresh_pressure = config.get('dataset_refresh_io_pressure_pct', DEFAULT_DATASET_REFRESH_IO_PRESSURE_PCT)
+    if type(refresh_pressure) is not int or not 0 <= refresh_pressure <= 100:
+        raise ValueError('dataset_refresh_io_pressure_pct 必须为 0～100 的整数百分比')
     lock_path = Path(paths["training_lock_file"])
     if enabled and not lock_path.parent.is_dir():
         raise ValueError("training_lock_file 的父目录必须已存在")
@@ -566,7 +581,10 @@ def load_config(path: Path) -> dict:
             "training_lock_file": str(lock_path),
             "training_state_dir": str(path.resolve().parent / ".training-state"),
             "enable_training_trace": trace_enabled, "dataset_roots": dataset_roots,
-            "dataset_staging_quota_bytes": quota}
+            "dataset_staging_quota_bytes": quota,
+            "dataset_refresh_read_rate_bytes_per_second": refresh_rate,
+            "dataset_refresh_min_free_bytes": refresh_min_free,
+            "dataset_refresh_io_pressure_pct": refresh_pressure}
 
 
 class LockBundle:
@@ -2050,6 +2068,14 @@ def execute_operation(config: dict, operation: dict, stop: threading.Event) -> N
         elif operation["kind"] == "fetch_log":
             fetch_remote_log(config, operation, stop, endpoint)
             return
+        elif operation["kind"] == "batch_history":
+            _run_dir, log_path = operation_paths(config, payload, allow_legacy_flat=True)
+            if log_path is None:
+                raise ValueError("远程训练日志路径缺失")
+            configured = payload.get("batch")
+            if type(configured) is not int or not 1 <= configured <= 1024:
+                raise ValueError("Batch 初始值无效")
+            result["batch_history"] = read_batch_history(log_path, configured, full=True)
         else:
             raise ValueError("未知远程操作")
     except Exception as exc:
@@ -2086,6 +2112,68 @@ _METRIC_CSV_READER = METRIC_FILES["MetricCsvReader"](maximum_files=4)
 _REMOTE_CSV_GENERATIONS = {}
 _REMOTE_CSV_GENERATION_LOCK = threading.Lock()
 # END PORTABLE METRIC CORE
+
+
+_BATCH_REDUCTION = re.compile(r"\bwith batch=(\d+)\.\s+Reducing to batch=(\d+) and retrying\b", re.I)
+_BATCH_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_BATCH_LOG_CACHE = {}
+_BATCH_LOG_LOCK = threading.Lock()
+
+
+def _append_batch_reductions(history, lines, configured):
+    result = list(history or [])
+    for line in lines:
+        match = _BATCH_REDUCTION.search(_BATCH_ANSI.sub("", line))
+        if not match:
+            continue
+        old, new = map(int, match.groups())
+        if not 1 <= new < old <= 1024:
+            continue
+        if not result:
+            if configured > 0 and old != configured:
+                continue
+            result = [old]
+        if result[-1] == new:
+            continue
+        if result[-1] == old and len(result) < 8:
+            result.append(new)
+    return result if len(result) > 1 else []
+
+
+def read_batch_history(path: Path, configured: int, *, full: bool = False) -> list[int]:
+    """Read appended lines during training, or scan historical log once in place."""
+    if full:
+        # Historical scans can be large. Never hold the live-report cache lock.
+        history = []
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                history = _append_batch_reductions(history, (line,), configured)
+        return history
+    key = str(path)
+    with _BATCH_LOG_LOCK:
+        try:
+            with path.open("rb") as handle:
+                info = os.fstat(handle.fileno())
+                state = _BATCH_LOG_CACHE.get(key)
+                if not state or state[0] != info.st_dev or state[1] != info.st_ino or info.st_size < state[2]:
+                    state = (info.st_dev, info.st_ino, 0, [])
+                handle.seek(state[2])
+                history = list(state[3])
+                while True:
+                    start = handle.tell()
+                    raw = handle.readline()
+                    if not raw:
+                        break
+                    if not raw.endswith(b"\n"):
+                        handle.seek(start)
+                        break
+                    history = _append_batch_reductions(history, [raw.decode("utf-8", errors="replace")], configured)
+                if len(_BATCH_LOG_CACHE) >= 256 and key not in _BATCH_LOG_CACHE:
+                    _BATCH_LOG_CACHE.pop(next(iter(_BATCH_LOG_CACHE)))
+                _BATCH_LOG_CACHE[key] = (info.st_dev, info.st_ino, handle.tell(), history)
+                return history
+        except OSError:
+            return list(_BATCH_LOG_CACHE.get(key, (None, None, None, []))[3])
 
 
 def read_remote_progress(run_dir: Path, *, final: bool = False,
@@ -2279,6 +2367,9 @@ def _save_terminal_for_retry(config: dict, task: dict, payload: dict) -> Path:
 
 def training_report_payload(task: dict, payload: dict) -> dict:
     """Old centers have strict schemas; only advertise negotiated additions."""
+    if task.get('batch_history_version') == 1:
+        payload = {**payload, 'batch_history': read_batch_history(
+            Path(task['log_path']), int(task['parameters']['batch']))}
     if task.get('dataset_provenance_version') == 1 and task.get('dataset_snapshot'):
         return {**payload, 'dataset_snapshot': task['dataset_snapshot']}
     return payload
@@ -2957,7 +3048,7 @@ def fulfill_refresh_request(config: dict, request_id: str, stop: threading.Event
 
 
 # BEGIN PORTABLE DATASET CORE (generated from backend/app/dataset_files.py)
-DATASET_FILES_SOURCE = '"""Portable dataset file operations; embedded unchanged into the standalone Agent."""\nfrom __future__ import annotations\nimport hashlib\nimport json\nimport os\nimport re\nfrom pathlib import Path, PurePosixPath\nimport shutil\nimport tarfile\n\nMAX_BYTES = 50 * 1024**3\nMAX_FILES = 200_010\nMARKER = ".yolo-platform-dataset.json"\n\n\ndef report_progress(check, stage, processed=0, total=None, unit=\'files\', current_file=\'\'):\n    """Optional progress hook; legacy callers keep the same cancellation callback."""\n    report = getattr(check, \'progress\', None)\n    if report:\n        report({\'stage\': stage, \'processed\': processed, \'total\': total, \'unit\': unit,\n                \'current_file\': str(current_file)[-400:]})\n\n\ndef digest(path, check=None, stage=None):\n    value = hashlib.sha256()\n    processed = 0\n    total = Path(path).stat().st_size if stage else None\n    if stage:\n        report_progress(check, stage, 0, total, \'bytes\')\n    with Path(path).open("rb") as stream:\n        for chunk in iter(lambda: stream.read(1024 * 1024), b""):\n            if check:\n                check()\n            value.update(chunk)\n            processed += len(chunk)\n            if stage:\n                report_progress(check, stage, processed, total, \'bytes\')\n    return value.hexdigest()\n\n\ndef inside(path, roots, create=False):\n    raw = Path(path).expanduser()\n    resolved = raw.resolve()\n    if not raw.is_absolute() or raw != resolved:\n        raise ValueError("目录必须为可解析的绝对路径，不能包含符号链接")\n    allowed = [Path(root).resolve() for root in roots]\n    if not any(root == resolved or root in resolved.parents for root in allowed):\n        raise ValueError("目录不在数据集允许范围内，请核对服务器配置")\n    if create:\n        resolved.mkdir(parents=True, exist_ok=True)\n    return resolved\n\n\ndef check_root(path, roots, create=False):\n    root = inside(path, roots, create)\n    if not root.is_dir():\n        raise ValueError("目录不存在或不是文件夹")\n    # Exercise actual filesystem permissions, rather than only reporting os.access.\n    import tempfile\n    with tempfile.TemporaryFile(dir=root):\n        pass\n    usage = shutil.disk_usage(root)\n    return {"resolved_path": str(root), "free_bytes": usage.free, "total_bytes": usage.total,\n            "status": "ready"}\n\n\ndef scan(root, check=None, stage="scan"):\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError("数据集目录不存在或为符号链接")\n    files, total = [], 0\n    report_progress(check, stage)\n    for directory, dirs, names in os.walk(root, followlinks=False):\n        for name in dirs:\n            if (Path(directory) / name).is_symlink():\n                raise ValueError("数据集不能包含符号链接目录")\n        for name in sorted(names):\n            if name.endswith(\'.cache\') or name in {MARKER, \'.dataset-content.json\'}:\n                continue\n            path = Path(directory) / name\n            if path.is_symlink() or not path.is_file():\n                raise ValueError("数据集不能包含符号链接或特殊文件")\n            relative = path.relative_to(root).as_posix()\n            safe_member(relative)\n            size = path.stat().st_size\n            total += size\n            if total > MAX_BYTES or len(files) >= MAX_FILES:\n                raise ValueError("数据集超过 50 GB 或 20 万文件限制")\n            if check:\n                check()\n            report_progress(check, stage, len(files), current_file=relative)\n            before = path.stat()\n            sha = digest(path, check)\n            after = path.stat()\n            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):\n                raise ValueError("数据集在校验中发生修改，请停止修改后重试")\n            files.append({"path": relative, "size": size, "sha256": sha})\n    report_progress(check, stage, len(files), len(files))\n    files.sort(key=lambda x: x[\'path\'])\n    signature = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()\n    return {"files": files, "total_bytes": total, "fingerprint": signature}\n\n\ndef safe_member(name):\n    p = PurePosixPath(name)\n    if not name or p.is_absolute() or \'\\\\\' in name or any(part in {\'\', \'.\', \'..\'} or part.startswith(\'.\') for part in name.split(\'/\')) or any(ord(c) < 32 for c in name):\n        raise ValueError("数据文件相对路径无效")\n    return p\n\n\ndef pack(root, archive, check=None, *, manifest=None):\n    # Reuse quota/archive planning while retaining full source verification.\n    manifest = manifest if manifest is not None else scan(root, check)\n    archive = Path(archive)\n    archive.parent.mkdir(parents=True, exist_ok=True)\n    temporary = archive.with_suffix(\'.tmp\')\n    processed = 0\n    report_progress(check, \'pack\', 0, manifest[\'total_bytes\'], \'bytes\')\n    class Reader:\n        def __init__(self, stream, name):\n            self.stream, self.name = stream, name\n        def read(self, size=-1):\n            nonlocal processed\n            data = self.stream.read(size)\n            processed += len(data)\n            if check:\n                check()\n            report_progress(check, \'pack\', processed, manifest[\'total_bytes\'], \'bytes\', self.name)\n            return data\n    with tarfile.open(temporary, \'w\') as tar:\n        for file in manifest[\'files\']:\n            if check:\n                check()\n            path = Path(root) / file[\'path\']\n            info = tar.gettarinfo(str(path), arcname=file[\'path\'])\n            if not info.isfile():\n                raise ValueError(\'数据集不能包含符号链接或特殊文件\')\n            with path.open(\'rb\') as stream:\n                tar.addfile(info, Reader(stream, file[\'path\']))\n    # Reject concurrent source changes before handing a snapshot to another node.\n    if scan(root, check, stage=\'source_verify\')[\'fingerprint\'] != manifest[\'fingerprint\']:\n        temporary.unlink(missing_ok=True)\n        raise ValueError("源数据在导出期间发生修改")\n    temporary.replace(archive)\n    return {**manifest, \'archive_size\': archive.stat().st_size, \'archive_sha256\': digest(archive, check, stage=\'archive_hash\')}\n\n\ndef unpack(archive, target, manifest, check=None):\n    target = Path(target)\n    target.mkdir(parents=True, exist_ok=True)\n    entries = {item[\'path\']: item for item in manifest[\'files\']}\n    if len(entries) != len(manifest[\'files\']) or len(entries) > MAX_FILES or sum(i[\'size\'] for i in entries.values()) > MAX_BYTES:\n        raise ValueError("数据清单大小或路径无效")\n    seen = set()\n    processed = 0\n    total = sum(i[\'size\'] for i in entries.values())\n    report_progress(check, \'unpack\', 0, total, \'bytes\')\n    with tarfile.open(archive, \'r:\') as tar:\n        for item in tar:\n            if check:\n                check()\n            safe_member(item.name)\n            spec = entries.get(item.name)\n            if not item.isfile() or item.name in seen or not spec or item.size != spec[\'size\']:\n                raise ValueError("归档文件类型、大小或清单不匹配")\n            seen.add(item.name)\n            path = target / item.name\n            path.parent.mkdir(parents=True, exist_ok=True)\n            source = tar.extractfile(item)\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n            with path.open(\'xb\') as output:\n                for chunk in iter(lambda: source.read(1024 * 1024), b\'\'):\n                    output.write(chunk)\n                    if check:\n                        check()\n            if digest(path, check) != spec[\'sha256\']:\n                raise ValueError("数据文件 SHA-256 校验失败")\n            processed += item.size\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n    if seen != set(entries):\n        raise ValueError("归档缺少数据文件")\n\n\ndef publish(archive, root, name, manifest, identity, config_text, check=None):\n    if not name or name.startswith(\'.\') or \'/\' in name or \'\\\\\' in name:\n        raise ValueError("数据集名称无效")\n    if not re.fullmatch(r\'[0-9a-f]{32}\', identity):\n        raise ValueError(\'操作编号无效\')\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError(\'目标根目录不可用\')\n    destination = root / name\n    if destination.exists() or destination.is_symlink():\n        try:\n            metadata = json.loads((destination / MARKER).read_text())\n        except (OSError, ValueError):\n            metadata = {}\n        if metadata.get(\'operation_id\') == identity:\n            actual = scan(destination, check)\n            if actual[\'fingerprint\'] != metadata.get(\'fingerprint\'):\n                raise ValueError(\'已发布的目录内容发生变化，请人工核对\')\n            return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\'), \'already_published\': True}\n        raise ValueError("目标存在同名目录，不允许覆盖")\n    work = root / (\'.dataset-publish-\' + identity)\n    if work.is_symlink():\n        raise ValueError(\'临时目录不能是符号链接\')\n    if work.exists():\n        shutil.rmtree(work)\n    required = manifest[\'total_bytes\'] + 100 * 1024**2\n    if shutil.disk_usage(root).free < required:\n        raise ValueError("目标磁盘空间不足")\n    try:\n        unpack(archive, work, manifest, check)\n        if config_text is not None:\n            (work / \'data.yaml\').write_text(config_text, encoding=\'utf-8\')\n        actual = scan(work, check, stage=\'target_verify\')\n        (work / MARKER).write_text(json.dumps({\'version\': 1, \'name\': name, \'operation_id\': identity,\n                                               \'fingerprint\': actual[\'fingerprint\']}, ensure_ascii=False), encoding=\'utf-8\')\n        if check:\n            check(\'committing\')\n        if destination.exists() or destination.is_symlink():\n            raise ValueError("目标目录已出现，拒绝覆盖")\n        work.rename(destination)\n        return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\')}\n    finally:\n        if work.exists():\n            shutil.rmtree(work)\n\n\ndef remove_dataset(path, roots, expected_fingerprint, check=None):\n    path = inside(path, roots)\n    allowed = [Path(root).resolve() for root in roots]\n    if any(path == root or path in root.parents for root in allowed) or not path.parent.is_dir():\n        raise ValueError("不能删除根目录或离线磁盘上的数据")\n    if not expected_fingerprint:\n        raise ValueError("缺少内容指纹，拒绝删除")\n    quarantine = path.parent / (\'.dataset-delete-\' + hashlib.sha256(\n        (str(path) + expected_fingerprint).encode()).hexdigest()[:32])\n    if quarantine.is_symlink():\n        raise ValueError("删除暂存目录不能为符号链接")\n    if quarantine.exists():\n        # A crash may have interrupted rmtree. Only this path+snapshot\'s private\n        # quarantine may be resumed; a newly created source is never removed.\n        if check:\n            check(\'committing\')\n        shutil.rmtree(quarantine)\n        return {\'deleted\': True, \'recovered\': True}\n    if not path.exists():\n        return {\'already_missing\': True}\n    if scan(path, check, stage=\'delete_verify\')[\'fingerprint\'] != expected_fingerprint:\n        raise ValueError("数据集内容已变化，拒绝删除，请重新校验")\n    if check:\n        check(\'committing\')\n    report_progress(check, \'remove\')\n    path.rename(quarantine)\n    shutil.rmtree(quarantine)\n    return {\'deleted\': True}\n'
+DATASET_FILES_SOURCE = '"""Portable dataset file operations; embedded unchanged into the standalone Agent."""\nfrom __future__ import annotations\nimport hashlib\nimport json\nimport os\nimport re\nfrom pathlib import Path, PurePosixPath\nimport shutil\nimport tarfile\n\nMAX_BYTES = 50 * 1024**3\nMAX_FILES = 200_010\nMARKER = ".yolo-platform-dataset.json"\n\n\ndef report_progress(check, stage, processed=0, total=None, unit=\'files\', current_file=\'\'):\n    """Optional progress hook; legacy callers keep the same cancellation callback."""\n    report = getattr(check, \'progress\', None)\n    if report:\n        report({\'stage\': stage, \'processed\': processed, \'total\': total, \'unit\': unit,\n                \'current_file\': str(current_file)[-400:]})\n\n\ndef throttle_read(check, size):\n    """Optional caller-owned budget; ordinary and legacy file work is unchanged."""\n    throttle = getattr(check, \'throttle_bytes\', None)\n    if throttle and size:\n        throttle(size)\n\n\ndef digest(path, check=None, stage=None):\n    value = hashlib.sha256()\n    processed = 0\n    total = Path(path).stat().st_size if stage else None\n    if stage:\n        report_progress(check, stage, 0, total, \'bytes\')\n    with Path(path).open("rb") as stream:\n        for chunk in iter(lambda: stream.read(1024 * 1024), b""):\n            if check:\n                check()\n            throttle_read(check, len(chunk))\n            value.update(chunk)\n            processed += len(chunk)\n            if stage:\n                report_progress(check, stage, processed, total, \'bytes\')\n    return value.hexdigest()\n\n\ndef inside(path, roots, create=False):\n    raw = Path(path).expanduser()\n    resolved = raw.resolve()\n    if not raw.is_absolute() or raw != resolved:\n        raise ValueError("目录必须为可解析的绝对路径，不能包含符号链接")\n    allowed = [Path(root).resolve() for root in roots]\n    if not any(root == resolved or root in resolved.parents for root in allowed):\n        raise ValueError("目录不在数据集允许范围内，请核对服务器配置")\n    if create:\n        resolved.mkdir(parents=True, exist_ok=True)\n    return resolved\n\n\ndef check_root(path, roots, create=False):\n    root = inside(path, roots, create)\n    if not root.is_dir():\n        raise ValueError("目录不存在或不是文件夹")\n    # Exercise actual filesystem permissions, rather than only reporting os.access.\n    import tempfile\n    with tempfile.TemporaryFile(dir=root):\n        pass\n    usage = shutil.disk_usage(root)\n    return {"resolved_path": str(root), "free_bytes": usage.free, "total_bytes": usage.total,\n            "status": "ready"}\n\n\ndef scan(root, check=None, stage="scan"):\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError("数据集目录不存在或为符号链接")\n    files, total = [], 0\n    report_progress(check, stage)\n    for directory, dirs, names in os.walk(root, followlinks=False):\n        for name in dirs:\n            if (Path(directory) / name).is_symlink():\n                raise ValueError("数据集不能包含符号链接目录")\n        for name in sorted(names):\n            if name.endswith(\'.cache\') or name in {MARKER, \'.dataset-content.json\'}:\n                continue\n            if name == \'.dataset-storage.lock\' and Path(directory) == root:\n                # An Agent can be asked to export the allow-listed root itself.\n                # Its advisory lock is platform metadata, not dataset content.\n                continue\n            path = Path(directory) / name\n            # Give optional background readers a small metadata-I/O budget as\n            # well as byte budgets. Ordinary callers have no throttle hook.\n            throttle_read(check, 4096)\n            if path.is_symlink() or not path.is_file():\n                raise ValueError("数据集不能包含符号链接或特殊文件")\n            relative = path.relative_to(root).as_posix()\n            safe_member(relative)\n            before = path.stat()\n            size = before.st_size\n            total += size\n            if total > MAX_BYTES or len(files) >= MAX_FILES:\n                raise ValueError("数据集超过 50 GB 或 20 万文件限制")\n            if check:\n                check()\n            report_progress(check, stage, len(files), current_file=relative)\n            sha = digest(path, check)\n            after = path.stat()\n            if (before.st_dev, before.st_ino, before.st_mode, before.st_size,\n                    before.st_mtime_ns, before.st_ctime_ns) != (\n                    after.st_dev, after.st_ino, after.st_mode, after.st_size,\n                    after.st_mtime_ns, after.st_ctime_ns):\n                raise ValueError("数据集在校验中发生修改，请停止修改后重试")\n            files.append({"path": relative, "size": size, "sha256": sha})\n    report_progress(check, stage, len(files), len(files))\n    files.sort(key=lambda x: x[\'path\'])\n    signature = hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()\n    return {"files": files, "total_bytes": total, "fingerprint": signature}\n\n\ndef safe_member(name):\n    p = PurePosixPath(name)\n    if not name or p.is_absolute() or \'\\\\\' in name or any(part in {\'\', \'.\', \'..\'} or part.startswith(\'.\') for part in name.split(\'/\')) or any(ord(c) < 32 for c in name):\n        raise ValueError("数据文件相对路径无效")\n    return p\n\n\ndef pack(root, archive, check=None, *, manifest=None):\n    # Reuse quota/archive planning while retaining full source verification.\n    manifest = manifest if manifest is not None else scan(root, check)\n    archive = Path(archive)\n    archive.parent.mkdir(parents=True, exist_ok=True)\n    temporary = archive.with_suffix(\'.tmp\')\n    processed = 0\n    report_progress(check, \'pack\', 0, manifest[\'total_bytes\'], \'bytes\')\n    class Reader:\n        def __init__(self, stream, name):\n            self.stream, self.name = stream, name\n            self.hash = hashlib.sha256()\n        def read(self, size=-1):\n            nonlocal processed\n            data = self.stream.read(size)\n            processed += len(data)\n            if check:\n                check()\n            throttle_read(check, len(data))\n            self.hash.update(data)\n            report_progress(check, \'pack\', processed, manifest[\'total_bytes\'], \'bytes\', self.name)\n            return data\n    try:\n        with tarfile.open(temporary, \'w\') as tar:\n            for file in manifest[\'files\']:\n                if check:\n                    check()\n                throttle_read(check, 4096)\n                path = Path(root) / file[\'path\']\n                info = tar.gettarinfo(str(path), arcname=file[\'path\'])\n                if not info.isfile() or info.size != file[\'size\']:\n                    raise ValueError(\'源数据在导出期间发生修改\')\n                with path.open(\'rb\') as stream:\n                    reader = Reader(stream, file[\'path\'])\n                    tar.addfile(info, reader)\n                    if reader.hash.hexdigest() != file[\'sha256\']:\n                        raise ValueError(\'源数据在导出期间发生修改\')\n        # A second scan catches changes to files already copied and new files.\n        if scan(root, check, stage=\'source_verify\')[\'fingerprint\'] != manifest[\'fingerprint\']:\n            raise ValueError("源数据在导出期间发生修改")\n        temporary.replace(archive)\n    except BaseException:\n        temporary.unlink(missing_ok=True)\n        raise\n    return {**manifest, \'archive_size\': archive.stat().st_size, \'archive_sha256\': digest(archive, check, stage=\'archive_hash\')}\n\n\ndef unpack(archive, target, manifest, check=None):\n    target = Path(target)\n    target.mkdir(parents=True, exist_ok=True)\n    entries = {item[\'path\']: item for item in manifest[\'files\']}\n    if len(entries) != len(manifest[\'files\']) or len(entries) > MAX_FILES or sum(i[\'size\'] for i in entries.values()) > MAX_BYTES:\n        raise ValueError("数据清单大小或路径无效")\n    seen = set()\n    processed = 0\n    total = sum(i[\'size\'] for i in entries.values())\n    report_progress(check, \'unpack\', 0, total, \'bytes\')\n    with tarfile.open(archive, \'r:\') as tar:\n        for item in tar:\n            if check:\n                check()\n            safe_member(item.name)\n            spec = entries.get(item.name)\n            if not item.isfile() or item.name in seen or not spec or item.size != spec[\'size\']:\n                raise ValueError("归档文件类型、大小或清单不匹配")\n            seen.add(item.name)\n            path = target / item.name\n            path.parent.mkdir(parents=True, exist_ok=True)\n            source = tar.extractfile(item)\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n            with path.open(\'xb\') as output:\n                for chunk in iter(lambda: source.read(1024 * 1024), b\'\'):\n                    throttle_read(check, len(chunk))\n                    output.write(chunk)\n                    if check:\n                        check()\n            if digest(path, check) != spec[\'sha256\']:\n                raise ValueError("数据文件 SHA-256 校验失败")\n            processed += item.size\n            report_progress(check, \'unpack\', processed, total, \'bytes\', item.name)\n    if seen != set(entries):\n        raise ValueError("归档缺少数据文件")\n\n\ndef publish(archive, root, name, manifest, identity, config_text, check=None):\n    if not name or name.startswith(\'.\') or \'/\' in name or \'\\\\\' in name:\n        raise ValueError("数据集名称无效")\n    if not re.fullmatch(r\'[0-9a-f]{32}\', identity):\n        raise ValueError(\'操作编号无效\')\n    root = Path(root)\n    if root.is_symlink() or not root.is_dir():\n        raise ValueError(\'目标根目录不可用\')\n    destination = root / name\n    if destination.exists() or destination.is_symlink():\n        try:\n            metadata = json.loads((destination / MARKER).read_text())\n        except (OSError, ValueError):\n            metadata = {}\n        if metadata.get(\'operation_id\') == identity:\n            actual = scan(destination, check)\n            if actual[\'fingerprint\'] != metadata.get(\'fingerprint\'):\n                raise ValueError(\'已发布的目录内容发生变化，请人工核对\')\n            return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\'), \'already_published\': True}\n        raise ValueError("目标存在同名目录，不允许覆盖")\n    work = root / (\'.dataset-publish-\' + identity)\n    if work.is_symlink():\n        raise ValueError(\'临时目录不能是符号链接\')\n    if work.exists():\n        shutil.rmtree(work)\n    required = manifest[\'total_bytes\'] + 100 * 1024**2\n    if shutil.disk_usage(root).free < required:\n        raise ValueError("目标磁盘空间不足")\n    try:\n        unpack(archive, work, manifest, check)\n        if config_text is not None:\n            (work / \'data.yaml\').write_text(config_text, encoding=\'utf-8\')\n        actual = scan(work, check, stage=\'target_verify\')\n        (work / MARKER).write_text(json.dumps({\'version\': 1, \'name\': name, \'operation_id\': identity,\n                                               \'fingerprint\': actual[\'fingerprint\']}, ensure_ascii=False), encoding=\'utf-8\')\n        if check:\n            check(\'committing\')\n        if destination.exists() or destination.is_symlink():\n            raise ValueError("目标目录已出现，拒绝覆盖")\n        work.rename(destination)\n        return {\'path\': str(destination), \'fingerprint\': actual[\'fingerprint\'], \'total_bytes\': actual[\'total_bytes\'], \'config_sha256\': digest(destination / \'data.yaml\')}\n    finally:\n        if work.exists():\n            shutil.rmtree(work)\n\n\ndef remove_dataset(path, roots, expected_fingerprint, check=None):\n    path = inside(path, roots)\n    allowed = [Path(root).resolve() for root in roots]\n    if any(path == root or path in root.parents for root in allowed) or not path.parent.is_dir():\n        raise ValueError("不能删除根目录或离线磁盘上的数据")\n    if not expected_fingerprint:\n        raise ValueError("缺少内容指纹，拒绝删除")\n    quarantine = path.parent / (\'.dataset-delete-\' + hashlib.sha256(\n        (str(path) + expected_fingerprint).encode()).hexdigest()[:32])\n    if quarantine.is_symlink():\n        raise ValueError("删除暂存目录不能为符号链接")\n    if quarantine.exists():\n        # A crash may have interrupted rmtree. Only this path+snapshot\'s private\n        # quarantine may be resumed; a newly created source is never removed.\n        if check:\n            check(\'committing\')\n        shutil.rmtree(quarantine)\n        return {\'deleted\': True, \'recovered\': True}\n    if not path.exists():\n        return {\'already_missing\': True}\n    if scan(path, check, stage=\'delete_verify\')[\'fingerprint\'] != expected_fingerprint:\n        raise ValueError("数据集内容已变化，拒绝删除，请重新校验")\n    if check:\n        check(\'committing\')\n    report_progress(check, \'remove\')\n    path.rename(quarantine)\n    shutil.rmtree(quarantine)\n    return {\'deleted\': True}\n'
 DATASET_FILES = {}
 exec(compile(DATASET_FILES_SOURCE, "<dataset_files>", "exec"), DATASET_FILES)
 # END PORTABLE DATASET CORE
@@ -3092,13 +3183,45 @@ def poll_dataset_operation(config, busy):
     if busy:
         path += '?lightweight_only=true'
     work = dataset_api(config, path, 'POST', {}).get('operation')
-    if work and busy and work.get('phase') not in LIGHTWEIGHT_DATASET_PHASES:
+    if work and busy and work.get('phase') not in LIGHTWEIGHT_DATASET_PHASES and not concurrent_refresh_work(work):
         return None
     return work
 
 
-def dataset_blocks_training(thread, phase):
-    return thread is not None and thread.is_alive() and phase not in LIGHTWEIGHT_DATASET_PHASES
+def concurrent_refresh_work(work):
+    """Only a centre-negotiated refresh export may bypass the training gate."""
+    return (work.get('kind') == 'refresh' and work.get('phase') == 'export'
+            and work.get('read_only_during_training') is True)
+
+
+def dataset_blocks_training(thread, phase, read_only_refresh=False):
+    return (thread is not None and thread.is_alive()
+            and phase not in LIGHTWEIGHT_DATASET_PHASES and not read_only_refresh)
+
+
+def dataset_io_pressure_percent():
+    """Linux PSI is optional; unsupported systems rely on the read budget."""
+    try:
+        line = Path('/proc/pressure/io').read_text(encoding='ascii').splitlines()[0]
+        match = re.search(r'\bavg10=([0-9]+(?:\.[0-9]+)?)\b', line)
+        return float(match.group(1)) if match else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def dataset_refresh_resource_reason(config, staging, minimum_free):
+    if minimum_free and shutil.disk_usage(staging).free < minimum_free:
+        return 'low_disk_space'
+    threshold = config.get('dataset_refresh_io_pressure_pct', DEFAULT_DATASET_REFRESH_IO_PRESSURE_PCT)
+    pressure = dataset_io_pressure_percent() if threshold else None
+    if pressure is not None and pressure >= threshold:
+        return 'disk_pressure'
+    return None
+
+
+def verify_refresh_source(source, expected_fingerprint, check):
+    if DATASET_FILES['scan'](source, check, stage='source_verify')['fingerprint'] != expected_fingerprint:
+        raise ValueError('源数据在重新加载期间发生修改，请重试')
 
 
 def run_dataset_operation(config, work, stop):
@@ -3112,6 +3235,11 @@ def run_dataset_operation(config, work, stop):
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
     locks = []
     training_lock = None
+    read_only_refresh = concurrent_refresh_work(work)
+    minimum_free = [0]
+    resource_checked = [0.0, None]
+    current_progress = [None]
+    resume_progress = [None]
     last = [0.0]
     def check(stage=None):
         if stop.is_set():
@@ -3119,6 +3247,25 @@ def run_dataset_operation(config, work, stop):
         if stage or time.monotonic() - last[0] > 4:
             dataset_api(config, base + '/heartbeat', 'POST', {'token': token, 'phase': phase, 'committing': stage == 'committing'})
             last[0] = time.monotonic()
+        if read_only_refresh:
+            resumed = resume_progress[0]
+            while True:
+                now = time.monotonic()
+                if now - resource_checked[0] >= 2:
+                    resource_checked[:] = [now, dataset_refresh_resource_reason(config, state, minimum_free[0])]
+                if not resource_checked[1]:
+                    break
+                report_progress({'stage': 'paused_resource', 'resource_reason': resource_checked[1],
+                                 'processed': (resumed or {}).get('processed', 0),
+                                 'total': (resumed or {}).get('total'),
+                                 'unit': (resumed or {}).get('unit', 'files')})
+                if stop.wait(2):
+                    raise OSError('Agent 正在退出，等待下次恢复')
+                if time.monotonic() - last[0] > 4:
+                    dataset_api(config, base + '/heartbeat', 'POST', {'token': token, 'phase': phase})
+                    last[0] = time.monotonic()
+            if current_progress[0] and current_progress[0].get('stage') == 'paused_resource' and resumed:
+                report_progress(resumed)
     progress_last = [0.0, None, None]
     progress_sequence = [0]
     def report_progress(value):
@@ -3133,7 +3280,23 @@ def run_dataset_operation(config, work, stop):
             dataset_api(config, base + '/heartbeat', 'POST', {
                 'token': token, 'phase': phase, 'progress_run_id': work['progress_run_id'], 'progress': {**value, 'sequence': progress_sequence[0]}})
             progress_last[:] = [now, stage, done]
+            current_progress[0] = value
+            if stage != 'paused_resource':
+                resume_progress[0] = value
     check.progress = report_progress
+    if read_only_refresh:
+        rate = config.get('dataset_refresh_read_rate_bytes_per_second', DEFAULT_DATASET_REFRESH_READ_RATE)
+        scheduled = [time.monotonic()]
+        def throttle_bytes(count):
+            scheduled[0] = max(time.monotonic() - 0.25, scheduled[0]) + count / rate
+            while True:
+                delay = scheduled[0] - time.monotonic()
+                if delay <= 0:
+                    break
+                if stop.wait(min(delay, 0.25)):
+                    raise OSError('Agent 正在退出，等待下次恢复')
+                check()
+        check.throttle_bytes = throttle_bytes
     try:
         # Cross-process receipt ownership; never allow an expired lease to run
         # a second writer while the first still holds filesystem locks.
@@ -3152,6 +3315,9 @@ def run_dataset_operation(config, work, stop):
         receipt = state / 'result.json'
         if receipt.is_file():
             result = json.loads(receipt.read_text(encoding='utf-8'))
+            if read_only_refresh:
+                source = DATASET_FILES['inside'](work['path'], config['dataset_roots'])
+                verify_refresh_source(source, result['fingerprint'], check)
         else:
             check()
             # Only a successful authenticated lease check may claim a new or
@@ -3159,7 +3325,7 @@ def run_dataset_operation(config, work, stop):
             if owner is not None and not owner_path.exists():
                 dataset_atomic_json(owner_path, owner)
             report_progress({'stage': phase})
-            if phase not in LIGHTWEIGHT_DATASET_PHASES:
+            if phase not in LIGHTWEIGHT_DATASET_PHASES and not read_only_refresh:
                 training_lock = acquire_training_lock(config)
                 if training_lock is None:
                     report_progress({'stage': 'waiting_lock'})
@@ -3177,14 +3343,15 @@ def run_dataset_operation(config, work, stop):
                 result = DATASET_FILES['check_root'](str(path.absolute()), roots, work.get('create', False))
                 result['allowed_roots'] = roots
             else:
-                # These locks arbitrate dataset writes between Agent instances
-                # even if they report to different centres or use different IDs.
+                # Keep old Agents' global exclusive lock contract. Negotiated
+                # refresh readers share it; all writers remain exclusive.
                 for root in sorted(roots):
                     if Path(root).is_dir():
                         handle = (Path(root) / '.dataset-storage.lock').open('a')
                         locks.append(handle)
                         try:
-                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            mode = fcntl.LOCK_SH if read_only_refresh else fcntl.LOCK_EX
+                            fcntl.flock(handle, mode | fcntl.LOCK_NB)
                         except BlockingIOError:
                             report_progress({'stage': 'waiting_lock'})
                             return
@@ -3192,19 +3359,39 @@ def run_dataset_operation(config, work, stop):
                 if phase == 'export':
                     source = DATASET_FILES['inside'](work['path'], roots)
                     manifest_file = state / 'manifest.json'
-                    if archive.is_file() and manifest_file.is_file():
+                    reused_archive = archive.is_file() and manifest_file.is_file()
+                    if reused_archive:
+                        if read_only_refresh:
+                            minimum_free[0] = min(
+                                config.get('dataset_refresh_min_free_bytes', DEFAULT_DATASET_REFRESH_MIN_FREE),
+                                shutil.disk_usage(state).free)
                         result = json.loads(manifest_file.read_text())
                         if DATASET_FILES['digest'](archive, check, stage='archive_hash') != result['archive_sha256']:
                             archive.unlink()
+                            reused_archive = False
+                    elif archive.is_file():
+                        # A prior archive-hash failure has no durable receipt.
+                        # Never transfer an unverified orphan bundle.
+                        archive.unlink()
                     if not archive.is_file():
-                        size = DATASET_FILES['scan'](source, check)['total_bytes']
+                        manifest = DATASET_FILES['scan'](source, check)
+                        size = manifest['total_bytes']
+                        archive_budget = size + 10 * 1024 + sum(
+                            2048 + 2 * len(item['path'].encode('utf-8')) for item in manifest['files'])
                         used = sum(p.stat().st_size for p in state.parents[1].glob('*/*/bundle*'))
-                        if used + size * 2 > config.get('dataset_staging_quota_bytes', 100 * 1024**3):
+                        if used + archive_budget * 2 > config.get('dataset_staging_quota_bytes', 100 * 1024**3):
                             raise ValueError('Agent 数据集中转配额不足')
-                        if shutil.disk_usage(state).free < size * 2 + 100 * 1024**2:
+                        free = shutil.disk_usage(state).free
+                        if free < archive_budget * 2 + 100 * 1024**2:
                             raise ValueError('Agent 中转磁盘空间不足')
-                        result = DATASET_FILES['pack'](source, archive, check)
+                        if read_only_refresh:
+                            minimum_free[0] = min(
+                                config.get('dataset_refresh_min_free_bytes', DEFAULT_DATASET_REFRESH_MIN_FREE),
+                                max(0, free - archive_budget * 2 - 100 * 1024**2))
+                        result = DATASET_FILES['pack'](source, archive, check, manifest=manifest)
                         dataset_atomic_json(manifest_file, result)
+                    elif reused_archive and read_only_refresh:
+                        verify_refresh_source(source, result['fingerprint'], check)
                     offset = dataset_api(config, base + '/chunk', 'POST', {'token': token, 'offset': 0, 'data': ''})['offset']
                     report_progress({'stage': 'transfer', 'processed': offset, 'total': result['archive_size'], 'unit': 'bytes'})
                     with archive.open('rb') as stream:
@@ -3214,8 +3401,12 @@ def run_dataset_operation(config, work, stop):
                             chunk = stream.read(512 * 1024)
                             if not chunk:
                                 raise ValueError('导出文件在传输中被截断')
+                            if read_only_refresh:
+                                check.throttle_bytes(len(chunk))
                             offset = dataset_api(config, base + '/chunk', 'POST', {'token': token, 'offset': offset, 'data': base64.b64encode(chunk).decode()})['offset']
                             report_progress({'stage': 'transfer', 'processed': offset, 'total': result['archive_size'], 'unit': 'bytes'})
+                    if read_only_refresh:
+                        verify_refresh_source(source, result['fingerprint'], check)
                 elif phase == 'import':
                     manifest = work['manifest']
                     root = DATASET_FILES['inside'](work['root'], roots)
@@ -3402,6 +3593,7 @@ def main() -> int:
     active_operation: threading.Thread | None = None
     active_dataset_operation: threading.Thread | None = None
     active_dataset_phase: str | None = None
+    active_dataset_read_only_refresh = False
     dataset_reclamation: threading.Thread | None = None
     last_unready_reason: str | None = None
     LOGGER.info("监控 Agent 已启动，节点 %s，Agent %s；远程训练 %s", config["node_id"], VERSION,
@@ -3442,6 +3634,7 @@ def main() -> int:
                     work = poll_dataset_operation(config, busy)
                     if work:
                         active_dataset_phase = work['phase']
+                        active_dataset_read_only_refresh = concurrent_refresh_work(work)
                         active_dataset_operation = threading.Thread(target=run_dataset_operation, args=(config, work, stop), name='dataset-operation', daemon=True)
                         active_dataset_operation.start()
                 except HTTPError as exc:
@@ -3466,7 +3659,7 @@ def main() -> int:
                     active_states = load_active_runs(config)
                     legacy_active = any(not (state["task"].get("gpu_assignment") or [])
                                         for state in active_states)
-                    if dataset_blocks_training(active_dataset_operation, active_dataset_phase):
+                    if dataset_blocks_training(active_dataset_operation, active_dataset_phase, active_dataset_read_only_refresh):
                         pass  # Finish file work before claiming a fresh training run.
                     elif legacy_active:
                         # Old centers and CPU runs keep the node-wide serial contract.

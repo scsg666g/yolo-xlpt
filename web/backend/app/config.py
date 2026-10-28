@@ -183,6 +183,15 @@ DATASET_STORAGE_ALLOWED_ROOTS = project_path_list_env(
     "PLATFORM_DATASET_STORAGE_ALLOWED_ROOTS", str(PROJECT_ROOT), base=PROJECT_ROOT,
 )
 DATASET_STORAGE_QUOTA_BYTES = nonnegative_int_env("PLATFORM_DATASET_STORAGE_QUOTA_BYTES", 100 * 1024**3)
+# Read-only reloads have their own worker lane. These limits apply while a
+# local training run is active; 0 disables the corresponding limit. The PSI
+# check is optional on hosts without Linux I/O pressure accounting.
+DATASET_REFRESH_READ_BYTES_PER_SECOND = nonnegative_int_env(
+    "PLATFORM_DATASET_REFRESH_READ_BYTES_PER_SECOND", 32 * 1024**2)
+DATASET_REFRESH_IO_PRESSURE_PCT = nonnegative_int_env(
+    "PLATFORM_DATASET_REFRESH_IO_PRESSURE_PCT", 25)
+DATASET_REFRESH_MIN_FREE_BYTES = nonnegative_int_env(
+    "PLATFORM_DATASET_REFRESH_MIN_FREE_BYTES", 512 * 1024**2)
 # Zero disables reclamation for the corresponding snapshot class.
 DATASET_STORAGE_RETENTION_SECONDS = nonnegative_int_env("PLATFORM_DATASET_STORAGE_RETENTION_SECONDS", 24 * 3600)
 DATASET_FAILED_RETENTION_SECONDS = nonnegative_int_env("PLATFORM_DATASET_FAILED_RETENTION_SECONDS", 7 * 24 * 3600)

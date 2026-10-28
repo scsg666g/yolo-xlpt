@@ -4,6 +4,7 @@ import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider
 import { Activity, AlertCircle, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, ScanEye, SlidersHorizontal, Square, Terminal, Trophy, Workflow, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue } from '../api'
+import { batchHistoryForRun } from '../batchHistory'
 import { finiteMetricValue, hasAnyMetricValue, hasMetricValue, metricPointCount, metricSeriesDisplay } from '../chartMetrics'
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import { useAppearance } from '../appearance'
@@ -279,6 +280,7 @@ function TaskCanvasInner() {
       log_path: selectedRun.log_path,
       epochs: Number(snapshot.epochs ?? task.epochs),
       batch: Number(snapshot.batch ?? task.batch),
+      batch_history: batchHistoryForRun(task, selectedRun),
       imgsz: Number(snapshot.imgsz ?? task.imgsz),
       device: String(snapshot.device ?? task.device),
       workers: Number(snapshot.workers ?? task.workers),

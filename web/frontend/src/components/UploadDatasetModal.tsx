@@ -1,5 +1,6 @@
 import { hashDatasetFile, datasetSessionKey } from '../datasetUploadSession'
 import { datasetPhaseLabel } from '../datasetUploadSession'
+import { datasetOperationWait } from '../datasetOperationState'
 import type { DatasetLocation, DatasetOperation } from '../types'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { FolderOpen, LoaderCircle, Upload, X } from 'lucide-react'
@@ -159,7 +160,7 @@ export function UploadDatasetModal({ onClose, onUploaded, initialNode = 'local' 
         while (op.status !== 'completed') {
           if (op.status === 'failed') throw new Error(op.error || '后台处理失败，请在数据集管理的操作历史中重试')
           if (op.status === 'cancelled') throw new Error('后台操作已取消，请重新上传')
-          if (active.current) setStage(op.waiting_offline ? '等待远程服务器上线，可关闭窗口并在操作历史中查看' : op.waiting_training ? '等待服务器训练结束后传输，可关闭窗口并在操作历史中查看' : `${datasetPhaseLabel[op.phase] || op.phase}，可关闭窗口并在操作历史中查看`)
+          if (active.current) setStage(`${datasetOperationWait(op)?.label || datasetPhaseLabel[op.phase] || op.phase}，可关闭窗口并在操作历史中查看`)
           await new Promise<void>((resolve, reject) => {
             const abort = () => { window.clearTimeout(timer); reject(new DOMException('已暂停', 'AbortError')) }
             const timer = window.setTimeout(() => { signal.removeEventListener('abort', abort); resolve() }, 2000)

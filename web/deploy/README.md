@@ -1,5 +1,9 @@
 # 双实例部署与维护
 
+## 1.11.0 训练期间只读重新加载
+
+本机数据集重新加载使用独立后台执行通道，不占训练 GPU；远程 Agent 2.5.3 通过能力字段 `dataset_concurrent_refresh` 选择性启用。旧 Agent、旧中心与历史操作保持原调度保护。源数据在校验中变化时，本次操作失败并保留原有统计；导入、迁移、删除等写操作仍按路径和租约保护。资源预算由开发版平台的 `PLATFORM_DATASET_REFRESH_READ_BYTES_PER_SECOND`（默认 32 MiB/s）、`PLATFORM_DATASET_REFRESH_IO_PRESSURE_PCT`（默认 25）及 `PLATFORM_DATASET_REFRESH_MIN_FREE_BYTES`（默认 512 MiB）控制，远程 Agent 有对应可选配置。生产升级需分别在安全窗口重启目标后端，Agent 按原有训练保留重载流程更新；不需要清理旧数据库、任务、配置或状态目录。
+
 ## 1.10.0 数据与运行可靠性配置
 
 本版保留已有数据库、任务目录、数据集和 Agent 状态目录；训练 Attempt 的数据集快照是新增的可选参数字段，旧记录继续显示“未记录”，不做回填或强制迁移。指标读取会识别 CSV 替换、截断和同 Epoch 更正，本机与 Agent 端均适用。执行中心模型测试仍使用 CPU 单通道，耗时较长的模型可通过 `PLATFORM_MODEL_TEST_TIMEOUT_SECONDS` 调整超时（默认 300 秒）。

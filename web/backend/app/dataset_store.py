@@ -28,7 +28,9 @@ from sqlalchemy.orm import Session
 from . import dataset_files as files
 from .dataset_progress import record_progress as record_work_progress, progress_reporter
 from .config import (DATA_ROOT, DATASET_ROOTS, DATASET_STORAGE_ALLOWED_ROOTS, DATASET_STORAGE_QUOTA_BYTES,
-                     DATASET_STORAGE_RETENTION_SECONDS, DATASET_FAILED_RETENTION_SECONDS, PROJECT_ROOT)
+                     DATASET_STORAGE_RETENTION_SECONDS, DATASET_FAILED_RETENTION_SECONDS, PROJECT_ROOT,
+                     DATASET_REFRESH_READ_BYTES_PER_SECOND, DATASET_REFRESH_IO_PRESSURE_PCT,
+                     DATASET_REFRESH_MIN_FREE_BYTES)
 from .database import SessionLocal, get_db
 from .models import ComputeNode, DatasetEntry, DatasetLocation, DatasetOperation, DatasetOperationHistoryRemoval, TrainingRun, TrainingTask, utcnow
 from .gpu_reservations import acquire_node_claim_lock
@@ -133,8 +135,93 @@ def concurrent_dataset_reads(db, node_id):
     return bool(node and ((node.snapshot or {}).get('training') or {}).get('dataset_concurrent_reads') is True)
 
 
+def concurrent_dataset_refresh(db, node_id):
+    """Only a reporting Agent can opt into training-safe, read-only exports."""
+    if node_id == 'local':
+        return True
+    node = db.get(ComputeNode, node_id)
+    capability = ((node.snapshot or {}).get('training') or {}) if node else {}
+    return capability.get('dataset_concurrent_reads') is True and capability.get('dataset_concurrent_refresh') is True
+
+
+def read_only_refresh(op):
+    return op.kind == 'refresh' and op.payload.get('phase') == 'export'
+
+
+def training_safe_operation(op, *, concurrent_reads, concurrent_refresh):
+    phase = op.payload.get('phase')
+    return ((phase in LIGHTWEIGHT_PHASES and concurrent_reads)
+            or (read_only_refresh(op) and concurrent_refresh))
+
+
 def lightweight_operation(op):
     return op.payload.get('phase') in LIGHTWEIGHT_PHASES
+
+
+def local_refresh(op):
+    return op.kind == 'refresh' and op.payload.get('source_node') == 'local'
+
+
+def refresh_lane_operation(op):
+    """Centre-side read work, whether its immutable source is local or remote."""
+    return (op.kind == 'refresh' and op.node_id == 'local'
+            and (local_refresh(op) or op.payload.get('phase') == 'validate'))
+
+
+def local_mutation_paths(op):
+    """Paths the current local execution phase may write."""
+    paths = []
+    p = op.payload
+    phase = p.get('phase')
+    if phase == 'import' and op.kind in ('upload', 'migrate') and p.get('target_node') == 'local' and p.get('destination'):
+        paths.append(p['destination'])
+    if (phase == 'remove' and (op.kind == 'delete' or (op.kind == 'migrate' and p.get('remove_source')))
+            and p.get('source_node') == 'local' and p.get('source_path')):
+        paths.append(p['source_path'])
+    if phase == 'check' and op.kind == 'check' and op.node_id == 'local' and p.get('path'):
+        paths.append(p['path'])
+    return paths
+
+
+def local_paths_overlap(first, second):
+    a, b = Path(first).resolve(), Path(second).resolve()
+    return a == b or a in b.parents or b in a.parents
+
+
+def local_mutation_conflicts(op, source):
+    if op.kind == 'check':
+        # Checking a parent location creates its tempfile in that parent, not
+        # inside the dataset being reloaded.
+        root = Path(source).resolve()
+        return any((path := Path(raw).resolve()) == root or root in path.parents
+                   for raw in local_mutation_paths(op))
+    return any(local_paths_overlap(path, source) for path in local_mutation_paths(op))
+
+
+def local_mutation_blocked_by_refresh(db, op):
+    if not local_mutation_paths(op):
+        return False
+    for refresh in db.scalars(select(DatasetOperation).where(
+            DatasetOperation.kind == 'refresh', DatasetOperation.status.in_(ACTIVE))):
+        source = refresh.payload.get('source_path')
+        # An older mutation has priority over a queued reload; otherwise both
+        # lanes could wait on each other forever.
+        if refresh.status == 'pending' and (operation_time(op.created_at), op.id) < (operation_time(refresh.created_at), refresh.id):
+            continue
+        if refresh.id != op.id and source and local_refresh(refresh) and local_mutation_conflicts(op, source):
+            return True
+    return False
+
+
+def local_refresh_blocked_by_older_mutation(db, op):
+    source = op.payload.get('source_path')
+    if not source:
+        return False
+    for other in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_(ACTIVE))):
+        if (other.id != op.id and (operation_time(other.created_at), other.id) < (operation_time(op.created_at), op.id)
+                and local_mutation_conflicts(other, source)):
+            return True
+    return False
 
 
 def operation_read(op, db=None):
@@ -176,21 +263,39 @@ def operation_read(op, db=None):
         capability = ((node.snapshot or {}).get('training') or {}) if node else {}
         concurrent = concurrent_dataset_reads(db, op.node_id)
         busy = training_active(db, op.node_id)
-        lightweight = lightweight_operation(op) and concurrent
-        value['waiting_training'] = op.status == 'pending' and busy and not lightweight
-        value['waiting_lock'] = value['waiting_lock'] or (op.status == 'pending' and not lightweight and not value['waiting_training'] and bool(capability.get('lock_occupied')))
-        if op.status == 'pending' and lightweight:
+        refresh = concurrent_dataset_refresh(db, op.node_id)
+        safe = training_safe_operation(op, concurrent_reads=concurrent, concurrent_refresh=refresh)
+        value['waiting_training'] = op.status == 'pending' and busy and not safe
+        value['waiting_lock'] = value['waiting_lock'] or (op.status == 'pending' and not safe and not value['waiting_training'] and bool(capability.get('lock_occupied')))
+        if op.status == 'pending' and safe:
             value['waiting_lock'] = False  # Discard a pre-upgrade lock-wait sample.
-        if op.status == 'pending' and lightweight and (busy or capability.get('lock_occupied')):
-            # A blocked pack/import does not precede a runnable directory check.
+        if op.status == 'pending' and safe and (busy or capability.get('lock_occupied')):
+            # Blocked mutations do not precede runnable read-only work.
             earlier = db.scalars(select(DatasetOperation).where(
                 DatasetOperation.node_id == op.node_id, DatasetOperation.status.in_(ACTIVE),
                 or_(DatasetOperation.created_at < op.created_at,
                     (DatasetOperation.created_at == op.created_at) & (DatasetOperation.id < op.id))))
-            value['queue_ahead'] = sum(lightweight_operation(item) or bool(
+            value['queue_ahead'] = sum(training_safe_operation(
+                item, concurrent_reads=concurrent, concurrent_refresh=refresh) or bool(
                 item.lease_until and operation_time(item.lease_until) > utcnow()) for item in earlier)
-    if db and op.node_id == 'local' and op.kind == 'refresh' and op.payload.get('phase') == 'export':
-        value['waiting_training'] = op.status == 'pending' and training_active(db, 'local')
+    if db and op.node_id == 'local':
+        value['waiting_path_lock'] = op.status == 'pending' and local_mutation_blocked_by_refresh(db, op)
+        earlier_lane = [item for item in db.scalars(select(DatasetOperation).where(
+            DatasetOperation.kind == 'refresh', DatasetOperation.node_id == 'local',
+            DatasetOperation.status.in_(ACTIVE))) if refresh_lane_operation(item)
+            and (operation_time(item.created_at), item.id) < (operation_time(op.created_at), op.id)]
+        if refresh_lane_operation(op):
+            value['waiting_training'] = False
+            value['waiting_path_lock'] = (op.status == 'pending' and local_refresh(op)
+                                          and local_refresh_blocked_by_older_mutation(db, op))
+            runnable_refreshes = sum(1 for item in earlier_lane if item.status != 'pending'
+                                     or not local_refresh(item)
+                                     or not local_refresh_blocked_by_older_mutation(db, item))
+            value['queue_ahead'] = runnable_refreshes
+            value['waiting_resource'] = (op.status == 'pending' and runnable_refreshes > 0) or (
+                op.status in ACTIVE and bool(progress and progress.get('stage') == 'paused_resource'))
+        elif op.status == 'pending':
+            value['queue_ahead'] -= len(earlier_lane)
     return value
 
 
@@ -298,8 +403,10 @@ def mutation_pending(db, node_id):
 
 def node_dataset_file_work(db, node_id):
     concurrent = concurrent_dataset_reads(db, node_id)
+    refresh = concurrent_dataset_refresh(db, node_id)
     return any(op.payload.get('phase') in ('export', 'import', 'remove', 'discover')
-               and not (concurrent and lightweight_operation(op)) for op in db.scalars(
+               and not training_safe_operation(
+                   op, concurrent_reads=concurrent, concurrent_refresh=refresh) for op in db.scalars(
         select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE))))
 
 
@@ -798,7 +905,7 @@ def verify_snapshot(op, check=None):
         shutil.rmtree(target, ignore_errors=True)
 
 
-def action_payload(op):
+def action_payload(op, *, concurrent_refresh=False):
     p, phase = op.payload, op.payload['phase']
     common = {'id': op.id, 'token': op.lease, 'phase': phase, 'progress_run_id': p.get('progress_run_id')}
     if phase == 'discover':
@@ -806,7 +913,9 @@ def action_payload(op):
     if phase == 'check':
         return {**common, 'path': p['path'], 'create': p.get('create', False)}
     if phase == 'export':
-        return {**common, 'path': p['source_path']}
+        return {**common, 'path': p['source_path'],
+                **({'kind': 'refresh', 'read_only_during_training': True}
+                   if read_only_refresh(op) and concurrent_refresh else {})}
     if phase == 'import':
         return {**common, 'root': str(PurePosixPath(p['destination']).parent), 'name': p['name'],
                 'manifest': json.loads((job_dir(op.id) / 'manifest.json').read_text()),
@@ -946,6 +1055,106 @@ def lease_check(db, identity, token, phase=None, committing=False):
     return op
 
 
+def local_io_pressure_pct():
+    """Linux PSI is optional; missing support leaves the byte-rate budget active."""
+    path = os.getenv('PLATFORM_DATASET_REFRESH_IO_PRESSURE_FILE', '/proc/pressure/io')
+    if not path:
+        return 0.0
+    try:
+        pressure_path = Path(path).expanduser()
+        if not pressure_path.is_absolute():
+            pressure_path = PROJECT_ROOT / pressure_path
+        line = next((line for line in pressure_path.read_text().splitlines() if line.startswith('some ')), '')
+        return float(next(part[6:] for part in line.split() if part.startswith('avg10=')))
+    except (OSError, StopIteration, ValueError):
+        return 0.0
+
+
+def local_refresh_free_bytes():
+    return shutil.disk_usage(STORE_ROOT).free
+
+
+def refresh_snapshot_disk_budget(manifest):
+    """Conservative tar headers and unpacked filesystem metadata allowance."""
+    paths = [len(item['path'].encode('utf-8')) for item in manifest['files']]
+    # GNU/PAX headers and block rounding can exceed a simple two-header
+    # allowance for long or non-ASCII paths. The unpacked tree also consumes
+    # directory entries and filesystem metadata.
+    metadata = sum(4096 + 2 * size for size in paths)
+    archive = manifest['total_bytes'] + metadata
+    unpacked = manifest['total_bytes'] + metadata
+    return archive, unpacked
+
+
+class LocalRefreshBudget:
+    """Throttle only read-heavy reload work, including scans and archive copies."""
+    def __init__(self, check):
+        self.check = check
+        self.last_training_probe = 0.0
+        self.training = False
+        self.next_read_at = 0.0
+        self.last_resource_probe = 0.0
+        self.pressure = 0.0
+        self.free_bytes = None
+        self.paused = False
+        self.resume_progress = None
+
+    def remember_progress(self, value):
+        if value.get('stage') != 'paused_resource':
+            self.resume_progress = dict(value)
+
+    def training_now(self):
+        now = time.monotonic()
+        if now - self.last_training_probe >= 1:
+            with SessionLocal() as db:
+                self.training = training_active(db, 'local')
+            self.last_training_probe = now
+        return self.training
+
+    def guard(self):
+        while True:
+            training = self.training_now()
+            now = time.monotonic()
+            if now - self.last_resource_probe >= 2:
+                if DATASET_REFRESH_MIN_FREE_BYTES:
+                    self.free_bytes = local_refresh_free_bytes()
+                if training and DATASET_REFRESH_IO_PRESSURE_PCT:
+                    self.pressure = local_io_pressure_pct()
+                self.last_resource_probe = now
+            reason = None
+            if (DATASET_REFRESH_MIN_FREE_BYTES and self.free_bytes is not None
+                    and self.free_bytes < DATASET_REFRESH_MIN_FREE_BYTES):
+                reason = 'low_disk_space'
+            elif training and DATASET_REFRESH_IO_PRESSURE_PCT and self.pressure >= DATASET_REFRESH_IO_PRESSURE_PCT:
+                reason = 'disk_pressure'
+            if not reason:
+                if self.paused and self.resume_progress:
+                    self.check.progress(self.resume_progress)
+                self.paused = False
+                if not training:
+                    self.next_read_at = 0.0
+                return training
+            self.paused = True
+            self.check.progress({'stage': 'paused_resource', 'resource_reason': reason})
+            self.check()
+            time.sleep(0.25)
+
+    def throttle(self, byte_count):
+        if not byte_count or not self.guard():
+            return
+        rate = DATASET_REFRESH_READ_BYTES_PER_SECOND
+        if not rate:
+            return
+        self.next_read_at = max(self.next_read_at, time.monotonic()) + byte_count / rate
+        while self.training_now():
+            remaining = self.next_read_at - time.monotonic()
+            if remaining <= 0:
+                return
+            self.check()
+            time.sleep(min(0.25, remaining))
+        self.next_read_at = 0.0
+
+
 def execute_local(db, op):
     identity, token, phase = op.id, op.lease, op.payload['phase']
     run_id = uid()
@@ -967,6 +1176,14 @@ def execute_local(db, op):
             if record_work_progress(current, value, run_id, 'local'):
                 db.commit()
     check.progress = progress_reporter(persist)
+    if refresh_lane_operation(op):
+        budget = LocalRefreshBudget(check)
+        report = check.progress
+        def budgeted_progress(value):
+            budget.remember_progress(value)
+            report(value)
+        check.progress = budgeted_progress
+        check.throttle_bytes = budget.throttle
     check.progress({'stage': phase})
     check()
     p = op.payload
@@ -988,15 +1205,27 @@ def execute_local(db, op):
     elif phase in ('export', 'prepare_upload'):
         source = p['staging'] if phase == 'prepare_upload' else str(files.inside(p['source_path'], DATASET_STORAGE_ALLOWED_ROOTS))
         manifest = files.scan(source, check)
-        if DATASET_STORAGE_QUOTA_BYTES and sum(f.stat().st_size for f in STORE_ROOT.glob('*/bundle*')) + manifest['total_bytes'] * 2 > DATASET_STORAGE_QUOTA_BYTES:
+        archive_budget, unpack_budget = refresh_snapshot_disk_budget(manifest) if local_refresh(op) else (
+            manifest['total_bytes'], manifest['total_bytes'])
+        if DATASET_STORAGE_QUOTA_BYTES and sum(f.stat().st_size for f in STORE_ROOT.glob('*/bundle*')) + archive_budget + unpack_budget > DATASET_STORAGE_QUOTA_BYTES:
             raise ValueError('平台数据集中转配额不足，请先处理失败操作或增加 PLATFORM_DATASET_STORAGE_QUOTA_BYTES')
-        required = manifest['total_bytes'] * 2 + 100 * 1024**2
+        reserve = max(100 * 1024**2, DATASET_REFRESH_MIN_FREE_BYTES) if local_refresh(op) else 100 * 1024**2
+        required = archive_budget + unpack_budget + reserve
         if shutil.disk_usage(directory).free < required:
             raise ValueError('平台中转磁盘空间不足')
         result = files.pack(source, directory / 'bundle.tar', check, manifest=manifest)
         save_json(directory / 'manifest.json', result)
     elif phase == 'validate':
+        if refresh_lane_operation(op):
+            manifest = json.loads((directory / 'manifest.json').read_text())
+            _, unpack_budget = refresh_snapshot_disk_budget(manifest)
+            if shutil.disk_usage(directory).free < unpack_budget + DATASET_REFRESH_MIN_FREE_BYTES:
+                raise ValueError('平台中转磁盘空间不足，无法安全展开重新加载快照')
         result = verify_snapshot(op, check)
+        if local_refresh(op):
+            source = files.inside(p['source_path'], DATASET_STORAGE_ALLOWED_ROOTS)
+            if files.scan(source, check, stage='source_verify')['fingerprint'] != result[0]['fingerprint']:
+                raise ValueError('源数据在重新加载期间发生修改，保留原有统计，请重试')
     elif phase == 'import':
         action = action_payload(op)
         root = files.inside(action['root'], DATASET_STORAGE_ALLOWED_ROOTS)
@@ -1022,31 +1251,46 @@ class DatasetWorker:
     def __init__(self):
         self.stop_event = threading.Event()
         self.thread = None
+        self.refresh_thread = None
         self.last_tick_at = None
+        self.refresh_last_tick_at = None
         self.last_error = None
         self.last_error_at = None
         self.active_error = None
+        self.refresh_error = None
+        self.refresh_error_at = None
+        self.refresh_active_error = None
         self._last_cleanup = 0.0
 
     def health_state(self):
         alive = bool(self.thread and self.thread.is_alive())
-        return {'status': 'error' if alive and self.active_error else 'running' if alive else 'stopped',
+        refresh_alive = bool(self.refresh_thread and self.refresh_thread.is_alive())
+        return {'status': 'error' if alive and (self.active_error or self.refresh_active_error or not refresh_alive)
+                else 'running' if alive else 'stopped',
                 'last_tick_at': self.last_tick_at.isoformat() if self.last_tick_at else None,
                 'last_error': self.last_error,
                 'last_error_at': self.last_error_at.isoformat() if self.last_error_at else None,
-                'active_error': self.active_error}
+                'active_error': self.active_error,
+                'refresh_last_tick_at': self.refresh_last_tick_at.isoformat() if self.refresh_last_tick_at else None,
+                'refresh_error': self.refresh_error,
+                'refresh_error_at': self.refresh_error_at.isoformat() if self.refresh_error_at else None,
+                'refresh_active_error': self.refresh_active_error}
 
     def start(self):
-        if self.thread and self.thread.is_alive():
-            return
         self.stop_event.clear()
-        self.thread = threading.Thread(target=self.run, daemon=True, name='dataset-storage')
-        self.thread.start()
+        if not self.thread or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self.run, daemon=True, name='dataset-storage')
+            self.thread.start()
+        if not self.refresh_thread or not self.refresh_thread.is_alive():
+            self.refresh_thread = threading.Thread(target=self.run_refresh, daemon=True, name='dataset-refresh')
+            self.refresh_thread.start()
 
     def stop(self):
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=5)
+        if self.refresh_thread:
+            self.refresh_thread.join(timeout=5)
 
     def tick(self):
         STORE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -1059,9 +1303,8 @@ class DatasetWorker:
                 candidates = db.scalars(select(DatasetOperation).where(
                     DatasetOperation.node_id == 'local', DatasetOperation.status.in_(ACTIVE))
                     .order_by(DatasetOperation.created_at, DatasetOperation.id))
-                local_training = training_active(db, 'local')
-                op = next((item for item in candidates if not (
-                    local_training and item.kind == 'refresh' and item.payload.get('phase') == 'export')), None)
+                op = next((item for item in candidates if not refresh_lane_operation(item)
+                           and not local_mutation_blocked_by_refresh(db, item)), None)
                 if op:
                     try:
                         execute_local(db, op)
@@ -1070,6 +1313,28 @@ class DatasetWorker:
                         logger.warning('dataset_operation_failed id=%s error=%s', op.id, type(exc).__name__)
                 self.cleanup(db)
                 self.last_tick_at = utcnow()
+
+    def tick_refresh(self):
+        STORE_ROOT.mkdir(parents=True, exist_ok=True)
+        with (STORE_ROOT / '.refresh.worker.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            with SessionLocal() as db:
+                candidates = db.scalars(select(DatasetOperation).where(
+                    DatasetOperation.kind == 'refresh', DatasetOperation.node_id == 'local',
+                    DatasetOperation.status.in_(ACTIVE))
+                    .order_by(DatasetOperation.created_at, DatasetOperation.id))
+                op = next((item for item in candidates if refresh_lane_operation(item)
+                           and (not local_refresh(item) or not local_refresh_blocked_by_older_mutation(db, item))), None)
+                if op:
+                    try:
+                        execute_local(db, op)
+                    except Exception as exc:
+                        mark_error(db, op, exc)
+                        logger.warning('dataset_refresh_failed id=%s error=%s', op.id, type(exc).__name__)
+                self.refresh_last_tick_at = utcnow()
 
     def cleanup(self, db):
         # Filesystem directories bound the scan, not the ever-growing journal.
@@ -1134,6 +1399,17 @@ class DatasetWorker:
                 logger.exception('dataset_worker_failed')
             self.stop_event.wait(1)
 
+    def run_refresh(self):
+        while not self.stop_event.is_set():
+            try:
+                self.tick_refresh()
+                self.refresh_active_error = None
+            except Exception as exc:
+                self.refresh_error = self.refresh_active_error = str(exc)[:600] or type(exc).__name__
+                self.refresh_error_at = utcnow()
+                logger.exception('dataset_refresh_worker_failed')
+            self.stop_event.wait(1)
+
 
 worker = DatasetWorker()
 
@@ -1184,9 +1460,10 @@ def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, d
         capability = ((node.snapshot or {}).get('training') or {}) if node else {}
         busy = training_active(db, node_id)
         concurrent = concurrent_dataset_reads(db, node_id)
-        reads_only = lightweight_only or (concurrent and (busy or capability.get('lock_occupied')))
-        op = next((item for item in operations if not reads_only or (
-            lightweight_operation(item) and (item.payload.get('phase') == 'check' or concurrent))), None)
+        refresh = concurrent_dataset_refresh(db, node_id)
+        reads_only = lightweight_only or ((concurrent or refresh) and (busy or capability.get('lock_occupied')))
+        op = next((item for item in operations if not reads_only or item.payload.get('phase') == 'check'
+                   or training_safe_operation(item, concurrent_reads=concurrent, concurrent_refresh=refresh)), None)
         if not op:
             return {'operation': None}
         if op.payload['phase'] == 'discover':
@@ -1194,7 +1471,8 @@ def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, d
             if not supports_discovery(db, node_id):
                 return {'operation': None, 'message': '目录扫描需要 Agent 2.2.0 及 dataset_discovery 能力'}
         # An expired lease reuses its token, so a saved commit receipt is replayed.
-        if busy and not (op.payload['phase'] == 'check' or (concurrent and lightweight_operation(op))):
+        if busy and not (op.payload.get('phase') == 'check' or training_safe_operation(
+                op, concurrent_reads=concurrent, concurrent_refresh=refresh)):
             return {'operation': None}
         if op.payload['phase'] == 'remove':
             try:
@@ -1207,7 +1485,7 @@ def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, d
                       'heartbeat_at': utcnow().isoformat()}
         op.lease_until, op.status = utcnow() + timedelta(seconds=120), 'running' if op.status != 'committing' else 'committing'
         db.commit()
-        return {'operation': action_payload(op)}
+        return {'operation': action_payload(op, concurrent_refresh=refresh)}
 
 
 class AgentMessage(BaseModel):

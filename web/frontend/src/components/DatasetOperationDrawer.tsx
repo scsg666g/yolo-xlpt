@@ -2,6 +2,7 @@ import { DatasetOperationProgress } from './DatasetOperationProgress'
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { api, formatBytes } from '../api'
+import { datasetOperationWait } from '../datasetOperationState'
 import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationPage, DatasetOperationSummary } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { DatasetServerSelect, type DatasetServerOption } from './DatasetServerSelect'
@@ -122,7 +123,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
           <div className="dataset-history-row-main">{selectionMode && <input type="checkbox" className="dataset-history-checkbox" aria-label={`选择记录：${j.name || j.id}`} disabled={!j.can_delete_history || loading} checked={selectedIds.includes(j.id)} onChange={e => setSelected(current => e.target.checked ? [...current, j.id] : current.filter(id => id !== j.id))} />}
           <button type="button" className="dataset-history-row-toggle" aria-expanded={detail === j.id} aria-controls={`operation-${j.id}`} onClick={() => setDetail(detail === j.id ? '' : j.id)}>
             {detail === j.id ? <ChevronDown size={16} /> : <ChevronRight size={16} />}<span><strong title={j.name}>{j.name || '保存位置检查'}</strong><small>{kinds[j.kind] || j.kind} · {j.source_node_name || j.node_name || j.node_id}{j.target_node && j.target_node !== j.source_node ? ` → ${j.target_node_name || j.target_node}` : ''}</small></span>
-            <span className={`dataset-job-state ${j.status}`}>{statuses[j.status] || j.status}</span><time>{new Date(j.created_at).toLocaleString('zh-CN')}</time>
+            <span className={`dataset-job-state ${j.status} ${datasetOperationWait(j)?.reason || ''}`}>{datasetOperationWait(j)?.badge || statuses[j.status] || j.status}</span><time>{new Date(j.created_at).toLocaleString('zh-CN')}</time>
           </button><button type="button" className="dataset-history-delete" aria-label={`删除记录：${j.name || j.id}`} title={j.can_delete_history ? '删除操作记录，保留数据集文件' : '仅已完成或已取消的记录可删除；失败操作请先重试或取消'} disabled={!j.can_delete_history || !!busy || loading} onClick={() => askRemoval([j.id])}><Trash2 size={15} /></button></div>
           <DatasetOperationProgress operation={j} />
           {detail === j.id && <div id={`operation-${j.id}`} className="dataset-history-detail">

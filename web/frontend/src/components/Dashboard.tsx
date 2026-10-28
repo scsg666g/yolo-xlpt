@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Copy, Cpu, Folder, FolderInput, FolderPlus, GitCompareArrows, GripVertical, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
+import { batchPath } from '../batchHistory'
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { DeletionJob, TaskDeletionPreview, TaskGroup, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
@@ -26,17 +27,20 @@ const deletionPhaseLabels: Record<DeletionJob['phase'], string> = {
   center_cleanup: '正在清理平台关联数据',
   completed: '清理完成',
   failed: '清理失败',
+  workspace_busy: '工作区占用，待重试',
 }
 
 function deletionPhaseLabel(job: DeletionJob): string {
   if (job.status === 'succeeded') return '清理完成'
+  if (job.phase === 'workspace_busy' && job.status === 'failed') return deletionPhaseLabels.workspace_busy
   if (job.status === 'failed') return '清理失败'
   if (job.status === 'cancelled') return '清理已取消'
   return deletionPhaseLabels[job.phase] || job.message || '正在处理'
 }
 
-function deletionTone(job: DeletionJob): 'active' | 'failed' | 'completed' | 'cancelled' {
+function deletionTone(job: DeletionJob): 'active' | 'failed' | 'completed' | 'cancelled' | 'workspace-busy' {
   if (job.status === 'succeeded') return 'completed'
+  if (job.phase === 'workspace_busy' && job.status === 'failed') return 'workspace-busy'
   if (job.status === 'failed') return 'failed'
   if (job.status === 'cancelled') return 'cancelled'
   return 'active'
@@ -667,6 +671,7 @@ export function Dashboard() {
 
   function renderDeletionJobStatus(job: DeletionJob) {
     const nodeStatus = deletionNodeStatusLabel(job.node_status)
+    const workspaceBusy = job.phase === 'workspace_busy' && job.status === 'failed'
     const agentStillRequired = job.executor === 'remote'
       && job.status !== 'succeeded'
       && job.phase !== 'center_cleanup'
@@ -683,7 +688,7 @@ export function Dashboard() {
         {job.required_agent_version ? ` · 要求 ${job.required_agent_version} 或以上` : ''}
         {job.node_status === 'offline' ? ` · 最后在线 ${dateTimeLabel(job.last_seen_at)}` : ''}
       </small>}
-      {job.error && <p className="deletion-job-error"><AlertTriangle size={14} />{job.error}</p>}
+      {job.error && !workspaceBusy && <p className="deletion-job-error"><AlertTriangle size={14} />{job.error}</p>}
     </>
   }
 
@@ -719,7 +724,7 @@ export function Dashboard() {
         {job && renderDeletionReceipt(job)}
       </div>
       <div className="trash-item-actions">
-        <button type="button" className="button ghost compact" disabled={deleting || restoreBlocked} title={restoreBlocked ? '永久清理已提交，该任务不能恢复' : '恢复任务'} onClick={() => void restoreTask(task)}><RotateCcw size={14} />恢复</button>
+        <button type="button" className="button ghost compact" disabled={deleting || restoreBlocked} title={restoreBlocked ? (job?.phase === 'workspace_busy' ? '已提交永久清理；工作区空闲后重试，任务不能恢复' : '永久清理已提交，该任务不能恢复') : '恢复任务'} onClick={() => void restoreTask(task)}><RotateCcw size={14} />恢复</button>
         <button type="button" className="button danger compact" disabled={permanentDisabled} title={permanentDisabled ? (jobActive || legacyPending ? '文件清理正在进行' : '当前清理任务不可重试') : permanentLabel} onClick={() => openDeletion(task, true)}><Trash2 size={14} />{permanentLabel}</button>
       </div>
     </article>
@@ -764,10 +769,11 @@ export function Dashboard() {
   function renderTaskCard(task: TrainingTask) {
     const completionNote = earlyStoppingExplanation(task)
     const epochProgress = trainingEpochProgress(task)
+    const batch = batchPath(task.batch, task.batch_history)
     return <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { const source = tasks.find((item) => item.id === draggingId); if (source?.group_id !== task.group_id) return; event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
       <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整组内顺序" aria-label="按住拖动调整组内顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`} title={completionNote || undefined}>{statusIcon(task.status)}{trainingStatusLabel(task)}</span></div>
       <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" disabled={taskActionIds.has(task.id)} title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
-      <p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p>
+      <div className="task-execution-row"><p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p><span className={`task-batch-path ${batch.adjusted ? 'adjusted' : ''}`} title={batch.title}>{batch.cardLabel}</span></div>
       <div className="progress-heading"><span>Epoch {task.completed_epochs} / {trainingEpochTarget(task)}</span><strong title="实际完成轮数占目标轮数的比例">轮数进度 {Math.round(epochProgress)}%</strong></div>
       <div className="progress"><i style={{ width: `${epochProgress}%` }} /></div>
       {completionNote && <p className="training-completion-note">{completionNote}</p>}

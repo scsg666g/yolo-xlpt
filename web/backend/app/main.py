@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
@@ -67,6 +68,7 @@ from .schemas import ArtifactRead, EffectiveBestWeightRead, EventRead, LayoutUpd
 from .services import (
     add_event,
     backfill_training_runs,
+    backfill_batch_histories,
     create_training_run,
     current_run,
     discover_classification_datasets,
@@ -130,6 +132,8 @@ async def lifespan(_: FastAPI):
     migrate_training_logs()
     dataset_worker.start()
     scheduler.start()
+    # Historical logs can be large; recover them off the API startup path.
+    threading.Thread(target=backfill_batch_histories, name="batch-history-backfill", daemon=True).start()
     inference_worker.start()
     local_deletion_worker.start()
     _task_snapshot = await asyncio.to_thread(load_task_snapshot)

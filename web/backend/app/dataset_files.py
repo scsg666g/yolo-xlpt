@@ -21,6 +21,13 @@ def report_progress(check, stage, processed=0, total=None, unit='files', current
                 'current_file': str(current_file)[-400:]})
 
 
+def throttle_read(check, size):
+    """Optional caller-owned budget; ordinary and legacy file work is unchanged."""
+    throttle = getattr(check, 'throttle_bytes', None)
+    if throttle and size:
+        throttle(size)
+
+
 def digest(path, check=None, stage=None):
     value = hashlib.sha256()
     processed = 0
@@ -31,6 +38,7 @@ def digest(path, check=None, stage=None):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             if check:
                 check()
+            throttle_read(check, len(chunk))
             value.update(chunk)
             processed += len(chunk)
             if stage:
@@ -77,22 +85,32 @@ def scan(root, check=None, stage="scan"):
         for name in sorted(names):
             if name.endswith('.cache') or name in {MARKER, '.dataset-content.json'}:
                 continue
+            if name == '.dataset-storage.lock' and Path(directory) == root:
+                # An Agent can be asked to export the allow-listed root itself.
+                # Its advisory lock is platform metadata, not dataset content.
+                continue
             path = Path(directory) / name
+            # Give optional background readers a small metadata-I/O budget as
+            # well as byte budgets. Ordinary callers have no throttle hook.
+            throttle_read(check, 4096)
             if path.is_symlink() or not path.is_file():
                 raise ValueError("数据集不能包含符号链接或特殊文件")
             relative = path.relative_to(root).as_posix()
             safe_member(relative)
-            size = path.stat().st_size
+            before = path.stat()
+            size = before.st_size
             total += size
             if total > MAX_BYTES or len(files) >= MAX_FILES:
                 raise ValueError("数据集超过 50 GB 或 20 万文件限制")
             if check:
                 check()
             report_progress(check, stage, len(files), current_file=relative)
-            before = path.stat()
             sha = digest(path, check)
             after = path.stat()
-            if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            if (before.st_dev, before.st_ino, before.st_mode, before.st_size,
+                    before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_dev, after.st_ino, after.st_mode, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns):
                 raise ValueError("数据集在校验中发生修改，请停止修改后重试")
             files.append({"path": relative, "size": size, "sha256": sha})
     report_progress(check, stage, len(files), len(files))
@@ -119,29 +137,39 @@ def pack(root, archive, check=None, *, manifest=None):
     class Reader:
         def __init__(self, stream, name):
             self.stream, self.name = stream, name
+            self.hash = hashlib.sha256()
         def read(self, size=-1):
             nonlocal processed
             data = self.stream.read(size)
             processed += len(data)
             if check:
                 check()
+            throttle_read(check, len(data))
+            self.hash.update(data)
             report_progress(check, 'pack', processed, manifest['total_bytes'], 'bytes', self.name)
             return data
-    with tarfile.open(temporary, 'w') as tar:
-        for file in manifest['files']:
-            if check:
-                check()
-            path = Path(root) / file['path']
-            info = tar.gettarinfo(str(path), arcname=file['path'])
-            if not info.isfile():
-                raise ValueError('数据集不能包含符号链接或特殊文件')
-            with path.open('rb') as stream:
-                tar.addfile(info, Reader(stream, file['path']))
-    # Reject concurrent source changes before handing a snapshot to another node.
-    if scan(root, check, stage='source_verify')['fingerprint'] != manifest['fingerprint']:
+    try:
+        with tarfile.open(temporary, 'w') as tar:
+            for file in manifest['files']:
+                if check:
+                    check()
+                throttle_read(check, 4096)
+                path = Path(root) / file['path']
+                info = tar.gettarinfo(str(path), arcname=file['path'])
+                if not info.isfile() or info.size != file['size']:
+                    raise ValueError('源数据在导出期间发生修改')
+                with path.open('rb') as stream:
+                    reader = Reader(stream, file['path'])
+                    tar.addfile(info, reader)
+                    if reader.hash.hexdigest() != file['sha256']:
+                        raise ValueError('源数据在导出期间发生修改')
+        # A second scan catches changes to files already copied and new files.
+        if scan(root, check, stage='source_verify')['fingerprint'] != manifest['fingerprint']:
+            raise ValueError("源数据在导出期间发生修改")
+        temporary.replace(archive)
+    except BaseException:
         temporary.unlink(missing_ok=True)
-        raise ValueError("源数据在导出期间发生修改")
-    temporary.replace(archive)
+        raise
     return {**manifest, 'archive_size': archive.stat().st_size, 'archive_sha256': digest(archive, check, stage='archive_hash')}
 
 
@@ -170,6 +198,7 @@ def unpack(archive, target, manifest, check=None):
             report_progress(check, 'unpack', processed, total, 'bytes', item.name)
             with path.open('xb') as output:
                 for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    throttle_read(check, len(chunk))
                     output.write(chunk)
                     if check:
                         check()

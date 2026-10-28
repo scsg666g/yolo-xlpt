@@ -81,6 +81,11 @@ button { color: inherit; }
 .task-name-row .task-rename-button { flex-shrink: 0; width: 25px; height: 25px; color: var(--muted); }
 .task-rename-button:hover, .task-rename-button:focus-visible { color: var(--green); background: color-mix(in srgb, var(--green) 12%, transparent); }
 .task-rename-button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.task-execution-row { display: flex; align-items: baseline; gap: 8px; min-width: 0; margin: 9px 0 0; }
+.task-execution-row .task-path { flex: 1; min-width: 0; margin: 0; }
+.task-batch-path { flex: 0 1 auto; max-width: 60%; color: var(--muted); font: 500 11px/1.4 "DM Mono", monospace; text-align: right; overflow-wrap: anywhere; }
+.task-batch-path.adjusted { color: #ecb76f; }
+:root[data-theme='light'] .task-batch-path.adjusted { color: #9c5a0e; }
 .rename-task-modal { width: min(420px, calc(100vw - 32px)); }
 .rename-task-modal header h2 { margin: 0; font-size: 16px; }
 .rename-task-error { margin: 12px 0 0; }
@@ -397,12 +402,13 @@ button { color: inherit; }
 .trash-modal header { align-items: flex-start; }
 .trash-modal header p { margin: 5px 0 0; color: #657582; font-size: 11px; }
 .trash-header-actions { display: flex; align-items: center; gap: 7px; }
-.trash-list { min-height: 150px; display: grid; align-content: start; gap: 9px; overflow: auto; padding: 18px 20px; }
+.trash-list { min-height: 150px; display: grid; grid-auto-rows: max-content; align-content: start; gap: 9px; overflow: auto; padding: 18px 20px; }
 .trash-operation-notice { margin: 0; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--green) 28%, var(--line)); border-radius: 7px; color: var(--green); background: color-mix(in srgb, var(--green) 7%, var(--panel)); font-size: 11px; }
 .trash-item { min-height: 88px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 13px 14px; border: 1px solid #263641; border-left-width: 3px; border-radius: 8px; background: #0b131a; }
 .trash-item.retained { border-left-color: #6d7d88; }
 .trash-item.active { border-left-color: #4f9fca; }
 .trash-item.failed { border-left-color: #bd5960; }
+.trash-item.workspace-busy { border-left-color: #b28745; }
 .trash-item.cancelled { border-left-color: #b28745; }
 .trash-item.completed { border-left-color: var(--green); }
 .trash-item.is-new { box-shadow: 0 0 0 1px color-mix(in srgb, var(--green) 42%, transparent); }
@@ -418,6 +424,7 @@ button { color: inherit; }
 .deletion-status.retained { color: #b4c0c7; }
 .deletion-status.active { color: #8bcfff; border-color: #3b6380; background: #162b3a; }
 .deletion-status.failed { color: #ffadb0; border-color: #744048; background: #351d22; }
+.deletion-status.workspace-busy { color: #f2c274; border-color: #725b36; background: #2a2318; }
 .deletion-status.cancelled { color: #f2c274; border-color: #725b36; background: #2a2318; }
 .deletion-status.completed { color: #8cebc5; border-color: #3d6c60; background: #173128; }
 .deletion-node-status.online { color: #8cebc5; }
@@ -441,10 +448,17 @@ button { color: inherit; }
 .trash-modal footer { align-items: center; }
 .trash-modal footer span { margin-right: auto; color: #637580; font-size: 11px; }
 :root[data-theme='light'] .trash-item { border-color: #d3e0e7; background: #f7fafb; }
+:root[data-theme='light'] .trash-item.retained { border-left-color: #8397a1; }
+:root[data-theme='light'] .trash-item.active { border-left-color: #4f9fca; }
+:root[data-theme='light'] .trash-item.failed { border-left-color: #bd5960; }
+:root[data-theme='light'] .trash-item.workspace-busy,
+:root[data-theme='light'] .trash-item.cancelled { border-left-color: #b28745; }
+:root[data-theme='light'] .trash-item.completed { border-left-color: #20a880; }
 :root[data-theme='light'] .trash-item-title strong { color: #294758; }
 :root[data-theme='light'] .trash-item-copy > span, :root[data-theme='light'] .trash-item-copy > small, :root[data-theme='light'] .trash-modal footer span, :root[data-theme='light'] .deletion-job-heading, :root[data-theme='light'] .deletion-job-message { color: #718692; }
 :root[data-theme='light'] .deletion-status.active { color: #276f9d; border-color: #aacadd; background: #edf7fc; }
 :root[data-theme='light'] .deletion-status.failed { color: #9b4048; border-color: #e3c1c5; background: #fff2f3; }
+:root[data-theme='light'] .deletion-status.workspace-busy { color: #986219; border-color: #e6d2ad; background: #fff8e9; }
 :root[data-theme='light'] .deletion-status.cancelled { color: #986219; border-color: #e6d2ad; background: #fff8e9; }
 :root[data-theme='light'] .deletion-status.completed { color: #087e61; border-color: #acd7ca; background: #eaf7f3; }
 :root[data-theme='light'] .deletion-job-error { color: #9b4048; }

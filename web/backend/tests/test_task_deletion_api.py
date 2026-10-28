@@ -128,6 +128,35 @@ def test_remote_center_cleanup_does_not_claim_agent_is_required(deletion_client)
     assert "Agent" not in job["message"]
 
 
+def test_historical_workspace_lock_rejection_has_retry_guidance(deletion_client):
+    client, db, task = deletion_client
+    node = ComputeNode(id="busy-node", name="测试服务器", kind="agent", enabled=True,
+                       agent_version="2.4.1", report_interval_seconds=5,
+                       last_seen_at=utcnow())
+    task.execution_node_id = node.id
+    task.deleted_at = utcnow()
+    task.deleted_reason = "remote_delete_failed"
+    original_error = "远程文件清理失败：训练工作区正在使用，已拒绝远程删除；请等待训练结束后重试"
+    operation = RemoteOperation(id="old-busy", node_id=node.id, task_id=task.id,
+                                kind="delete", status="failed", error=original_error,
+                                payload={"runs": []})  # Old records may lack scope/phase.
+    db.add_all([node, operation])
+    db.commit()
+
+    job = client.get("/api/task-deletions").json()[0]
+    assert job["status"] == "failed"
+    assert job["phase"] == "workspace_busy"
+    assert job["retryable"] is True
+    assert "训练结束后重试" in job["message"]
+    assert job["error"] == original_error
+
+    operation.error = "远程文件清理失败：目录权限不足"
+    db.commit()
+    other = client.get("/api/task-deletions").json()[0]
+    assert other["phase"] == "failed"
+    assert other["message"] == operation.error
+
+
 def test_history_limit_cannot_hide_latest_failure_of_trashed_task(deletion_client):
     client, db, task = deletion_client
     task.deleted_at = utcnow()

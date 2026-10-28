@@ -37,6 +37,7 @@ from .gpu_reservations import (
 )
 from .models import ComputeNode, MetricPoint, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 from .services import add_event, compute_inventory, mirror_run_to_task, remote_log_path
+from .batch_history import append_reductions
 from .process_attribution import inspect_process_owner
 
 router = APIRouter(prefix="/api/compute", tags=["compute nodes"])
@@ -159,6 +160,7 @@ class TrainingCapability(BaseModel):
     dataset_discovery: bool = False
     dataset_progress: bool = False
     dataset_concurrent_reads: bool = False
+    dataset_concurrent_refresh: bool = False
 
     @field_validator("output_roots", "model_test_roots", "dataset_roots")
     @classmethod
@@ -186,6 +188,7 @@ class RemoteRunUpdate(BaseModel):
     latest_metrics: dict[str, Any] = Field(default_factory=dict)
     metrics: list[dict[str, Any]] = Field(default_factory=list, max_length=256)
     log_tail: list[str] = Field(default_factory=list, max_length=200)
+    batch_history: list[Annotated[int, Field(ge=1, le=1024)]] | None = Field(default=None, max_length=8)
     exit_code: int | None = None
     error_message: str | None = Field(default=None, max_length=4000)
     completion_info: dict[str, Any] = Field(default_factory=dict, max_length=8)
@@ -213,6 +216,13 @@ class RemoteRunUpdate(BaseModel):
     @classmethod
     def clean_logs(cls, value: list[str]) -> list[str]:
         return [line[:4000] for line in value]
+
+    @field_validator("batch_history")
+    @classmethod
+    def decreasing_batch_history(cls, value):
+        if value is not None and (len(value) == 1 or any(a <= b for a, b in zip(value, value[1:]))):
+            raise ValueError("Batch 调整记录必须是逐步下降的完整路径")
+        return value
 
     @field_validator("completion_info")
     @classmethod
@@ -874,6 +884,9 @@ async def report(node_id: str, request: Request, db: Session = Depends(get_db)):
                         if ordered_report else {}), **refresh_metadata}
     node.agent_version = payload.agent_version
     node.last_seen_at = received_at
+    if agent_version_at_least(node.agent_version, (2, 5, 3)):
+        from .remote_operations import queue_batch_history_scan
+        queue_batch_history_scan(db, node)
     db.commit()
     return {"status": "ok", "report_interval_seconds": node.report_interval_seconds,
             **({"refresh_request_id": pending_request} if pending_request and not completed_request else {})}
@@ -1036,6 +1049,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
             "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
             "platform_instance_id": platform_instance_id(),
             "dataset_provenance_version": 1,
+            "batch_history_version": 1,
             "task_type": task.task_type, "launch_mode": run.launch_mode,
             "model_path": run.model_path, "data_path": run.data_path,
             "checkpoint_path": run.checkpoint_path, "run_dir": run.run_dir, "claim_lease": lease,
@@ -1128,6 +1142,16 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
     run.progress = payload.progress
     run.latest_metrics = payload.latest_metrics
     run.remote_log_tail = payload.log_tail[-200:]
+    configured_batch = int((run.parameter_snapshot or {}).get("batch") or task.batch)
+    reported_history = (payload.batch_history if payload.batch_history is not None else
+                        append_reductions(list(run.batch_history or []), payload.log_tail, configured_batch))
+    if payload.batch_history and payload.batch_history[0] != configured_batch:
+        raise HTTPException(422, "Batch 调整记录与 Attempt 启动配置不一致")
+    if reported_history and (not run.batch_history or
+                             (reported_history[0] == run.batch_history[0] and len(reported_history) > len(run.batch_history))):
+        run.batch_history = list(reported_history)
+    if payload.batch_history is not None and payload.status in terminal:
+        run.batch_history_scanned = True
     if payload.run_dir and payload.run_dir != run.run_dir:
         raise HTTPException(422, "远程运行目录不得更改")
     if payload.command:

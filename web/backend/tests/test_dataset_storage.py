@@ -63,6 +63,7 @@ def env(tmp_path, monkeypatch):
 def finish_local():
     for _ in range(8):
         store.worker.tick()
+        store.worker.tick_refresh()
 
 
 def location(client, path, node='local'):
@@ -124,6 +125,7 @@ def remote_tick(client, factory, root, agent, identity):
 def pump(client, factory, root, agent, identity):
     for _ in range(10):
         store.worker.tick()
+        store.worker.tick_refresh()
         remote_tick(client, factory, root, agent, identity)
 
 

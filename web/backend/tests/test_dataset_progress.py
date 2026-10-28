@@ -81,6 +81,17 @@ def test_progress_rejects_stale_retry_and_out_of_order_reports():
     assert not progress.record_progress(op, {'stage': 'pack'}, run, 'local')
 
 
+def test_resource_pause_does_not_mark_reading_or_pause_as_completed():
+    run = uuid.uuid4().hex
+    op = DatasetOperation(payload={'phase': 'export', 'progress_run_id': run})
+    assert progress.record_progress(op, {'stage': 'pack', 'processed': 5, 'total': 10}, run, 'local')
+    assert progress.record_progress(op, {'stage': 'paused_resource',
+                                         'resource_reason': 'disk_pressure'}, run, 'local')
+    assert op.payload['progress_steps'] == []
+    assert progress.record_progress(op, {'stage': 'pack', 'processed': 5, 'total': 10}, run, 'local')
+    assert op.payload['progress_steps'] == []
+
+
 @pytest.mark.parametrize('value', [
     {'stage': 'invalid'}, {'stage': 'pack', 'processed': -1},
     {'stage': 'pack', 'processed': float('nan')},
