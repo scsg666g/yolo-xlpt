@@ -169,15 +169,8 @@ weights/
 *.ckpt
 *.safetensors
 *.ts
-!web/frontend/src/api.ts
-!web/frontend/src/appearance.ts
-!web/frontend/src/preferences.ts
-!web/frontend/src/types.ts
-!web/frontend/src/env.d.ts
-!web/frontend/src/useModalFocus.ts
-!web/frontend/src/remoteOutputPaths.ts
-!web/frontend/src/trainingCompletion.ts
-!web/frontend/src/chartMetrics.ts
+# TypeScript application source must not be mistaken for transport-stream videos.
+!/web/frontend/src/**/*.ts
 !web/frontend/vite.config.ts
 *.pb
 *.onnx
