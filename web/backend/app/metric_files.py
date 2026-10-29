@@ -16,7 +16,7 @@ class MetricCsvReader:
         self._files = OrderedDict()
         self._lock = threading.RLock()
 
-    def read(self, path, *, final=False, incremental=False):
+    def read(self, path, *, final=False, incremental=False, include_metadata=False):
         path = Path(path)
         key = str(path.absolute())
         with self._lock:
@@ -37,7 +37,8 @@ class MetricCsvReader:
                         if not reset and state['signature'] == signature and (not final or not state['partial']):
                             state['delta'] = []
                             self._files[key] = state
-                            return self._snapshot(state, incremental=incremental)
+                            return self._snapshot(state, incremental=incremental,
+                                                  include_metadata=include_metadata)
                     if reset:
                         state = {'offset': 0, 'header': None, 'metrics': [], 'completed': 0,
                                  'latest': {}, 'anchor': b'', 'partial': False, 'delta': [],
@@ -78,16 +79,24 @@ class MetricCsvReader:
                 self._files[key] = state
                 while len(self._files) > self.maximum_files:
                     self._files.popitem(last=False)
-                return self._snapshot(state, incremental=incremental)
+                return self._snapshot(state, incremental=incremental, include_metadata=include_metadata,
+                                      reset=reset)
             except (OSError, csv.Error):
                 # Missing files can be normal during trainer startup/rotation.
-                return {'completed': 0, 'latest': {}, 'metrics': [], 'generation': 0}
+                snapshot = {'completed': 0, 'latest': {}, 'metrics': [], 'generation': 0}
+                if include_metadata:
+                    snapshot.update(reset=False, authoritative=False, has_metrics=False)
+                return snapshot
 
     @staticmethod
-    def _snapshot(state, *, incremental=False):
-        return {'completed': state['completed'], 'latest': dict(state['latest']),
-                'metrics': list(state['delta'] if incremental else state['metrics']),
-                'generation': state['generation']}
+    def _snapshot(state, *, incremental=False, include_metadata=False, reset=False):
+        snapshot = {'completed': state['completed'], 'latest': dict(state['latest']),
+                    'metrics': list(state['delta'] if incremental else state['metrics']),
+                    'generation': state['generation']}
+        if include_metadata:
+            snapshot.update(reset=reset, authoritative=state['header'] is not None,
+                            has_metrics=bool(state['metrics']))
+        return snapshot
 
     @staticmethod
     def _metric(row):
@@ -96,6 +105,8 @@ class MetricCsvReader:
             if not math.isfinite(epoch_number):
                 return None
             epoch = int(epoch_number)
+            if epoch < 0:
+                return None
         except (ValueError, TypeError, OverflowError):
             return None
         values = {}

@@ -23,6 +23,8 @@ const palette = ['#159a78', '#347bd1', '#a45fc7', '#e28a32', '#d95c72', '#178fa5
 const collapsedGroupsKey = 'yolo-task-groups-collapsed-v1'
 const ungroupedKey = '__ungrouped__'
 const activeRunStatuses = new Set<TrainingRun['status']>(['queued', 'starting', 'running', 'stopping'])
+// Active and selected attempts still refresh on every poll; only the full catalog is less frequent.
+const catalogRefreshIntervalMs = 5 * 60_000
 
 function initialCollapsedGroups(): Set<string> {
   try {
@@ -156,7 +158,6 @@ export function ExperimentCompare() {
   const activeRequest = useRef<AbortController | null>(null)
   const catalog = useRef<ComparisonRun[]>([])
   const catalogLoadedAt = useRef(0)
-  const metricCache = useRef(new Map<string, { revision: string; points: MetricPoint[] }>())
   const [metricKey, setMetricKey] = useState('metrics/mAP50(B)')
   const [baselineId, setBaselineId] = useState('')
   const [evaluationMode, setEvaluationMode] = useState<'latest' | 'best'>('latest')
@@ -233,7 +234,7 @@ export function ExperimentCompare() {
     const controller = new AbortController()
     activeRequest.current = controller
     try {
-      const refreshCatalog = Date.now() - catalogLoadedAt.current >= 60_000
+      const refreshCatalog = Date.now() - catalogLoadedAt.current >= catalogRefreshIntervalMs
       let items = catalog.current
       let taskGroups: TaskGroup[] | undefined
       if (refreshCatalog) {
@@ -283,14 +284,10 @@ export function ExperimentCompare() {
         }
       }
       const selectedItems = limitedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as ComparisonRun[]
-      const results = await Promise.allSettled(selectedItems.map(async (item) => {
-        const revision = `${item.run.updated_at}:${item.run.completed_epochs}:${item.run.status}`
-        const cached = metricCache.current.get(item.id)
-        if (cached?.revision === revision) return cached.points
-        const points = await api.runMetrics(item.task.id, item.run.id, controller.signal)
-        if (version === requestVersion.current) metricCache.current.set(item.id, { revision, points })
-        return points
-      }))
+      // Corrected metrics can change an existing Epoch without changing run.updated_at.
+      // Refresh selected runs on each poll; the full catalog remains throttled.
+      const results = await Promise.allSettled(selectedItems.map((item) =>
+        api.runMetrics(item.task.id, item.run.id, controller.signal)))
       if (version !== requestVersion.current) return
       const points: Record<string, MetricPoint[]> = {}
       const failures: Record<string, string> = {}
@@ -345,6 +342,14 @@ export function ExperimentCompare() {
     const next = [...new Set(ids)].slice(0, compareLimit)
     setSelectedIds(next)
     setBaselineId((current) => next.includes(current) ? current : next[0] || '')
+  }
+
+  function openPicker() {
+    // Refresh the complete catalog on explicit open so new and older unselected
+    // attempts appear promptly without restoring costly full-catalog polling.
+    catalogLoadedAt.current = 0
+    setPickerOpen(true)
+    void load()
   }
 
   function removeRunFromComparison(id: string) {
@@ -589,7 +594,7 @@ export function ExperimentCompare() {
 
   return <div className="page compare-page" style={experimentLayout}>
     <div className="compare-cleanup-actions"><AttemptDeletionHistory /></div>
-    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较任意历史 Attempt 的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => setPickerOpen((value) => !value)}><Layers3 size={16} />选择运行 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
+    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较任意历史 Attempt 的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => pickerOpen ? setPickerOpen(false) : openPicker()}><Layers3 size={16} />选择运行 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
     {pickerOpen && <div className="compare-picker">
       <header><div><strong>选择参与对比的训练运行</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；可选择每个任务的任意历史 Attempt</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
       <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务、模型或 Attempt" /></div>
@@ -634,8 +639,8 @@ export function ExperimentCompare() {
     </div>}
     {deleteNotice && <div className="compare-notice compare-delete-success" role="status"><Check size={17} /><div><strong>Attempt 清理已提交</strong><span>{deleteNotice}</span></div></div>}
     {error && <div className="alert error">{error}</div>}
-    {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练运行</strong><span>{compareLimit === 2 ? '请选择 2 个运行' : `可同时选择 2～${compareLimit} 个运行`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={() => setPickerOpen(true)}>选择训练运行</button></div> : <>
-      {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个训练运行才能对比</strong><span>当前只有一个运行，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={() => setPickerOpen(true)}>继续选择</button></div>}
+    {loading ? <div className="compare-empty">正在载入实验数据…</div> : !selected.length ? <div className="compare-empty"><Activity size={34} /><strong>选择要比较的训练运行</strong><span>{compareLimit === 2 ? '请选择 2 个运行' : `可同时选择 2～${compareLimit} 个运行`}，查看参数差异和指标曲线。</span><button className="button primary" onClick={openPicker}>选择训练运行</button></div> : <>
+      {selected.length < 2 && <div className="compare-notice"><AlertCircle size={17} /><div><strong>至少需要两个训练运行才能对比</strong><span>当前只有一个运行，暂时无法生成实验对比。</span></div><button className="button ghost" onClick={openPicker}>继续选择</button></div>}
       <section className={`selected-experiments${selected.length > 4 ? ' many' : ''}`}>{selected.map((item, index) => <article key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><button onClick={() => setSelection(selectedIds.filter((id) => id !== item.id))}><X size={14} /></button><span>ATTEMPT {String(item.run.attempt_number).padStart(3, '0')} · {item.run.launch_mode.toUpperCase()}</span><h3>{item.task.name}</h3><p>{item.view.model_path.split('/').pop()} · {item.view.task_type}</p><div className="selected-run-status"><span className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</span>{item.run.status !== 'completed' && <small>阶段性数据</small>}</div><div className="selected-run-progress"><i style={{ width: `${item.view.progress}%` }} /></div><footer><strong>{metricValue({ ...item.view, latest_metrics: latestRunValues(item) }, [primaryMetric(item.view.task_type)?.key || ''])}</strong><small>{primaryMetric(item.view.task_type)?.name || '主指标'}</small><strong>{Math.round(item.view.progress)}%</strong><small>进度</small></footer></article>)}</section>
       {selected.length >= 2 && <>
       <section className="compare-panel metric-summary-panel">

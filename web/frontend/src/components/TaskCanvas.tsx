@@ -20,6 +20,7 @@ import { ModelTestModal } from './ModelTestModal'
 import { isSupportedModelTestTask, modelTestMetrics } from './ModelTestShared'
 import { TrainingTraceModal } from './TrainingTraceModal'
 import { AttemptDeletionHistory } from './AttemptDeletionHistory'
+import { refreshFailures, settledRunValue } from '../refreshResults'
 
 const nodeTypes = { panel: CanvasNode }
 const initialEdges: Edge[] = [
@@ -114,6 +115,9 @@ function TaskCanvasInner() {
   const [newArtifactIds, setNewArtifactIds] = useState<number[]>([])
   const [lastOutputAt, setLastOutputAt] = useState(Date.now())
   const previousUpdate = useRef<{ runId: string; epoch: number; logs: string; status: string; artifacts: Map<number, string> } | null>(null)
+  const currentDetails = useRef({ metrics, artifacts, effectiveBestWeight, events, logs })
+  const detailOwner = useRef({ taskId: '', runId: '' })
+  currentDetails.current = { metrics, artifacts, effectiveBestWeight, events, logs }
   const requestVersion = useRef(0)
   const pendingRequest = useRef<{ version: number; controller: AbortController } | null>(null)
   const mutationPending = useRef(false)
@@ -140,7 +144,17 @@ function TaskCanvasInner() {
     try {
       // Validate the task first so a stale canvas URL does not fire several
       // dependent 404 requests on every polling cycle.
-      const [taskData, runData] = await Promise.all([api.task(taskId, controller.signal), api.runs(taskId, controller.signal)])
+      const [taskResult, runResult] = await Promise.allSettled([api.task(taskId, controller.signal), api.runs(taskId, controller.signal)])
+      if (taskResult.status === 'rejected') {
+        if (!controller.signal.aborted && (taskResult.reason as { status?: number } | null)?.status === 404) {
+          navigate('/', { replace: true })
+          return
+        }
+        throw taskResult.reason
+      }
+      if (runResult.status === 'rejected') throw runResult.reason
+      const taskData = taskResult.value
+      const runData = runResult.value
       if (version !== requestVersion.current) return
       hasLoadedTask.current = true
       setInitialLoadError('')
@@ -153,31 +167,38 @@ function TaskCanvasInner() {
       setTask(taskData); setRuns(runData)
       if (!selectedRun) {
         if (selectedId !== selectedRunId) setSelectedRunId(selectedId)
+        detailOwner.current = { taskId, runId: '' }
+        currentDetails.current = { metrics: [], artifacts: [], effectiveBestWeight: null, events: [], logs: [] }
         setMetrics([]); setArtifacts([]); setEvents([]); setLogs([])
         setEffectiveBestWeight(null)
         setSyncError('')
         setLastSyncedAt(Date.now())
         return
       }
-      const [metricData, artifactData, effectiveBestWeightData, eventData, logData] = await Promise.all([
+      const [metricResult, artifactResult, effectiveBestWeightResult, eventResult, logResult] = await Promise.allSettled([
         api.runMetrics(taskId, selectedRun.id, controller.signal), api.runArtifacts(taskId, selectedRun.id, controller.signal),
         api.runEffectiveBestWeight(taskId, selectedRun.id, controller.signal), api.runEvents(taskId, selectedRun.id, controller.signal),
         api.runLogs(taskId, selectedRun.id, controller.signal),
       ])
       if (version !== requestVersion.current) return
       const previous = previousUpdate.current
-      const currentEpoch = metricData.at(-1)?.epoch || selectedRun.completed_epochs
-      const isLiveRun = selectedRun.id === taskData.current_run_id
-      const logSignature = logData.lines.join('\n')
-      const artifactSignatures = new Map(artifactData.map((artifact) => [artifact.id, `${artifact.modified_at}:${artifact.size}`]))
       const sameRun = previous?.runId === selectedRun.id
-      const changedArtifacts = sameRun ? artifactData.filter((artifact) => previous.artifacts.get(artifact.id) !== artifactSignatures.get(artifact.id)).map((artifact) => artifact.id) : []
+      const currentEpoch = metricResult.status === 'fulfilled'
+        ? metricResult.value.at(-1)?.epoch || selectedRun.completed_epochs
+        : sameRun && previous ? previous.epoch : selectedRun.completed_epochs
+      const isLiveRun = selectedRun.id === taskData.current_run_id
+      const logSignature = logResult.status === 'fulfilled' ? logResult.value.lines.join('\n') : sameRun && previous ? previous.logs : ''
+      const artifactSignatures = artifactResult.status === 'fulfilled'
+        ? new Map(artifactResult.value.map((artifact) => [artifact.id, `${artifact.modified_at}:${artifact.size}`]))
+        : sameRun && previous ? previous.artifacts : new Map<number, string>()
+      const changedArtifacts = sameRun && artifactResult.status === 'fulfilled'
+        ? artifactResult.value.filter((artifact) => previous.artifacts.get(artifact.id) !== artifactSignatures.get(artifact.id)).map((artifact) => artifact.id) : []
       if (!sameRun || currentEpoch !== previous.epoch || logSignature !== previous.logs || selectedRun.status !== previous.status || changedArtifacts.length) {
         setLastOutputAt(Date.now())
       }
       if (previous?.runId === selectedRun.id && isLiveRun) {
-        if (currentEpoch > previous.epoch) setEpochPulse((value) => value === 'a' ? 'b' : 'a')
-        if (logSignature !== previous.logs) setLogPulse((value) => value === 'a' ? 'b' : 'a')
+        if (metricResult.status === 'fulfilled' && currentEpoch > previous.epoch) setEpochPulse((value) => value === 'a' ? 'b' : 'a')
+        if (logResult.status === 'fulfilled' && logSignature !== previous.logs) setLogPulse((value) => value === 'a' ? 'b' : 'a')
         if (changedArtifacts.length) {
           setArtifactPulse((value) => value === 'a' ? 'b' : 'a')
           setNewArtifactIds(changedArtifacts)
@@ -191,18 +212,30 @@ function TaskCanvasInner() {
         artifacts: artifactSignatures,
       }
       if (selectedId !== selectedRunId) setSelectedRunId(selectedId)
-      setMetrics(metricData); setArtifacts(artifactData); setEvents(eventData); setLogs(logData.lines)
-      setEffectiveBestWeight(effectiveBestWeightData)
-      setSyncError('')
+      const sameDetailRun = detailOwner.current.taskId === taskId && detailOwner.current.runId === selectedRun.id
+      const detailState = {
+        metrics: settledRunValue(metricResult, currentDetails.current.metrics, sameDetailRun, []),
+        artifacts: settledRunValue(artifactResult, currentDetails.current.artifacts, sameDetailRun, []),
+        effectiveBestWeight: settledRunValue(effectiveBestWeightResult, currentDetails.current.effectiveBestWeight, sameDetailRun, null),
+        events: settledRunValue(eventResult, currentDetails.current.events, sameDetailRun, []),
+        logs: settledRunValue(logResult, { lines: currentDetails.current.logs, path: null }, sameDetailRun, { lines: [], path: null }).lines,
+      }
+      detailOwner.current = { taskId, runId: selectedRun.id }
+      currentDetails.current = detailState
+      setMetrics(detailState.metrics)
+      setArtifacts(detailState.artifacts)
+      setEffectiveBestWeight(detailState.effectiveBestWeight)
+      setEvents(detailState.events)
+      setLogs(detailState.logs)
+      const failures = refreshFailures([
+        ['指标', metricResult], ['产物', artifactResult], ['最佳权重', effectiveBestWeightResult],
+        ['事件', eventResult], ['日志', logResult],
+      ])
+      setSyncError(failures.join('；'))
       setLastSyncedAt(Date.now())
     } catch (reason) {
       if (controller.signal.aborted || version !== requestVersion.current) return
       if (resolvedSelectedId !== undefined && resolvedSelectedId !== selectedRunId) setSelectedRunId(resolvedSelectedId)
-      const status = reason instanceof Error ? (reason as Error & { status?: number }).status : undefined
-      if (status === 404) {
-        navigate('/', { replace: true })
-        return
-      }
       const message = reason instanceof Error ? reason.message : '加载失败'
       if (hasLoadedTask.current) setSyncError(message)
       else setInitialLoadError(message)
@@ -239,6 +272,9 @@ function TaskCanvasInner() {
     previousUpdate.current = null
     setEpochPulse(undefined); setLogPulse(undefined); setArtifactPulse(undefined)
     setNewArtifactIds([])
+    if (detailOwner.current.taskId === taskId && detailOwner.current.runId === selectedRunId) return
+    detailOwner.current = { taskId, runId: '' }
+    currentDetails.current = { metrics: [], artifacts: [], effectiveBestWeight: null, events: [], logs: [] }
     setMetrics([]); setArtifacts([]); setEffectiveBestWeight(null); setEvents([]); setLogs([])
   }, [taskId, selectedRunId])
 

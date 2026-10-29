@@ -23,7 +23,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from .config import DATA_ROOT, WEB_ROOT, platform_instance_id
@@ -188,6 +188,7 @@ class RemoteRunUpdate(BaseModel):
     progress: float = Field(default=0, ge=0, le=100, allow_inf_nan=False)
     latest_metrics: dict[str, Any] = Field(default_factory=dict)
     metrics: list[dict[str, Any]] = Field(default_factory=list, max_length=256)
+    metrics_reset: bool = False
     log_tail: list[str] = Field(default_factory=list, max_length=200)
     batch_history: list[Annotated[int, Field(ge=1, le=1024)]] | None = Field(default=None, max_length=8)
     exit_code: int | None = None
@@ -1050,6 +1051,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
             "task_id": task.id, "run_id": run.id, "attempt_number": run.attempt_number,
             "platform_instance_id": platform_instance_id(),
             "dataset_provenance_version": 1,
+            "metric_snapshot_version": 1,
             "batch_history_version": 1,
             "task_type": task.task_type, "launch_mode": run.launch_mode,
             "model_path": run.model_path, "data_path": run.data_path,
@@ -1143,6 +1145,20 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
         payload.exit_code not in {None, 0} or payload.completion_info.get("reason") == "exception"
     ):
         raise HTTPException(422, "异常退出的训练不能标记为已完成")
+    if payload.metrics_reset and not payload.metrics:
+        raise HTTPException(422, "指标重置必须携带有效快照数据")
+    if payload.metrics_reset:
+        for point in payload.metrics:
+            try:
+                epoch = int(point["epoch"])
+                elapsed = float(point.get("elapsed", 0))
+                valid = (epoch >= 0 and epoch <= payload.completed_epochs
+                         and isinstance(point["values"], dict)
+                         and math.isfinite(elapsed) and elapsed >= 0)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                raise HTTPException(422, "指标重置快照包含无效数据")
     effective_status = "stopping" if run.stop_requested and payload.status in {"starting", "running"} else payload.status
     run.status = effective_status
     run.pid = payload.pid if payload.status in {"starting", "running", "stopping"} else None
@@ -1162,6 +1178,8 @@ def update_remote_run(node_id: str, run_id: str, payload: RemoteRunUpdate, reque
         run.batch_history_scanned = True
     if payload.run_dir and payload.run_dir != run.run_dir:
         raise HTTPException(422, "远程运行目录不得更改")
+    if payload.metrics_reset:
+        db.execute(delete(MetricPoint).where(MetricPoint.run_id == run.id))
     if payload.command:
         run.command = payload.command
     if payload.error_message:
@@ -1277,4 +1295,4 @@ def remote_run_control(node_id: str, run_id: str, request: Request, db: Session 
     run = db.get(TrainingRun, run_id)
     if not run or run.execution_node_id != node_id:
         raise HTTPException(404, "远程训练运行不存在")
-    return {"stop": bool(run.stop_requested), "status": run.status}
+    return {"stop": bool(run.stop_requested), "status": run.status, "metric_snapshot_version": 1}

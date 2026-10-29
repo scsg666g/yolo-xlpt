@@ -11,6 +11,7 @@ import re
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -837,6 +838,12 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
         point.epoch: point
         for point in db.scalars(select(MetricPoint).where(MetricPoint.run_id == run.id)).all()
     }
+    snapshot_epochs = {metric["epoch"] for metric in snapshot["metrics"]}
+    if snapshot_epochs:
+        for epoch, point in list(existing.items()):
+            if epoch not in snapshot_epochs:
+                db.delete(point)
+                existing.pop(epoch)
     for point in existing.values():
         normalized_values = {
             key: None if isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -850,7 +857,7 @@ def sync_metrics(db, task: TrainingTask, run: TrainingRun | None = None) -> None
             # fallback used below for newly parsed invalid CSV durations.
             point.elapsed = 0.0
     latest: dict[str, Any] = {}
-    latest_epoch = run.completed_epochs
+    latest_epoch = 0 if snapshot_epochs else run.completed_epochs
     has_valid_epoch = False
     for metric in snapshot["metrics"]:
         epoch, values, elapsed = metric["epoch"], metric["values"], metric["elapsed"]
@@ -965,20 +972,34 @@ def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> No
         artifact.path: artifact
         for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id)).all()
     }
+    # A mount or the run directory may be temporarily unavailable. Its absence
+    # is not proof that the previously indexed files were permanently deleted.
     if not root.is_dir():
-        for artifact in known.values():
-            db.delete(artifact)
         return
     discovered = []
-    for path in root.rglob("*"):
-        if not path.is_file() or path.name.startswith("."):
-            continue
-        try:
-            raw = str(path.resolve())
-            stat = path.stat()
-        except OSError:
-            continue
-        discovered.append((path, raw, stat.st_size, datetime.fromtimestamp(stat.st_mtime, timezone.utc)))
+    scan_complete = True
+
+    def scan_error(error: OSError) -> None:
+        nonlocal scan_complete
+        scan_complete = False
+        logger.warning("Artifact scan incomplete for %s: %s", root, error)
+
+    # os.walk reports inaccessible subdirectories through onerror. Path.rglob
+    # can silently skip them, which would otherwise erase still-valid records.
+    for directory, _, filenames in os.walk(root, onerror=scan_error):
+        for filename in filenames:
+            if filename.startswith("."):
+                continue
+            path = Path(directory) / filename
+            try:
+                file_stat = path.stat()
+                if not stat.S_ISREG(file_stat.st_mode):
+                    continue
+                raw = str(path.resolve())
+            except OSError as error:
+                scan_error(error)
+                continue
+            discovered.append((path, raw, file_stat.st_size, datetime.fromtimestamp(file_stat.st_mtime, timezone.utc)))
     discovered_paths: set[str] = set()
     for path, raw, size, modified_at in discovered:
         discovered_paths.add(raw)
@@ -1018,9 +1039,10 @@ def sync_artifacts(db, task: TrainingTask, run: TrainingRun | None = None) -> No
             artifact = existing
         if artifact:
             known[raw] = artifact
-    for raw, artifact in known.items():
-        if raw not in discovered_paths:
-            db.delete(artifact)
+    if scan_complete:
+        for raw, artifact in known.items():
+            if raw not in discovered_paths:
+                db.delete(artifact)
 
 
 def import_existing_runs() -> int:

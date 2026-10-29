@@ -88,6 +88,8 @@ export function Datasets() {
   const deleteDialog = useRef<HTMLDivElement>(null)
   const deleteCancelButton = useRef<HTMLButtonElement>(null)
   const deleteOpener = useRef<HTMLButtonElement | null>(null)
+  const deletePreviewVersion = useRef(0)
+  const deletePreviewController = useRef<AbortController | null>(null)
 
   const loadDatasets = useCallback(async () => {
     loadRequest.current?.controller.abort()
@@ -212,6 +214,11 @@ export function Datasets() {
     }
   }, [deleteTarget])
 
+  useEffect(() => () => {
+    deletePreviewVersion.current += 1
+    deletePreviewController.current?.abort()
+  }, [])
+
   useEffect(() => {
     if (deleteTarget && deleting) deleteDialog.current?.focus()
   }, [deleteTarget, deleting])
@@ -264,17 +271,32 @@ export function Datasets() {
   }
 
   function openDeleteDialog(dataset: ManagedDataset, opener: HTMLButtonElement) {
+    deletePreviewController.current?.abort()
+    const version = ++deletePreviewVersion.current
+    const controller = new AbortController()
+    deletePreviewController.current = controller
     setError('')
     setNotice('')
+    setDeleteTarget(null)
     deleteOpener.current = opener
-    void api.datasetDeletePreview(dataset.id).then(preview => {
+    void api.datasetDeletePreview(dataset.id, controller.signal).then(preview => {
+      if (version !== deletePreviewVersion.current || controller.signal.aborted) return
       if (!preview.can_delete) { setError(preview.delete_block_reason || '该数据集仍被引用、未接管或正在处理，请刷新后检查'); return }
       setDeleteTarget(preview)
-    }).catch((e: Error) => setError(e.message))
+    }).catch((e: Error) => {
+      if (version === deletePreviewVersion.current && !controller.signal.aborted) setError(e.message)
+    }).finally(() => {
+      if (deletePreviewController.current === controller) deletePreviewController.current = null
+    })
   }
 
   function closeDeleteDialog() {
-    if (!deleting) setDeleteTarget(null)
+    if (!deleting) {
+      deletePreviewVersion.current += 1
+      deletePreviewController.current?.abort()
+      deletePreviewController.current = null
+      setDeleteTarget(null)
+    }
   }
 
   function handleDeleteDialogKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {

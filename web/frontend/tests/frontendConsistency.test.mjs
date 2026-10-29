@@ -20,9 +20,21 @@ function loadModule(name, globals = {}) {
 const { metricProfile, primaryMetric, bestMetricPoint } = loadModule('metricProfiles')
 const { groupMetricSummary, taskMetric } = loadModule('groupMetrics')
 const { comparisonEvidence } = loadModule('comparisonEvidence')
+const { refreshFailures, settledRunValue } = loadModule('refreshResults')
 const { applyHistoryRefresh, bridgeHistoryHead, refreshActiveHistoryTail, mergeHistoryHead, retainedHistorySelection, historyNeedsDetailRefresh } = loadModule('modelTestHistory')
 
 const point = (epoch, values) => ({ epoch, values })
+
+test('partial detail refresh keeps prior successful sections and reports only failed sections', () => {
+  const oldMetrics = [{ epoch: 3 }]
+  const oldArtifacts = [{ id: 4 }]
+  const metricsResult = { status: 'fulfilled', value: [{ epoch: 4 }] }
+  const artifactsResult = { status: 'rejected', reason: new Error('节点暂不可用') }
+  assert.deepEqual(settledRunValue(metricsResult, oldMetrics, false, []), [{ epoch: 4 }])
+  assert.deepEqual(settledRunValue(artifactsResult, oldArtifacts, true, []), oldArtifacts)
+  assert.deepEqual(settledRunValue(artifactsResult, oldArtifacts, false, []), [])
+  assert.deepEqual(refreshFailures([['指标', metricsResult], ['产物', artifactsResult]]), ['产物：节点暂不可用'])
+})
 
 test('all task types choose their own primary metric and best evaluation epoch', () => {
   const cases = [

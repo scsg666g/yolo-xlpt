@@ -193,3 +193,38 @@ test('active comparison details refresh logs without an epoch change, and keep c
     assert.equal(detail().props.details.logs.lines[0], 'final line')
   } finally { view.dispose() }
 })
+
+test('comparison refreshes same-Epoch metric corrections and opening picker fetches new attempts', async () => {
+  const task = { id: 'task-a', name: '测试任务', task_type: 'detect', model_path: 'models/base.pt', data_path: 'datasets/data.yaml',
+    epochs: 10, batch: 2, imgsz: 32, device: 'cpu', workers: 0, config: {}, current_run_id: 'run-a', group_id: null }
+  const run = { id: 'run-a', task_id: task.id, status: 'completed', attempt_number: 1, launch_mode: 'fresh',
+    model_path: task.model_path, data_path: task.data_path, parameter_snapshot: {}, updated_at: 'unchanged',
+    completed_epochs: 1, latest_metrics: { 'metrics/mAP50(B)': 0.4 }, progress: 100, execution_node_id: null }
+  let score = 0.4; let includeNew = false; let metricRequests = 0; let catalogRequests = 0
+  const view = historyView('ExperimentCompare', {
+    taskGroups: async () => [],
+    experiments: async (_offset, _signal, runIds) => {
+      if (!runIds) catalogRequests++
+      const runs = [run, { ...run, id: 'run-b', attempt_number: 2 },
+        ...(includeNew ? [{ ...run, id: 'run-c', attempt_number: 3 }] : [])]
+      const matching = runIds ? runs.filter(item => runIds.includes(item.id)) : runs
+      return { items: matching.map(item => ({ task: { ...task }, run: { ...item } })), total: matching.length, limit: 200 }
+    },
+    runMetrics: async () => { metricRequests++; return [{ epoch: 1, values: { 'metrics/mAP50(B)': score } }] },
+  }, 'runs=run-a,run-b')
+  try {
+    await view.settle()
+    const chartValue = () => view.findAll(node => node.type === 'LineChartView')[0].props.option.series[0].data[0][1]
+    assert.equal(chartValue(), 0.4)
+    const previousRequests = metricRequests
+    score = 0.7
+    await view.tick()
+    assert.equal(chartValue(), 0.7)
+    assert.ok(metricRequests > previousRequests, 'selected metrics re-fetch even when run metadata is unchanged')
+    includeNew = true
+    const beforeOpen = catalogRequests
+    await view.click(view.findAll(node => node.type === 'button' && node.props.className === 'button primary')[0])
+    assert.ok(catalogRequests > beforeOpen, 'opening picker requests the full catalog')
+    assert.equal(view.findAll(node => node.props.className === 'compare-run-select').length, 3)
+  } finally { view.dispose() }
+})

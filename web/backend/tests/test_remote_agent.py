@@ -94,6 +94,7 @@ def test_remote_progress_skips_invalid_epochs_and_normalizes_elapsed(agent, tmp_
         "NaN,5,0.1,ignored-nan\n"
         "Infinity,6,0.2,ignored-positive-infinity\n"
         "-Infinity,7,0.3,ignored-negative-infinity\n"
+        "-1,8,0.4,ignored-negative-epoch\n"
         "1e309,8,0.4,ignored-overflow\n"
         "invalid,9,0.5,ignored-text\n"
         ",10,0.6,ignored-empty\n"
@@ -156,6 +157,62 @@ def test_remote_progress_payload_resends_appended_epoch_correction(agent, traini
         {'epoch': 1, 'elapsed': 1.0, 'values': {'score': 0.1}},
         {'epoch': 1, 'elapsed': 2.0, 'values': {'score': 0.9}},
     ]
+    assert updates[-1]['status'] == 'completed'
+
+
+def test_remote_metric_reset_survives_failed_report_and_rewritten_csv(agent, training, monkeypatch):
+    config, task = training
+    task['metric_snapshot_version'] = 1
+    csv_path = Path(task['run_dir']) / 'results.csv'
+
+    class Process:
+        pid = 123457
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            self.returncode = 0
+            return 0
+
+    process = Process()
+
+    class Stop:
+        ticks = 0
+
+        def is_set(self):
+            return False
+
+        def wait(self, seconds):
+            if seconds == 2:
+                self.ticks += 1
+                if self.ticks == 2:
+                    csv_path.write_text('epoch,time,score\n1,3,0.9\n')
+                elif self.ticks == 3:
+                    process.returncode = 0
+            return False
+
+    def popen(*args, **kwargs):
+        csv_path.write_text('epoch,time,score\n1,1,0.1\n2,2,0.2\n')
+        return process
+
+    updates = []
+
+    def api(_config, path, method='GET', payload=None, *args):
+        if path.endswith('/update'):
+            updates.append(dict(payload))
+            if len([item for item in updates if item.get('metrics_reset')]) == 1:
+                raise URLError('report lost')
+        return {}
+
+    monkeypatch.setattr(agent.subprocess, 'Popen', popen)
+    monkeypatch.setattr(agent, 'api_json', api)
+    agent.run_remote_task(config, task, Stop())
+    resets = [item for item in updates if item.get('metrics_reset')]
+    assert len(resets) == 2
+    assert [point['epoch'] for point in resets[0]['metrics']] == [1, 2]
+    assert resets[1]['metrics'] == [{'epoch': 1, 'elapsed': 3.0, 'values': {'score': 0.9}}]
     assert updates[-1]['status'] == 'completed'
 
 
@@ -675,6 +732,30 @@ def test_terminal_backlog_survives_outage_and_retries_all_epochs(agent, training
     assert [m["epoch"] for p in received for m in p["metrics"]] == list(range(1, 601))
     assert not path.exists()
     assert agent.load_active_run(config) is None
+
+
+def test_metric_snapshot_reset_is_sent_only_with_first_terminal_batch(agent, training, monkeypatch):
+    config, task = training
+    task['metric_snapshot_version'] = 1
+    metrics = [{'epoch': i, 'values': {'score': 0.5}} for i in range(1, 601)]
+    path = agent.save_pending_final(config, task['run_id'], {
+        'status': 'completed', 'completed_epochs': 600, 'progress': 100,
+        'exit_code': 0, 'metrics': metrics, 'metrics_reset': True,
+    })
+    received = []
+
+    def online(_config, _path, method, payload):
+        received.append(payload)
+        return {'status': payload['status']}
+
+    monkeypatch.setattr(agent, 'api_json', online)
+    assert agent.retry_pending_finals(config) is False
+    assert agent.retry_pending_finals(config) is False
+    assert agent.retry_pending_finals(config) is True
+    assert [batch.get('metrics_reset', False) for batch in received] == [True, False, False]
+    assert 'metrics_reset' not in received[1] and 'metrics_reset' not in received[2]
+    assert [row['epoch'] for batch in received for row in batch['metrics']] == list(range(1, 601))
+    assert not path.exists()
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -1467,6 +1548,8 @@ def test_recovery_classifies_process_that_exited_before_agent_restart(
     agent, training, monkeypatch, scenario, expected,
 ):
     config, task = training
+    if scenario == 'uncertain':
+        task.update(completed_epochs=3, latest_metrics={'score': 0.3})
     run_dir = Path(task["run_dir"])
     weights = run_dir / "weights"
     weights.mkdir(parents=True)
@@ -1497,7 +1580,8 @@ def test_recovery_classifies_process_that_exited_before_agent_restart(
 
     def api(_config, path, method="GET", payload=None, extra_headers=None):
         if path.endswith("/control"):
-            return {"status": "running", "stop": False}
+            return {"status": "running", "stop": False,
+                    **({'metric_snapshot_version': 1} if scenario == 'uncertain' else {})}
         if path.endswith("/artifacts") or path.endswith("/trace"):
             return {}
         updates.append(payload)
@@ -1512,11 +1596,90 @@ def test_recovery_classifies_process_that_exited_before_agent_restart(
     assert updates[-1]["status"] == expected
     assert updates[-1]["completed_epochs"] == (3 if full_epochs else 1)
     assert updates[-1]["exit_code"] is None
+    if scenario == 'uncertain':
+        assert updates[-1]['metrics_reset'] is True
+        assert updates[-1]['latest_metrics'] == {'score': 0.1}
     assert updates[-1]["progress"] == (100 if expected == "completed" else pytest.approx(min(99.99, (3 if full_epochs else 1) * 100 / 3)))
     if expected == "completed":
         assert updates[-1]["completion_info"]["source"] == "legacy_log"
     if expected == "interrupted":
         assert "无法取得原进程退出码" in updates[-1]["error_message"]
+
+
+@pytest.mark.parametrize(('control', 'expected_reset'), [
+    ({'status': 'running', 'stop': False}, False),
+    ({'status': 'running', 'stop': False, 'metric_snapshot_version': 2}, False),
+    ({'status': 'running', 'stop': False, 'metric_snapshot_version': 1}, True),
+    (None, True),  # A failed request does not renegotiate capabilities.
+])
+def test_recovery_renegotiates_stale_metric_snapshot_capability(
+    agent, training, monkeypatch, control, expected_reset,
+):
+    config, task = training
+    task.update(metric_snapshot_version=1, completed_epochs=3, latest_metrics={'score': 0.3})
+    Path(task['run_dir']).mkdir(parents=True)
+    (Path(task['run_dir']) / 'results.csv').write_text('epoch,time,score\n1,1,0.1\n')
+    updates = []
+
+    def api(_config, path, method='GET', payload=None, extra_headers=None):
+        if path.endswith('/control'):
+            if control is None:
+                raise URLError('offline')
+            return control
+        if path.endswith('/artifacts') or path.endswith('/trace'):
+            return {}
+        updates.append(payload)
+        return {'status': payload['status']}
+
+    monkeypatch.setattr(agent, 'api_json', api)
+    state = {'phase': 'running', 'task': task, 'run_id': task['run_id'],
+             'process': {'pid': 99999999, 'start_ticks': 1, 'boot_id': 'gone',
+                         'cmdline_sha256': '0' * 64}, 'command': []}
+    lock = agent.acquire_training_lock(config)
+    agent.recover_remote_task(config, state, threading.Event(), training_lock=lock)
+    assert len(updates) == 1
+    assert updates[0].get('metrics_reset', False) is expected_reset
+    assert updates[0]['completed_epochs'] == (1 if expected_reset else 3)
+    assert task.get('metric_snapshot_version') == (1 if expected_reset else None)
+
+
+def test_recovery_control_capability_can_disappear_mid_monitoring(agent, training, monkeypatch):
+    config, task = training
+    task.update(metric_snapshot_version=1, completed_epochs=3, latest_metrics={'score': 0.3})
+    Path(task['run_dir']).mkdir(parents=True)
+    (Path(task['run_dir']) / 'results.csv').write_text('epoch,time,score\n1,1,0.1\n')
+    controls = [
+        {'status': 'running', 'stop': False, 'metric_snapshot_version': 1},
+        {'status': 'running', 'stop': False},
+    ]
+    updates = []
+    stop = threading.Event()
+    stop.preserve_training = True
+    monkeypatch.setattr(agent, '_recovery_identity', lambda state: {'pid': 123})
+    monkeypatch.setattr(agent, 'process_holds_training_lock', lambda *_: True)
+    monkeypatch.setattr(agent, 'process_identity_matches', lambda *_: True)
+    monkeypatch.setattr(agent, 'save_active_run', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(agent, 'detach_training', lambda *_args: (_ for _ in ()).throw(agent.TrainingDetached()))
+    monkeypatch.setattr(agent, 'report_manifest', lambda *_: None)
+    monkeypatch.setattr(agent, 'report_training_trace', lambda *_: None)
+
+    def api(_config, path, method='GET', payload=None, extra_headers=None):
+        if path.endswith('/control'):
+            return controls.pop(0)
+        if path.endswith('/update'):
+            updates.append(payload)
+            stop.set()
+            return {'status': payload['status']}
+        return {}
+
+    monkeypatch.setattr(agent, 'api_json', api)
+    state = {'phase': 'running', 'task': task, 'run_id': task['run_id'],
+             'process': {'pid': 123}, 'command': []}
+    agent.recover_remote_task(config, state, stop, process_holds_lock=True)
+    assert len(updates) == 1
+    assert 'metrics_reset' not in updates[0]
+    assert updates[0]['completed_epochs'] == 3
+    assert 'metric_snapshot_version' not in task
 
 
 def test_remote_training_outcome_runner_is_used_when_trace_is_disabled(agent, training):

@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
 DEFAULT_DATASET_REFRESH_READ_RATE = 32 * 1024**2
 DEFAULT_DATASET_REFRESH_MIN_FREE = 512 * 1024**2
@@ -2152,7 +2152,7 @@ def run_operations(config: dict, operation: dict, stop: threading.Event) -> None
 
 
 # BEGIN PORTABLE METRIC CORE (generated from backend/app/metric_files.py)
-METRIC_FILES_SOURCE = '"""Incremental training CSV reads; standard library only for standalone Agents."""\nfrom __future__ import annotations\n\nimport csv\nimport math\nimport threading\nfrom collections import OrderedDict\nfrom pathlib import Path\n\n\nclass MetricCsvReader:\n    """Keep bounded per-file caches; incomplete trailing records wait for a newline."""\n\n    def __init__(self, maximum_files=128):\n        self.maximum_files = max(1, maximum_files)\n        self._files = OrderedDict()\n        self._lock = threading.RLock()\n\n    def read(self, path, *, final=False, incremental=False):\n        path = Path(path)\n        key = str(path.absolute())\n        with self._lock:\n            try:\n                info = path.stat()\n                signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)\n                state = self._files.pop(key, None)\n                with path.open(\'rb\') as stream:\n                    reset = state is None or state[\'signature\'][:2] != signature[:2]\n                    reset = reset or info.st_size < state[\'offset\']\n                    if state is not None and not reset:\n                        # An append must retain the already consumed suffix. Same-size\n                        # rewrites and resumed/truncated files start a fresh generation.\n                        reset = info.st_size <= state[\'signature\'][2] and signature != state[\'signature\']\n                        if not reset and state[\'anchor\']:\n                            stream.seek(state[\'offset\'] - len(state[\'anchor\']))\n                            reset = stream.read(len(state[\'anchor\'])) != state[\'anchor\']\n                        if not reset and state[\'signature\'] == signature and (not final or not state[\'partial\']):\n                            state[\'delta\'] = []\n                            self._files[key] = state\n                            return self._snapshot(state, incremental=incremental)\n                    if reset:\n                        state = {\'offset\': 0, \'header\': None, \'metrics\': [], \'completed\': 0,\n                                 \'latest\': {}, \'anchor\': b\'\', \'partial\': False, \'delta\': [],\n                                 \'generation\': (state[\'generation\'] + 1) if state else 1}\n                    state[\'delta\'] = []\n                    stream.seek(state[\'offset\'])\n                    state[\'partial\'] = False\n                    while True:\n                        start = stream.tell()\n                        line = stream.readline()\n                        if not line:\n                            break\n                        if not line.endswith(b\'\\n\') and not final:\n                            stream.seek(start)\n                            state[\'partial\'] = True\n                            break\n                        try:\n                            values = next(csv.reader([line.decode(\'utf-8-sig\', errors=\'replace\')]))\n                        except (csv.Error, StopIteration):\n                            continue\n                        if state[\'header\'] is None:\n                            state[\'header\'] = [value.strip() for value in values]\n                            continue\n                        # CSV output contains one numeric record per physical line.\n                        # Reject truncated/extra fields rather than publishing half an epoch.\n                        if len(values) != len(state[\'header\']):\n                            continue\n                        metric = self._metric(dict(zip(state[\'header\'], values)))\n                        if metric is not None:\n                            state[\'metrics\'].append(metric)\n                            state[\'delta\'].append(metric)\n                            state[\'completed\'] = max(state[\'completed\'], metric[\'epoch\'])\n                            state[\'latest\'] = metric[\'values\']\n                    state[\'offset\'] = stream.tell()\n                    stream.seek(max(0, state[\'offset\'] - 256))\n                    state[\'anchor\'] = stream.read(min(256, state[\'offset\']))\n                state[\'signature\'] = signature\n                self._files[key] = state\n                while len(self._files) > self.maximum_files:\n                    self._files.popitem(last=False)\n                return self._snapshot(state, incremental=incremental)\n            except (OSError, csv.Error):\n                # Missing files can be normal during trainer startup/rotation.\n                return {\'completed\': 0, \'latest\': {}, \'metrics\': [], \'generation\': 0}\n\n    @staticmethod\n    def _snapshot(state, *, incremental=False):\n        return {\'completed\': state[\'completed\'], \'latest\': dict(state[\'latest\']),\n                \'metrics\': list(state[\'delta\'] if incremental else state[\'metrics\']),\n                \'generation\': state[\'generation\']}\n\n    @staticmethod\n    def _metric(row):\n        try:\n            epoch_number = float(row.get(\'epoch\', \'\'))\n            if not math.isfinite(epoch_number):\n                return None\n            epoch = int(epoch_number)\n        except (ValueError, TypeError, OverflowError):\n            return None\n        values = {}\n        for key, raw in row.items():\n            if not key or key in {\'epoch\', \'time\'}:\n                continue\n            if raw is None or raw == \'\':\n                values[key] = None\n                continue\n            try:\n                number = float(raw)\n                values[key] = number if math.isfinite(number) else None\n            except (ValueError, TypeError, OverflowError):\n                values[key] = str(raw)[:200]\n        try:\n            elapsed = float(row.get(\'time\') or 0)\n            if not math.isfinite(elapsed) or elapsed < 0:\n                elapsed = 0.0\n        except (ValueError, TypeError, OverflowError):\n            elapsed = 0.0\n        return {\'epoch\': epoch, \'elapsed\': elapsed, \'values\': values}\n'
+METRIC_FILES_SOURCE = '"""Incremental training CSV reads; standard library only for standalone Agents."""\nfrom __future__ import annotations\n\nimport csv\nimport math\nimport threading\nfrom collections import OrderedDict\nfrom pathlib import Path\n\n\nclass MetricCsvReader:\n    """Keep bounded per-file caches; incomplete trailing records wait for a newline."""\n\n    def __init__(self, maximum_files=128):\n        self.maximum_files = max(1, maximum_files)\n        self._files = OrderedDict()\n        self._lock = threading.RLock()\n\n    def read(self, path, *, final=False, incremental=False, include_metadata=False):\n        path = Path(path)\n        key = str(path.absolute())\n        with self._lock:\n            try:\n                info = path.stat()\n                signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)\n                state = self._files.pop(key, None)\n                with path.open(\'rb\') as stream:\n                    reset = state is None or state[\'signature\'][:2] != signature[:2]\n                    reset = reset or info.st_size < state[\'offset\']\n                    if state is not None and not reset:\n                        # An append must retain the already consumed suffix. Same-size\n                        # rewrites and resumed/truncated files start a fresh generation.\n                        reset = info.st_size <= state[\'signature\'][2] and signature != state[\'signature\']\n                        if not reset and state[\'anchor\']:\n                            stream.seek(state[\'offset\'] - len(state[\'anchor\']))\n                            reset = stream.read(len(state[\'anchor\'])) != state[\'anchor\']\n                        if not reset and state[\'signature\'] == signature and (not final or not state[\'partial\']):\n                            state[\'delta\'] = []\n                            self._files[key] = state\n                            return self._snapshot(state, incremental=incremental,\n                                                  include_metadata=include_metadata)\n                    if reset:\n                        state = {\'offset\': 0, \'header\': None, \'metrics\': [], \'completed\': 0,\n                                 \'latest\': {}, \'anchor\': b\'\', \'partial\': False, \'delta\': [],\n                                 \'generation\': (state[\'generation\'] + 1) if state else 1}\n                    state[\'delta\'] = []\n                    stream.seek(state[\'offset\'])\n                    state[\'partial\'] = False\n                    while True:\n                        start = stream.tell()\n                        line = stream.readline()\n                        if not line:\n                            break\n                        if not line.endswith(b\'\\n\') and not final:\n                            stream.seek(start)\n                            state[\'partial\'] = True\n                            break\n                        try:\n                            values = next(csv.reader([line.decode(\'utf-8-sig\', errors=\'replace\')]))\n                        except (csv.Error, StopIteration):\n                            continue\n                        if state[\'header\'] is None:\n                            state[\'header\'] = [value.strip() for value in values]\n                            continue\n                        # CSV output contains one numeric record per physical line.\n                        # Reject truncated/extra fields rather than publishing half an epoch.\n                        if len(values) != len(state[\'header\']):\n                            continue\n                        metric = self._metric(dict(zip(state[\'header\'], values)))\n                        if metric is not None:\n                            state[\'metrics\'].append(metric)\n                            state[\'delta\'].append(metric)\n                            state[\'completed\'] = max(state[\'completed\'], metric[\'epoch\'])\n                            state[\'latest\'] = metric[\'values\']\n                    state[\'offset\'] = stream.tell()\n                    stream.seek(max(0, state[\'offset\'] - 256))\n                    state[\'anchor\'] = stream.read(min(256, state[\'offset\']))\n                state[\'signature\'] = signature\n                self._files[key] = state\n                while len(self._files) > self.maximum_files:\n                    self._files.popitem(last=False)\n                return self._snapshot(state, incremental=incremental, include_metadata=include_metadata,\n                                      reset=reset)\n            except (OSError, csv.Error):\n                # Missing files can be normal during trainer startup/rotation.\n                snapshot = {\'completed\': 0, \'latest\': {}, \'metrics\': [], \'generation\': 0}\n                if include_metadata:\n                    snapshot.update(reset=False, authoritative=False, has_metrics=False)\n                return snapshot\n\n    @staticmethod\n    def _snapshot(state, *, incremental=False, include_metadata=False, reset=False):\n        snapshot = {\'completed\': state[\'completed\'], \'latest\': dict(state[\'latest\']),\n                    \'metrics\': list(state[\'delta\'] if incremental else state[\'metrics\']),\n                    \'generation\': state[\'generation\']}\n        if include_metadata:\n            snapshot.update(reset=reset, authoritative=state[\'header\'] is not None,\n                            has_metrics=bool(state[\'metrics\']))\n        return snapshot\n\n    @staticmethod\n    def _metric(row):\n        try:\n            epoch_number = float(row.get(\'epoch\', \'\'))\n            if not math.isfinite(epoch_number):\n                return None\n            epoch = int(epoch_number)\n            if epoch < 0:\n                return None\n        except (ValueError, TypeError, OverflowError):\n            return None\n        values = {}\n        for key, raw in row.items():\n            if not key or key in {\'epoch\', \'time\'}:\n                continue\n            if raw is None or raw == \'\':\n                values[key] = None\n                continue\n            try:\n                number = float(raw)\n                values[key] = number if math.isfinite(number) else None\n            except (ValueError, TypeError, OverflowError):\n                values[key] = str(raw)[:200]\n        try:\n            elapsed = float(row.get(\'time\') or 0)\n            if not math.isfinite(elapsed) or elapsed < 0:\n                elapsed = 0.0\n        except (ValueError, TypeError, OverflowError):\n            elapsed = 0.0\n        return {\'epoch\': epoch, \'elapsed\': elapsed, \'values\': values}\n'
 METRIC_FILES = {}
 exec(compile(METRIC_FILES_SOURCE, "<metric_files>", "exec"), METRIC_FILES)
 _METRIC_CSV_READER = METRIC_FILES["MetricCsvReader"](maximum_files=4)
@@ -2225,16 +2225,34 @@ def read_batch_history(path: Path, configured: int, *, full: bool = False) -> li
 
 def read_remote_progress(run_dir: Path, *, final: bool = False,
                          sent_epochs: set[int] | None = None,
-                         pending_metrics: dict[int, dict] | None = None) -> tuple[int, dict, list[dict]]:
+                         pending_metrics: dict[int, dict] | None = None,
+                         metric_state: dict | None = None,
+                         full_snapshot: bool = False) -> tuple[int, dict, list[dict]]:
     # Monitoring consumes deltas; outcome/recovery readers need a non-consuming
     # full snapshot even when progress was read earlier in this process.
+    full_snapshot = full_snapshot or bool(metric_state is not None and not metric_state.get("initialized"))
     snapshot = _METRIC_CSV_READER.read(run_dir / "results.csv", final=final,
-                                     incremental=sent_epochs is not None)
+                                     incremental=sent_epochs is not None and not full_snapshot,
+                                     include_metadata=metric_state is not None)
+    if metric_state is not None:
+        if snapshot.get("has_metrics") and (snapshot.get("reset") or not metric_state.get("initialized")):
+            metric_state["reset_pending"] = True
+            metric_state["initialized"] = True
+        metric_state.update(reset=snapshot.get("reset", False),
+                            authoritative=snapshot.get("authoritative", False),
+                            has_metrics=snapshot.get("has_metrics", False),
+                            generation=snapshot.get("generation", 0))
     key = str((run_dir / "results.csv").absolute())
     with _REMOTE_CSV_GENERATION_LOCK:
         previous = _REMOTE_CSV_GENERATIONS.get(key)
         _REMOTE_CSV_GENERATIONS[key] = snapshot['generation']
     if previous is not None and previous != snapshot['generation'] and sent_epochs is not None:
+        if metric_state is not None:
+            if snapshot.get("has_metrics"):
+                metric_state["reset_pending"] = True
+            else:
+                metric_state["initialized"] = False
+                metric_state.pop("reset_pending", None)
         sent_epochs.clear()
         if pending_metrics is not None:
             pending_metrics.clear()
@@ -2289,6 +2307,9 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
         raise ValueError("本地最终状态无效")
     metrics = payload.get("metrics", [])
     batch = dict(payload, metrics=metrics[:256])
+    # False is the old protocol's default; only a true reset needs negotiation.
+    if not batch.get("metrics_reset"):
+        batch.pop("metrics_reset", None)
     if len(metrics) > 256:
         batch["status"] = "stopping" if payload["status"] == "stopped" else "running"
         for key in ("error_message", "exit_code", "stop_reason"):
@@ -2306,7 +2327,9 @@ def deliver_pending_final(config: dict, path: Path) -> bool:
         # an authenticated, identity-checked deletion tombstone may retire it.
         return reconcile_deleted_final(config, path, payload)
     if len(metrics) > 256 and response.get("status") not in {"completed", "stopped", "failed", "interrupted"}:
-        save_pending_final(config, run_id, dict(payload, metrics=metrics[256:]))
+        remaining = dict(payload, metrics=metrics[256:])
+        remaining.pop("metrics_reset", None)
+        save_pending_final(config, run_id, remaining)
         return False
     clear_active_run(config, run_id)
     path.unlink()
@@ -2458,6 +2481,8 @@ def _save_terminal_for_retry(config: dict, task: dict, payload: dict) -> Path:
 
 def training_report_payload(task: dict, payload: dict) -> dict:
     """Old centers have strict schemas; only advertise negotiated additions."""
+    if task.get('metric_snapshot_version') != 1 and 'metrics_reset' in payload:
+        payload = {key: value for key, value in payload.items() if key != 'metrics_reset'}
     if task.get('batch_history_version') == 1:
         payload = {**payload, 'batch_history': read_batch_history(
             Path(task['log_path']), int(task['parameters']['batch']))}
@@ -2637,6 +2662,14 @@ def recovered_natural_exit(task: dict, completed: int, log_lines: list[str]) -> 
             None)
 
 
+def update_metric_snapshot_capability(task: dict, control: dict) -> None:
+    """Use only a successful control response to renegotiate this optional field."""
+    if control.get("metric_snapshot_version") == 1:
+        task["metric_snapshot_version"] = 1
+    else:
+        task.pop("metric_snapshot_version", None)
+
+
 def recover_remote_task(config: dict, state: dict, stop: threading.Event, training_lock=None,
                         process_holds_lock: bool = False) -> None:
     """Monitor an orphaned, identity-verified process without starting a duplicate."""
@@ -2701,6 +2734,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
         identity = _recovery_identity(state)
         try:
             control = api_json(config, endpoint + "/control")
+            update_metric_snapshot_capability(task, control)
         except (OSError, ValueError, HTTPError, URLError):
             control = {}
         if control.get("status") in {"completed", "failed", "stopped", "interrupted"}:
@@ -2709,9 +2743,13 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             clear_active_run(config, run_id)
             return
         if identity is None:
-            completed, latest, metrics = read_remote_progress(Path(task["run_dir"]))
-            completed = max(completed, task.get("completed_epochs", 0))
-            latest = latest or task.get("latest_metrics", {})
+            metric_state: dict = {}
+            completed, latest, metrics = read_remote_progress(
+                Path(task["run_dir"]), metric_state=metric_state, full_snapshot=True,
+            )
+            if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+                completed = max(completed, task.get("completed_epochs", 0))
+                latest = latest or task.get("latest_metrics", {})
             log_lines = recent_log_lines(Path(task["log_path"]))
             requested_stop = bool(control.get("stop"))
             if requested_stop:
@@ -2730,7 +2768,9 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 "completed_epochs": completed,
                 "progress": (100 if status == "completed" else
                              min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100)),
-                "latest_metrics": latest, "metrics": metrics, "log_tail": log_lines,
+                "latest_metrics": latest, "metrics": metrics,
+                "metrics_reset": task.get("metric_snapshot_version") == 1 and bool(metric_state.get("reset_pending")),
+                "log_tail": log_lines,
                 "command": state.get("command") or [], "run_dir": task.get("run_dir")})
             _deliver_terminal_once(config, path)
             return
@@ -2741,6 +2781,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
         stop_reason = "platform_stop" if requested_stop else None
         sent_epochs: set[int] = set()
         pending_metrics: dict[int, dict] = {}
+        metric_state: dict = {}
         sent_trace_images: set[str] = set()
         last_artifacts_at = 0.0
         while process_identity_matches(identity) and not stop.is_set():
@@ -2748,6 +2789,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 _terminate_recovered_process(identity)
             try:
                 control = api_json(config, endpoint + "/control")
+                update_metric_snapshot_capability(task, control)
                 if control.get("stop"):
                     requested_stop, stop_reason = True, "platform_stop"
                     _terminate_recovered_process(identity)
@@ -2755,9 +2797,12 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 pass
             completed, latest, metrics = read_remote_progress(
                 Path(task["run_dir"]), sent_epochs=sent_epochs, pending_metrics=pending_metrics,
+                metric_state=metric_state,
             )
-            completed = max(completed, task.get("completed_epochs", 0))
-            latest = latest or task.get("latest_metrics", {})
+            if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+                completed = max(completed, task.get("completed_epochs", 0))
+            if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+                latest = latest or task.get("latest_metrics", {})
             pending_metrics.update((item["epoch"], item) for item in metrics)
             new_metrics = [pending_metrics[epoch] for epoch in sorted(pending_metrics)
                            if epoch not in sent_epochs][:256]
@@ -2773,6 +2818,8 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                        "progress": min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
                        "latest_metrics": latest, "metrics": new_metrics,
                        "log_tail": recent_log_lines(Path(task["log_path"])), "run_dir": task["run_dir"]}
+            if task.get("metric_snapshot_version") == 1 and metric_state.get("reset_pending"):
+                payload["metrics_reset"] = True
             if command:
                 payload["command"] = command
             payload = training_report_payload(task, payload)
@@ -2783,6 +2830,10 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 sent_epochs.update(item["epoch"] for item in new_metrics)
                 for item in new_metrics:
                     pending_metrics.pop(item["epoch"], None)
+                if payload.get("metrics_reset"):
+                    task.update(completed_epochs=completed, progress=payload["progress"],
+                                latest_metrics=latest)
+                metric_state.pop("reset_pending", None)
                 if response.get("stop_requested"):
                     requested_stop, stop_reason = True, "platform_stop"
             except (OSError, ValueError, HTTPError, URLError):
@@ -2809,10 +2860,13 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
                 raise RuntimeError("强制停止后进程仍存活，保留活动记录以便重试")
         completed, latest, metrics = read_remote_progress(
             Path(task["run_dir"]), final=True, sent_epochs=sent_epochs, pending_metrics=pending_metrics,
+            metric_state=metric_state,
         )
         pending_metrics.update((item["epoch"], item) for item in metrics)
-        completed = max(completed, task.get("completed_epochs", 0))
-        latest = latest or task.get("latest_metrics", {})
+        if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+            completed = max(completed, task.get("completed_epochs", 0))
+        if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+            latest = latest or task.get("latest_metrics", {})
         log_lines = recent_log_lines(Path(task["log_path"]))
         if requested_stop:
             status, error, exit_code = "stopped", None, None
@@ -2830,6 +2884,7 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             "progress": 100 if status == "completed" else min(99.99, completed / max(1, int(task["parameters"]["epochs"])) * 100),
             "latest_metrics": latest,
             "metrics": [pending_metrics[epoch] for epoch in sorted(pending_metrics) if epoch not in sent_epochs],
+            "metrics_reset": task.get("metric_snapshot_version") == 1 and bool(metric_state.get("reset_pending")),
             "log_tail": log_lines, "command": command,
             "run_dir": task["run_dir"]})
         _deliver_terminal_once(config, path)
@@ -2858,6 +2913,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
     last_warning = 0.0
     last_metrics: set[int] = set()
     pending_metrics: dict[int, dict] = {}
+    metric_state: dict = {}
     command_reported = False
     sent_trace_images: set[str] = set()
     last_trace_at = 0.0
@@ -2879,6 +2935,8 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
         pending_metrics.update((item["epoch"], item) for item in payload.get("metrics", []))
         payload = dict(payload, metrics=[pending_metrics[epoch] for epoch in sorted(pending_metrics)
                                          if epoch not in last_metrics][:256])
+        if task.get("metric_snapshot_version") == 1 and metric_state.get("reset_pending"):
+            payload["metrics_reset"] = True
         payload = training_report_payload(task, payload)
         if not command_reported:
             payload["command"] = command
@@ -2895,6 +2953,10 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
         last_metrics.update(item["epoch"] for item in payload.get("metrics", []))
         for item in payload.get("metrics", []):
             pending_metrics.pop(item["epoch"], None)
+        if payload.get("metrics_reset"):
+            task.update(completed_epochs=payload["completed_epochs"],
+                        progress=payload["progress"], latest_metrics=payload["latest_metrics"])
+        metric_state.pop("reset_pending", None)
         if response.get("stop_requested"):
             request_stop("platform_stop")
 
@@ -2935,9 +2997,12 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                     break
                 completed, latest, metrics = read_remote_progress(
                     Path(task["run_dir"]), sent_epochs=last_metrics, pending_metrics=pending_metrics,
+                    metric_state=metric_state,
                 )
-                completed = max(completed, task.get("completed_epochs", 0))
-                latest = latest or task.get("latest_metrics", {})
+                if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+                    completed = max(completed, task.get("completed_epochs", 0))
+                if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+                    latest = latest or task.get("latest_metrics", {})
                 if time.monotonic() - last_manifest_at >= 30:
                     try:
                         report_manifest(config, manifest_payload)
@@ -2973,10 +3038,13 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                 exit_code = process.wait()
         completed, latest, metrics = read_remote_progress(
             Path(task["run_dir"]), final=True, sent_epochs=last_metrics, pending_metrics=pending_metrics,
+            metric_state=metric_state,
         )
         pending_metrics.update((item["epoch"], item) for item in metrics)
-        completed = max(completed, task.get("completed_epochs", 0))
-        latest = latest or task.get("latest_metrics", {})
+        if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+            completed = max(completed, task.get("completed_epochs", 0))
+        if task.get("metric_snapshot_version") != 1 or not metric_state.get("reset_pending"):
+            latest = latest or task.get("latest_metrics", {})
         try:
             report_manifest(config, manifest_payload)
         except (OSError, ValueError, HTTPError, URLError):
@@ -3004,6 +3072,7 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
                          "latest_metrics": latest,
                          "metrics": [pending_metrics[epoch] for epoch in sorted(pending_metrics)
                                      if epoch not in last_metrics],
+                         "metrics_reset": task.get("metric_snapshot_version") == 1 and bool(metric_state.get("reset_pending")),
                          "log_tail": log_lines, "exit_code": exit_code, "command": command,
                          "error_message": error, "stop_reason": stop_reason, "run_dir": task["run_dir"]}
         pending_path = _save_terminal_for_retry(config, task, final_payload)

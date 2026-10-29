@@ -66,6 +66,29 @@ def test_csv_replacement_and_partial_rows_do_not_publish_invalid_metrics(tmp_pat
     assert reader.read(path)['metrics'] == []
 
 
+def test_csv_rejects_negative_epoch_before_sending_reset_snapshot(tmp_path):
+    path = tmp_path / 'results.csv'
+    path.write_text('epoch,time,score\n-1,1,0.1\n1,2,0.2\n')
+    snapshot = MetricCsvReader().read(path, include_metadata=True)
+    assert snapshot['has_metrics']
+    assert [point['epoch'] for point in snapshot['metrics']] == [1]
+
+
+def test_metric_reader_marks_complete_replacement_but_not_missing_file_as_authoritative(tmp_path):
+    path = tmp_path / 'results.csv'
+    path.write_text('epoch,time,score\n1,1,0.1\n2,2,0.2\n')
+    reader = MetricCsvReader()
+    first = reader.read(path, include_metadata=True)
+    assert first['reset'] and first['has_metrics']
+    path.write_text('epoch,time,score\n1,3,0.8\n')
+    replaced = reader.read(path, include_metadata=True)
+    assert replaced['reset'] and replaced['has_metrics']
+    assert [point['epoch'] for point in replaced['metrics']] == [1]
+    path.unlink()
+    missing = reader.read(path, include_metadata=True)
+    assert not missing['authoritative'] and not missing['has_metrics']
+
+
 def test_incremental_consumer_receives_only_new_rows_and_full_reader_remains_compatible(tmp_path):
     path = tmp_path / 'results.csv'
     path.write_text('epoch,time,score\n1,1,0.1\n2,2,0.2\n')
@@ -95,6 +118,29 @@ def test_agent_resends_same_epoch_after_results_rewrite(agent, tmp_path):
     _, _, rows = agent.read_remote_progress(run_dir, sent_epochs=sent)
     assert sent == set()
     assert rows == [{'epoch': 1, 'elapsed': 1.0, 'values': {'score': 0.9}}]
+
+
+def test_agent_reset_requires_valid_snapshot_and_resends_after_csv_rewrite(agent, tmp_path):
+    run_dir = tmp_path / 'attempt-001'
+    run_dir.mkdir()
+    path = run_dir / 'results.csv'
+    sent, pending, state = set(), {}, {}
+    path.write_text('epoch,time,score\n1,1,0.1\n2,2,0.2\n')
+    completed, _, rows = agent.read_remote_progress(
+        run_dir, sent_epochs=sent, pending_metrics=pending, metric_state=state)
+    assert completed == 2 and state['reset_pending']
+    sent.update(point['epoch'] for point in rows)
+    state.pop('reset_pending')  # Simulate a successful center acknowledgement.
+    path.write_text('epoch,time,score\n1,3,0.9\n')
+    completed, _, rows = agent.read_remote_progress(
+        run_dir, sent_epochs=sent, pending_metrics=pending, metric_state=state)
+    assert completed == 1 and state['reset_pending'] and sent == set()
+    assert rows == [{'epoch': 1, 'elapsed': 3.0, 'values': {'score': 0.9}}]
+    # A failed center request must leave the reset flag for the next heartbeat.
+    assert state['reset_pending']
+    path.write_text('epoch,time,score\n')
+    agent.read_remote_progress(run_dir, sent_epochs=sent, pending_metrics=pending, metric_state=state)
+    assert not state.get('reset_pending')
 
 
 def test_agent_allows_appended_correction_for_acknowledged_epoch(agent, tmp_path):

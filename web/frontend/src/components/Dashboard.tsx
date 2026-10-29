@@ -238,15 +238,26 @@ export function Dashboard() {
 
   useEffect(() => {
     let cancelled = false
+    let pollVersion = 0
     let timer: ReturnType<typeof window.setTimeout> | undefined
     async function poll() {
+      if (document.hidden) return
+      const version = ++pollVersion
       await refresh()
-      if (!cancelled) timer = window.setTimeout(poll, 3000)
+      if (!cancelled && !document.hidden && version === pollVersion) timer = window.setTimeout(poll, 3000)
     }
+    function onVisibilityChange() {
+      pollVersion += 1
+      if (timer !== undefined) window.clearTimeout(timer)
+      if (!document.hidden) void poll()
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
     void poll()
     return () => {
       cancelled = true
+      pollVersion += 1
       if (timer !== undefined) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
       if (taskRequest.current) {
         window.clearTimeout(taskRequest.current.timer)
         taskRequest.current.controller.abort()

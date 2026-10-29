@@ -57,9 +57,9 @@
 
 本仓库的服务模板按两套独立 checkout 配置：开发版使用 `18088`，使用版使用 `18089`。两套服务必须使用不同的 systemd 服务名，不能都安装成 `yolo-platform.service`。模板存在不代表两套服务已在目标机器安装或运行。
 
-安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.12.1**，配套远程 Agent 为 **2.6.0**。
+安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.12.2**，配套远程 Agent 为 **2.6.1**。
 
-仓库同时保存 `yolo-platform-dev.service` 和 `yolo-platform-prod.service`，分别配置两套路径和端口。环境差异放在各实例的 `.env` 中，服务模板也分开维护，减少因开发/使用版配置混用引起的冲突。
+仓库保留 `yolo-platform-dev.service` 和 `yolo-platform-prod.service` 供既有部署沿用；它们是特定部署环境下的静态示例，包含原有 checkout 与 Python 环境路径。新 checkout 可用 `render_systemd_unit.py` 按本机项目根目录和 Python 解释器生成对应 unit，脚本只输出配置，不安装、启停或修改任何 systemd 服务。环境差异仍放在各实例自己的 `.env` 中。
 
 | 实例 | 项目目录 | 端口 | systemd 建议名称 | 默认数据库 |
 | --- | --- | --- | --- | --- |
@@ -70,7 +70,22 @@
 
 ## 配置和运行账户
 
-先安装中心后端、实际训练环境和前端依赖并构建前端。模板中的项目路径、Python 路径和端口是部署示例，必须按目标服务器调整。`YOLO_BIN` 未设置时，后端先查找当前 Python 环境同目录的 `yolo`，再查找 `PATH`；生产环境可显式指向已验证的训练程序，但不应把某台开发机路径写入通用配置。
+先安装中心后端、实际训练环境和前端依赖并构建前端。静态模板中的项目路径和 Python 路径是部署示例，必须确认与目标服务器相符；也可由生成器从目标 checkout 和指定 Python 环境生成。端口分别固定为开发版 `18088`、使用版 `18089`。`YOLO_BIN` 未设置时，后端先查找当前 Python 环境同目录的 `yolo`，再查找 `PATH`；生产环境可显式指向已验证的训练程序，但不应把某台开发机路径写入通用配置。
+
+从任意 checkout 生成 unit 到临时文件并检查结果，不会影响正在运行的服务：
+
+```bash
+python3 web/deploy/render_systemd_unit.py \
+  --instance development \
+  --project-root "$PWD" \
+  --python "$(command -v python3)" \
+  --output /tmp/yolo-platform-dev.service
+systemd-analyze verify /tmp/yolo-platform-dev.service
+```
+
+使用版 checkout 在确认使用版目录及其 Python 环境后，将 `--instance` 设为 `production`，输出到另一个临时文件。临时验证不等于安装或热更新；正在训练时应继续保持当前服务和运行进程不变。需要安装生成文件时，按维护窗口和备份流程另行部署。
+
+本机训练由后端进程启动，默认 systemd `KillMode=control-group` 会在 `restart/stop` 时清理同一服务控制组内的训练子进程；训练使用独立会话并不能规避这一点。开发版或使用版只要还有本机训练在运行，就不要用普通 `systemctl restart/stop` 部署后端。请先让这些训练自然结束，再安排后端更新；远程训练的 Agent 更新另按 Agent 文档核验原版本和 `ExecReload` 后使用保留训练的 reload。仅复制源码或生成 unit 不会替换已运行的后端进程。
 
 两套实例分别准备自己的 `web/.env`。只在文件不存在时从 `.env.example` 创建，已有文件应逐项核对，不能直接覆盖。例如在开发项目根目录执行：
 
@@ -127,7 +142,7 @@ curl --fail http://127.0.0.1:18089/api/health
 
 核对各自 `.env` 中的 `PLATFORM_INSTANCE_NAME` 与模板一致：开发版为 `development`，使用版为 `production`。`EnvironmentFile` 中的同名变量会覆盖服务的 `Environment=` 设置，直接复制示例中的 `local` 会使健康接口显示 `local`；自定义启动未设置时可能显示项目目录名，例如 `yolo`。服务使用单个 Uvicorn worker，且同一数据库和目录只由一个后端实例管理；不能通过增加 worker 或另开共享状态的 Uvicorn 进程扩容。
 
-仓库中的旧 `yolo-platform.service` 对应开发路径，不适合两套实例都安装成同名服务。安装前先检查已有服务和端口监听，避免旧服务与新模板重复启动。
+仓库中的旧 `yolo-platform.service` 对应开发部署，不适合两套实例都安装成同名服务。静态模板不会随仓库位置自动变化；如果继续使用它们，应逐项核对 checkout 和 Python 路径。安装前先检查已有服务和端口监听，避免旧服务与新模板重复启动。
 
 ## 更新与备份顺序
 

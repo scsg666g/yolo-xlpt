@@ -1031,6 +1031,80 @@ def test_sync_artifacts_removes_records_for_disappeared_local_files(tmp_path: Pa
     session.close()
 
 
+def test_sync_artifacts_preserves_records_when_run_directory_is_temporarily_unavailable(tmp_path: Path):
+    run_dir = tmp_path / "run-unavailable"
+    run_dir.mkdir()
+    result = run_dir / "results.csv"
+    result.write_text("epoch,metric\n", encoding="utf-8")
+    session = make_session(tmp_path)
+    task = make_task("task-unavailable-artifact", run_dir=str(run_dir))
+    run = TrainingRun(
+        id="run-unavailable-artifact", task=task, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+    sync_artifacts(session, task, run)
+    session.commit()
+    artifact_id = session.scalar(select(Artifact).where(Artifact.run_id == run.id)).id
+
+    offline_dir = tmp_path / "run-offline"
+    run_dir.rename(offline_dir)
+    sync_artifacts(session, task, run)
+    session.commit()
+    assert session.get(Artifact, artifact_id) is not None
+
+    offline_dir.rename(run_dir)
+    sync_artifacts(session, task, run)
+    session.commit()
+    assert session.get(Artifact, artifact_id).path == str(result.resolve())
+    session.close()
+
+
+def test_sync_artifacts_preserves_records_when_subdirectory_scan_fails(tmp_path: Path, monkeypatch):
+    run_dir = tmp_path / "run-partial"
+    hidden = run_dir / "weights"
+    hidden.mkdir(parents=True)
+    result = run_dir / "results.csv"
+    weight = hidden / "best.pt"
+    result.write_text("epoch,metric\n", encoding="utf-8")
+    weight.write_bytes(b"model")
+    session = make_session(tmp_path)
+    task = make_task("task-partial-artifact", run_dir=str(run_dir))
+    run = TrainingRun(
+        id="run-partial-artifact", task=task, attempt_number=1, launch_mode="fresh", status="completed",
+        model_path=task.model_path, data_path=task.data_path, run_dir=str(run_dir), parameter_snapshot={},
+    )
+    task.current_run_id = run.id
+    session.add_all([task, run])
+    session.commit()
+    sync_artifacts(session, task, run)
+    session.commit()
+    artifacts = session.scalars(select(Artifact).where(Artifact.run_id == run.id)).all()
+    ids = {artifact.name: artifact.id for artifact in artifacts}
+    assert set(ids) == {"results.csv", "weights/best.pt"}
+
+    def partial_walk(_root, onerror):
+        yield str(run_dir), ["weights"], ["results.csv"]
+        onerror(PermissionError("weights temporarily unavailable"))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(services_module.os, "walk", partial_walk)
+        sync_artifacts(session, task, run)
+        session.commit()
+    assert {artifact.name: artifact.id for artifact in session.scalars(
+        select(Artifact).where(Artifact.run_id == run.id)
+    ).all()} == ids
+
+    sync_artifacts(session, task, run)
+    session.commit()
+    assert {artifact.name: artifact.id for artifact in session.scalars(
+        select(Artifact).where(Artifact.run_id == run.id)
+    ).all()} == ids
+    session.close()
+
+
 def test_import_existing_runs_isolates_corrupt_args_yaml(tmp_path: Path, monkeypatch):
     ultralytics_root = tmp_path / "ultralytics"
     bad = ultralytics_root / "runs" / "00-bad" / "args.yaml"
