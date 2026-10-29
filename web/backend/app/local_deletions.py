@@ -18,6 +18,7 @@ from .models import ComputeNode, RemoteOperation, TrainingRun, TrainingTask, utc
 from .run_deletions import (
     _validate_frozen_attempt_plan,
     build_local_attempt_delete_plan,
+    checkpoint_releases,
     delete_attempt_records,
     execute_local_attempt_plan,
     is_attempt_payload,
@@ -299,7 +300,12 @@ class LocalDeletionWorker:
                     raise ValueError("待清理 Attempt 记录不存在")
                 frozen_plan = (operation.payload or {}).get("plan")
                 if isinstance(frozen_plan, dict):
-                    validate_attempt_deletion(db, task, run, ignore_operation_id=operation.id)
+                    stored_receipt = (operation.payload or {}).get("receipt")
+                    validate_attempt_deletion(
+                        db, task, run, ignore_operation_id=operation.id,
+                        checkpoint_release_records=(frozen_plan.get("checkpoint_releases")
+                                                    if isinstance(stored_receipt, dict) else None),
+                    )
                     _validate_frozen_attempt_plan(frozen_plan, task, run)
                 else:
                     # Compatibility for pending jobs created before plans were
@@ -310,6 +316,11 @@ class LocalDeletionWorker:
                         run,
                         ignore_operation_id=operation.id,
                     )
+                if not isinstance((operation.payload or {}).get("receipt"), dict):
+                    frozen_plan = {
+                        **frozen_plan,
+                        "checkpoint_releases": checkpoint_releases(db, task, run),
+                    }
                 receipt = (operation.payload or {}).get("receipt")
                 operation.payload = _phase_payload(
                     operation.payload,
@@ -368,7 +379,11 @@ class LocalDeletionWorker:
                 if not run or run.task_id != task.id:
                     raise ValueError("待清理 Attempt 记录不存在")
                 _validate_frozen_attempt_plan(frozen_plan, task, run)
-                delete_attempt_records(db, task.id, run.id)
+                delete_attempt_records(
+                    db, task.id, run.id,
+                    checkpoint_release_records=(stored_plan.get("checkpoint_releases")
+                                                if "checkpoint_releases" in stored_plan else None),
+                )
                 operation.status = "succeeded"
                 operation.error = None
                 operation.payload = _phase_payload(

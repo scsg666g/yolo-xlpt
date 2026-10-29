@@ -340,6 +340,8 @@ body:has(.compare-page) { min-width: 0; }
 .compare-run-delete-body ul { display: grid; gap: 7px; margin: 15px 0 0; padding-left: 18px; color: #8fa1ac; font-size: 11px; line-height: 1.55; }
 .compare-run-delete-body li::marker { color: #b9757b; }
 .compare-run-delete-body .alert { margin: 15px 0 0; }
+.compare-run-delete-guidance { margin: 12px 0 0; color: #a9bbc5; font-size: 11px; line-height: 1.65; }
+.compare-run-delete-retry { margin-top: 12px; }
 .compare-run-delete-modal > footer { align-items: center; }
 .compare-run-delete-modal > footer > span { margin-right: auto; color: #6d808c; font-size: 10px; line-height: 1.5; }
 
@@ -349,6 +351,7 @@ body:has(.compare-page) { min-width: 0; }
 :root[data-theme='light'] .compare-run-delete-body > p { color: #294758; }
 :root[data-theme='light'] .compare-run-delete-body ul { color: #587180; }
 :root[data-theme='light'] .compare-run-delete-body li::marker { color: #bd4953; }
+:root[data-theme='light'] .compare-run-delete-guidance { color: #526d7c; }
 :root[data-theme='light'] .compare-run-delete-modal > footer > span { color: #6f8591; }
 
 @media (max-width: 600px) {

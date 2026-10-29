@@ -60,6 +60,7 @@ from .run_deletions import (
     remote_output_root_for_run,
     validate_attempt_deletion,
     checkpoint_releases,
+    checkpoint_required_absent_files,
 )
 from .services import add_event, artifact_kind
 
@@ -70,6 +71,8 @@ LEGACY_FLAT_DELETE_AGENT_VERSION = "2.0.1"
 LEGACY_FLAT_DELETE_AGENT_VERSION_PARTS = (2, 0, 1)
 TASK_DELETE_AGENT_VERSION = "2.0.4"
 TASK_DELETE_AGENT_VERSION_PARTS = (2, 0, 4)
+ABSENT_BEST_AGENT_VERSION = "2.6.2"
+ABSENT_BEST_AGENT_VERSION_PARTS = (2, 6, 2)
 DELETE_RECEIPT_VERSION = 1
 MODEL_ASSET_OPERATION_PREFIX = "model-asset:"
 MAX_REMOTE_MODEL_BYTES = 8 * 1024**3
@@ -898,9 +901,14 @@ def prepare_attempt_delete_payload(db: Session, task: TrainingTask, run: Trainin
     releases = checkpoint_releases(db, task, run)
     if releases and not agent_version_at_least(node.agent_version, (2, 0, 8)):
         raise ValueError("释放历史续训检查点依赖需要 Agent 2.0.8 或以上版本")
+    absent_files = checkpoint_required_absent_files(db, task, run)
+    if absent_files and not agent_version_at_least(node.agent_version, ABSENT_BEST_AGENT_VERSION_PARTS):
+        raise ValueError(f"验证历史最佳权重缺失需要远程 Agent {ABSENT_BEST_AGENT_VERSION} 或以上版本")
     from .final_receipts import receipt_proofs
     payload = {
         "required_files": [file for release in releases for file in release["required_files"]],
+        "required_absent_files": absent_files,
+        "checkpoint_releases": releases,
         "scope": "attempt",
         "run_id": run.id,
         "attempt_number": run.attempt_number,
@@ -925,12 +933,16 @@ def live_protected_paths(
     deleting_task_id: str,
     *,
     deleting_run_id: str | None = None,
+    released_run_ids: set[str] | None = None,
 ) -> list[str]:
     """Return current references that a queued remote deletion must preserve."""
     protected: set[str] = set()
     source = db.get(TrainingRun, deleting_run_id) if deleting_run_id else None
     source_task = db.get(TrainingTask, deleting_task_id) if source else None
-    released = {item["run_id"] for item in checkpoint_releases(db, source_task, source)} if source_task else set()
+    released = (
+        set(released_run_ids) if released_run_ids is not None
+        else {item["run_id"] for item in checkpoint_releases(db, source_task, source)} if source_task else set()
+    )
     tasks = db.scalars(select(TrainingTask).where(TrainingTask.execution_node_id == node_id))
     for task in tasks:
         # Task resources are shared by all its Attempts and must never be
@@ -1160,6 +1172,9 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
                 releases = checkpoint_releases(db, task, target_run)
                 if releases and not agent_version_at_least(node.agent_version, (2, 0, 8)):
                     raise ValueError("释放历史续训检查点依赖需要 Agent 2.0.8 或以上版本")
+                absent_files = checkpoint_required_absent_files(db, task, target_run)
+                if absent_files and not agent_version_at_least(node.agent_version, ABSENT_BEST_AGENT_VERSION_PARTS):
+                    raise ValueError(f"验证历史最佳权重缺失需要远程 Agent {ABSENT_BEST_AGENT_VERSION} 或以上版本")
             except ValueError as exc:
                 operation.status, operation.error = "failed", str(exc)
                 db.commit()
@@ -1167,11 +1182,14 @@ def poll_operations(node_id: str, request: Request, db: Session = Depends(get_db
         operation_payload = {
             **operation.payload,
             **({"required_files": [file for release in releases for file in release["required_files"]]} if attempt_scope else {}),
+            **({"required_absent_files": absent_files} if attempt_scope else {}),
+            **({"checkpoint_releases": releases} if attempt_scope else {}),
             "protected_paths": live_protected_paths(
                 db,
                 node_id,
                 operation.task_id,
                 deleting_run_id=(operation.payload or {}).get("run_id") if attempt_scope else None,
+                released_run_ids={item["run_id"] for item in releases} if attempt_scope else None,
             ),
         }
     lease = secrets.token_hex(16)
@@ -1641,10 +1659,14 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
             or target_run.status in ACTIVE
         ):
             raise HTTPException(409, "该 Attempt 当前不能永久删除")
-        try:
-            validate_attempt_deletion(db, task, target_run, ignore_operation_id=operation.id)
-        except ValueError as exc:
-            raise HTTPException(409, str(exc)) from exc
+        if payload.success:
+            try:
+                validate_attempt_deletion(
+                    db, task, target_run, ignore_operation_id=operation.id,
+                    checkpoint_release_records=(operation.payload or {}).get("checkpoint_releases"),
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
     if operation.kind == "delete" and task:
         if attempt_scope:
             if payload.success:
@@ -1664,7 +1686,10 @@ def operation_result(node_id: str, operation_id: str, payload: OperationResult, 
                         if other.id == operation.id or is_attempt_payload(other.payload, target_run.id) or same_run:
                             for path in (operation_file(other), operation_file(other, False)):
                                 path.unlink(missing_ok=True)
-                    delete_attempt_records(db, task.id, target_run.id)
+                    delete_attempt_records(
+                        db, task.id, target_run.id,
+                        checkpoint_release_records=(operation.payload or {}).get("checkpoint_releases"),
+                    )
                     add_event(db, task.id, "run_deleted", f"远程 Attempt {operation.payload.get('attempt_number', '')} 已删除")
                 except Exception as exc:
                     detail = f"{type(exc).__name__}: {exc}"[-1600:]

@@ -192,6 +192,8 @@ DATASET_REFRESH_IO_PRESSURE_PCT = nonnegative_int_env(
     "PLATFORM_DATASET_REFRESH_IO_PRESSURE_PCT", 25)
 DATASET_REFRESH_MIN_FREE_BYTES = nonnegative_int_env(
     "PLATFORM_DATASET_REFRESH_MIN_FREE_BYTES", 512 * 1024**2)
-# Zero disables reclamation for the corresponding snapshot class.
+# Controls the retention of completed/cancelled browser upload staging only.
+# Centre transfer snapshots are reclaimed as soon as terminal work releases
+# them; failed snapshots retain their separate retry window.
 DATASET_STORAGE_RETENTION_SECONDS = nonnegative_int_env("PLATFORM_DATASET_STORAGE_RETENTION_SECONDS", 24 * 3600)
 DATASET_FAILED_RETENTION_SECONDS = nonnegative_int_env("PLATFORM_DATASET_FAILED_RETENTION_SECONDS", 7 * 24 * 3600)

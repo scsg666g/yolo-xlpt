@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.models import Artifact, ComputeNode, TaskEvent, TrainingRun, TrainingTask, utcnow
+from app.models import Artifact, ComputeNode, RemoteOperation, TaskEvent, TrainingRun, TrainingTask, utcnow
 import app.database as database_module
 import app.run_deletions as deletions
 import app.services as services
@@ -67,6 +67,57 @@ def test_delete_old_checkpoint_retains_independent_results_and_provenance(tmp_pa
     assert (next_dir / "weights/best.pt").read_bytes() == b"weight"
 
 
+@pytest.mark.parametrize("stale_source_best", [False, True])
+def test_delete_missing_source_with_last_only_descendant_retains_resume_weight(tmp_path, monkeypatch, stale_source_best):
+    factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
+    with factory() as db:
+        source = db.get(TrainingRun, "source")
+        child = db.get(TrainingRun, "child")
+        rows_to_remove = [(child, "best.pt")]
+        if not stale_source_best:
+            rows_to_remove.append((source, "best.pt"))
+        for run, name in rows_to_remove:
+            for artifact in db.scalars(select(Artifact).where(Artifact.run_id == run.id)):
+                if artifact.name == "weights/" + name:
+                    db.delete(artifact)
+        db.commit()
+    (next_dir / "weights/best.pt").unlink()
+    for item in (first_dir / "weights").iterdir():
+        item.unlink()
+    (first_dir / "weights").rmdir()
+    first_dir.rmdir()
+    with factory() as db:
+        indexed_best, _ = services.effective_best_weight(db, db.get(TrainingRun, "child"))
+        assert (indexed_best is not None) == stale_source_best
+        queue_local_run_delete(db, db.get(TrainingTask, "chain"), db.get(TrainingRun, "source"))
+        db.commit()
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        child = db.get(TrainingRun, "child")
+        assert db.get(TrainingRun, "source") is None
+        assert child.checkpoint_path is None
+        assert child.checkpoint_source["source_deleted"] is True
+        assert child.checkpoint_source["checkpoint_path"] == str(first_dir / "weights/last.pt")
+        assert services.effective_best_weight(db, child)[0] is None
+    assert (next_dir / "weights/last.pt").read_bytes() == b"weight"
+
+
+def test_last_only_descendant_does_not_release_unindexed_existing_source_best(tmp_path, monkeypatch):
+    factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
+    (next_dir / "weights/best.pt").unlink()
+    with factory() as db:
+        source = db.get(TrainingRun, "source")
+        child = db.get(TrainingRun, "child")
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id.in_([source.id, child.id]))):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.flush()
+        assert services.effective_best_weight(db, child)[0] is None
+        with pytest.raises(ValueError, match="检查点"):
+            queue_local_run_delete(db, db.get(TrainingTask, "chain"), source)
+    assert (first_dir / "weights/best.pt").exists()
+
+
 @pytest.mark.parametrize("problem", ["running", "queued", "failed", "interrupted", "missing_best", "missing_last", "symlink"])
 def test_checkpoint_dependency_not_released_without_safe_descendant(tmp_path, monkeypatch, problem):
     factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
@@ -83,6 +134,56 @@ def test_checkpoint_dependency_not_released_without_safe_descendant(tmp_path, mo
         with pytest.raises(ValueError, match="检查点"):
             queue_local_run_delete(db, db.get(TrainingTask, "chain"), db.get(TrainingRun, "source"))
     assert (first_dir / "weights/last.pt").exists()
+
+
+def test_last_only_descendant_cannot_lose_ancestor_best(tmp_path, monkeypatch):
+    factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
+    ancestor_dir = first_dir.parent / "attempt-000"
+    (ancestor_dir / "weights").mkdir(parents=True)
+    (ancestor_dir / "weights/last.pt").write_bytes(b"weight")
+    (ancestor_dir / "weights/best.pt").write_bytes(b"weight")
+    (next_dir / "weights/best.pt").unlink()
+    with factory() as db:
+        task = db.get(TrainingTask, "chain")
+        source = db.get(TrainingRun, "source")
+        source.launch_mode = "resume"
+        source.checkpoint_path = str(ancestor_dir / "weights/last.pt")
+        ancestor = TrainingRun(id="ancestor", task=task, attempt_number=0, status="stopped",
+                               model_path="base.pt", data_path="data.yaml", run_dir=str(ancestor_dir))
+        db.add(ancestor)
+        db.add_all([
+            Artifact(task_id=task.id, run_id=ancestor.id, kind="weight", name="weights/last.pt",
+                     path=str(ancestor_dir / "weights/last.pt"), size=6),
+            Artifact(task_id=task.id, run_id=ancestor.id, kind="weight", name="weights/best.pt",
+                     path=str(ancestor_dir / "weights/best.pt"), size=6),
+        ])
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == source.id)):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == "child")):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.flush()
+        assert services.effective_best_weight(db, source)[1].id == ancestor.id
+        with pytest.raises(ValueError, match="检查点"):
+            queue_local_run_delete(db, task, source)
+
+
+def test_last_only_descendant_cannot_release_resumed_source_without_indexed_best(tmp_path, monkeypatch):
+    factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
+    (next_dir / "weights/best.pt").unlink()
+    (first_dir / "weights/best.pt").unlink()
+    with factory() as db:
+        task = db.get(TrainingTask, "chain")
+        source = db.get(TrainingRun, "source")
+        source.launch_mode = "resume"
+        source.checkpoint_path = str(first_dir.parent / "attempt-000/weights/last.pt")
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id.in_(["source", "child"]))):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.flush()
+        with pytest.raises(ValueError, match="检查点"):
+            queue_local_run_delete(db, task, source)
 
 
 def remote_chain(client, factory, tmp_path):
@@ -132,6 +233,113 @@ def test_remote_old_checkpoint_cleanup_checks_real_independent_files(monitoring_
             assert not Path(payload["run_dir"]).exists()
 
 
+def test_remote_last_only_descendant_releases_unindexed_history(monitoring_client, agent, tmp_path, monkeypatch):
+    client, factory = monitoring_client
+    credential, config, payload, child_id = remote_chain(client, factory, tmp_path)
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "2.6.2"
+        child = db.get(TrainingRun, child_id)
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == child_id)):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.commit()
+        best = Path(child.run_dir) / "weights/best.pt"
+    best.unlink()
+    endpoint = f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}"
+    preview = client.get(endpoint + "/deletion-preview")
+    assert preview.status_code == 200 and preview.json()["allowed"]
+    assert client.delete(endpoint).status_code == 202
+    work = claim(client, credential)
+    assert len(work["payload"]["required_files"]) == 1
+    assert work["payload"]["required_files"][0]["path"].endswith("weights/last.pt")
+    assert work["payload"]["required_absent_files"] == [str(Path(payload["run_dir"]) / "weights/best.pt")]
+    agent.execute_operation(config, work, threading.Event())
+    with factory() as db:
+        child = db.get(TrainingRun, child_id)
+        assert db.get(TrainingRun, payload["run_id"]) is None
+        assert child.checkpoint_path is None
+        assert child.checkpoint_source["source_deleted"] is True
+    assert (best.parent / "last.pt").read_bytes() == b"independent"
+
+
+def test_remote_last_only_descendant_requires_agent_absence_support(monitoring_client, tmp_path):
+    client, factory = monitoring_client
+    credential, _config, payload, child_id = remote_chain(client, factory, tmp_path)
+    with factory() as db:
+        child = db.get(TrainingRun, child_id)
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == child_id)):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.commit()
+    (Path(child.run_dir) / "weights/best.pt").unlink()
+    endpoint = f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}"
+    preview = client.get(endpoint + "/deletion-preview")
+    assert not preview.json()["allowed"]
+    assert "2.6.2" in preview.json()["blockers"][0]
+    assert client.delete(endpoint).status_code == 409
+    with factory() as db:
+        assert db.get(TrainingRun, payload["run_id"])
+        assert db.get(TrainingRun, child_id).checkpoint_path
+
+
+def test_remote_last_only_descendant_refuses_source_best_created_after_preview(monitoring_client, agent, tmp_path, monkeypatch):
+    client, factory = monitoring_client
+    credential, config, payload, child_id = remote_chain(client, factory, tmp_path)
+    monkeypatch.setattr(agent, "api_json", agent_api(client, credential))
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "2.6.2"
+        child = db.get(TrainingRun, child_id)
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == child_id)):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.commit()
+    (Path(child.run_dir) / "weights/best.pt").unlink()
+    endpoint = f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}"
+    assert client.get(endpoint + "/deletion-preview").json()["allowed"]
+    assert client.delete(endpoint).status_code == 202
+    work = claim(client, credential)
+    source_best = Path(payload["run_dir"]) / "weights/best.pt"
+    source_best.parent.mkdir(parents=True, exist_ok=True)
+    source_best.write_bytes(b"historical best")
+    agent.execute_operation(config, work, threading.Event())
+    with factory() as db:
+        assert db.get(TrainingRun, payload["run_id"])
+        assert db.get(TrainingRun, child_id).checkpoint_path
+        assert db.get(RemoteOperation, work["id"]).status == "failed"
+    assert source_best.read_bytes() == b"historical best"
+
+
+def test_remote_cleanup_detaches_verified_reference_after_successor_weight_changes(monitoring_client, agent, tmp_path, monkeypatch):
+    client, factory = monitoring_client
+    credential, config, payload, child_id = remote_chain(client, factory, tmp_path)
+    with factory() as db:
+        db.get(ComputeNode, credential["node"]["id"]).agent_version = "2.6.2"
+        child = db.get(TrainingRun, child_id)
+        for artifact in db.scalars(select(Artifact).where(Artifact.run_id == child_id)):
+            if artifact.name == "weights/best.pt":
+                db.delete(artifact)
+        db.commit()
+    (Path(child.run_dir) / "weights/best.pt").unlink()
+    endpoint = f"/api/tasks/{payload['task_id']}/runs/{payload['run_id']}"
+    assert client.delete(endpoint).status_code == 202
+    work = claim(client, credential)
+    api = agent_api(client, credential)
+
+    def report_after_weight_disappears(config, path, method="GET", payload=None, extra_headers=None, **kwargs):
+        if path.endswith("/result"):
+            (Path(child.run_dir) / "weights/last.pt").unlink()
+        return api(config, path, method, payload, extra_headers, **kwargs)
+
+    monkeypatch.setattr(agent, "api_json", report_after_weight_disappears)
+    agent.execute_operation(config, work, threading.Event())
+    with factory() as db:
+        assert db.get(TrainingRun, payload["run_id"]) is None
+        child = db.get(TrainingRun, child_id)
+        assert child.checkpoint_path is None
+        assert child.checkpoint_source["source_deleted"] is True
+
+
 def test_preview_blocks_old_agent_without_mutation(monitoring_client, tmp_path):
     client, factory = monitoring_client
     credential, config, payload, child_id = remote_chain(client, factory, tmp_path)
@@ -144,6 +352,90 @@ def test_preview_blocks_old_agent_without_mutation(monitoring_client, tmp_path):
     assert "2.0.8" in response.json()["blockers"][0]
     with factory() as db:
         assert db.get(TrainingRun, child_id).checkpoint_path
+
+
+def test_local_cleanup_keeps_release_snapshot_when_successor_file_changes(tmp_path, monkeypatch):
+    factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
+    with factory() as db:
+        operation = queue_local_run_delete(db, db.get(TrainingTask, "chain"), db.get(TrainingRun, "source"))
+        db.commit()
+        release_records = operation.payload["plan"]["checkpoint_releases"]
+        assert release_records[0]["run_id"] == "child"
+        assert len(release_records[0]["required_files"]) == 2
+    # An external cleanup can change a descendant after the source was
+    # validated. Finalizing must still clear the exact proven dependency.
+    original_execute = deletions.execute_local_attempt_plan
+
+    def execute_then_remove_child(plan):
+        receipt = original_execute(plan)
+        (next_dir / "weights/best.pt").unlink()
+        return receipt
+
+    monkeypatch.setattr("app.local_deletions.execute_local_attempt_plan", execute_then_remove_child)
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        assert db.get(RemoteOperation, operation.id).status == "succeeded"
+        assert db.get(TrainingRun, "source") is None
+        child = db.get(TrainingRun, "child")
+        assert child.checkpoint_path is None
+        assert child.checkpoint_source["source_deleted"] is True
+    assert not first_dir.exists()
+
+
+def test_local_cleanup_resumes_from_receipt_after_successor_file_changes(tmp_path, monkeypatch):
+    factory, first_dir, next_dir = local_chain(tmp_path, monkeypatch)
+    with factory() as db:
+        operation = queue_local_run_delete(db, db.get(TrainingTask, "chain"), db.get(TrainingRun, "source"))
+        db.commit()
+        operation_id = operation.id
+        plan = operation.payload["plan"]
+
+    # Simulate a worker restart after the physical cleanup receipt was saved
+    # but before the source row and checkpoint dependency were finalized.
+    receipt = deletions.execute_local_attempt_plan(plan)
+    receipt.update({
+        "plan_version": plan["version"],
+        "task_id": "chain",
+        "run_id": "source",
+        "attempt_number": plan["attempt_number"],
+        "completed_at": utcnow().isoformat(),
+    })
+    with factory() as db:
+        operation = db.get(RemoteOperation, operation_id)
+        operation.payload = {**operation.payload, "phase": "recording", "receipt": receipt}
+        db.commit()
+    (next_dir / "weights/best.pt").unlink()
+
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        assert db.get(RemoteOperation, operation_id).status == "succeeded"
+        assert db.get(TrainingRun, "source") is None
+        child = db.get(TrainingRun, "child")
+        assert child.checkpoint_path is None
+        assert child.checkpoint_source["checkpoint_path"] == str(first_dir / "weights/last.pt")
+    assert (next_dir / "weights/last.pt").is_file()
+
+
+def test_local_cleanup_keeps_source_row_if_dependency_identity_changes(tmp_path, monkeypatch):
+    factory, first_dir, _next_dir = local_chain(tmp_path, monkeypatch)
+    with factory() as db:
+        operation = queue_local_run_delete(db, db.get(TrainingTask, "chain"), db.get(TrainingRun, "source"))
+        db.commit()
+    original_execute = deletions.execute_local_attempt_plan
+
+    def execute_then_change_checkpoint(plan):
+        receipt = original_execute(plan)
+        with factory() as db:
+            db.get(TrainingRun, "child").checkpoint_path = str(first_dir / "weights/alternate.pt")
+            db.commit()
+        return receipt
+
+    monkeypatch.setattr("app.local_deletions.execute_local_attempt_plan", execute_then_change_checkpoint)
+    assert LocalDeletionWorker(session_factory=factory).process_one()
+    with factory() as db:
+        assert db.get(RemoteOperation, operation.id).status == "failed"
+        assert db.get(TrainingRun, "source") is not None
+        assert db.get(TrainingRun, "child").checkpoint_path.endswith("alternate.pt")
 
 
 def test_local_stop_escalates_once_and_checks_adopted_identity(tmp_path, monkeypatch):

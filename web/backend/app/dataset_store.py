@@ -6,6 +6,7 @@ need no inbound port. A phase token is stable across retries for crash receipts.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -54,6 +55,28 @@ def job_dir(identity):
     return STORE_ROOT / identity
 
 
+@contextmanager
+def snapshot_access(identity, *, blocking=True):
+    """Keep a snapshot alive across local work and centre-side Agent I/O.
+
+    The lock lives outside the directory being renamed for reclamation. A
+    bounded set of stripes avoids leaving one lock file per historical job.
+    """
+    job_dir(identity)
+    locks = STORE_ROOT / '.snapshot-locks'
+    locks.mkdir(parents=True, exist_ok=True)
+    with (locks / (identity[:3] + '.lock')).open('a+b') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
 def failed_snapshot_expired(op, now=None):
     """Only disposable pre-commit snapshots may expire; receipts stay durable."""
     now = now or utcnow()
@@ -71,7 +94,7 @@ def restart_snapshot(op):
         (job_dir(op.id) / name).unlink(missing_ok=True)
     payload = dict(op.payload)
     for key in ('archive_size', 'archive_sha256', 'fingerprint', 'snapshot_reclaimed', 'verified_archive',
-                'cache_cleaned_at', 'progress', 'progress_steps', 'started_at', 'heartbeat_at'):
+                'snapshot_lock_v1', 'cache_cleaned_at', 'progress', 'progress_steps', 'started_at', 'heartbeat_at'):
         payload.pop(key, None)
     if op.kind != 'upload':
         for key in ('names', 'stats', 'warnings'):
@@ -1302,6 +1325,7 @@ def execute_local(db, op):
         lease_check(db, identity, token, phase)
         op.status = 'running' if op.status != 'committing' else 'committing'
         op.payload = {**op.payload, 'progress_run_id': run_id,
+                      'snapshot_lock_v1': True,
                       'started_at': op.payload.get('started_at') or utcnow().isoformat()}
         db.commit()
     last = [0.0]
@@ -1387,6 +1411,62 @@ def execute_local(db, op):
         phase_success(db, op, result)
 
 
+def reclaim_snapshot(db, identity, *, now=None):
+    """Detach a disposable centre snapshot only after its last reader exits."""
+    directory = job_dir(identity)
+    if not directory.is_dir() or directory.is_symlink():
+        return False
+    now = now or utcnow()
+    # Always take the snapshot lock before the mutation lock. Executors use
+    # the same order, so cancellation cannot deadlock with a running export.
+    with snapshot_access(identity, blocking=False) as available:
+        if not available:
+            return False
+        with managed_dataset_mutation():
+            if not directory.is_dir() or directory.is_symlink():
+                return False
+            db.expire_all()
+            op = db.get(DatasetOperation, identity)
+            if op:
+                terminal = op.status in TERMINAL
+                failed = failed_snapshot_expired(op, now)
+                if not terminal and not failed:
+                    return False
+                # A terminal operation from a rolling upgrade may still have
+                # an old executor without the snapshot lock.
+                if (terminal and not op.payload.get('snapshot_lock_v1')
+                        and op.lease_until and operation_time(op.lease_until) > now):
+                    return False
+                if failed:
+                    # Keep the journal retryable after its cached bytes expire.
+                    op.payload = {**op.payload, 'snapshot_reclaimed': True}
+                    db.commit()
+            else:
+                try:
+                    orphan_age = time.time() - directory.stat().st_mtime
+                except OSError:
+                    return False
+                if not DATASET_FAILED_RETENTION_SECONDS or orphan_age < DATASET_FAILED_RETENTION_SECONDS:
+                    return False
+            quarantine = STORE_ROOT / ('.reclaimed-' + uid())
+            directory.rename(quarantine)
+    try:
+        shutil.rmtree(quarantine)
+    except FileNotFoundError:
+        pass  # Another cleanup pass already finished this detached directory.
+    except OSError:
+        logger.warning('dataset_snapshot_cleanup_deferred id=%s', identity)
+    return True
+
+
+def reclaim_terminal_now(db, identity):
+    """Best-effort fast path; the periodic scan retries interrupted cleanup."""
+    try:
+        reclaim_snapshot(db, identity)
+    except Exception:
+        logger.exception('dataset_terminal_snapshot_cleanup_deferred id=%s', identity)
+
+
 class DatasetWorker:
     def __init__(self):
         self.stop_event = threading.Event()
@@ -1401,6 +1481,7 @@ class DatasetWorker:
         self.refresh_error_at = None
         self.refresh_active_error = None
         self._last_cleanup = 0.0
+        self._last_terminal_cleanup = 0.0
 
     def health_state(self):
         alive = bool(self.thread and self.thread.is_alive())
@@ -1447,10 +1528,12 @@ class DatasetWorker:
                            and not local_mutation_blocked_by_refresh(db, item)), None)
                 if op:
                     try:
-                        execute_local(db, op)
+                        with snapshot_access(op.id):
+                            execute_local(db, op)
                     except Exception as exc:
                         mark_error(db, op, exc)
                         logger.warning('dataset_operation_failed id=%s error=%s', op.id, type(exc).__name__)
+                    reclaim_terminal_now(db, op.id)
                 self.cleanup(db)
                 self.last_tick_at = utcnow()
 
@@ -1470,25 +1553,40 @@ class DatasetWorker:
                            and (not local_refresh(item) or not local_refresh_blocked_by_older_mutation(db, item))), None)
                 if op:
                     try:
-                        execute_local(db, op)
+                        with snapshot_access(op.id):
+                            execute_local(db, op)
                     except Exception as exc:
                         mark_error(db, op, exc)
                         logger.warning('dataset_refresh_failed id=%s error=%s', op.id, type(exc).__name__)
+                    reclaim_terminal_now(db, op.id)
+                self.cleanup(db)
                 self.refresh_last_tick_at = utcnow()
 
     def cleanup(self, db):
         # Filesystem directories bound the scan, not the ever-growing journal.
         clock = time.monotonic()
-        if self.thread and self.thread.is_alive() and clock - self._last_cleanup < 60:
+        full_cleanup = clock - self._last_cleanup >= 60
+        if (self.thread and self.thread.is_alive() and not full_cleanup
+                and clock - self._last_terminal_cleanup < 5):
             return
-        self._last_cleanup = clock
+        self._last_terminal_cleanup = clock
+        if full_cleanup:
+            self._last_cleanup = clock
         now = utcnow()
         terminal_cutoff = now - timedelta(seconds=DATASET_STORAGE_RETENTION_SECONDS)
+        if not STORE_ROOT.is_dir():
+            return
         for directory in STORE_ROOT.iterdir():
             if directory.name.startswith('.reclaimed-') and directory.is_dir() and not directory.is_symlink():
                 suffix = directory.name.removeprefix('.reclaimed-')
                 if len(suffix) == 32 and all(c in '0123456789abcdef' for c in suffix):
-                    shutil.rmtree(directory)
+                    if full_cleanup:
+                        try:
+                            shutil.rmtree(directory)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            logger.warning('dataset_snapshot_quarantine_cleanup_deferred path=%s', directory.name)
                 continue
             if directory.is_symlink() or not directory.is_dir() or len(directory.name) != 32:
                 continue
@@ -1498,33 +1596,18 @@ class DatasetWorker:
                     continue
             except ValueError:
                 continue
-            with managed_dataset_mutation():
+            if full_cleanup:
+                reclaim_snapshot(db, identity, now=now)
+            else:
+                # The frequent pass only targets terminal operations. Keep
+                # failed/orphan retention scans at the original minute cadence.
                 db.expire_all()
                 op = db.get(DatasetOperation, identity)
-                if not op:
-                    try:
-                        orphan_age = time.time() - directory.stat().st_mtime
-                    except OSError:
-                        continue
-                    if not DATASET_FAILED_RETENTION_SECONDS or orphan_age < DATASET_FAILED_RETENTION_SECONDS:
-                        continue
-                    terminal = failed = False
-                else:
-                    terminal = bool(DATASET_STORAGE_RETENTION_SECONDS and op.status in TERMINAL
-                                    and operation_time(op.updated_at) <= terminal_cutoff)
-                    failed = failed_snapshot_expired(op, now)
-                if not terminal and not failed:
-                    if op:
-                        continue
-                if failed:
-                    # Persist restart requirement before deleting any cache bytes.
-                    # Upload staging remains available for a new pack.
-                    op.payload = {**op.payload, 'snapshot_reclaimed': True}
-                    db.commit()
-                quarantine = STORE_ROOT / ('.reclaimed-' + uid())
-                directory.rename(quarantine)
-            shutil.rmtree(quarantine)
-        self.cleanup_upload_staging(db, terminal_cutoff)
+                terminal = bool(op and op.status in TERMINAL)
+                if terminal:
+                    reclaim_terminal_now(db, identity)
+        if full_cleanup or not self.thread or not self.thread.is_alive():
+            self.cleanup_upload_staging(db, terminal_cutoff)
 
     def cleanup_upload_staging(self, db, terminal_cutoff):
         """Retry owned terminal uploads independently of removed bundle caches."""
@@ -1659,6 +1742,7 @@ def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, d
                 mark_error(db, op, exc)
                 return {'operation': None}
         op.payload = {**op.payload, 'progress_run_id': uid(),
+                      'snapshot_lock_v1': True,
                       'started_at': op.payload.get('started_at') or utcnow().isoformat(),
                       'heartbeat_at': utcnow().isoformat()}
         op.lease_until, op.status = utcnow() + timedelta(seconds=120), 'running' if op.status != 'committing' else 'committing'
@@ -1703,6 +1787,14 @@ def agent_heartbeat(node_id: str, identity: str, body: AgentMessage, request: Re
 @router.post('/agent/{node_id}/{identity}/finish')
 def agent_finish(node_id: str, identity: str, body: AgentMessage, request: Request, db: Session = Depends(get_db)):
     auth(node_id, request, db)
+    try:
+        with snapshot_access(identity):
+            return finish_agent_operation(node_id, identity, body, request, db)
+    finally:
+        reclaim_terminal_now(db, identity)
+
+
+def finish_agent_operation(node_id, identity, body, request, db):
     # Slow archive hashing stays outside the global mutation lock. The Agent
     # has stopped writing before sending this receipt; recheck its phase before
     # the short durable transition to reject concurrent cancellation.
@@ -1775,15 +1867,17 @@ def authorized_transfer(db, node_id, identity, token, request):
 
 @router.get('/agent/{node_id}/{identity}/chunk')
 def download_chunk(node_id: str, identity: str, token: str, offset: int, request: Request, db: Session = Depends(get_db)):
-    op = authorized_transfer(db, node_id, identity, token, request)
-    if op.payload['phase'] != 'import' or offset < 0:
-        raise HTTPException(409, '传输阶段不匹配')
-    with (job_dir(identity) / 'bundle.tar').open('rb') as handle:
-        handle.seek(offset)
-        data = handle.read(512 * 1024)
-    op.transferred = max(op.transferred, offset + len(data))
-    db.commit()
-    return {'data': base64.b64encode(data).decode(), 'offset': offset}
+    auth(node_id, request, db)
+    with snapshot_access(identity):
+        op = authorized_transfer(db, node_id, identity, token, request)
+        if op.payload['phase'] != 'import' or offset < 0:
+            raise HTTPException(409, '传输阶段不匹配')
+        with (job_dir(identity) / 'bundle.tar').open('rb') as handle:
+            handle.seek(offset)
+            data = handle.read(512 * 1024)
+        op.transferred = max(op.transferred, offset + len(data))
+        db.commit()
+        return {'data': base64.b64encode(data).decode(), 'offset': offset}
 
 
 class Chunk(BaseModel):

@@ -1057,6 +1057,61 @@ def test_delete_refuses_while_training_owns_output_root(agent, training):
         agent.release_training_lock(lock)
 
 
+def test_delete_accepts_verified_absent_source_best_and_preserves_successor_last(agent, training):
+    config, task = training
+    source_dir = Path(task["run_dir"])
+    source_dir.mkdir(parents=True)
+    (source_dir / "marker.txt").write_text("old attempt")
+    successor_last = source_dir.parent / "attempt-002/weights/last.pt"
+    successor_last.parent.mkdir(parents=True)
+    successor_last.write_bytes(b"independent checkpoint")
+    payload = {
+        "runs": [{**task, "output_root": task["parameters"]["remote_output_root"]}],
+        "required_files": [{"path": str(successor_last), "size": successor_last.stat().st_size}],
+        "required_absent_files": [str(source_dir / "weights/best.pt")],
+    }
+
+    agent.delete_remote_files(config, payload)
+
+    assert not source_dir.exists()
+    assert successor_last.read_bytes() == b"independent checkpoint"
+
+
+@pytest.mark.parametrize("invalid", ["present", "dangling_symlink", "symlink_parent", "other_attempt",
+                                     "other_name", "relative", "duplicate", "not_list", "not_string"])
+def test_delete_rejects_unverified_absent_source_best_without_removing_files(agent, training, invalid):
+    config, task = training
+    source_dir = Path(task["run_dir"])
+    source_dir.mkdir(parents=True)
+    marker = source_dir / "marker.txt"
+    marker.write_text("must survive")
+    best = source_dir / "weights/best.pt"
+    if invalid == "present":
+        best.parent.mkdir()
+        best.write_bytes(b"best")
+    elif invalid == "dangling_symlink":
+        best.parent.mkdir()
+        best.symlink_to(source_dir / "missing.pt")
+    elif invalid == "symlink_parent":
+        best.parent.symlink_to(source_dir.parent / "absent-weights")
+    absent_files = {
+        "other_attempt": [str(source_dir.parent / "attempt-002/weights/best.pt")],
+        "other_name": [str(source_dir / "weights/last.pt")],
+        "relative": ["weights/best.pt"],
+        "duplicate": [str(best), str(best)],
+        "not_list": str(best),
+        "not_string": [123],
+    }.get(invalid, [str(best)])
+
+    with pytest.raises(ValueError, match="源 Attempt"):
+        agent.delete_remote_files(config, {
+            "runs": [{**task, "output_root": task["parameters"]["remote_output_root"]}],
+            "required_absent_files": absent_files,
+        })
+
+    assert marker.read_text() == "must survive"
+
+
 def test_delete_legacy_flat_attempt_preserves_canonical_children(agent, training):
     config, task = training
     output_root = Path(task["parameters"]["remote_output_root"])

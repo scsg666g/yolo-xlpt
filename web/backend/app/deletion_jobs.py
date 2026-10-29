@@ -11,6 +11,10 @@ from .models import ComputeNode, ModelTest, RemoteOperation, TrainingRun, Traini
 
 TASK_DELETE_AGENT_VERSION = "2.0.4"
 LEGACY_FLAT_DELETE_AGENT_VERSION = "2.0.1"
+CHECKPOINT_RELEASE_AGENT_VERSION = "2.0.8"
+CHECKPOINT_RELEASE_AGENT_VERSION_PARTS = (2, 0, 8)
+ABSENT_BEST_AGENT_VERSION = "2.6.2"
+ABSENT_BEST_AGENT_VERSION_PARTS = (2, 6, 2)
 ACTIVE = {"pending", "running", "finalizing", "center_cleaning"}
 PHASES = {
     "remote_cleanup": "waiting_agent",
@@ -82,8 +86,15 @@ def serialize_deletion_job(operation: RemoteOperation, task: TrainingTask | None
         for item in attempt_runs
     )
     if attempt_scope:
-        required_agent_version = LEGACY_FLAT_DELETE_AGENT_VERSION if legacy_flat_attempt else REQUIRED_AGENT_VERSION
-        required_agent_parts = (2, 0, 1) if legacy_flat_attempt else (1, 8, 0)
+        if payload.get("required_absent_files"):
+            required_agent_version = ABSENT_BEST_AGENT_VERSION
+            required_agent_parts = ABSENT_BEST_AGENT_VERSION_PARTS
+        elif payload.get("checkpoint_releases") or payload.get("required_files"):
+            required_agent_version = CHECKPOINT_RELEASE_AGENT_VERSION
+            required_agent_parts = CHECKPOINT_RELEASE_AGENT_VERSION_PARTS
+        else:
+            required_agent_version = LEGACY_FLAT_DELETE_AGENT_VERSION if legacy_flat_attempt else REQUIRED_AGENT_VERSION
+            required_agent_parts = (2, 0, 1) if legacy_flat_attempt else (1, 8, 0)
     else:
         required_agent_version = TASK_DELETE_AGENT_VERSION
         required_agent_parts = (2, 0, 4)

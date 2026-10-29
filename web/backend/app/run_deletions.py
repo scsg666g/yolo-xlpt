@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import posixpath
 import re
+import stat
 from pathlib import Path, PurePosixPath
 
 from sqlalchemy import delete, select, update
@@ -20,6 +21,7 @@ from .services import (
     _safe_delete_directory,
     _validate_deletion_target,
     current_run,
+    effective_best_weight,
     mirror_run_to_task,
 )
 
@@ -272,11 +274,44 @@ def _remote_overlaps(first: PurePosixPath, second: PurePosixPath) -> bool:
     return left == right or left in right.parents or right in left.parents
 
 
-def releasable_checkpoint_files(db: Session, task: TrainingTask, source: TrainingRun, other: TrainingRun) -> list[dict]:
-    """Only completed/stopped descendants with independent best AND last can detach.
+def _missing_source_best(task: TrainingTask, source: TrainingRun) -> str | None:
+    """Return a source best path only when it is provably absent locally.
 
-    Remote evidence is revalidated on the Agent before any unlink. Historical
-    provenance is retained separately when the deletion is acknowledged.
+    Remote hosts require the Agent to confirm absence immediately before
+    cleanup; the center cannot stat a remote filesystem.
+    """
+    try:
+        directory = remote_attempt_layout(task, source)[2] if task.execution_node_id else local_attempt_layout(task, source)[1]
+    except ValueError:
+        return None
+    best = directory / "weights" / "best.pt"
+    if not task.execution_node_id:
+        try:
+            for parent in reversed(best.parents):
+                try:
+                    mode = parent.lstat().st_mode
+                except FileNotFoundError:
+                    break
+                if not stat.S_ISDIR(mode):
+                    return None
+            best.lstat()
+        except FileNotFoundError:
+            pass
+        except (OSError, RuntimeError):
+            return None
+        else:
+            return None
+    return str(best)
+
+
+def releasable_checkpoint_files(db: Session, task: TrainingTask, source: TrainingRun, other: TrainingRun) -> list[dict]:
+    """Detach a finished descendant only after its remaining weights are safe.
+
+    A resumed run can legitimately have no best.pt when it never beats the
+    inherited best fitness. In that case its own last.pt is sufficient only
+    when there is no indexed best.pt in the source's checkpoint ancestry to
+    lose by detaching it. Remote weight evidence is revalidated by the Agent.
+    Historical provenance is retained when the deletion is acknowledged.
     """
     if (other.status not in {"completed", "stopped"} or other.completed_epochs <= 0 or not other.run_dir
             or other.attempt_number <= source.attempt_number or other.launch_mode != "resume"
@@ -291,20 +326,56 @@ def releasable_checkpoint_files(db: Session, task: TrainingTask, source: Trainin
     if layout != CANONICAL_LAYOUT:
         return []
     artifacts = list(db.scalars(select(Artifact).where(Artifact.run_id == other.id, Artifact.kind == "weight")))
-    result = []
-    for name in ("best.pt", "last.pt"):
+    def weight_file(name: str) -> dict | None:
         expected = convert(other.run_dir) / "weights" / name
         artifact = next((item for item in artifacts if convert(item.path) == expected and item.size > 0), None)
         if not artifact:
-            return []
+            return None
         if not remote:
             try:
                 if expected.is_symlink() or expected.resolve() != expected.absolute() or not expected.is_file() or expected.stat().st_size != artifact.size:
-                    return []
+                    return None
             except OSError:
-                return []
-        result.append({"path": str(expected), "size": artifact.size, "run_id": other.id})
-    return result
+                return None
+        return {"path": str(expected), "size": artifact.size, "run_id": other.id}
+
+    last = weight_file("last.pt")
+    if not last:
+        return []
+    best = weight_file("best.pt")
+    if best:
+        return [best, last]
+    # An indexed but invalid best.pt must not turn into a last-only release:
+    # the UI would still advertise that best weight after the source is gone.
+    if any(Path(item.name).name == "best.pt" and item.size > 0 for item in artifacts):
+        return []
+    # A resumed source may itself inherit an unindexed best.pt from an older
+    # Attempt. Neither the center nor the local Artifact index can prove that
+    # entire ancestry absent, so keep requiring an independent child best.
+    if source.launch_mode == "resume" or source.checkpoint_path:
+        return []
+    inherited_best, best_source = effective_best_weight(db, source)
+    missing_best = _missing_source_best(task, source)
+    if not missing_best:
+        return []
+    if inherited_best is not None:
+        # Deleting the source must never sever an older Attempt's still
+        # indexed best. A direct source artifact may be stale on a local host;
+        # remotely the Agent must independently prove its path is absent.
+        if best_source.id != source.id or convert(inherited_best.path) != convert(missing_best):
+            return []
+    return [last]
+
+
+def checkpoint_required_absent_files(db: Session, task: TrainingTask, source: TrainingRun) -> list[str]:
+    """Source best must be absent before a last-only descendant can detach."""
+    if not task.execution_node_id:
+        return []
+    releases = checkpoint_releases(db, task, source)
+    if not any(len(item["required_files"]) == 1 for item in releases):
+        return []
+    best = _missing_source_best(task, source)
+    return [best] if best else []
 
 
 def checkpoint_is_owned(task: TrainingTask, source: TrainingRun, checkpoint: str, targets: list) -> bool:
@@ -344,12 +415,60 @@ def checkpoint_releases(db: Session, task: TrainingTask, source: TrainingRun) ->
     return result
 
 
+def verified_checkpoint_releases(db: Session, task: TrainingTask, source: TrainingRun, expected: list[dict]) -> list[dict]:
+    """Ensure a persisted deletion release still names the same descendants.
+
+    The source files may already be gone when the database transaction runs;
+    do not recompute eligibility from mutable descendant files at that point.
+    """
+    if not isinstance(expected, list):
+        raise ValueError("Attempt 删除缺少已验证的续训引用清单")
+    if task.deleted_at:
+        raise ValueError("任务已进入删除流程，已保留 Attempt 历史记录")
+    if task.execution_node_id and source.execution_node_id not in {None, task.execution_node_id}:
+        raise ValueError("Attempt 所属远程节点在清理后发生变化，已保留历史记录")
+    if not task.execution_node_id and source.execution_node_id:
+        raise ValueError("Attempt 所属节点在清理后发生变化，已保留历史记录")
+    targets = (
+        remote_attempt_path_candidates(task, source, [a.path for a in db.scalars(select(Artifact).where(Artifact.run_id == source.id))])
+        if task.execution_node_id else attempt_path_candidates(task, source)
+    )
+    recorded = {}
+    for item in expected:
+        if not isinstance(item, dict) or not all(key in item for key in ("run_id", "attempt_number", "checkpoint_path")):
+            raise ValueError("Attempt 删除的续训引用清单无效")
+        run_id = item["run_id"]
+        if not isinstance(run_id, str) or run_id in recorded:
+            raise ValueError("Attempt 删除的续训引用清单无效")
+        recorded[run_id] = item
+    live = {}
+    for other in db.scalars(select(TrainingRun).where(TrainingRun.task_id == task.id, TrainingRun.id != source.id)):
+        if other.checkpoint_path and checkpoint_is_owned(task, source, other.checkpoint_path, targets):
+            live[other.id] = other
+    if set(live) != set(recorded):
+        raise ValueError("Attempt 删除后续训引用发生变化，已保留历史记录供重试")
+    for run_id, other in live.items():
+        item = recorded[run_id]
+        if (
+            other.attempt_number != item["attempt_number"]
+            or other.checkpoint_path != item["checkpoint_path"]
+            or other.launch_mode != "resume"
+            or other.status not in {"completed", "stopped"}
+            or other.completed_epochs <= 0
+            or other.attempt_number <= source.attempt_number
+            or other.execution_node_id not in {None, task.execution_node_id}
+        ):
+            raise ValueError("Attempt 删除后续训引用发生变化，已保留历史记录供重试")
+    return expected
+
+
 def validate_attempt_deletion(
     db: Session,
     task: TrainingTask,
     run: TrainingRun,
     *,
     ignore_operation_id: str | None = None,
+    checkpoint_release_records: list[dict] | None = None,
 ) -> None:
     """Reject unsafe or concurrently referenced Attempts before queuing work."""
     if task.deleted_at:
@@ -401,6 +520,10 @@ def validate_attempt_deletion(
     related_runs = db.scalars(select(TrainingRun).where(
         TrainingRun.task_id == task.id, TrainingRun.id != run.id,
     )).all()
+    approved_releases = {}
+    if checkpoint_release_records is not None:
+        verified_checkpoint_releases(db, task, run, checkpoint_release_records)
+        approved_releases = {item["run_id"]: item for item in checkpoint_release_records}
     for other in related_runs:
         other_artifacts = list(db.scalars(select(Artifact).where(Artifact.run_id == other.id)))
         try:
@@ -420,8 +543,12 @@ def validate_attempt_deletion(
         if any(overlaps(target, candidate) for target in target_paths for candidate in other_paths):
             raise ValueError("该 Attempt 的训练目录或日志与其他 Attempt 重叠，不能安全删除")
         if other.checkpoint_path and checkpoint_is_owned(task, run, other.checkpoint_path, target_paths):
-            if not releasable_checkpoint_files(db, task, run, other):
-                raise ValueError(f"该 Attempt 的检查点仍被 Attempt {other.attempt_number:03d} 引用；需结束续训并保有独立 best.pt 和 last.pt 后才能清理")
+            if other.id not in approved_releases and not releasable_checkpoint_files(db, task, run, other):
+                raise ValueError(
+                    f"该 Attempt 的检查点仍被 Attempt {other.attempt_number:03d} 引用；"
+                    "需结束续训并保有独立 last.pt。若仍有已登记的历史最佳权重，"
+                    "后续 Attempt 还需独立 best.pt 才能清理"
+                )
         for artifact in other_artifacts:
             artifact_path = convert_path(artifact.path)
             protected_paths.append(artifact_path)
@@ -454,6 +581,7 @@ def validate_attempt_deletion(
         from .remote_operations import live_protected_paths
         protected_paths.extend(PurePosixPath(path) for path in live_protected_paths(
             db, task.execution_node_id, task.id, deleting_run_id=run.id,
+            released_run_ids=set(approved_releases) if checkpoint_release_records is not None else None,
         ))
     if any(overlaps(target, protected) for target in target_paths for protected in protected_paths):
         raise ValueError("该 Attempt 路径仍被其他任务或资源引用，不能安全删除")
@@ -497,6 +625,7 @@ def build_local_attempt_delete_plan(
         "log_target": str(log_target) if log_target is not None else None,
         "runtime_target": str(runtime_target),
         "targets": sorted(str(path) for path in targets),
+        "checkpoint_releases": checkpoint_releases(db, task, run),
     }
 
 
@@ -670,7 +799,9 @@ def delete_attempt_files(task: TrainingTask, run: TrainingRun) -> list[str]:
     return deleted
 
 
-def delete_attempt_records(db: Session, task_id: str, run_id: str) -> TrainingTask | None:
+def delete_attempt_records(
+    db: Session, task_id: str, run_id: str, *, checkpoint_release_records: list[dict] | None = None,
+) -> TrainingTask | None:
     """Drop run-owned rows while preserving ModelTest history and the task."""
     run = db.get(TrainingRun, run_id)
     task = db.get(TrainingTask, task_id)
@@ -678,7 +809,11 @@ def delete_attempt_records(db: Session, task_id: str, run_id: str) -> TrainingTa
         return task
     # Files have been removed and acknowledged; archive the origin, then drop
     # only the released runtime dependency. Do not erase the training history.
-    for release in checkpoint_releases(db, task, run):
+    releases = verified_checkpoint_releases(
+        db, task, run,
+        checkpoint_release_records if checkpoint_release_records is not None else checkpoint_releases(db, task, run),
+    )
+    for release in releases:
         other = db.get(TrainingRun, release["run_id"])
         other.checkpoint_source = {
             **(other.checkpoint_source or {}), "run_id": run.id,

@@ -576,7 +576,11 @@ def test_hide_upload_history_keeps_result_files_and_reclamation(env):
         op = db.get(DatasetOperation, identity)
         op.updated_at = utcnow() - timedelta(hours=25)
         db.commit()
-    assert store.job_dir(identity).is_dir()
+    assert not store.job_dir(identity).exists()
+    # A snapshot left by an older platform is reclaimed without erasing its
+    # journal, upload receipt, or published training files.
+    store.job_dir(identity).mkdir()
+    (store.job_dir(identity) / 'bundle.tar').write_bytes(b'legacy snapshot')
     finish_local()
     assert not store.job_dir(identity).exists()
     assert not (uploads.UPLOAD_ROOT / identity).exists()

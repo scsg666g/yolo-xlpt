@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
 DEFAULT_DATASET_REFRESH_READ_RATE = 32 * 1024**2
 DEFAULT_DATASET_REFRESH_MIN_FREE = 512 * 1024**2
@@ -1752,6 +1752,37 @@ def delete_remote_files(config: dict, payload: dict) -> dict | None:
                     or not candidate.is_file() or candidate.stat().st_size != item["size"]):
                 raise ValueError("后续 Attempt 的独立权重缺失、变更或路径不可验证，已拒绝清理旧检查点")
             required_paths.append(resolved)
+        required_absent_files = payload.get("required_absent_files", [])
+        if not isinstance(required_absent_files, list):
+            raise ValueError("源 Attempt 权重缺失校验清单无效")
+        source_best_paths = {run_dir / "weights" / "best.pt" for run_dir, _log, _layout in plans}
+        checked_absent_paths = set()
+        for raw_path in required_absent_files:
+            if (not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096
+                    or any(ord(character) < 32 for character in raw_path)):
+                raise ValueError("源 Attempt 权重缺失校验清单无效")
+            candidate = Path(raw_path)
+            if (not candidate.is_absolute() or candidate not in source_best_paths
+                    or candidate in checked_absent_paths):
+                raise ValueError("源 Attempt 的 best.pt 存在或路径不可验证，已拒绝释放续训依赖")
+            try:
+                for parent in reversed(candidate.parents):
+                    try:
+                        parent_mode = parent.lstat().st_mode
+                    except FileNotFoundError:
+                        break  # A missing ancestor proves the candidate absent.
+                    if not stat.S_ISDIR(parent_mode):
+                        raise ValueError("源 Attempt 的 best.pt 父目录类型无效，已拒绝释放续训依赖")
+                if candidate.resolve() != candidate:
+                    raise ValueError("源 Attempt 的 best.pt 路径包含符号链接，已拒绝释放续训依赖")
+                candidate.lstat()  # A dangling symlink also counts as present.
+            except FileNotFoundError:
+                pass
+            except (OSError, RuntimeError) as exc:
+                raise ValueError("源 Attempt 的 best.pt 路径不可验证，已拒绝释放续训依赖") from exc
+            else:
+                raise ValueError("源 Attempt 的 best.pt 仍然存在，已拒绝释放续训依赖")
+            checked_absent_paths.add(candidate)
         protected = [Path(path).resolve() for path in payload.get("protected_paths", [])]
         protected.extend(required_paths)
         protected.extend([Path(config["training_cwd"]).resolve(), Path(config["yolo_bin"]).resolve()])

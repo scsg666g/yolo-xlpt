@@ -1,5 +1,9 @@
 # 双实例部署与维护
 
+## 1.12.3 数据集中转快照清理
+
+开发版中心更新后，已完成或已取消操作的 `dataset_storage` 快照在执行者退出后回收，旧版遗留终态快照在后台扫描时回收；失败快照仍按原保留期供重试。`PLATFORM_DATASET_STORAGE_RETENTION_SECONDS` 现在仅控制成功/取消的浏览器上传暂存会话保留时间，默认 86400 秒，设为 `0` 关闭该暂存会话回收；`PLATFORM_DATASET_FAILED_RETENTION_SECONDS` 继续控制失败快照保留时间。现有数据库与真实数据集无需迁移；本项清理不要求更新 Agent，当前配套版本为 **2.6.2**。仅部署开发版，使用版由维护者另行安排。
+
 ## 1.12.1 训练器更新
 
 开发平台升级至 **1.12.1**，Agent 保持 **2.6.0**。本次修复位于 Ultralytics 训练器：每个需要此修复的本机或远程训练环境均须更新仓库中的 Ultralytics 源码，并按该环境既有方式安装或使用；仅替换 Agent 脚本不会更新训练器。保留数据库、历史 Run、配置、状态目录与正在运行的训练进程；新进程启动后才使用修复。两个独立 Agent 包无需升级。
@@ -20,7 +24,7 @@
 
 本版保留已有数据库、任务目录、数据集和 Agent 状态目录；训练 Attempt 的数据集快照是新增的可选参数字段，旧记录继续显示“未记录”，不做回填或强制迁移。指标读取会识别 CSV 替换、截断和同 Epoch 更正，本机与 Agent 端均适用。执行中心模型测试仍使用 CPU 单通道，耗时较长的模型可通过 `PLATFORM_MODEL_TEST_TIMEOUT_SECONDS` 调整超时（默认 300 秒）。
 
-数据集操作快照与失败缓存的自动清理由 `PLATFORM_DATASET_STORAGE_RETENTION_SECONDS`（默认 86400 秒）和 `PLATFORM_DATASET_FAILED_RETENTION_SECONDS`（默认 604800 秒）控制；设为 `0` 可关闭相应清理。远程 Agent 2.5.0 可在新旧中心之间能力协商，更新脚本时保留节点原配置、`.training-state/` 与 `.dataset-state/`。仅维护者更新开发版服务和两个独立 Agent 分发包；不要覆盖生产使用版平台或服务器私有配置。
+终态中心中转快照安全退出后自动清理；浏览器上传暂存与失败快照分别由 `PLATFORM_DATASET_STORAGE_RETENTION_SECONDS`（默认 86400 秒）和 `PLATFORM_DATASET_FAILED_RETENTION_SECONDS`（默认 604800 秒）控制，设为 `0` 关闭对应回收。远程 Agent 2.5.0 可在新旧中心之间能力协商，更新脚本时保留节点原配置、`.training-state/` 与 `.dataset-state/`。仅维护者更新开发版服务；不要覆盖生产使用版平台或服务器私有配置。
 
 ## 1.7.0 Agent 保留训练重载与进度接管
 
@@ -57,7 +61,7 @@
 
 本仓库的服务模板按两套独立 checkout 配置：开发版使用 `18088`，使用版使用 `18089`。两套服务必须使用不同的 systemd 服务名，不能都安装成 `yolo-platform.service`。模板存在不代表两套服务已在目标机器安装或运行。
 
-安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.12.2**，配套远程 Agent 为 **2.6.1**。
+安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.12.3**，配套远程 Agent 为 **2.6.2**。
 
 仓库保留 `yolo-platform-dev.service` 和 `yolo-platform-prod.service` 供既有部署沿用；它们是特定部署环境下的静态示例，包含原有 checkout 与 Python 环境路径。新 checkout 可用 `render_systemd_unit.py` 按本机项目根目录和 Python 解释器生成对应 unit，脚本只输出配置，不安装、启停或修改任何 systemd 服务。环境差异仍放在各实例自己的 `.env` 中。
 

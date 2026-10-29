@@ -225,14 +225,18 @@ def test_attempt_deletion_list_keeps_active_and_failed_jobs_outside_history_limi
 
 
 @pytest.mark.parametrize(
-    ("layout", "agent_version", "required_version", "upgrade_required"),
+    ("layout", "agent_version", "required_version", "upgrade_required", "payload_extra"),
     [
-        ("canonical", "1.8.0", "1.8.0", False),
-        ("legacy_flat", "1.8.0", "2.0.1", True),
+        ("canonical", "1.8.0", "1.8.0", False, {}),
+        ("legacy_flat", "1.8.0", "2.0.1", True, {}),
+        ("canonical", "2.0.7", "2.0.8", True, {"checkpoint_releases": [{"run_id": "child"}]}),
+        ("legacy_flat", "2.0.8", "2.0.8", False, {"required_files": [{"path": "/runs/child/last.pt"}]}),
+        ("canonical", "2.6.1", "2.6.2", True, {"required_absent_files": ["/runs/source/best.pt"]}),
+        ("legacy_flat", "2.6.2", "2.6.2", False, {"required_absent_files": ["/runs/source/best.pt"]}),
     ],
 )
 def test_attempt_deletion_list_uses_attempt_agent_requirement(
-    deletion_client, layout, agent_version, required_version, upgrade_required,
+    deletion_client, layout, agent_version, required_version, upgrade_required, payload_extra,
 ):
     _, db, task = deletion_client
     node = ComputeNode(
@@ -250,6 +254,7 @@ def test_attempt_deletion_list_uses_attempt_agent_requirement(
         payload={
             "scope": "attempt", "run_id": run.id, "attempt_number": 1,
             "runs": [{"layout": layout}],
+            **payload_extra,
         },
     )
     db.add_all([node, run, operation])
@@ -258,5 +263,7 @@ def test_attempt_deletion_list_uses_attempt_agent_requirement(
     job = next(item for item in list_attempt_deletion_jobs(db) if item["id"] == operation.id)
     assert job["required_agent_version"] == required_version
     assert (job["phase"] == "agent_upgrade_required") is upgrade_required
+    if upgrade_required:
+        assert required_version in job["message"]
     if not upgrade_required:
         assert "完整任务清理" not in job["message"]
