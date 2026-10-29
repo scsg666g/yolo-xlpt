@@ -357,11 +357,14 @@ body:has(.datasets-page) { min-width: 0; }
 .dataset-discovery-selection > .button { margin-left: auto; }
 .dataset-discovery-candidates { display: grid; gap: 10px; }
 .dataset-discovery-candidates > article { min-width: 0; display: flex; gap: 12px; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.dataset-discovery-candidates > article.candidate-ready { border-left: 3px solid var(--green); background: color-mix(in srgb, var(--green) 5%, var(--panel-2)); }
+.dataset-discovery-candidates > article.candidate-registered { border-left: 3px solid var(--blue); background: color-mix(in srgb, var(--blue) 5%, var(--panel-2)); }
 .dataset-discovery-candidates > article > div { min-width: 0; flex: 1; }
 .dataset-discovery-candidate-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 5px; }
 .dataset-discovery-candidate-heading strong { font-weight: 500; overflow-wrap: anywhere; font-size: 14px; }
 .dataset-candidate-state { border-radius: 5px; padding: 2px 7px; color: var(--muted); background: var(--panel); font-size: 11px; }
-.dataset-candidate-state.ready, .dataset-candidate-state.registered { color: var(--green); background: color-mix(in srgb, var(--green) 8%, var(--panel)); }
+.dataset-candidate-state.ready { color: var(--green); background: color-mix(in srgb, var(--green) 12%, var(--panel)); }
+.dataset-candidate-state.registered { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, var(--panel)); }
 .dataset-candidate-state.needs_attention, .dataset-candidate-state.inaccessible { color: #bc872c; }
 .dataset-discovery-candidates p { margin: 6px 0; color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .dataset-discovery-pagination { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; padding: 16px 0; color: var(--muted); font-size: 12px; }
