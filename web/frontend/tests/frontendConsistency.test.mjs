@@ -18,6 +18,7 @@ function loadModule(name, globals = {}) {
   return module.exports
 }
 const { metricProfile, primaryMetric, bestMetricPoint } = loadModule('metricProfiles')
+const { groupMetricSummary, taskMetric } = loadModule('groupMetrics')
 const { comparisonEvidence } = loadModule('comparisonEvidence')
 const { applyHistoryRefresh, bridgeHistoryHead, refreshActiveHistoryTail, mergeHistoryHead, retainedHistorySelection, historyNeedsDetailRefresh } = loadModule('modelTestHistory')
 
@@ -45,6 +46,39 @@ test('all task types choose their own primary metric and best evaluation epoch',
   assert.equal(metricProfile('unknown'), undefined)
   assert.equal(metricProfile('__proto__'), undefined)
   assert.equal(bestMetricPoint([point(1, { 'metrics/accuracy_top1': null })], 'classify'), undefined)
+})
+
+test('group ranks latest mAP50 and pairs mAP50-95 from the same task', () => {
+  const task = (name, latest_metrics, task_type = 'detect', execution_node_id = null) => ({
+    name, task_type, execution_node_id, data_path: 'data.yaml', latest_metrics,
+  })
+  const summary = groupMetricSummary([
+    task('local winner', { 'metrics/mAP50(B)': 0.91, 'metrics/mAP50-95(B)': 0.51 }),
+    task('remote runner-up', { 'metrics/mAP50(B)': 0.87, 'metrics/mAP50-95(B)': 0.79 }, 'detect', 'remote-1'),
+  ])
+  assert.equal(summary.highest.task.name, 'local winner')
+  assert.equal(summary.highest.value, 0.91)
+  assert.equal(summary.companion.value, 0.51)
+  assert.equal(summary.mixedSources, true)
+
+  const historical = groupMetricSummary([
+    task('historical', { 'metrics/mAP50(B)': '0.95' }),
+    task('older', { 'metrics/mAP50(B)': 0.6, 'metrics/mAP50-95(B)': 0.5 }),
+    task('missing primary', { 'metrics/mAP50-95(B)': 0.99 }),
+    task('invalid primary', { 'metrics/mAP50(B)': 'n/a' }),
+  ])
+  assert.equal(historical.highest.task.name, 'historical')
+  assert.equal(taskMetric(historical.highest.task, 'metrics/mAP50(B)').toFixed(4), '0.9500')
+  assert.equal(historical.companion.value, null)
+  assert.equal(historical.count, 2)
+  assert.equal(groupMetricSummary([task('zero', { 'metrics/mAP50(B)': 0 })]).highest.value, 0)
+  assert.equal(groupMetricSummary([task('classify', { 'metrics/accuracy_top1': 0.8 }, 'classify')]).companion, null)
+  assert.equal(groupMetricSummary([task('detect', { 'metrics/mAP50(B)': 0.9 }), task('classify', { 'metrics/accuracy_top1': 0.8 }, 'classify')]).mixedMetrics, true)
+  for (const [taskType, suffix] of [['segment', 'M'], ['pose', 'P'], ['obb', 'B']]) {
+    const paired = groupMetricSummary([task(taskType, { [`metrics/mAP50(${suffix})`]: 0.75, [`metrics/mAP50-95(${suffix})`]: 0.44 }, taskType)])
+    assert.equal(paired.highest.value, 0.75)
+    assert.equal(paired.companion.value, 0.44)
+  }
 })
 
 test('background history refresh preserves loaded pages, cursor selection and updated head', () => {
