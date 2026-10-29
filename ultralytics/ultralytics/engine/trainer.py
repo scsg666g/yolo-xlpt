@@ -517,6 +517,7 @@ class BaseTrainer:
                             x["momentum"] = float(np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum]))
 
                 # Forward
+                retry_oom = False
                 try:
                     with autocast(torch.bfloat16 if self.args.amp == "bf16" else self.amp, device=self.device.type):
                         batch = self.preprocess_batch(batch)
@@ -565,6 +566,8 @@ class BaseTrainer:
                     )
                     batch = loss = preds = None
                     self.loss = self.loss_items = self.tloss = None
+                    retry_oom = True
+                if retry_oom:
                     self._clear_memory()
                     self._build_train_pipeline()  # rebuild dataloaders, optimizer, scheduler
                     self.scheduler.last_epoch = self.start_epoch - 1

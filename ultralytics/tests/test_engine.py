@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import sys
+import weakref
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,46 @@ from ultralytics.nn.distill_model import DistillationModel
 from ultralytics.nn.tasks import DetectionModel, load_checkpoint
 from ultralytics.utils import ASSETS, DEFAULT_CFG, IS_RASPBERRYPI, WEIGHTS_DIR
 from ultralytics.utils.torch_utils import unwrap_model
+
+
+def test_oom_retry_releases_failed_forward_before_rebuild(tmp_path):
+    """Rebuild the real CPU training pipeline only after failed-forward traceback tensors are released."""
+    failed_tensor = []
+    pipeline_batches = []
+
+    class RetryTrainer(detect.DetectionTrainer):
+        def preprocess_batch(self, batch):
+            if not failed_tensor:
+                probe = torch.ones(1)
+                failed_tensor.append(weakref.ref(probe))
+                raise RuntimeError("CUDA out of memory")
+            return super().preprocess_batch(batch)
+
+        def _build_train_pipeline(self):
+            if pipeline_batches:
+                assert sys.exc_info()[0] is None, "pipeline rebuilt inside the failed forward's except block"
+                assert failed_tensor[0]() is None, "failed forward's traceback still retains tensors"
+            pipeline_batches.append(self.batch_size)
+            return super()._build_train_pipeline()
+
+    trainer = RetryTrainer(
+        overrides={
+            "data": "coco8.yaml",
+            "model": "yolo26n.yaml",
+            "imgsz": 32,
+            "epochs": 1,
+            "batch": 4,
+            "device": "cpu",
+            "project": tmp_path,
+            "plots": False,
+            "workers": 0,
+            "save": False,
+            "amp": False,
+        }
+    )
+    trainer.train()
+    assert pipeline_batches == [4, 2]
+    assert trainer.args.batch == trainer.batch_size == 2
 
 
 def test_func(*args, **kwargs):
