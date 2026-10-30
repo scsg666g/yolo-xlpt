@@ -1,18 +1,24 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { api, formatBytes } from '../api'
 import type { ComputeNode, DatasetLocation, ManagedDataset } from '../types'
 import { useModalFocus } from '../useModalFocus'
-import { MoreHorizontal, X } from 'lucide-react'
+import { ChevronDown, MoreHorizontal, X } from 'lucide-react'
 import { DatasetServerSelect } from './DatasetServerSelect'
 
 
-export function DatasetStorageSettings() {
+export function DatasetStorageSettings({ defaultExpanded = false, refreshToken = 0, onStatusChange }: { defaultExpanded?: boolean; refreshToken?: number; onStatusChange?: (status: { loading: boolean; checkedAt: Date | null; error: string }) => void }) {
   const section = useRef<HTMLElement>(null)
+  const contentId = useId()
+  const [expanded, setExpanded] = useState(defaultExpanded)
   const [locations, setLocations] = useState<DatasetLocation[]>([])
   const [nodes, setNodes] = useState<ComputeNode[]>([])
   const [error, setError] = useState('')
+  const [loadError, setLoadError] = useState('')
   const [busy, setBusy] = useState(false)
   const [adding, setAdding] = useState(false)
+  const checkedAt = useRef<Date | null>(null)
+  const onStatusChangeRef = useRef(onStatusChange)
+  useEffect(() => { onStatusChangeRef.current = onStatusChange }, [onStatusChange])
   const [form, setForm] = useState({ node_id: 'local', name: '', path: '', create: false, is_default: false })
   useEffect(() => {
     let active = true
@@ -22,16 +28,23 @@ export function DatasetStorageSettings() {
     async function load() {
       if (!active || running || document.hidden) return
       running = true; controller = new AbortController()
+      onStatusChangeRef.current?.({ loading: true, checkedAt: checkedAt.current, error: '' })
       try {
         const [ls, ns] = await Promise.all([api.datasetLocations(controller.signal), api.computeNodes(controller.signal)])
-        if (active) { setLocations(ls); setNodes(ns) }
-      } catch (e) { if (active && !controller.signal.aborted) setError(e instanceof Error ? e.message : '保存位置读取失败') }
+        if (active) {
+          setLocations(ls); setNodes(ns); setLoadError(''); checkedAt.current = new Date()
+          onStatusChangeRef.current?.({ loading: false, checkedAt: checkedAt.current, error: '' })
+        }
+      } catch (e) { if (active && !controller.signal.aborted) {
+        const message = e instanceof Error ? e.message : '保存位置读取失败'
+        setLoadError(message); onStatusChangeRef.current?.({ loading: false, checkedAt: checkedAt.current, error: message })
+      } }
       finally { running = false; if (active) timer = setTimeout(load, 5000) }
     }
     function visible() { if (!document.hidden) { clearTimeout(timer); void load() } }
     void load(); document.addEventListener('visibilitychange', visible)
     return () => { active = false; controller?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
-  }, [])
+  }, [refreshToken])
   useEffect(() => {
     const root = section.current
     function outside(event: PointerEvent) {
@@ -53,9 +66,16 @@ export function DatasetStorageSettings() {
     try { await work(); setLocations(await api.datasetLocations()) } catch (e) { setError(e instanceof Error ? e.message : '目录操作失败') } finally { setBusy(false) }
   }
   return <section ref={section} className="dataset-storage-panel" aria-busy={busy}>
-    <div className="dataset-section-heading"><strong>数据集保存位置</strong><button type="button" className="button compact ghost" onClick={() => setAdding(!adding)}>{adding ? '收起' : '添加保存位置'}</button></div>
-    <p>默认位置仅影响新上传；旧数据仍按登记的服务器和实际路径管理。相对路径以所选服务器项目目录为基准。</p>
+    <div className="dataset-section-heading">
+      <button type="button" className="dataset-storage-toggle" aria-expanded={expanded} aria-controls={contentId} onClick={() => setExpanded(value => !value)}>
+        <ChevronDown size={16} /><strong>数据集保存位置</strong><span>{locations.length} 个位置 · {expanded ? '收起' : '展开'}</span>
+      </button>
+      <button type="button" className="button compact ghost" onClick={() => { setExpanded(true); setAdding(value => !value) }}>{adding ? '取消添加' : '添加保存位置'}</button>
+    </div>
     {error && <div className="alert error" role="alert">{error}</div>}
+    {loadError && <div className="alert error" role="alert">保存位置刷新失败：{loadError}{checkedAt.current ? '；保留最近一次成功数据。' : ''}</div>}
+    <div id={contentId} className="dataset-storage-content" hidden={!expanded}>
+    <p>默认位置仅影响新上传；旧数据仍按登记的服务器和实际路径管理。相对路径以所选服务器项目目录为基准。</p>
     {adding && <div className="form-grid dataset-location-form">
       <label>服务器<DatasetServerSelect label="保存位置所在服务器" value={form.node_id} disabled={busy} onChange={v => setForm({ ...form, node_id: v })} options={[{ id: 'local', name: '本机（中台）' }, ...nodes.filter(n => n.kind === 'agent' && n.enabled).map(n => ({ id: n.id, name: n.name, status: n.status === 'online' ? '在线' : '离线' }))]} /></label>
       <label>位置名称<input value={form.name} disabled={busy} maxLength={160} placeholder="例如：训练数据盘" onChange={e => setForm({ ...form, name: e.target.value })} /></label>
@@ -73,6 +93,7 @@ export function DatasetStorageSettings() {
         <details className="dataset-location-more"><summary aria-label={`更多操作：${l.name}`} title="更多操作"><MoreHorizontal size={18} /></summary><div><button type="button" className="button compact ghost" disabled={busy} onClick={e => { e.currentTarget.closest('details')?.removeAttribute('open'); void action(() => api.updateDatasetLocation(l.id, !l.enabled, false)) }}>{l.enabled ? '禁用' : '启用'}</button>
         <button type="button" className="button compact danger" disabled={busy || l.is_default} onClick={e => { e.currentTarget.closest('details')?.removeAttribute('open'); void action(() => api.forgetDatasetLocation(l.id)) }}>移除配置</button></div></details></div>
     </article>)}</div></section>)}</div>
+    </div>
   </section>
 }
 
@@ -85,7 +106,7 @@ export function DatasetStorageModal({ onClose }: { onClose: () => void }) {
   }, [])
   return <div className="modal-backdrop" onMouseDown={onClose}><div ref={ref} className="modal dataset-storage-modal" role="dialog" aria-modal="true" aria-labelledby="dataset-storage-title" tabIndex={-1} onMouseDown={e => e.stopPropagation()}>
     <header><h2 id="dataset-storage-title">保存位置配置</h2><button type="button" className="icon-button" aria-label="关闭保存位置" onClick={onClose}><X size={20} /></button></header>
-    <div className="dataset-storage-modal-body"><DatasetStorageSettings /></div>
+    <div className="dataset-storage-modal-body"><DatasetStorageSettings defaultExpanded /></div>
     <footer><button type="button" className="button ghost" onClick={onClose}>关闭</button></footer>
   </div></div>
 }

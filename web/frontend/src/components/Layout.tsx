@@ -1,4 +1,4 @@
-import { DatasetStorageSettings } from './DatasetStorage'
+import { DatasetSettings, type DatasetSettingsStatus } from './DatasetSettings'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Activity, Boxes, Check, Cpu, Database, Download, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Server, Settings2, Sun, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
@@ -24,6 +24,7 @@ const settingsSections = [
   { id: 'training', label: '实验与训练', description: '实验对比参数。', icon: Activity },
   { id: 'services', label: '服务状态', description: '数据库与后台服务运行状态。', icon: Cpu },
   { id: 'storage', label: '存储与路径', description: '训练输出目录等平台路径。', icon: FolderOpen },
+  { id: 'datasets', label: '数据集', description: '保存位置、上传中转空间与后台处理策略。', icon: Database },
 ] as const
 
 type SettingsSection = typeof settingsSections[number]['id']
@@ -96,6 +97,8 @@ export function Layout() {
   const [storageError, setStorageError] = useState('')
   const [storageCheckedAt, setStorageCheckedAt] = useState<Date | null>(null)
   const [diagnosticsNotice, setDiagnosticsNotice] = useState('')
+  const [datasetRefreshToken, setDatasetRefreshToken] = useState(0)
+  const [datasetSettingsStatus, setDatasetSettingsStatus] = useState<DatasetSettingsStatus>({ loading: false, checkedAt: null, locationCheckedAt: null, error: '' })
   const healthController = useRef<AbortController | null>(null)
   const nodesController = useRef<AbortController | null>(null)
   const storageController = useRef<AbortController | null>(null)
@@ -280,6 +283,7 @@ export function Layout() {
   }
 
   function refreshSettingsStatus() {
+    if (settingsSection === 'datasets') { setDatasetRefreshToken(value => value + 1); return }
     void checkHealth(true)
     void loadComputeNodes()
     if (settingsSection === 'storage') void loadStorageHealth()
@@ -299,9 +303,9 @@ export function Layout() {
     }
     if (event.key !== 'Tab') return
 
-    const controls = event.currentTarget.querySelectorAll<HTMLElement>(
-      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
-    )
+    const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled), summary, a[href], [tabindex]:not([tabindex="-1"])',
+    )).filter(control => control.getClientRects().length > 0 && control.getAttribute('aria-hidden') !== 'true')
     const first = controls[0]
     const last = controls[controls.length - 1]
     if (!first || !last) {
@@ -331,7 +335,9 @@ export function Layout() {
   const coreCheckedLabel = health.checkedAt ? health.checkedAt.toLocaleTimeString('zh-CN') : '尚未完成'
   const nodesCheckedLabel = computeNodesCheckedAt ? computeNodesCheckedAt.toLocaleTimeString('zh-CN') : '尚未完成'
   const storageCheckedLabel = storageCheckedAt ? storageCheckedAt.toLocaleTimeString('zh-CN') : '尚未完成'
-  const settingsCheckedLabel = settingsSection === 'storage'
+  const settingsCheckedLabel = settingsSection === 'datasets'
+    ? `设置读取：${datasetSettingsStatus.checkedAt?.toLocaleTimeString('zh-CN') || '尚未完成'} · 保存位置：${datasetSettingsStatus.locationCheckedAt?.toLocaleTimeString('zh-CN') || '尚未完成'}${datasetSettingsStatus.error ? ' · 刷新失败，保留上次结果' : ''}`
+    : settingsSection === 'storage'
     ? `存储检查：${storageCheckedLabel} · 节点成功读取：${nodesCheckedLabel}`
     : ['overview', 'services'].includes(settingsSection)
       ? `核心检查：${coreCheckedLabel} · 节点成功读取：${nodesCheckedLabel}`
@@ -475,7 +481,6 @@ export function Layout() {
                 </>}
 
                 {settingsSection === 'storage' && <>
-                  <DatasetStorageSettings />
                   <div className="form-grid settings-path-grid">
                     <label className="span-2">平台服务器 · 训练输出目录<input readOnly title={storageHealth?.path || health.details?.runs_root || ''} value={storageHealth?.path || health.details?.runs_root || '—'} /></label>
                   </div>
@@ -501,8 +506,9 @@ export function Layout() {
                       {modelRoots.length ? <details><summary>模型测试目录 · {modelRoots.length} 项</summary><div className="settings-storage-roots">{modelRoots.map((root) => <code key={root}>{root}</code>)}</div></details> : <small>Agent 尚未上报允许的模型测试目录</small>}
                     </div>
                   })}</div> : <div className="settings-empty-state">尚未登记远程 Agent</div>}
-                  <p className="settings-readonly-note">训练和模型目录来自运行环境；数据集保存位置可在上方配置，目录检查结果含服务器时间。</p>
+                  <p className="settings-readonly-note">训练和模型目录来自运行环境；数据集保存位置可在“数据集”分类中配置，目录检查结果含服务器时间。</p>
                 </>}
+                {settingsSection === 'datasets' && <DatasetSettings refreshToken={datasetRefreshToken} onStatusChange={setDatasetSettingsStatus} />}
               </section>
             </div>
           </div>
@@ -512,7 +518,7 @@ export function Layout() {
               <button type="button" className="button ghost" onClick={resetAppearance}><RotateCcw size={15} />恢复默认版</button>
             </> : <>
               <span style={{ marginRight: 'auto' }}>{settingsCheckedLabel}</span>
-              <button type="button" className="button ghost" disabled={health.phase === 'checking'} onClick={refreshSettingsStatus}><RefreshCw size={15} className={health.phase === 'checking' ? 'spin' : ''} />重新检查</button>
+              <button type="button" className="button ghost" disabled={settingsSection === 'datasets' ? datasetSettingsStatus.loading : health.phase === 'checking'} onClick={refreshSettingsStatus}><RefreshCw size={15} className={(settingsSection === 'datasets' ? datasetSettingsStatus.loading : health.phase === 'checking') ? 'spin' : ''} />重新检查</button>
             </>}
             <button type="button" className="button" onClick={closeSettings}>关闭</button>
           </footer>

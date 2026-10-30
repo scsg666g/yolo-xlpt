@@ -590,6 +590,44 @@ export interface DatasetLocation {
   enabled: boolean; is_default: boolean; status: string; updated_at: string
   details: { free_bytes?: number; total_bytes?: number; message?: string; checked_at?: string }
 }
+export interface DatasetPolicy {
+  storage_quota_bytes: number
+  failed_retention_seconds: number
+  refresh_read_bytes_per_second: number
+  refresh_io_pressure_pct: number
+  refresh_min_free_bytes: number
+}
+export interface DatasetSettingsResponse {
+  revision: number
+  policy: DatasetPolicy
+  defaults: DatasetPolicy
+  policy_source: 'instance' | 'environment'
+  policy_error: string | null
+  scope: 'platform_local'
+  paths: { transfer: string; upload_staging: string }
+  cleanup: { terminal_snapshots: 'after_release'; upload_staging_retention_seconds: number; failed_retention_seconds: number }
+  storage: {
+    sampled_at: string | null
+    status: 'pending' | 'complete' | 'partial' | 'error'
+    sampling: boolean
+    transfer_bytes: number | null
+    upload_staging_bytes: number | null
+    total_bytes: number | null
+    quota_used_bytes: number | null
+    quota_remaining_bytes: number | null
+    entries_scanned: number
+    limit_reached: boolean
+    error: string | null
+    displayed_operation_count: number
+    truncated_operation_count: number
+    operations: Array<{ id: string; name: string; kind: string; status: string; bundle_bytes: number; transfer_bytes: number; upload_staging_bytes: number; total_bytes: number; cleanup_state: 'active' | 'reserved' | 'pending' | 'retained' | 'orphan'; cleanup_reason: string; sampled_complete: boolean }>
+    disk: { free_bytes: number | null; total_bytes: number | null }
+    registered_bytes: { local: { bytes: number; count: number; unknown_count: number }; remote: { bytes: number; count: number; unknown_count: number }; measured_at: string; source: 'catalogue'; nodes: Array<{ node_id: string; bytes: number; count: number; unknown_count: number }> }
+  }
+  worker: NonNullable<PlatformHealth['dataset_worker_health']>
+  operations: { active: DatasetOperation[]; active_count: number; failed_count: number }
+  remote_nodes: Array<{ id: string; name: string; online: boolean; last_seen_at: string | null; agent_version: string | null; dataset_roots: string[]; concurrent_reads: boolean | null; concurrent_refresh: boolean | null }>
+}
 export interface DatasetOperation {
   progress?: { stage: string; phase: string; executor: string; processed: number; total: number | null; unit: 'files' | 'bytes' | 'directories'; current_file: string; sampled_at: string; changed_at: string; started_at: string; rate: number | null; eta_seconds: number | null; resource_reason?: string | null } | null
   progress_steps?: Array<{ stage: string; phase: string; executor: string }>

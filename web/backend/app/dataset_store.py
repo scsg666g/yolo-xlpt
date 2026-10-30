@@ -27,6 +27,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from . import dataset_files as files
+from . import dataset_policy as policy_store
 from .dataset_progress import record_progress as record_work_progress, progress_reporter
 from .config import (DATA_ROOT, DATASET_ROOTS, DATASET_STORAGE_ALLOWED_ROOTS, DATASET_STORAGE_QUOTA_BYTES,
                      DATASET_STORAGE_RETENTION_SECONDS, DATASET_FAILED_RETENTION_SECONDS, PROJECT_ROOT,
@@ -44,6 +45,18 @@ ACTIVE = ('pending', 'running', 'committing')
 LIGHTWEIGHT_PHASES = ('check', 'discover')
 TERMINAL = ('completed', 'cancelled')
 logger = logging.getLogger(__name__)
+
+
+def dataset_policy_defaults():
+    return {'storage_quota_bytes': DATASET_STORAGE_QUOTA_BYTES,
+            'failed_retention_seconds': DATASET_FAILED_RETENTION_SECONDS,
+            'refresh_read_bytes_per_second': DATASET_REFRESH_READ_BYTES_PER_SECOND,
+            'refresh_io_pressure_pct': DATASET_REFRESH_IO_PRESSURE_PCT,
+            'refresh_min_free_bytes': DATASET_REFRESH_MIN_FREE_BYTES}
+
+
+def dataset_policy():
+    return policy_store.read(STORE_ROOT, dataset_policy_defaults())['policy']
 
 
 def uid():
@@ -81,12 +94,13 @@ def snapshot_access(identity, *, blocking=True):
 def failed_snapshot_expired(op, now=None):
     """Only disposable pre-commit snapshots may expire; receipts stay durable."""
     now = now or utcnow()
-    return bool(DATASET_FAILED_RETENTION_SECONDS and op.status == 'failed'
+    retention = dataset_policy()['failed_retention_seconds']
+    return bool(retention and op.status == 'failed'
                 and op.kind in ('upload', 'register', 'refresh', 'migrate')
                 and not op.payload.get('published') and not op.payload.get('commit_started')
                 and (not op.lease_until or operation_time(op.lease_until) <= now)
                 and (op.payload.get('snapshot_reclaimed') or
-                     (now - operation_time(op.updated_at)).total_seconds() >= DATASET_FAILED_RETENTION_SECONDS))
+                     (now - operation_time(op.updated_at)).total_seconds() >= retention))
 
 
 def restart_snapshot(op):
@@ -1483,6 +1497,7 @@ class LocalRefreshBudget:
         self.free_bytes = None
         self.paused = False
         self.resume_progress = None
+        self.policy = None
 
     def remember_progress(self, value):
         if value.get('stage') != 'paused_resource':
@@ -1500,17 +1515,19 @@ class LocalRefreshBudget:
         while True:
             training = self.training_now()
             now = time.monotonic()
-            if now - self.last_resource_probe >= 2:
-                if DATASET_REFRESH_MIN_FREE_BYTES:
+            policy = dataset_policy()
+            if now - self.last_resource_probe >= 2 or self.policy != policy:
+                self.policy = policy
+                if policy['refresh_min_free_bytes']:
                     self.free_bytes = local_refresh_free_bytes()
-                if training and DATASET_REFRESH_IO_PRESSURE_PCT:
+                if training and policy['refresh_io_pressure_pct']:
                     self.pressure = local_io_pressure_pct()
                 self.last_resource_probe = now
             reason = None
-            if (DATASET_REFRESH_MIN_FREE_BYTES and self.free_bytes is not None
-                    and self.free_bytes < DATASET_REFRESH_MIN_FREE_BYTES):
+            if (policy['refresh_min_free_bytes'] and self.free_bytes is not None
+                    and self.free_bytes < policy['refresh_min_free_bytes']):
                 reason = 'low_disk_space'
-            elif training and DATASET_REFRESH_IO_PRESSURE_PCT and self.pressure >= DATASET_REFRESH_IO_PRESSURE_PCT:
+            elif training and policy['refresh_io_pressure_pct'] and self.pressure >= policy['refresh_io_pressure_pct']:
                 reason = 'disk_pressure'
             if not reason:
                 if self.paused and self.resume_progress:
@@ -1527,11 +1544,19 @@ class LocalRefreshBudget:
     def throttle(self, byte_count):
         if not byte_count or not self.guard():
             return
-        rate = DATASET_REFRESH_READ_BYTES_PER_SECOND
+        rate = dataset_policy()['refresh_read_bytes_per_second']
         if not rate:
             return
         self.next_read_at = max(self.next_read_at, time.monotonic()) + byte_count / rate
         while self.training_now():
+            current_rate = dataset_policy()['refresh_read_bytes_per_second']
+            if not current_rate:
+                self.next_read_at = 0.0
+                return
+            if current_rate != rate:
+                now = time.monotonic()
+                self.next_read_at = now + max(0.0, self.next_read_at - now) * rate / current_rate
+                rate = current_rate
             remaining = self.next_read_at - time.monotonic()
             if remaining <= 0:
                 return
@@ -1593,9 +1618,10 @@ def execute_local(db, op):
         manifest = files.scan(source, check)
         archive_budget, unpack_budget = refresh_snapshot_disk_budget(manifest) if local_refresh(op) else (
             manifest['total_bytes'], manifest['total_bytes'])
-        if DATASET_STORAGE_QUOTA_BYTES and sum(f.stat().st_size for f in STORE_ROOT.glob('*/bundle*')) + archive_budget + unpack_budget > DATASET_STORAGE_QUOTA_BYTES:
-            raise ValueError('平台数据集中转配额不足，请先处理失败操作或增加 PLATFORM_DATASET_STORAGE_QUOTA_BYTES')
-        reserve = max(100 * 1024**2, DATASET_REFRESH_MIN_FREE_BYTES) if local_refresh(op) else 100 * 1024**2
+        policy = dataset_policy()
+        if policy['storage_quota_bytes'] and sum(f.stat().st_size for f in STORE_ROOT.glob('*/bundle*')) + archive_budget + unpack_budget > policy['storage_quota_bytes']:
+            raise ValueError('平台数据集中转配额不足，请先处理失败操作或在平台设置→数据集中调整配额；未设置实例覆盖时也可增加 PLATFORM_DATASET_STORAGE_QUOTA_BYTES')
+        reserve = max(100 * 1024**2, policy['refresh_min_free_bytes']) if local_refresh(op) else 100 * 1024**2
         required = archive_budget + unpack_budget + reserve
         if shutil.disk_usage(directory).free < required:
             raise ValueError('平台中转磁盘空间不足')
@@ -1605,7 +1631,7 @@ def execute_local(db, op):
         if refresh_lane_operation(op):
             manifest = json.loads((directory / 'manifest.json').read_text())
             _, unpack_budget = refresh_snapshot_disk_budget(manifest)
-            if shutil.disk_usage(directory).free < unpack_budget + DATASET_REFRESH_MIN_FREE_BYTES:
+            if shutil.disk_usage(directory).free < unpack_budget + dataset_policy()['refresh_min_free_bytes']:
                 raise ValueError('平台中转磁盘空间不足，无法安全展开重新加载快照')
         result = verify_snapshot(op, check)
         if local_refresh(op):
@@ -1668,7 +1694,8 @@ def reclaim_snapshot(db, identity, *, now=None):
                     orphan_age = time.time() - directory.stat().st_mtime
                 except OSError:
                     return False
-                if not DATASET_FAILED_RETENTION_SECONDS or orphan_age < DATASET_FAILED_RETENTION_SECONDS:
+                retention = dataset_policy()['failed_retention_seconds']
+                if not retention or orphan_age < retention:
                     return False
             quarantine = STORE_ROOT / ('.reclaimed-' + uid())
             directory.rename(quarantine)
@@ -2128,7 +2155,8 @@ def upload_chunk(node_id: str, identity: str, body: Chunk, request: Request, db:
         if len(data) > 512 * 1024 or current + len(data) > files.MAX_BYTES + files.MAX_FILES * 2048:
             raise HTTPException(413, '数据包超出限制')
         if data:
-            if shutil.disk_usage(directory).free < len(data) + 100 * 1024**2 or (DATASET_STORAGE_QUOTA_BYTES and sum(p.stat().st_size for p in STORE_ROOT.glob('*/bundle*')) + len(data) > DATASET_STORAGE_QUOTA_BYTES):
+            quota = dataset_policy()['storage_quota_bytes']
+            if shutil.disk_usage(directory).free < len(data) + 100 * 1024**2 or (quota and sum(p.stat().st_size for p in STORE_ROOT.glob('*/bundle*')) + len(data) > quota):
                 raise HTTPException(507, '平台中转磁盘或配额不足')
             with target.open('ab') as handle:
                 handle.write(data)
@@ -2136,3 +2164,9 @@ def upload_chunk(node_id: str, identity: str, body: Chunk, request: Request, db:
         op.transferred = current
         db.commit()
         return {'offset': current}
+
+
+# Keep these endpoints on the existing router so test apps and embedded
+# deployments receive the same settings API as the platform server.
+from .dataset_settings import router as settings_router
+router.include_router(settings_router)
