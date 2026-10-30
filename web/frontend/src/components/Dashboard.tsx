@@ -172,10 +172,6 @@ export function Dashboard() {
   const taskActionRequests = useRef(new Set<string>())
   const navigate = useNavigate()
   const closeOverview = useCallback(() => setOverviewMode(null), [])
-  const openOverviewTask = useCallback((taskId: string) => {
-    setOverviewMode(null)
-    navigate(`/tasks/${taskId}/canvas`)
-  }, [navigate])
   const deleteDialogRef = useModalFocus<HTMLDivElement>(Boolean(deleteTarget), closeDeletion, {
     canClose: !deleting,
     initialFocusSelector: '[data-modal-initial-focus]',
@@ -838,7 +834,7 @@ export function Dashboard() {
           </section>
         })}</div>}
     </section>
-    {overviewMode && <Suspense fallback={<div className="modal-backdrop overview-loading-backdrop" role="status"><div className="overview-loading"><RefreshCw size={17} className="spin" />正在打开任务总览…</div></div>}><TaskOverviewModal mode={overviewMode} tasks={tasks} nodeNames={nodeNames} onClose={closeOverview} onOpenTask={openOverviewTask} /></Suspense>}
+    {overviewMode && <Suspense fallback={<div className="modal-backdrop overview-loading-backdrop" role="status"><div className="overview-loading"><RefreshCw size={17} className="spin" />正在打开任务总览…</div></div>}><TaskOverviewModal mode={overviewMode} tasks={tasks} nodeNames={nodeNames} onClose={closeOverview} onNavigate={closeOverview} /></Suspense>}
     {ordering && <div className="order-saving" role="status"><RefreshCw size={13} className="spin" />正在保存任务顺序…</div>}
     {renameTarget && <RenameTaskModal task={renameTarget} onClose={() => setRenameTarget(null)} onSaved={(updated) => { setTasks((current) => current.map((task) => task.id === updated.id ? { ...task, name: updated.name } : task)); setRenameTarget(null) }} />}
     {deleteTarget && <div className="modal-backdrop delete-choice-backdrop" onMouseDown={() => closeDeletion()}>

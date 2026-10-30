@@ -26,7 +26,7 @@
 .task-overview-reset:focus-visible { outline: 3px solid var(--green); outline-offset: 2px; }
 .task-overview-empty { flex: 1 1 auto; display: grid; place-items: center; padding: 24px; color: var(--muted); font-size: 13px; text-align: center; }
 
-.task-overview-card { --card-accent: var(--green); width: 306px; min-height: 188px; display: flex; flex-direction: column; gap: 12px; padding: 17px; border: 1px solid var(--line); border-radius: 13px; color: var(--text); background: var(--panel); box-shadow: 0 11px 32px rgba(0, 0, 0, .12); cursor: pointer; text-align: left; transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease, background .18s ease; }
+.task-overview-card { --card-accent: var(--green); width: 306px; min-height: 188px; display: flex; flex-direction: column; gap: 12px; padding: 17px; border: 1px solid var(--line); border-radius: 13px; color: var(--text); background: var(--panel); box-shadow: 0 11px 32px rgba(0, 0, 0, .12); cursor: pointer; text-align: left; text-decoration: none; -webkit-tap-highlight-color: transparent; touch-action: manipulation; transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
 .task-overview-card:hover { transform: translateY(-3px); border-color: var(--card-accent); box-shadow: 0 16px 36px rgba(0, 0, 0, .2); }
 .task-overview-card:active { transform: translateY(-1px) scale(.985); }
 .task-overview-card.tone-attention { --card-accent: #e98585; border-color: color-mix(in srgb, var(--card-accent) 43%, var(--line)); }
@@ -35,8 +35,11 @@
 .task-overview-card-top { width: 100%; display: flex; align-items: center; gap: 9px; min-width: 0; }
 .task-overview-card-icon { flex: 0 0 auto; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 8px; color: var(--card-accent); background: color-mix(in srgb, var(--card-accent) 12%, var(--panel)); }
 .task-overview-card-title { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 700; }
-.task-overview-card-open { flex: 0 0 auto; color: var(--muted); transition: color .18s ease, transform .18s ease; }
-.task-overview-card:hover .task-overview-card-open { color: var(--card-accent); transform: translate(2px, -2px); }
+.task-overview-card-open { flex: 0 0 auto; min-height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--panel-2); font-size: 10px; font-weight: 600; white-space: nowrap; transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
+.task-overview-card-open svg { flex: 0 0 auto; transition: transform .16s ease; }
+.task-overview-card:hover .task-overview-card-open, .task-overview-card:focus-visible .task-overview-card-open { color: var(--card-accent); border-color: var(--card-accent); background: color-mix(in srgb, var(--card-accent) 12%, var(--panel)); }
+.task-overview-card:hover .task-overview-card-open svg, .task-overview-card:focus-visible .task-overview-card-open svg { transform: translate(1px, -1px); }
+.task-overview-card:active .task-overview-card-open { transform: scale(.96); background: color-mix(in srgb, var(--card-accent) 20%, var(--panel)); }
 .task-overview-card-context { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .task-overview-status { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 23px; padding: 3px 8px; border-radius: 999px; color: var(--card-accent); background: color-mix(in srgb, var(--card-accent) 11%, var(--panel)); font-size: 10px; font-weight: 700; white-space: nowrap; }
 .task-overview-server { display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px; min-width: 0; max-width: 62%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font-size: 10px; }
@@ -80,6 +83,6 @@
 
 @media (prefers-reduced-motion: reduce) {
   .task-overview-backdrop, .task-overview-dialog, .task-overview-progress.indeterminate > span { animation: none; }
-  .task-overview-card, .task-overview-progress > span, .task-overview-card-open, .task-overview-close, .task-overview-reset { transition: none; }
-  .task-overview-card:hover, .task-overview-card:active, .task-overview-close:hover { transform: none; }
+  .task-overview-card, .task-overview-progress > span, .task-overview-card-open, .task-overview-card-open svg, .task-overview-close, .task-overview-reset { transition: none; }
+  .task-overview-card:hover, .task-overview-card:active, .task-overview-card:active .task-overview-card-open, .task-overview-card:hover .task-overview-card-open svg, .task-overview-card:focus-visible .task-overview-card-open svg, .task-overview-close:hover { transform: none; }
 }

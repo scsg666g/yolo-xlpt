@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock3, Maximize2, Monitor, Search, Server, X, Zap } from 'lucide-react'
 import { Background, BackgroundVariant, Controls, ReactFlow, ReactFlowProvider, useNodesInitialized, useReactFlow, type Node, type NodeProps } from '@xyflow/react'
 import { statusLabel } from '../api'
@@ -16,13 +17,13 @@ type Props = {
   tasks: TrainingTask[]
   nodeNames: Record<string, string>
   onClose: () => void
-  onOpenTask: (taskId: string) => void
+  onNavigate: () => void
 }
 
 type OverviewData = {
   task: TrainingTask
   serverName: string
-  onOpenTask: (taskId: string) => void
+  onNavigate: () => void
 }
 
 type OverviewNode = Node<OverviewData, 'taskOverview'>
@@ -86,7 +87,7 @@ function cardSignature(task: TrainingTask): string {
 }
 
 function cardAccessibilityLabel(task: TrainingTask, current: number, target: number, percent: number | null): string {
-  const label = '查看任务 ' + task.name + '，' + trainingStatusLabel(task)
+  const label = '打开训练画布：' + task.name + '，' + trainingStatusLabel(task)
   if (task.status === 'running') return label + '，已完成 ' + current + ' / ' + (target > 0 ? target : '目标未知') + ' Epoch' + (percent === null ? '' : '，' + percent + '%')
   if (task.status === 'queued') return label + '，' + (task.queue_reason || '等待调度')
   if (task.status === 'starting') return label + '，准备训练'
@@ -96,7 +97,7 @@ function cardAccessibilityLabel(task: TrainingTask, current: number, target: num
 }
 
 const TaskOverviewNode = memo(function TaskOverviewNode({ data }: NodeProps<OverviewNode>) {
-  const { task, serverName, onOpenTask } = data
+  const { task, serverName, onNavigate } = data
   const tone = cardTone(task.status)
   const target = trainingEpochTarget(task)
   const current = Math.max(0, task.completed_epochs || 0)
@@ -105,11 +106,13 @@ const TaskOverviewNode = memo(function TaskOverviewNode({ data }: NodeProps<Over
   const earlyStop = earlyStoppingExplanation(task)
   const time = task.finished_at || task.updated_at
 
-  return <button type="button" className={'task-overview-card nodrag nopan tone-' + tone} onClick={() => onOpenTask(task.id)} aria-label={cardAccessibilityLabel(task, current, target, percent)}>
+  return <Link to={'/tasks/' + encodeURIComponent(task.id) + '/canvas'} draggable={false} className={'task-overview-card nodrag nopan tone-' + tone} onClick={(event) => {
+    if (event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) onNavigate()
+  }} aria-label={cardAccessibilityLabel(task, current, target, percent)}>
     <span className="task-overview-card-top">
       <span className="task-overview-card-icon" aria-hidden="true">{tone === 'attention' ? <AlertTriangle size={17} /> : tone === 'completed' ? <CheckCircle2 size={17} /> : task.status === 'running' ? <Zap size={17} /> : <Clock3 size={17} />}</span>
       <span className="task-overview-card-title" title={task.name}>{task.name}</span>
-      <ArrowUpRight size={16} className="task-overview-card-open" aria-hidden="true" />
+      <span className="task-overview-card-open" title={'打开训练画布：' + task.name} aria-hidden="true"><span>打开画布</span><ArrowUpRight size={16} /></span>
     </span>
     <span className="task-overview-card-context"><span className={'task-overview-status status-' + task.status}>{trainingStatusLabel(task)}</span><span className="task-overview-server" title={serverName}>{task.execution_node_id ? <Server size={13} /> : <Monitor size={13} />}{serverName}</span></span>
     {task.status === 'running' && <span className="task-overview-card-main">
@@ -136,12 +139,12 @@ const TaskOverviewNode = memo(function TaskOverviewNode({ data }: NodeProps<Over
       <span className="task-overview-card-row"><span>{task.status === 'draft' ? '尚未启动' : '已手动停止'}</span><strong>{current} / {target > 0 ? target : '—'} Epoch</strong></span>
       <span className="task-overview-card-foot"><span>{metric || '暂无验证指标'}</span><span>{formatTime(time)}</span></span>
     </span>}
-  </button>
-}, (before, after) => before.data.serverName === after.data.serverName && before.data.onOpenTask === after.data.onOpenTask && cardSignature(before.data.task) === cardSignature(after.data.task))
+  </Link>
+}, (before, after) => before.data.task.id === after.data.task.id && before.data.serverName === after.data.serverName && before.data.onNavigate === after.data.onNavigate && cardSignature(before.data.task) === cardSignature(after.data.task))
 
 const nodeTypes = { taskOverview: TaskOverviewNode }
 
-function TaskOverviewCanvas({ mode, tasks, nodeNames, onOpenTask, query }: Pick<Props, 'mode' | 'tasks' | 'nodeNames' | 'onOpenTask'> & { query: string }) {
+function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query }: Pick<Props, 'mode' | 'tasks' | 'nodeNames' | 'onNavigate'> & { query: string }) {
   const { fitView, setViewport } = useReactFlow<OverviewNode>()
   const nodesInitialized = useNodesInitialized()
   const lastCentered = useRef<string | null>(null)
@@ -155,10 +158,13 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onOpenTask, query }: Pick<
     id: task.id,
     type: 'taskOverview',
     position: { x: index % columns.current * 328, y: Math.floor(index / columns.current) * 234 },
-    data: { task, serverName: taskServerName(task, nodeNames), onOpenTask },
+    data: { task, serverName: taskServerName(task, nodeNames), onNavigate },
     draggable: false,
     selectable: false,
-  })), [visibleTasks, nodeNames, onOpenTask])
+    // React Flow disables pointer events on static nodes without node handlers.
+    // Keep the card link interactive while the canvas remains pannable.
+    style: { pointerEvents: 'all' },
+  })), [visibleTasks, nodeNames, onNavigate])
 
   useEffect(() => {
     if (membershipKey === lastCentered.current || (visibleTasks.length <= 6 && !nodesInitialized)) return
@@ -182,16 +188,16 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onOpenTask, query }: Pick<
   if (nodes.length === 0) return <div className="task-overview-empty" role="status">{normalizedQuery ? '没有找到匹配的任务。' : '当前没有' + modeTitles[mode] + '的任务。'}</div>
 
   return <div className="task-overview-flow" aria-label={modeTitles[mode] + '任务画布'}>
-    <ReactFlow nodes={nodes} edges={[]} nodeTypes={nodeTypes} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} panOnDrag zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.25} maxZoom={1.5} defaultViewport={{ x: 24, y: 24, zoom: 1 }} onlyRenderVisibleElements={nodes.length > 12} attributionPosition="bottom-left">
+    <ReactFlow nodes={nodes} edges={[]} nodeTypes={nodeTypes} nodesDraggable={false} nodesConnectable={false} nodesFocusable={false} elementsSelectable={false} panOnDrag zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.25} maxZoom={1.5} defaultViewport={{ x: 24, y: 24, zoom: 1 }} onlyRenderVisibleElements={nodes.length > 12} attributionPosition="bottom-left">
       <Background variant={BackgroundVariant.Dots} gap={22} size={1} />
       <Controls showInteractive={false} showFitView={false} position="bottom-right" />
     </ReactFlow>
-    <span className="task-overview-canvas-tip"><Maximize2 size={13} />拖动画布 · 滚轮缩放 · 点击卡片查看详情</span>
+    <span className="task-overview-canvas-tip"><Maximize2 size={13} />拖动画布 · 滚轮缩放 · 点击卡片或箭头打开训练画布</span>
     <button type="button" className="task-overview-reset" onClick={resetViewport} aria-label={visibleTasks.length <= 6 ? '重新适配所有任务' : '回到任务列表首屏'}>{visibleTasks.length <= 6 ? '适配画布' : '回到首屏'}</button>
   </div>
 }
 
-export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onOpenTask }: Props) {
+export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onNavigate }: Props) {
   const [query, setQuery] = useState('')
   const dialogRef = useModalFocus<HTMLDivElement>(true, onClose, { initialFocusSelector: '[data-modal-initial-focus]' })
   const count = tasks.filter((task) => matchesMode(task, mode)).length
@@ -200,7 +206,7 @@ export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onOpenTask 
     <div ref={dialogRef} className="modal task-overview-dialog" role="dialog" aria-modal="true" aria-labelledby="task-overview-title" aria-describedby="task-overview-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
       <header className="task-overview-header"><div><span className="eyebrow">TRAINING OVERVIEW</span><h2 id="task-overview-title">{modeTitles[mode]} <span>{count}</span></h2><p id="task-overview-description">{modeDescriptions[mode]}</p></div><button type="button" className="task-overview-close" data-modal-initial-focus onClick={onClose} aria-label="关闭任务总览"><X size={19} /></button></header>
       <div className="task-overview-toolbar"><label><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索任务名称或执行服务器" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务或服务器" /></label><span>{query.trim() ? '已筛选' : '拖动浏览更多任务'}</span></div>
-      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onOpenTask={onOpenTask} query={query} /></ReactFlowProvider>
+      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onNavigate={onNavigate} query={query} /></ReactFlowProvider>
     </div>
   </div>
 }
