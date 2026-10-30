@@ -57,6 +57,7 @@ from .model_assets import router as model_assets_router
 from .parameter_catalog import is_finite_number, load_parameter_catalog, validate_parameter_values
 from .remote_operations import (
     active_remote_delete,
+    cached_fetch_digest,
     matching_fetch,
     operation_file,
     queue_attempt_delete,
@@ -83,6 +84,8 @@ from .services import (
     scheduler,
     sync_metrics,
     validate_input_path,
+    validate_training_model_path,
+    validate_remote_training_model_path,
     validate_remote_training_data_path,
     validate_training_data_path,
 )
@@ -359,7 +362,8 @@ def registered_dataset_resources(db):
 def resources(db: Session = Depends(get_db)):
     return {
         "gpus": gpu_inventory(),
-        "models": discover_files(MODEL_ROOTS, {".pt", ".pth", ".onnx", ".yaml", ".yml"}),
+        "models": [item for item in discover_files(MODEL_ROOTS, {".pt", ".yaml", ".yml"})
+                   if Path(item["path"]).suffix in {".pt", ".yaml", ".yml"}],
         "datasets": registered_dataset_resources(db),
         "classification_datasets": discover_classification_datasets(DATASET_ROOTS),
     }
@@ -527,19 +531,20 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             reject_unavailable_remote_training(node, 422)
             model_path = payload.model_path.strip()
             try:
+                model_path = validate_remote_training_model_path(model_path)
                 data_path = validate_remote_training_data_path(payload.task_type, payload.data_path)
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
             output_root = (payload.remote_output_root or "").strip()
-            if not Path(model_path).is_absolute() or not Path(output_root).is_absolute():
-                raise HTTPException(422, "远程模型和输出目录都必须是远程服务器上的绝对路径")
+            if not Path(output_root).is_absolute():
+                raise HTTPException(422, "远程输出目录必须是远程服务器上的绝对路径")
             if any("\x00" in value for value in (model_path, data_path, output_root)):
                 raise HTTPException(422, "路径不能包含空字符")
             reject_active_remote_delete(db, node.id)
         else:
             reject_local_task_cleanup(db)
             try:
-                model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+                model_path = str(validate_training_model_path(payload.model_path, MODEL_ROOTS))
                 data_path = str(validate_training_data_path(payload.task_type, payload.data_path))
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
@@ -605,6 +610,7 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
         reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
         try:
+            validate_remote_training_model_path(task.model_path)
             validate_remote_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -612,6 +618,7 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
         if not Path(task.model_path).exists() or not Path(task.data_path).exists():
             raise HTTPException(409, "模型或数据集路径已经失效，请克隆任务并选择有效路径")
         try:
+            validate_training_model_path(task.model_path, MODEL_ROOTS)
             validate_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -643,6 +650,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
         reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
         try:
+            validate_remote_training_model_path(task.model_path)
             validate_remote_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -696,12 +704,13 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
         reject_invalid_remote_output_root(node, task.config, 409)
         reject_unsupported_remote_parameters(node, task.config, 409)
         try:
+            validate_remote_training_model_path(task.model_path)
             validate_remote_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
     else:
         try:
-            validate_input_path(task.model_path, MODEL_ROOTS, "模型文件")
+            validate_training_model_path(task.model_path, MODEL_ROOTS)
             validate_training_data_path(task.task_type, task.data_path)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -1059,11 +1068,9 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
         try:
             if payload.model_path is not None:
                 if task.execution_node_id:
-                    if not Path(payload.model_path).is_absolute() or "\x00" in payload.model_path:
-                        raise ValueError("远程模型必须是绝对路径")
-                    task.model_path = payload.model_path.strip()
+                    task.model_path = validate_remote_training_model_path(payload.model_path)
                 else:
-                    task.model_path = str(validate_input_path(payload.model_path, MODEL_ROOTS, "模型文件"))
+                    task.model_path = str(validate_training_model_path(payload.model_path, MODEL_ROOTS))
             if payload.data_path is not None:
                 if task.execution_node_id:
                     task.data_path = validate_remote_training_data_path(task.task_type, payload.data_path)
@@ -1284,6 +1291,14 @@ def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
         operation = matching_fetch(db, artifact)
         if not operation or operation.status != "succeeded" or not operation_file(operation).is_file():
             raise HTTPException(409, "远程文件尚未传输完成，请先准备下载")
+        digest, cache_error = cached_fetch_digest(operation)
+        if cache_error or digest is None:
+            raise HTTPException(409, "远程文件缓存校验失败，请重新准备下载")
+        if (operation.payload or {}).get("sha256") is None:
+            # Historic fetches may predate digest persistence. Verify their size
+            # and current bytes, then retain the digest for future requests.
+            operation.payload = {**(operation.payload or {}), "sha256": digest}
+            db.commit()
         return FileResponse(operation_file(operation), filename=Path(artifact.name).name,
                             media_type=mimetypes.guess_type(artifact.name)[0])
     path = Path(artifact.path).resolve()

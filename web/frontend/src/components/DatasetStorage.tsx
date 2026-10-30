@@ -30,10 +30,16 @@ export function DatasetStorageSettings({ defaultExpanded = false, refreshToken =
       running = true; controller = new AbortController()
       onStatusChangeRef.current?.({ loading: true, checkedAt: checkedAt.current, error: '' })
       try {
-        const [ls, ns] = await Promise.all([api.datasetLocations(controller.signal), api.computeNodes(controller.signal)])
-        if (active) {
-          setLocations(ls); setNodes(ns); setLoadError(''); checkedAt.current = new Date()
-          onStatusChangeRef.current?.({ loading: false, checkedAt: checkedAt.current, error: '' })
+        const [locationResult, nodeResult] = await Promise.allSettled([api.datasetLocations(controller.signal), api.computeNodes(controller.signal)])
+        if (active && !controller.signal.aborted) {
+          const failures: string[] = []
+          if (locationResult.status === 'fulfilled') { setLocations(locationResult.value); checkedAt.current = new Date() }
+          else failures.push(`保存位置：${locationResult.reason instanceof Error ? locationResult.reason.message : '读取失败'}`)
+          if (nodeResult.status === 'fulfilled') setNodes(nodeResult.value)
+          else failures.push(`服务器列表：${nodeResult.reason instanceof Error ? nodeResult.reason.message : '读取失败'}`)
+          const message = failures.join('；')
+          setLoadError(message)
+          onStatusChangeRef.current?.({ loading: false, checkedAt: checkedAt.current, error: message })
         }
       } catch (e) { if (active && !controller.signal.aborted) {
         const message = e instanceof Error ? e.message : '保存位置读取失败'
@@ -73,7 +79,7 @@ export function DatasetStorageSettings({ defaultExpanded = false, refreshToken =
       <button type="button" className="button compact ghost" onClick={() => { setExpanded(true); setAdding(value => !value) }}>{adding ? '取消添加' : '添加保存位置'}</button>
     </div>
     {error && <div className="alert error" role="alert">{error}</div>}
-    {loadError && <div className="alert error" role="alert">保存位置刷新失败：{loadError}{checkedAt.current ? '；保留最近一次成功数据。' : ''}</div>}
+    {loadError && <div className="alert error" role="alert">刷新未全部成功：{loadError}{checkedAt.current ? '；未成功的部分保留上次数据。' : ''}</div>}
     <div id={contentId} className="dataset-storage-content" hidden={!expanded}>
     <p>默认位置仅影响新上传；旧数据仍按登记的服务器和实际路径管理。相对路径以所选服务器项目目录为基准。</p>
     {adding && <div className="form-grid dataset-location-form">

@@ -1,7 +1,7 @@
 import { metricProfile } from '../metricProfiles'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArtifactDownload } from './ArtifactDownload'
-import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, addEdge, useEdgesState, useNodesState, useReactFlow, type Connection, type Edge, type Node } from '@xyflow/react'
+import { Background, Controls, MarkerType, MiniMap, ReactFlow, ReactFlowProvider, useEdgesState, useNodesState, useReactFlow, type Edge, type Node } from '@xyflow/react'
 import { Activity, AlertCircle, ArrowLeft, Box, Braces, Check, Clock3, Cpu, Database, Download, FileArchive, FileText, Gauge, History, LoaderCircle, Maximize, Play, Radio, RefreshCw, RotateCcw, Save, ScanEye, SlidersHorizontal, Square, Terminal, Trophy, Workflow, Zap } from 'lucide-react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, formatBytes, metricValue } from '../api'
@@ -126,7 +126,7 @@ function TaskCanvasInner() {
   const layoutSaveController = useRef<AbortController | null>(null)
   const layoutFeedbackTimer = useRef<number | null>(null)
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges)
+  const [edges, setEdges] = useEdgesState<Edge>(initialEdges)
   const { fitView, getViewport } = useReactFlow()
 
   const cancelPendingRefresh = useCallback(() => {
@@ -382,6 +382,14 @@ function TaskCanvasInner() {
     [isCurrentRun, task, viewTask],
   )
   const remoteResource = Boolean(task?.execution_node_id)
+  const openNode = useCallback((id: string) => {
+    if (isCurrentRun && id === 'config') setEditingParameters(true)
+    if (isCurrentRun && (id === 'dataset' || id === 'model')) setEditingResource(id)
+    if (id === 'logs') setViewingLogs(true)
+    if (id === 'trace') setViewingTrace(true)
+    if (id === 'inference') { setTestingArtifact(bestWeight || null); setModelTestOpen(true) }
+    if (['runtime', 'status', 'metrics', 'artifacts', 'weights'].includes(id)) setDetailKind(id as CanvasDetailKind)
+  }, [bestWeight, isCurrentRun])
   const nodeData = useMemo<Record<string, PanelNodeData> | null>(() => viewTask ? {
     dataset: { title: displayedDataPath.split('/').pop() || '数据集', kicker: `DATASET${!isCurrentRun ? ' · 历史快照' : dataPathChanged ? ' · 重新训练使用' : ' · 双击编辑'}`, icon: <Database size={17} />, content: <><p className="mono path-value">{displayedDataPath}</p>{dataPathChanged && selectedRun && <div className="resource-snapshot-note"><span>当前 Attempt 使用</span><code>{selectedRun.data_path}</code><small>重新训练将使用上方新路径</small></div>}{remoteResource ? row('路径校验', <span className="check-pending">Agent 启动时检查</span>) : row('配置状态', resourceConfig.path_issues && (resourceConfig.path_issues as { data_missing?: boolean }).data_missing ? <span className="bad">路径失效</span> : <span className="good">可用</span>)}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换训练数据集</div>}</> },
     model: { title: displayedModelPath.split('/').pop() || '基础模型', kicker: `MODEL${!isCurrentRun ? ' · 历史快照' : modelPathChanged ? ' · 重新训练使用' : ' · 双击编辑'}`, icon: <Box size={17} />, accent: '#6da8ff', content: <><p className="mono path-value">{displayedModelPath}</p>{modelPathChanged && selectedRun && <div className="resource-snapshot-note"><span>当前 Attempt 使用</span><code>{selectedRun.model_path}</code><small>重新训练将使用上方新路径</small></div>}{remoteResource && row('路径校验', <span className="check-pending">Agent 启动时检查</span>)}{row('任务类型', viewTask.task_type)}{row('预训练', viewTask.config.pretrained === false ? '关闭' : '启用')}{isCurrentRun && <div className="node-edit-hint"><SlidersHorizontal size={12} />双击更换基础模型</div>}</> },
@@ -401,9 +409,10 @@ function TaskCanvasInner() {
     setNodes((current) => Object.entries(nodeData).map(([id, data]) => {
       const existing = current.find((node) => node.id === id)
       const saved = task.canvas_layout.nodes?.find((node) => node.id === id)
-      return { ...existing, id, type: 'panel', data, position: existing?.position || saved?.position || positions[id], className: `node-${id}` }
+      const canOpen = isCurrentRun || !['dataset', 'model', 'config'].includes(id)
+      return { ...existing, id, type: 'panel', data: { ...data, onOpen: canOpen ? () => openNode(id) : undefined, openLabel: id === 'dataset' ? '更换训练数据集' : id === 'model' ? '更换基础模型' : id === 'config' ? '编辑超参数配置' : `查看${data.title}`, openText: ['dataset', 'model', 'config'].includes(id) ? '编辑' : '查看详情' }, position: existing?.position || saved?.position || positions[id], className: `node-${id}` }
     }))
-  }, [task, nodeData, setNodes])
+  }, [task, nodeData, isCurrentRun, openNode, setNodes])
 
   useEffect(() => {
     const flowStatus = isCurrentRun ? viewTask?.status : undefined
@@ -414,12 +423,6 @@ function TaskCanvasInner() {
       className: `flow-edge flow-${flowStatus || 'idle'}`,
     })))
   }, [viewTask?.status, isCurrentRun, motionAllowed, setEdges])
-
-  const onConnect = useCallback((connection: Connection) => setEdges((items) => addEdge({
-    ...connection, markerEnd: { type: MarkerType.ArrowClosed },
-    animated: motionAllowed && currentIsActive && edgeIsActive(connection.source, connection.target, viewTask?.status),
-    className: `flow-edge flow-${isCurrentRun ? viewTask?.status || 'idle' : 'idle'}`,
-  }, items)), [setEdges, motionAllowed, currentIsActive, isCurrentRun, viewTask?.status])
 
   async function action(kind: 'start' | 'stop' | 'resume' | 'retry') {
     if (mutationPending.current) return
@@ -560,7 +563,7 @@ function TaskCanvasInner() {
       </div>
     </header>
     <div className={`canvas-wrap flow-${isCurrentRun ? viewTask.status : 'history'}`}>
-      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeDoubleClick={(_, node) => { if (isCurrentRun && node.id === 'config') setEditingParameters(true); if (isCurrentRun && (node.id === 'dataset' || node.id === 'model')) setEditingResource(node.id); if (node.id === 'logs') setViewingLogs(true); if (node.id === 'trace') setViewingTrace(true); if (node.id === 'inference') { setTestingArtifact(bestWeight || null); setModelTestOpen(true); } if (['runtime', 'status', 'metrics', 'artifacts', 'weights'].includes(node.id)) setDetailKind(node.id as CanvasDetailKind) }} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
+      <ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} nodesConnectable={false} edgesFocusable={false} edgesReconnectable={false} onNodeDoubleClick={(_, node) => openNode(node.id)} fitView fitViewOptions={{ padding: 0.15 }} minZoom={0.25} maxZoom={1.6}>
         <Background color={resolvedTheme === 'light' ? '#c8d8df' : '#24313d'} gap={24} size={1} />
         <MiniMap pannable zoomable nodeColor={(node) => node.id === 'status' ? (resolvedTheme === 'light' ? '#159a78' : '#70f0bd') : (resolvedTheme === 'light' ? '#b7cad6' : '#344657')} maskColor={resolvedTheme === 'light' ? 'rgba(225,235,242,.72)' : 'rgba(5,9,13,.72)'} />
         <Controls showInteractive={false} />

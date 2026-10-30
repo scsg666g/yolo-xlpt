@@ -386,6 +386,7 @@ export interface ManagedDatasetReference {
   name: string
   status: string
   deleted: boolean
+  certainty?: 'confirmed' | 'possible'
 }
 
 export interface ManagedDataset {

@@ -18,7 +18,7 @@ const dataset = {
 
 // Render the actual component and run its effects with a small hook host. Network
 // responses and browser visibility are controlled; no live service is contacted.
-function page(api, { component = 'Datasets', props = {} } = {}) {
+function page(api, { component = 'Datasets', file = component, props = {} } = {}) {
   const slots = []; const effects = []; const timers = new Map(); const listeners = new Map()
   let index = 0; let timerId = 0; let tree
   const same = (a, b) => a && b && a.length === b.length && a.every((value, i) => Object.is(value, b[i]))
@@ -29,6 +29,7 @@ function page(api, { component = 'Datasets', props = {} } = {}) {
       return [slots[i].value, (value) => { slots[i].value = typeof value === 'function' ? value(slots[i].value) : value }]
     },
     useRef(value) { const i = index++; return slots[i] ||= { current: value } },
+    useId() { const i = index++; return (slots[i] ||= { value: `component-${i}` }).value },
     useMemo(work, deps) { const i = index++; if (!slots[i] || !same(slots[i].deps, deps)) slots[i] = { value: work(), deps }; return slots[i].value },
     useCallback(work, deps) { return react.useMemo(() => work, deps) },
     useEffect(work, deps) {
@@ -39,7 +40,7 @@ function page(api, { component = 'Datasets', props = {} } = {}) {
   const document = { hidden: false, body: { style: { overflow: '' } }, activeElement: null, addEventListener: (name, work) => listeners.set(`document:${name}`, work), removeEventListener: name => listeners.delete(`document:${name}`) }
   const window = { addEventListener: (name, work) => listeners.set(`window:${name}`, work), removeEventListener: name => listeners.delete(`window:${name}`) }
   const module = { exports: {} }
-  vm.runInNewContext(compiled(`../src/components/${component}.tsx`), {
+  vm.runInNewContext(compiled(`../src/components/${file}.tsx`), {
     exports: module.exports, AbortController, Error, Map, Set, Date, URLSearchParams, document, window,
     crypto: { randomUUID: () => `request-${++timerId}` },
     setTimeout: work => { const id = ++timerId; timers.set(id, work); return id }, clearTimeout: id => timers.delete(id),
@@ -102,6 +103,25 @@ test('referenced external cards open registration removal and in-page adoption d
   modal = view.find(item => item.type === 'DatasetRegistrationModal')
   assert.equal(modal.props.mode, 'adopt')
   view.dispose()
+})
+
+test('remote references distinguish confirmed and possible while old records remain readable', async () => {
+  const remote = { ...dataset, node_id: 'remote-node', can_delete: false, references: [
+    { id: 'confirmed', name: '直接路径', status: 'completed', certainty: 'confirmed' },
+    { id: 'possible', name: '外部 YAML', status: 'stopped', certainty: 'possible' },
+    { id: 'legacy', name: '旧记录', status: 'draft' },
+  ] }
+  const view = page(baseApi({ datasetEntries: async () => [remote] }))
+  try {
+    await view.settle()
+    const card = view.find(item => item.type === 'article' && item.props?.className === 'dataset-card')
+    assert.match(visibleText(card), /1 个确定引用 · 1 个可能引用 · 1 个引用（旧版未分类）/)
+    assert.match(visibleText(card), /可能引用：平台暂无法核实远程 YAML/)
+    assert.match(visibleText(card), /旧版引用未标明确定程度/)
+    assert.match(visibleText(card), /确定引用 · completed/)
+    assert.match(visibleText(card), /可能引用 · stopped/)
+    assert.match(visibleText(card), /旧记录引用（未分类）/)
+  } finally { view.dispose() }
 })
 
 test('registration removal submits once, preserves errors in the modal and never calls file deletion', async () => {
@@ -321,4 +341,19 @@ test('dataset provenance never substitutes current information into old attempts
   assert.equal(value.node_id, 'node-b'); assert.equal(value.fingerprint, 'a'.repeat(64))
   assert.equal(value.config_sha256, null); assert.equal(value.captured_at, null)
   assert.deepEqual(Object.keys(value.stats), ['train_images']); assert.equal(value.classes.length, 1)
+})
+
+test('dataset storage keeps a successful location refresh when node metadata fails', async () => {
+  const location = { id: 'location-a', node_id: 'local', name: '本机数据盘', path: 'datasets',
+    status: 'ready', enabled: true, is_default: true, details: {} }
+  const status = []
+  const view = page({
+    datasetLocations: async () => [location],
+    computeNodes: async () => { throw new Error('节点暂不可用') },
+  }, { component: 'DatasetStorageSettings', file: 'DatasetStorage', props: { onStatusChange: state => status.push(state) } })
+  await view.settle()
+  assert.match(visibleText(view.find(item => item.props?.className === 'dataset-storage-toggle')), /1 个位置/)
+  assert.match(visibleText(view.find(item => item.props?.role === 'alert')), /服务器列表：节点暂不可用/)
+  assert.equal(status.at(-1)?.checkedAt instanceof Date, true)
+  view.dispose()
 })

@@ -197,6 +197,7 @@ export function ModelTests() {
   const detailController = useRef<AbortController | null>(null)
   const reuseController = useRef<AbortController | null>(null)
   const historyLoadMoreController = useRef<AbortController | null>(null)
+  const historyDetailRef = useRef<HTMLElement>(null)
   const historyItemsRef = useRef<ModelTestSummary[]>([])
   const historyTailCursor = useRef(0)
   const historyRefreshVersion = useRef(0)
@@ -956,7 +957,7 @@ export function ModelTests() {
       <div><span className="eyebrow">MODEL TEST CENTER</span><h1>模型测试</h1><p>选择本机路径、训练产物或远程 Agent 模型，上传图片完成独立测试。</p></div>
       <div className="model-tests-view-tabs" role="tablist" aria-label="模型测试视图">
         <button type="button" role="tab" aria-selected={view === 'new'} className={view === 'new' ? 'active' : ''} onClick={() => setView('new')}><Sparkles size={16} />新建测试</button>
-        <button type="button" role="tab" aria-selected={view === 'history'} className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}><History size={16} />全局历史<span>{history.length}</span></button>
+        <button type="button" role="tab" aria-selected={view === 'history'} className={view === 'history' ? 'active' : ''} onClick={() => setView('history')}><History size={16} />全局历史<span title={`当前筛选已加载 ${history.length} 条${historyCursor ? '，可继续加载更多' : ''}`}>已加载 {history.length}</span></button>
       </div>
     </header>
 
@@ -1085,7 +1086,7 @@ export function ModelTests() {
                 {!collapsed && <div className="model-test-history-group-items">{section.items.map((item) => {
                   const objects = item.files.reduce((sum, file) => sum + (file.prediction_count ?? file.detections ?? 0), 0)
                   const detected = item.files.filter((file) => (file.prediction_count ?? file.detections ?? 0) > 0).length
-                  return <button type="button" key={item.id} className={`model-test-history-item${selectedSummary?.id === item.id ? ' selected' : ''}`} onClick={() => { setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError('') }}>
+                  return <button type="button" key={item.id} className={`model-test-history-item${selectedSummary?.id === item.id ? ' selected' : ''}`} onClick={() => { setHistorySelectedId(item.id); setHistoryImage(0); setHistoryError(''); if (window.matchMedia('(max-width: 680px)').matches) window.requestAnimationFrame(() => historyDetailRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })) }}>
                     <HistoryImagePreview test={item} />
                     <div><span className={`model-test-history-status ${item.status}`}><i />{modelTestStatusLabels[item.status]}</span><time>{modelTestDate(item.created_at)}</time></div>
                     <strong>{modelTestWeightName(item)}<small>{sourceDescription(item)}</small></strong>
@@ -1097,7 +1098,7 @@ export function ModelTests() {
             })}{historyCursor && <button type="button" className="button ghost model-test-history-more" disabled={historyLoading || historyLoadingMore} onClick={() => void loadMoreHistory()}>{historyLoadingMore ? <LoaderCircle className="spin" size={14} /> : <History size={14} />}加载更多</button>}</div>
               : <div className="model-test-history-empty"><History size={30} /><strong>暂无匹配的测试记录</strong><span>新建测试或调整上方筛选条件</span></div>}
         </aside>
-        <section className="model-test-history-detail">
+        <section ref={historyDetailRef} className="model-test-history-detail" aria-label="测试记录详情">
           {selectedHistory ? <>
             <div className="model-test-history-heading"><div><span>{modelTestDate(selectedHistory.created_at)}</span><h3>{modelTestWeightName(selectedHistory)}</h3><p>{sourceDescription(selectedHistory)} · {modelTestParameterText(selectedHistory)}</p></div>{historyDetailLoading && <LoaderCircle className="spin" size={18} />}</div>
             <div className="model-test-history-source-strip">

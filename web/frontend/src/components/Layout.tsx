@@ -98,7 +98,7 @@ export function Layout() {
   const [storageCheckedAt, setStorageCheckedAt] = useState<Date | null>(null)
   const [diagnosticsNotice, setDiagnosticsNotice] = useState('')
   const [datasetRefreshToken, setDatasetRefreshToken] = useState(0)
-  const [datasetSettingsStatus, setDatasetSettingsStatus] = useState<DatasetSettingsStatus>({ loading: false, checkedAt: null, locationCheckedAt: null, error: '' })
+  const [datasetSettingsStatus, setDatasetSettingsStatus] = useState<DatasetSettingsStatus>({ loading: false, checkedAt: null, locationCheckedAt: null, error: '', policyDirty: false, policySaving: false })
   const healthController = useRef<AbortController | null>(null)
   const nodesController = useRef<AbortController | null>(null)
   const storageController = useRef<AbortController | null>(null)
@@ -289,8 +289,23 @@ export function Layout() {
     if (settingsSection === 'storage') void loadStorageHealth()
   }
 
+  function canLeaveSettingsSection() {
+    if (settingsSection !== 'datasets') return true
+    if (datasetSettingsStatus.policySaving) {
+      window.alert('数据集处理设置正在保存，请等待保存完成。')
+      return false
+    }
+    if (datasetSettingsStatus.policyDirty && !window.confirm('数据集处理设置有未保存的修改。离开后这些修改将丢失，是否继续？')) return false
+    setDatasetSettingsStatus((current) => ({ ...current, policyDirty: false }))
+    return true
+  }
+
   function closeSettings() {
-    setSettingsOpen(false)
+    if (canLeaveSettingsSection()) setSettingsOpen(false)
+  }
+
+  function selectSettingsSection(section: SettingsSection) {
+    if (section !== settingsSection && canLeaveSettingsSection()) setSettingsSection(section)
   }
 
   function handleSettingsKeyDown(event: React.KeyboardEvent<HTMLElement>) {
@@ -390,7 +405,7 @@ export function Layout() {
             <nav className="settings-nav" aria-label="平台设置分类">
               <span className="settings-nav-heading">设置分类</span>
               {settingsSections.map(({ id, label, icon: Icon }) => (
-                <button key={id} type="button" className={settingsSection === id ? 'active' : ''} aria-current={settingsSection === id ? 'page' : undefined} aria-controls="platform-settings-content" onClick={() => setSettingsSection(id)}>
+                <button key={id} type="button" className={settingsSection === id ? 'active' : ''} aria-current={settingsSection === id ? 'page' : undefined} aria-controls="platform-settings-content" onClick={() => selectSettingsSection(id)}>
                   <Icon size={16} aria-hidden="true" />
                   <span>{label}</span>
                   {id === 'services' && <i className={`settings-nav-status ${health.phase}`} title={serviceLabel} aria-label={serviceLabel} />}

@@ -148,6 +148,7 @@ export function ExperimentCompare() {
   const [groups, setGroups] = useState<TaskGroup[]>([])
   const [metrics, setMetrics] = useState<Record<string, MetricPoint[]>>({})
   const [metricErrors, setMetricErrors] = useState<Record<string, string>>({})
+  const [metricUpdatedAt, setMetricUpdatedAt] = useState<Record<string, number>>({})
   const [includeIncomplete, setIncludeIncomplete] = useState(false)
   const [detailRunId, setDetailRunId] = useState<string | null>(null)
   const [runDetails, setRunDetails] = useState<Record<string, CompareRunDetails>>({})
@@ -163,10 +164,15 @@ export function ExperimentCompare() {
   const [evaluationMode, setEvaluationMode] = useState<'latest' | 'best'>('latest')
   const [search, setSearch] = useState('')
   const [pickerOpen, setPickerOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement>(null)
+  const pickerButtonRef = useRef<HTMLButtonElement>(null)
+  const pickerSearchRef = useRef<HTMLInputElement>(null)
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(initialCollapsedGroups)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<ComparisonRun | null>(null)
+  const modalOpenRef = useRef(false)
+  modalOpenRef.current = Boolean(detailRunId || deleteTarget)
   const [deleteError, setDeleteError] = useState('')
   const [deletePreview, setDeletePreview] = useState<RunDeletionPreview | null>(null)
   const [deletePreviewRevision, setDeletePreviewRevision] = useState(0)
@@ -278,6 +284,7 @@ export function ExperimentCompare() {
         setRunDetails((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
         setMetrics((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
         setMetricErrors((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
+        setMetricUpdatedAt((current) => Object.fromEntries(Object.entries(current).filter(([id]) => !deletingIds.has(id))))
         if (detailRunId && deletingIds.has(detailRunId)) {
           detailRequest.current?.abort()
           detailRequest.current = null
@@ -297,7 +304,18 @@ export function ExperimentCompare() {
         if (result.status === 'fulfilled') points[id] = result.value
         else failures[id] = result.reason instanceof Error ? result.reason.message : '指标加载失败'
       })
-      setMetrics(points); setMetricErrors(failures); setError('')
+      // Keep the last successful snapshot visible through transient polling failures.
+      // The error state explicitly labels it as cached, never as fresh data.
+      const selectedSet = new Set(selectedItems.map((item) => item.id))
+      setMetrics((current) => ({
+        ...Object.fromEntries(Object.entries(current).filter(([id]) => selectedSet.has(id))),
+        ...points,
+      }))
+      setMetricUpdatedAt((current) => ({
+        ...Object.fromEntries(Object.entries(current).filter(([id]) => selectedSet.has(id))),
+        ...Object.fromEntries(Object.keys(points).map((id) => [id, Date.now()])),
+      }))
+      setMetricErrors(failures); setError('')
     } catch (reason) {
       if (!controller.signal.aborted && version === requestVersion.current) setError(reason instanceof Error ? reason.message : '加载对比数据失败')
     } finally {
@@ -335,6 +353,29 @@ export function ExperimentCompare() {
   useEffect(() => () => detailRequest.current?.abort(), [])
 
   useEffect(() => {
+    if (!pickerOpen) return
+    const frame = window.requestAnimationFrame(() => pickerSearchRef.current?.focus())
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key !== 'Escape' || event.isComposing || modalOpenRef.current) return
+      event.preventDefault()
+      setPickerOpen(false)
+      pickerButtonRef.current?.focus()
+    }
+    function closeOutside(event: PointerEvent) {
+      if (modalOpenRef.current) return
+      if (!(event.target instanceof Node) || pickerRef.current?.contains(event.target) || pickerButtonRef.current?.contains(event.target)) return
+      setPickerOpen(false)
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    document.addEventListener('pointerdown', closeOutside)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      document.removeEventListener('keydown', closeOnEscape)
+      document.removeEventListener('pointerdown', closeOutside)
+    }
+  }, [pickerOpen])
+
+  useEffect(() => {
     try { window.localStorage.setItem(collapsedGroupsKey, JSON.stringify([...collapsedGroups])) } catch { /* Storage may be unavailable. */ }
   }, [collapsedGroups])
 
@@ -363,6 +404,11 @@ export function ExperimentCompare() {
       return next
     })
     setMetricErrors((current) => {
+      const next = { ...current }
+      delete next[id]
+      return next
+    })
+    setMetricUpdatedAt((current) => {
       const next = { ...current }
       delete next[id]
       return next
@@ -535,6 +581,7 @@ export function ExperimentCompare() {
   const chartPointCount = chartPointCounts.reduce((total, count) => total + count, 0)
   const chartRunsLoading = selected.filter((item) => metrics[item.id] === undefined && !metricErrors[item.id]).length
   const chartRunsWithErrors = selected.filter((item) => Boolean(metricErrors[item.id])).length
+  const chartRunsWithRetainedData = selected.filter((item) => Boolean(metricErrors[item.id]) && metrics[item.id] !== undefined).length
   const chartRunsWithoutData = chartPointCounts.filter((count, index) => count === 0 && metrics[selected[index].id] !== undefined && !metricErrors[selected[index].id]).length
   const chartRunsWithSinglePoint = chartPointCounts.filter((count) => count === 1).length
   const selectedMetricLabel = metricOptions.find((option) => option.key === effectiveMetricKey)?.label || effectiveMetricKey
@@ -542,7 +589,8 @@ export function ExperimentCompare() {
     chartRunsLoading && chartPointCount > 0 ? `${chartRunsLoading} 个运行的曲线数据仍在加载，当前先显示已加载结果` : '',
     chartRunsWithSinglePoint ? `${chartRunsWithSinglePoint} 个运行目前只有 1 个验证点，下一轮完成后将形成趋势线` : '',
     chartRunsWithoutData ? `${chartRunsWithoutData} 个运行尚无“${selectedMetricLabel}”指标` : '',
-    chartRunsWithErrors ? `${chartRunsWithErrors} 个运行的曲线数据加载失败` : '',
+    chartRunsWithRetainedData ? `${chartRunsWithRetainedData} 个运行本次刷新失败，曲线仍显示上次成功读取的数据，非实时值` : '',
+    chartRunsWithErrors > chartRunsWithRetainedData ? `${chartRunsWithErrors - chartRunsWithRetainedData} 个运行的曲线数据尚未成功加载` : '',
   ].filter(Boolean).join('；')
   const chartEmptyMessage = chartRunsLoading
     ? '正在加载指标曲线…'
@@ -601,10 +649,10 @@ export function ExperimentCompare() {
 
   return <div className="page compare-page" style={experimentLayout}>
     <div className="compare-cleanup-actions"><AttemptDeletionHistory /></div>
-    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较任意历史 Attempt 的训练配置、收敛趋势和指标。</p></div><button className="button primary" onClick={() => pickerOpen ? setPickerOpen(false) : openPicker()}><Layers3 size={16} />选择运行 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
-    {pickerOpen && <div className="compare-picker">
-      <header><div><strong>选择参与对比的训练运行</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；可选择每个任务的任意历史 Attempt</span></div><div className="picker-header-actions"><button className="picker-done" onClick={() => setPickerOpen(false)}>完成</button><button className="icon-button" onClick={() => setPickerOpen(false)}><X size={18} /></button></div></header>
-      <div className="compare-picker-search"><Search size={15} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务、模型或 Attempt" /></div>
+    <header className="page-header compare-header"><div><span className="eyebrow">EXPERIMENT ANALYSIS</span><h1>实验对比</h1><p>并排比较任意历史 Attempt 的训练配置、收敛趋势和指标。</p></div><button ref={pickerButtonRef} type="button" className="button primary" aria-expanded={pickerOpen} aria-controls="compare-run-picker" onClick={() => pickerOpen ? setPickerOpen(false) : openPicker()}><Layers3 size={16} />选择运行 <span className="selection-count">{selected.length}/{compareLimit}</span><ChevronDown size={15} /></button></header>
+    {pickerOpen && <div ref={pickerRef} id="compare-run-picker" className="compare-picker" role="region" aria-label="选择参与对比的训练运行">
+      <header><div><strong>选择参与对比的训练运行</strong><span>已选择 {selectedIds.length} 个，最多同时选择 {compareLimit} 个；可选择每个任务的任意历史 Attempt</span></div><div className="picker-header-actions"><button type="button" className="picker-done" onClick={() => { setPickerOpen(false); pickerButtonRef.current?.focus() }}>完成</button><button type="button" className="icon-button" aria-label="关闭运行选择" onClick={() => { setPickerOpen(false); pickerButtonRef.current?.focus() }}><X size={18} /></button></div></header>
+      <div className="compare-picker-search"><Search size={15} /><input ref={pickerSearchRef} aria-label="搜索训练运行" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务、模型或 Attempt" /></div>
       <label className="compare-incomplete-filter"><input type="checkbox" checked={includeIncomplete} onChange={(event) => setIncludeIncomplete(event.target.checked)} /><span>显示失败、已停止和已中断运行</span><small>当前筛选另有 {hiddenIncompleteCount} 个未选</small></label>
       <div className="compare-picker-list">{groupedExperiments.length ? groupedExperiments.map((group) => {
         const collapsed = collapsedGroups.has(group.key)
@@ -682,11 +730,11 @@ export function ExperimentCompare() {
         <div className="comparison-table metric-comparison-table"><table style={{ minWidth: 170 + selected.length * 220 }}>
           <thead><tr><th scope="col">指标</th>{selected.map((item, index) => <th scope="col" key={item.id} style={{ '--experiment-color': palette[index] } as React.CSSProperties}><div className="metric-experiment-heading"><i style={{ background: palette[index] }} /><span>{item.task.name}<small>Attempt {String(item.run.attempt_number).padStart(3, '0')}</small></span></div><button className={`metric-baseline-button ${item.id === baselineRun?.id ? 'active' : ''}`} aria-pressed={item.id === baselineRun?.id} aria-label={`将 ${item.task.name} Attempt ${String(item.run.attempt_number).padStart(3, '0')} 设为基准`} onClick={() => setBaselineId(item.id)}>{item.id === baselineRun?.id ? <><Check size={12} />基准实验</> : '设为基准'}</button></th>)}</tr></thead>
           <tbody>
-            <tr><th scope="row">训练状态</th>{selected.map((item) => <td key={item.id}><span className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</span>{metricErrors[item.id] && <small className="metric-load-error" title={metricErrors[item.id]}>曲线数据加载失败</small>}</td>)}</tr>
+            <tr><th scope="row">训练状态</th>{selected.map((item) => <td key={item.id}><span className={`status ${item.run.status}`}>{statusLabel(item.run.status)}</span>{metricErrors[item.id] && <small className="metric-load-error" title={metricErrors[item.id]}>{metrics[item.id] === undefined ? '曲线数据加载失败' : `指标刷新失败 · 保留上次数据（${new Date(metricUpdatedAt[item.id]).toLocaleString('zh-CN')}）`}</small>}</td>)}</tr>
             <tr><th scope="row">已记录 / 计划轮数</th>{selected.map((item) => <td key={item.id}>{item.view.completed_epochs} / {item.view.epochs}</td>)}</tr>
             {evaluationMode === 'best' && <tr><th scope="row">指标对应轮次</th>{selected.map((item) => {
               const point = evaluationPoints[item.id]
-              return <td key={item.id}>{metricErrors[item.id] ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : point ? `第 ${point.epoch} 轮` : '暂无数据'}</td>
+              return <td key={item.id}>{metricErrors[item.id] && metrics[item.id] === undefined ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : point ? `第 ${point.epoch} 轮` : '暂无数据'}</td>
             })}</tr>}
             {summaryMetricRows.map((row) => {
               const values = selected.map((item) => displayedMetric(evaluationValues(item), row.key))
@@ -699,8 +747,8 @@ export function ExperimentCompare() {
               const label = `${evaluationMode === 'latest' ? '最新' : '最佳轮次'}${row.unit === 'points' ? ' ' : ''}${row.label}`
               return <tr key={row.key}><th scope="row"><span>{label}</span><small className="metric-direction">{primaryMetricKeys.has(row.key) ? '主指标 · ' : ''}{direction === 'higher' ? '↑ 越高越好' : direction === 'lower' ? '↓ 越低越好 · 辅助参考' : '仅展示差值'}{hasIncompleteSelected ? ' · 最优仅比较已完成运行' : ''}</small></th>{selected.map((item, index) => <MetricComparisonCell key={item.id} value={values[index]} baselineValue={baselineValue} baseline={item.id === baselineRun?.id} baselineComplete={baselineRun?.run.status === 'completed'} complete={item.run.status === 'completed'} best={best !== null && item.run.status === 'completed' && values[index] === best} tied={tied} row={{ ...row, direction }} comparisonEnabled={comparisonEnabled} />)}</tr>
             })}
-            <tr><th scope="row">历史最佳主指标</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : bestMapLabel(metrics[item.id], item.view.task_type)}</td>)}</tr>
-            <tr><th scope="row">累计训练耗时</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : elapsedLabel(metrics[item.id]?.at(-1)?.elapsed)}</td>)}</tr>
+            <tr><th scope="row">历史最佳主指标</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] && metrics[item.id] === undefined ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : bestMapLabel(metrics[item.id], item.view.task_type)}</td>)}</tr>
+            <tr><th scope="row">累计训练耗时</th>{selected.map((item) => <td key={item.id}>{metricErrors[item.id] && metrics[item.id] === undefined ? '加载失败' : metrics[item.id] === undefined ? '加载中…' : elapsedLabel(metrics[item.id]?.at(-1)?.elapsed)}</td>)}</tr>
             <tr className="metric-dataset-row"><th scope="row">数据集配置</th>{selected.map((item) => <td key={item.id} title={item.view.data_path}>{item.view.data_path}</td>)}</tr>
           </tbody>
         </table></div>

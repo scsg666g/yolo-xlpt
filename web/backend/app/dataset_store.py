@@ -353,10 +353,12 @@ def operation_read(op, db=None):
 
 
 def reference_rows(db, entry, context=None):
+    certainty_by_id = {}
     if entry.node_id == 'local':
         tasks = dataset_references(db, str(Path(entry.path) / 'data.yaml'),
             local_tasks=context['tasks_by_node'].get('local', []) if context else None,
             historical=context['historical_by_node'].get('local', {}) if context else None)
+        certainty_by_id = {task.id: 'confirmed' for task in tasks}
     else:
         # We cannot open an unregistered remote YAML at the centre. Treat those
         # paths conservatively as potential aliases instead of guessing no refs.
@@ -370,6 +372,7 @@ def reference_rows(db, entry, context=None):
                     or_(TrainingRun.execution_node_id == entry.node_id,
                         TrainingRun.execution_node_id.is_(None) & (task.execution_node_id == entry.node_id)))))
             paths = [task.data_path if task.execution_node_id == entry.node_id else None, *historical]
+            certainty = None
             for raw in paths:
                 if not raw:
                     continue
@@ -377,9 +380,15 @@ def reference_rows(db, entry, context=None):
                 known = (context['entries_by_path'].get((entry.node_id, str(p.parent))) if context else
                     db.scalar(select(DatasetEntry).where(DatasetEntry.node_id == entry.node_id,
                                                         DatasetEntry.path == str(p.parent), DatasetEntry.status != 'deleted')))
-                if p == root or root in p.parents or ((not known or p.name != 'data.yaml' or not known.details.get('config_sha256')) and p.suffix in {'.yaml', '.yml'}):
-                    tasks.append(task)
+                if p == root or root in p.parents:
+                    certainty = 'confirmed'
                     break
+                if ((not known or p.name != 'data.yaml' or not known.details.get('config_sha256'))
+                        and p.suffix in {'.yaml', '.yml'}):
+                    certainty = 'possible'
+            if certainty:
+                tasks.append(task)
+                certainty_by_id[task.id] = certainty
     # Runtime data may differ from the editable task and resume request. Keep
     # historical/recycled attempts protected using the actual command/args too.
     known_ids = {task.id for task in tasks}
@@ -389,7 +398,7 @@ def reference_rows(db, entry, context=None):
     runs = (context['runs_by_node'].get(entry.node_id, []) if context else
             db.scalars(select(TrainingRun).where(node_filter)))
     for run in runs:
-        if run.task_id in known_ids:
+        if run.task_id in known_ids and certainty_by_id.get(run.task_id) == 'confirmed':
             continue
         task = context['tasks_by_id'].get(run.task_id) if context else db.get(TrainingTask, run.task_id)
         if not task:
@@ -403,9 +412,12 @@ def reference_rows(db, entry, context=None):
                      or PurePosixPath(entry.path) in PurePosixPath(path).parents
                      for path in run_data_paths(run)):
             continue
-        tasks.append(task)
-        known_ids.add(task.id)
-    return [{'id': t.id, 'name': t.name, 'status': t.status, 'deleted': bool(t.deleted_at)} for t in tasks]
+        certainty_by_id[task.id] = 'confirmed'
+        if task.id not in known_ids:
+            tasks.append(task)
+            known_ids.add(task.id)
+    return [{'id': t.id, 'name': t.name, 'status': t.status, 'deleted': bool(t.deleted_at),
+             'certainty': certainty_by_id[t.id]} for t in tasks]
 
 
 def remote_config_guards(db, node_id, source_path):

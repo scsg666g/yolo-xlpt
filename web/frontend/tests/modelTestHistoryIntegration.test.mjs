@@ -7,7 +7,7 @@ import ts from 'typescript'
 // Run actual component effects with deterministic network and timers. JSX stays
 // inspectable and no browser, service, user data or generated disk files are used.
 function historyView(component, api, query = 'runs=run-a') {
-  const slots = []; const effects = []; const timers = new Map()
+  const slots = []; const effects = []; const timers = new Map(); const listeners = new Map()
   let index = 0; let timerId = 0; let tree
   const same = (left, right) => left && right && left.length === right.length && left.every((value, i) => Object.is(value, right[i]))
   const react = {
@@ -27,9 +27,16 @@ function historyView(component, api, query = 'runs=run-a') {
   const window = {
     localStorage: { getItem: () => null, setItem: () => {} },
     setTimeout(work) { const id = ++timerId; timers.set(id, work); return id }, clearTimeout: id => timers.delete(id),
+    requestAnimationFrame(work) { work(); return ++timerId }, cancelAnimationFrame() {},
+    matchMedia: () => ({ matches: false }),
     addEventListener() {}, removeEventListener() {}, location: { search: `?${query}` },
   }
-  const document = { activeElement: null, hidden: false, addEventListener() {}, removeEventListener() {} }
+  const document = { activeElement: null, hidden: false,
+    addEventListener(name, work) { listeners.set(name, work) },
+    removeEventListener(name, work) { if (listeners.get(name) === work) listeners.delete(name) },
+  }
+  const clipboard = { copied: '', writeText: async function(value) { this.copied = value } }
+  const navigator = { clipboard, matchMedia: window.matchMedia }
   const searchParams = new URLSearchParams(query)
   const cache = new Map()
   const jsx = { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) }
@@ -53,7 +60,7 @@ function historyView(component, api, query = 'runs=run-a') {
     const compiled = ts.transpileModule(source, { compilerOptions: {
       target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX,
     } }).outputText
-    vm.runInNewContext(compiled, { exports: module.exports, require: load, window, document, AbortController, URL, URLSearchParams })
+    vm.runInNewContext(compiled, { exports: module.exports, require: load, window, document, navigator, AbortController, URL, URLSearchParams })
     return module.exports
   }
   const Component = load(component)[component]
@@ -77,10 +84,11 @@ function historyView(component, api, query = 'runs=run-a') {
   const settle = async () => { for (let pass = 0; pass < 5; pass++) { for (let i = 0; i < 50; i++) await Promise.resolve(); render() } }
   render()
   return {
-    findAll, settle,
+    findAll, settle, clipboard,
     async click(node) { assert.ok(node, 'control exists'); node.props.onClick(); render(); await settle() },
     async change(node, value) { assert.ok(node, 'control exists'); node.props.onChange({ target: { value } }); render(); await settle() },
     async tick() { const work = [...timers.values()]; timers.clear(); work.forEach(next => next()); await settle() },
+    keyDown(key) { listeners.get('keydown')?.({ key, isComposing: false, preventDefault() {} }); render() },
     dispose() { for (const item of slots) item?.cleanup?.() },
   }
 }
@@ -115,8 +123,16 @@ for (const component of ['ModelTests', 'ModelTestModal']) {
       await view.settle()
       if (component === 'ModelTests') await view.click(view.findAll(node => node.props.role === 'tab')[1])
       assert.equal(rows(view).length, 50)
+      if (component === 'ModelTests') {
+        const historyTab = view.findAll(node => node.props.role === 'tab' && node.props['aria-selected'] === true)[0]
+        assert.match(JSON.stringify(historyTab.props.children), /已加载 50/)
+      }
       await view.click(view.findAll(node => node.type === 'button' && node.props.className?.includes('model-test-history-more'))[0])
       assert.equal(rows(view).length, 100)
+      if (component === 'ModelTests') {
+        const historyTab = view.findAll(node => node.props.role === 'tab' && node.props['aria-selected'] === true)[0]
+        assert.match(JSON.stringify(historyTab.props.children), /已加载 100/)
+      }
       await view.click(rows(view)[80])
       assert.equal(workspace(view).props.test.id, 'test-80')
       assert.equal(workspace(view).props.test.status, 'queued')
@@ -226,5 +242,44 @@ test('comparison refreshes same-Epoch metric corrections and opening picker fetc
     await view.click(view.findAll(node => node.type === 'button' && node.props.className === 'button primary')[0])
     assert.ok(catalogRequests > beforeOpen, 'opening picker requests the full catalog')
     assert.equal(view.findAll(node => node.props.className === 'compare-run-select').length, 3)
+  } finally { view.dispose() }
+})
+
+test('comparison keeps the last curve after a failed poll, marks it stale and closes picker with Escape', async () => {
+  const task = { id: 'task-a', name: '远程任务', task_type: 'detect', model_path: 'models/base.pt', data_path: 'datasets/data.yaml',
+    epochs: 10, batch: 2, imgsz: 32, device: '0', workers: 0, config: {}, current_run_id: 'run-a', group_id: null }
+  const run = { id: 'run-a', task_id: task.id, status: 'completed', attempt_number: 1, launch_mode: 'fresh',
+    model_path: task.model_path, data_path: task.data_path, parameter_snapshot: {}, updated_at: 'same',
+    completed_epochs: 1, latest_metrics: { 'metrics/mAP50(B)': 0.4 }, progress: 100, execution_node_id: 'remote-a' }
+  let failFirst = false
+  const view = historyView('ExperimentCompare', {
+    taskGroups: async () => [],
+    experiments: async (_offset, _signal, ids) => {
+      const runs = [run, { ...run, id: 'run-b', attempt_number: 2 }]
+      const selected = ids ? runs.filter(item => ids.includes(item.id)) : runs
+      return { items: selected.map(item => ({ task: { ...task }, run: { ...item } })), total: selected.length, limit: 200 }
+    },
+    runMetrics: async (_task, id) => {
+      if (failFirst && id === 'run-a') throw new Error('远程请求超时')
+      return [{ epoch: 1, values: { 'metrics/mAP50(B)': id === 'run-a' ? 0.4 : 0.5 } }]
+    },
+  }, 'runs=run-a,run-b')
+  try {
+    await view.settle()
+    const chart = () => view.findAll(node => node.type === 'LineChartView')[0].props.option
+    assert.equal(chart().series[0].data[0][1], 0.4)
+    failFirst = true
+    await view.tick()
+    assert.equal(chart().series[0].data[0][1], 0.4, 'last successfully fetched data remains visible')
+    const warning = view.findAll(node => node.props.className === 'metric-load-error')[0]
+    assert.match(JSON.stringify(warning.props.children), /保留上次数据/)
+    assert.match(JSON.stringify(view.findAll(node => node.props.className === 'compare-chart-note')[0]?.props.children), /非实时值/)
+    const picker = view.findAll(node => node.props.className === 'button primary')[0]
+    assert.equal(picker.props['aria-expanded'], false)
+    await view.click(picker)
+    assert.equal(view.findAll(node => node.props.className === 'button primary')[0].props['aria-expanded'], true)
+    assert.equal(view.findAll(node => node.props.className === 'compare-picker')[0].props.role, 'region')
+    view.keyDown('Escape')
+    assert.equal(view.findAll(node => node.props.className === 'button primary')[0].props['aria-expanded'], false)
   } finally { view.dispose() }
 })

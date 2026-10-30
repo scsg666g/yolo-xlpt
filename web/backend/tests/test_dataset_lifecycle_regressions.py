@@ -221,6 +221,27 @@ def test_catalogue_reference_queries_are_batched_without_losing_historical_refs(
     assert all(not entry['can_delete'] for entry in catalogue.values())
 
 
+def test_remote_dataset_reference_certainty_preserves_conservative_delete_block(env):
+    client, factory, root, _ = env
+    identity = node(factory, root / 'remote')
+    directory = root / 'remote' / 'training'
+    with factory() as db:
+        db.add(DatasetEntry(id='remote-certainty', location_id='remote-location', node_id=identity,
+                            name='training', path=str(directory), ownership='managed', status='ready',
+                            details={'config_sha256': 'verified'}))
+        db.add(TrainingTask(id='direct-ref', name='direct', execution_node_id=identity,
+                            model_path='model.pt', data_path=str(directory / 'data.yaml'), status='stopped'))
+        db.add(TrainingTask(id='possible-ref', name='possible', execution_node_id=identity,
+                            model_path='model.pt', data_path=str(root / 'remote' / 'external.yaml'), status='stopped'))
+        db.commit()
+    entry = next(entry for entry in entries(client) if entry['id'] == 'remote-certainty')
+    refs = {ref['id']: ref for ref in entry['references']}
+    assert refs['direct-ref']['certainty'] == 'confirmed'
+    assert refs['possible-ref']['certainty'] == 'possible'
+    assert entry['can_delete'] is False
+    assert client.get('/api/dataset-storage/datasets/remote-certainty/delete-preview').json()['can_delete'] is False
+
+
 def test_explicit_local_node_reference_blocks_dataset_removal(env):
     client, factory, _, _ = env
     entry, folder, _ = setup_entry(env, False)

@@ -975,6 +975,12 @@ def test_prepare_refetches_same_size_corrupt_succeeded_cache(
         expected = (Path(payload["run_dir"]) / "weights/last.pt").read_bytes()
         cached.write_bytes(b"x" * len(expected))
 
+    # A previously prepared download must not serve altered bytes, even if
+    # the caller skips the prepare endpoint on the next request.
+    blocked_download = client.get(f"/api/artifacts/{weight['id']}/download")
+    assert blocked_download.status_code == 409
+    assert "缓存校验失败" in blocked_download.json()["detail"]
+
     replacement = client.post(prepare_url).json()
     assert replacement["status"] == "pending"
     assert replacement["operation_id"] != work["id"]

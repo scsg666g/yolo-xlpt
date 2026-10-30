@@ -48,6 +48,9 @@ body:has(.datasets-page) { min-width: 0; }
 .dataset-reference-state.free i { background: #70f0bd; }
 .dataset-reference-state.referenced { color: #a8c9f7; background: #152238; }
 .dataset-reference-state.referenced i { background: #79aef5; }
+.dataset-reference-state.possible { color: #d4a95b; background: color-mix(in srgb, #d4a95b 12%, var(--panel)); }
+.dataset-reference-state.possible i { background: #d4a95b; }
+.dataset-reference-note { margin: 7px 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 
 .dataset-metrics { margin: 16px 0 12px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border: 1px solid #1d2a34; border-radius: 7px; overflow: hidden; }
 .dataset-metrics > div { min-width: 0; padding: 10px 8px; border-left: 1px solid #1d2a34; }
@@ -59,6 +62,11 @@ body:has(.datasets-page) { min-width: 0; }
 .dataset-path { min-width: 0; min-height: 34px; padding: 7px 9px; display: flex; align-items: center; gap: 7px; border-radius: 6px; color: #718391; background: #091016; }
 .dataset-path svg { flex: 0 0 auto; }
 .dataset-path code { min-width: 0; overflow: hidden; font: 400 10px/1.5 "DM Mono", monospace; text-overflow: ellipsis; white-space: nowrap; }
+.dataset-path > button { width: 25px; height: 25px; flex: 0 0 auto; display: grid; place-items: center; margin-left: auto; border: 1px solid var(--line); border-radius: 5px; color: var(--text); background: var(--panel); cursor: pointer; }
+.dataset-path > button:hover, .dataset-path > button:focus-visible { color: var(--green); border-color: var(--green); }
+.dataset-path-details { margin: 5px 2px 0; color: var(--muted); font-size: 11px; }
+.dataset-path-details summary { width: max-content; max-width: 100%; cursor: pointer; }
+.dataset-path-details > code { display: block; margin-top: 6px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; color: var(--text); font: 400 11px/1.5 "DM Mono", monospace; overflow-wrap: anywhere; user-select: text; }
 .dataset-classes, .dataset-references { margin-top: 13px; }
 .dataset-section-heading { min-height: 25px; display: flex; align-items: center; gap: 6px; color: #7c8c99; }
 .dataset-section-heading strong { color: #aebbc5; font-size: 11px; }

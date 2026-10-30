@@ -518,6 +518,25 @@ def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
     return path
 
 
+TRAINING_MODEL_SUFFIXES = frozenset({'.pt', '.yaml', '.yml'})
+
+
+def validate_training_model_path(raw: str, roots: list[Path]) -> Path:
+    """Reject inference-only exports before queuing a local training attempt."""
+    path = validate_input_path(raw, roots, '模型文件')
+    if not path.is_file() or path.suffix.lower() not in TRAINING_MODEL_SUFFIXES:
+        raise ValueError('训练模型必须是 .pt 权重或 .yaml/.yml 模型配置文件')
+    return path
+
+
+def validate_remote_training_model_path(raw: str) -> str:
+    """Check only portable path syntax; the remote Agent checks its filesystem."""
+    path = Path(raw.strip())
+    if not path.is_absolute() or '\x00' in raw or path.suffix.lower() not in TRAINING_MODEL_SUFFIXES:
+        raise ValueError('远程训练模型必须是服务器上的绝对 .pt 或 .yaml/.yml 文件路径')
+    return str(path)
+
+
 def training_dataset_roots(raw: str) -> list[Path]:
     """Retain validated path access after removing a catalogue registration."""
     from .models import DatasetEntry, DatasetOperation

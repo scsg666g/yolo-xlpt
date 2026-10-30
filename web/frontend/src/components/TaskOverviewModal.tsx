@@ -144,27 +144,36 @@ const TaskOverviewNode = memo(function TaskOverviewNode({ data }: NodeProps<Over
 
 const nodeTypes = { taskOverview: TaskOverviewNode }
 
+function overviewColumns(width: number): number {
+  return Math.max(1, Math.min(3, Math.floor((Math.min(width - 32, 1120) - 20) / 320)))
+}
+
 function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query }: Pick<Props, 'mode' | 'tasks' | 'nodeNames' | 'onNavigate'> & { query: string }) {
   const { fitView, setViewport } = useReactFlow<OverviewNode>()
   const nodesInitialized = useNodesInitialized()
   const lastCentered = useRef<string | null>(null)
-  const columns = useRef(Math.max(1, Math.min(3, Math.floor((Math.min(window.innerWidth - 32, 1120) - 20) / 320))))
+  const [columns, setColumns] = useState(() => overviewColumns(window.innerWidth))
+  useEffect(() => {
+    const updateColumns = () => setColumns(overviewColumns(window.innerWidth))
+    window.addEventListener('resize', updateColumns)
+    return () => window.removeEventListener('resize', updateColumns)
+  }, [])
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const visibleTasks = useMemo(() => tasks.filter((task) => matchesMode(task, mode) && (!normalizedQuery || task.name.toLocaleLowerCase().includes(normalizedQuery) || taskServerName(task, nodeNames).toLocaleLowerCase().includes(normalizedQuery))), [tasks, mode, nodeNames, normalizedQuery])
   // Positions depend on membership, not live status values. Removing a task
   // compacts the grid; ordinary polling keeps the same layout and viewport.
-  const membershipKey = visibleTasks.map((task) => task.id).join('\u001f')
+  const membershipKey = columns + ':' + visibleTasks.map((task) => task.id).join('\u001f')
   const nodes = useMemo<OverviewNode[]>(() => visibleTasks.map((task, index) => ({
     id: task.id,
     type: 'taskOverview',
-    position: { x: index % columns.current * 328, y: Math.floor(index / columns.current) * 234 },
+    position: { x: index % columns * 328, y: Math.floor(index / columns) * 234 },
     data: { task, serverName: taskServerName(task, nodeNames), onNavigate },
     draggable: false,
     selectable: false,
     // React Flow disables pointer events on static nodes without node handlers.
     // Keep the card link interactive while the canvas remains pannable.
     style: { pointerEvents: 'all' },
-  })), [visibleTasks, nodeNames, onNavigate])
+  })), [visibleTasks, nodeNames, onNavigate, columns])
 
   useEffect(() => {
     if (membershipKey === lastCentered.current || (visibleTasks.length <= 6 && !nodesInitialized)) return

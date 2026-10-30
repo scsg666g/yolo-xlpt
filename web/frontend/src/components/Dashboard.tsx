@@ -5,6 +5,7 @@ import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Copy, C
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
 import { batchPath } from '../batchHistory'
+import { reorderVisibleGroupTasks } from '../taskOrder'
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { DeletionJob, TaskDeletionPreview, TaskGroup, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
@@ -142,6 +143,7 @@ export function Dashboard() {
   const [groupEditor, setGroupEditor] = useState<GroupEditorState | null>(null)
   const [moveTarget, setMoveTarget] = useState<TrainingTask | null>(null)
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set())
+  const [filteredCollapsedGroups, setFilteredCollapsedGroups] = useState<Set<string>>(() => new Set())
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
@@ -394,8 +396,11 @@ export function Dashboard() {
   const attention = tasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
   const selectedDeletionJob = deleteTarget ? latestDeletionJobs.get(deleteTarget.id) || null : null
 
-  function toggleGroup(key: string) {
-    setExpandedGroups((current) => {
+  useEffect(() => { setFilteredCollapsedGroups(new Set()) }, [search, filter])
+
+  function toggleGroup(key: string, filtering: boolean) {
+    const setGroups = filtering ? setFilteredCollapsedGroups : setExpandedGroups
+    setGroups((current) => {
       const next = new Set(current)
       if (next.has(key)) next.delete(key)
       else next.add(key)
@@ -435,35 +440,23 @@ export function Dashboard() {
   }
 
   function reorderedTasks(draggedId: string, targetId: string, after = false): TrainingTask[] {
-    if (draggedId === targetId) return tasks
-    const taskById = new Map(tasks.map((task) => [task.id, task]))
-    // A task can disappear while the pointer is held because polling updates the list.
-    // Keep the current order intact instead of creating an undefined card.
-    if (!taskById.has(draggedId) || !taskById.has(targetId)) return tasks
-    const visibleIds = new Set(filtered.map((task) => task.id))
-    const visibleOrder = filtered.map((task) => task.id).filter((id) => id !== draggedId)
-    const targetIndex = visibleOrder.indexOf(targetId)
-    if (targetIndex < 0) return tasks
-    visibleOrder.splice(targetIndex + (after ? 1 : 0), 0, draggedId)
-    const replacement = visibleOrder
-      .map((id) => taskById.get(id))
-      .filter((task): task is TrainingTask => Boolean(task))
-    if (replacement.length !== visibleIds.size) return tasks
-    let cursor = 0
-    return tasks.map((task) => visibleIds.has(task.id) ? replacement[cursor++] : task)
+    return reorderVisibleGroupTasks(tasks, filtered, groups.map((group) => group.id), draggedId, targetId, after)
   }
 
-  async function dropTask(targetId: string) {
-    if (!draggingId || draggingId === targetId || ordering) return
+  async function moveTask(sourceId: string, targetId: string) {
+    if (sourceId === targetId || ordering || orderRequest.current) return
     const previous = tasks
-    const sourceTask = tasks.find((task) => task.id === draggingId)
+    const sourceTask = tasks.find((task) => task.id === sourceId)
     const targetTask = tasks.find((task) => task.id === targetId)
-    if (!sourceTask || !targetTask || sourceTask.group_id !== targetTask.group_id) {
+    const knownGroups = new Set(groups.map((group) => group.id))
+    const sourceGroup = sourceTask?.group_id && knownGroups.has(sourceTask.group_id) ? sourceTask.group_id : null
+    const targetGroup = targetTask?.group_id && knownGroups.has(targetTask.group_id) ? targetTask.group_id : null
+    if (!sourceTask || !targetTask || sourceGroup !== targetGroup) {
       setDraggingId(null); setDragOverId(null)
       setError('请使用文件夹按钮将任务移动到其他分组')
       return
     }
-    const sourceIndex = filtered.findIndex((task) => task.id === draggingId)
+    const sourceIndex = filtered.findIndex((task) => task.id === sourceId)
     const targetIndex = filtered.findIndex((task) => task.id === targetId)
     if (sourceIndex < 0 || targetIndex < 0) {
       setDraggingId(null); setDragOverId(null)
@@ -472,14 +465,14 @@ export function Dashboard() {
     }
     // A card dragged toward a later position is placed after the target; a card
     // dragged toward an earlier position is placed before it.
-    const next = reorderedTasks(draggingId, targetId, sourceIndex < targetIndex)
+    const next = reorderedTasks(sourceId, targetId, sourceIndex < targetIndex)
     if (next === previous) {
       setDraggingId(null); setDragOverId(null)
       setError('任务列表刚刚发生变化，请重新拖动')
       return
     }
     setTasks(next)
-    setDraggingId(null); setDragOverId(null); dragMoved.current = true
+    setDraggingId(null); setDragOverId(null); dragMoved.current = Boolean(draggingId)
     setOrdering(true); orderRequest.current = true; setError('')
     try {
       await api.reorderTasks(next.map((task) => task.id))
@@ -490,6 +483,10 @@ export function Dashboard() {
       orderRequest.current = false
       setOrdering(false)
     }
+  }
+
+  function dropTask(targetId: string) {
+    if (draggingId) void moveTask(draggingId, targetId)
   }
 
   async function taskAction(event: React.MouseEvent, taskId: string, action: () => Promise<unknown>) {
@@ -756,12 +753,12 @@ export function Dashboard() {
     </div>
   }
 
-  function renderTaskCard(task: TrainingTask) {
+  function renderTaskCard(task: TrainingTask, index: number, groupTasks: TrainingTask[]) {
     const completionNote = earlyStoppingExplanation(task)
     const epochProgress = trainingEpochProgress(task)
     const batch = batchPath(task.batch, task.batch_history)
-    return <article key={task.id} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { const source = tasks.find((item) => item.id === draggingId); if (source?.group_id !== task.group_id) return; event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); void dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
-      <div className="task-card-top"><span className="task-drag-handle" title="按住拖动调整组内顺序" aria-label="按住拖动调整组内顺序"><GripVertical size={16} /></span><span className={`status ${task.status}`} title={completionNote || undefined}>{statusIcon(task.status)}{trainingStatusLabel(task)}</span></div>
+    return <article key={task.id} tabIndex={0} aria-label={`训练任务 ${task.name}，按回车打开训练画布`} draggable={!ordering} className={`task-card ${draggingId === task.id ? 'is-dragging' : ''} ${dragOverId === task.id ? 'is-drag-over' : ''}`} onClick={() => { if (dragMoved.current) { dragMoved.current = false; return } navigate(`/tasks/${task.id}/canvas`) }} onKeyDown={(event) => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); navigate(`/tasks/${task.id}/canvas`) } }} onDragStart={(event) => { setDraggingId(task.id); setDragOverId(null); dragMoved.current = true; event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', task.id) }} onDragOver={(event) => { const source = tasks.find((item) => item.id === draggingId); if (source?.group_id !== task.group_id) return; event.preventDefault(); if (draggingId && draggingId !== task.id) setDragOverId(task.id); event.dataTransfer.dropEffect = 'move' }} onDrop={(event) => { event.preventDefault(); dropTask(task.id) }} onDragEnd={() => { setDraggingId(null); setDragOverId(null) }}>
+      <div className="task-card-top"><div className="task-order-controls"><span className="task-drag-handle" title="按住拖动调整组内顺序" aria-hidden="true"><GripVertical size={16} /></span><button type="button" disabled={ordering || index === 0} title="前移一个位置" aria-label={`前移任务：${task.name}`} onClick={(event) => { event.stopPropagation(); if (index > 0) void moveTask(task.id, groupTasks[index - 1].id) }}>↑</button><button type="button" disabled={ordering || index === groupTasks.length - 1} title="后移一个位置" aria-label={`后移任务：${task.name}`} onClick={(event) => { event.stopPropagation(); if (index < groupTasks.length - 1) void moveTask(task.id, groupTasks[index + 1].id) }}>↓</button></div><span className={`status ${task.status}`} title={completionNote || undefined}>{statusIcon(task.status)}{trainingStatusLabel(task)}</span></div>
       <div className="task-name-row"><h3 title={task.name}>{task.name}</h3><button type="button" className="icon-button task-rename-button" disabled={taskActionIds.has(task.id)} title="重命名" aria-label={`重命名任务：${task.name}`} onClick={(event) => { event.stopPropagation(); setRenameTarget(task) }}><Pencil size={14} /></button></div><p className="task-path">{task.model_path.split('/').pop()} · {task.task_type}</p>
       <div className="task-execution-row"><p className="task-path" title={task.execution_node_id || 'local'}>执行服务器：{task.execution_node_id ? nodeNames[task.execution_node_id] || `远程 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'}</p><span className={`task-batch-path ${batch.adjusted ? 'adjusted' : ''}`} title={batch.title}>{batch.cardLabel}</span></div>
       <div className="progress-heading"><span>Epoch {task.completed_epochs} / {trainingEpochTarget(task)}</span><strong title="实际完成轮数占目标轮数的比例">轮数进度 {Math.round(epochProgress)}%</strong></div>
@@ -809,7 +806,7 @@ export function Dashboard() {
       {loading ? <div className="empty">正在加载任务…</div> : loadError && !tasks.length ? <div className="empty">暂时无法获取任务列表，请重新加载。</div> : filtered.length === 0 && (search.trim() || filter !== 'all') ? <div className="empty"><Cpu size={28} /><strong>没有匹配的训练任务</strong><span>请调整搜索关键词或状态筛选。</span></div> : tasks.length === 0 && groups.length === 0 ? <div className="empty"><Cpu size={28} /><strong>还没有训练任务</strong><span>可以先建立模型分组，再创建第一次训练。</span></div> :
         <div className="task-group-list">{groupedTasks.map((view) => {
           const isForcedOpen = Boolean(search.trim()) || filter !== 'all'
-          const isCollapsed = !expandedGroups.has(view.key) && !isForcedOpen
+          const isCollapsed = isForcedOpen ? filteredCollapsedGroups.has(view.key) : !expandedGroups.has(view.key)
           const activeCount = view.allTasks.filter((task) => activeStatuses.includes(task.status)).length
           const completedCount = view.allTasks.filter((task) => task.status === 'completed').length
           const attentionCount = view.allTasks.filter((task) => ['failed', 'interrupted'].includes(task.status)).length
@@ -820,7 +817,7 @@ export function Dashboard() {
           return <section className={`task-group ${isCollapsed ? 'is-collapsed' : ''}`} key={view.key}>
             <header className="task-group-header">
               <div className="task-group-heading">
-                <button type="button" className="task-group-toggle" aria-expanded={!isCollapsed} aria-controls={`task-group-${view.key}`} onClick={() => toggleGroup(view.key)}>
+                <button type="button" className="task-group-toggle" aria-expanded={!isCollapsed} aria-controls={`task-group-${view.key}`} onClick={() => toggleGroup(view.key, isForcedOpen)}>
                   <ChevronDown size={18} /><span className="task-group-icon"><Folder size={17} /></span><span className="task-group-title"><strong>{view.name}</strong><small>{view.tasks.length === view.allTasks.length ? `${view.allTasks.length} 个任务` : `${view.tasks.length}/${view.allTasks.length} 个任务`}</small></span>
                 </button>
                 <div className="task-group-actions">
@@ -830,7 +827,7 @@ export function Dashboard() {
               </div>
               <div className="task-group-summary"><span className={activeCount ? 'active' : ''}>进行中 <strong>{activeCount}</strong></span><span>已完成 <strong>{completedCount}</strong></span>{attentionCount > 0 && <span className="attention">需关注 <strong>{attentionCount}</strong></span>}<span title={mapDescription}>{mapSummary.mixedMetrics ? mapSummary.label : `最高 ${mapSummary.label}`} <strong>{mapSummary.highest ? mapSummary.highest.value.toFixed(4) : '—'}</strong></span>{mapSummary.companion && <span title={mapDescription}>最高 {mapSummary.label} 对应 {mapSummary.companion.label} <strong>{mapSummary.companion.value?.toFixed(4) ?? '—'}</strong></span>}{mapSummary.mixedSources && <span title="有指标的任务来自不同服务器、数据集路径或指标类型，数值汇总仅供参考，不作为模型优劣排名。">多来源，仅供参考</span>}{!mapSummary.highest && !mapSummary.mixedMetrics && <span>暂无有效指标</span>}</div>
             </header>
-            {!isCollapsed && <div id={`task-group-${view.key}`} className="task-group-body">{view.tasks.length ? <div className="task-grid">{view.tasks.map(renderTaskCard)}</div> : <div className="task-group-empty">分组中还没有任务，可在新建任务时选择该分组。</div>}</div>}
+            {!isCollapsed && <div id={`task-group-${view.key}`} className="task-group-body">{view.tasks.length ? <div className="task-grid">{view.tasks.map((task, index) => renderTaskCard(task, index, view.tasks))}</div> : <div className="task-group-empty">分组中还没有任务，可在新建任务时选择该分组。</div>}</div>}
           </section>
         })}</div>}
     </section>

@@ -11,6 +11,8 @@ export interface DatasetSettingsStatus {
   checkedAt: Date | null
   locationCheckedAt: Date | null
   error: string
+  policyDirty: boolean
+  policySaving: boolean
 }
 
 type PolicyDraft = Record<keyof DatasetPolicy, string>
@@ -70,8 +72,8 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
   const onStatusChangeRef = useRef(onStatusChange)
   useEffect(() => { onStatusChangeRef.current = onStatusChange }, [onStatusChange])
   useEffect(() => {
-    onStatusChangeRef.current?.({ loading: loading || saving || locationStatus.loading, checkedAt, locationCheckedAt: locationStatus.checkedAt, error: error || locationStatus.error })
-  }, [loading, saving, locationStatus, checkedAt, error])
+    onStatusChangeRef.current?.({ loading: loading || saving || locationStatus.loading, checkedAt, locationCheckedAt: locationStatus.checkedAt, error: error || locationStatus.error, policyDirty: dirty, policySaving: saving })
+  }, [loading, saving, locationStatus, checkedAt, error, dirty])
 
   const acceptData = useCallback((next: DatasetSettingsResponse) => {
     dataRef.current = next

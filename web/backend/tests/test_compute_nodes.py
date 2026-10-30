@@ -962,6 +962,31 @@ def test_remote_task_create_remains_compatible_with_old_agent_without_output_roo
                        headers=headers(credential)).json()["task"] is not None
 
 
+def test_remote_retry_rejects_inference_export_without_creating_attempt(monitoring_client):
+    client, factory = monitoring_client
+    credential = create(client)
+    node_id = credential["node"]["id"]
+    report_output_roots(client, credential, ["/remote/runs"])
+    with factory() as db:
+        task = TrainingTask(
+            id="legacy-inference-model", name="legacy inference model", task_type="detect",
+            execution_node_id=node_id, model_path="/remote/export.onnx",
+            data_path="/remote/data.yaml", config={"remote_output_root": "/remote/runs"},
+        )
+        db.add(task)
+        db.flush()
+        previous = create_training_run(db, task, "fresh")
+        previous.status = "failed"
+        task.status = "failed"
+        db.commit()
+    response = client.post("/api/tasks/legacy-inference-model/retry")
+    assert response.status_code == 422
+    assert "远程训练模型必须" in response.json()["detail"]
+    with factory() as db:
+        task = db.get(TrainingTask, "legacy-inference-model")
+        assert task.status == "failed" and len(task.runs) == 1
+
+
 @pytest.mark.parametrize(("action", "status"), [("start", "draft"), ("retry", "failed"), ("resume", "stopped")])
 def test_remote_launch_rechecks_output_roots_without_creating_attempt(monitoring_client, action, status):
     client, factory = monitoring_client

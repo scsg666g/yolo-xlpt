@@ -58,6 +58,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers, i
     async function load() {
       if (!active || running || document.hidden) return
       running = true; controller = new AbortController()
+      let nextInterval = (summary?.active || 0) > 0 ? 2000 : 15_000
       const params = new URLSearchParams({ page: String(page), page_size: '20', status, kind, node_id: server, q: search })
       if (snapshotRef.current) params.set('before', snapshotRef.current)
       if (after) params.set('after', dayBoundary(after))
@@ -67,19 +68,20 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers, i
           api.datasetOperationPage(params, controller.signal),
           showingTarget && initialTarget.operationId ? api.datasetOperation(initialTarget.operationId, controller.signal).catch(() => null) : null,
         ])
+        if (result.items.some((item) => ['pending', 'running', 'committing'].includes(item.status)) || (target && ['pending', 'running', 'committing'].includes(target.status))) nextInterval = 2000
         if (active) {
           if (!snapshotRef.current) { snapshotRef.current = result.snapshot; setSnapshot(result.snapshot) }
           setData(result); setError(''); setLoading(false)
           if (target) setTargetOperation(target)
           if (result.page !== page) setPage(result.page)
         }
-      } catch (e) { if (active && !controller.signal.aborted) { setError(e instanceof Error ? e.message : '操作记录加载失败'); setLoading(false) } }
-      finally { running = false; if (active) timer = setTimeout(load, 2000) }
+      } catch (e) { if (active && !controller.signal.aborted) { setError(e instanceof Error ? e.message : '操作记录加载失败'); setLoading(false); nextInterval = 5000 } }
+      finally { running = false; if (active) timer = setTimeout(load, nextInterval) }
     }
     function visible() { if (!document.hidden) { clearTimeout(timer); void load() } }
     setLoading(true); void load(); document.addEventListener('visibilitychange', visible)
     return () => { active = false; controller?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
-  }, [page, status, kind, server, search, after, through, refresh, initialTarget?.operationId, showingTarget])
+  }, [page, status, kind, server, search, after, through, refresh, initialTarget?.operationId, showingTarget, summary?.active])
   useEffect(() => {
     if (document.activeElement === document.body) ref.current?.focus()
   }, [data, ref])

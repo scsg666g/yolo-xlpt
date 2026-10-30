@@ -10,6 +10,7 @@ import {
   History,
   Settings2,
   CheckCircle2,
+  Copy,
   Database,
   FolderOpen,
   HardDrive,
@@ -66,6 +67,7 @@ export function Datasets() {
   const [error, setError] = useState('')
   const [loadError, setLoadError] = useState('')
   const [notice, setNotice] = useState('')
+  const [pathCopyError, setPathCopyError] = useState('')
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<DatasetFilter>('all')
   const [uploading, setUploading] = useState(false)
@@ -109,6 +111,31 @@ export function Datasets() {
   function showOperation(dataset: ManagedDataset) {
     setHistoryTarget({ operationId: dataset.blocking_operation_id || '', name: dataset.name, nodeId: dataset.node_id })
     setHistoryOpen(true)
+  }
+
+  async function copyDatasetPath(path: string) {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(path)
+      } else {
+        // Clipboard API needs a secure context; retain support for private HTTP deployments.
+        const field = document.createElement('textarea')
+        field.value = path
+        field.readOnly = true
+        field.style.position = 'fixed'
+        field.style.opacity = '0'
+        document.body.appendChild(field)
+        try {
+          field.select()
+          if (!document.execCommand('copy')) throw new Error('浏览器未允许复制')
+        } finally { field.remove() }
+      }
+      setPathCopyError('')
+      setNotice('数据集路径已复制')
+    } catch {
+      setNotice('')
+      setPathCopyError('复制失败；请展开路径后手动选择复制')
+    }
   }
 
   const loadDatasets = useCallback(async () => {
@@ -393,6 +420,7 @@ export function Datasets() {
     </header>
 
     {notice && <div className="dataset-feedback success" role="status"><CheckCircle2 size={17} />{notice}</div>}
+    {pathCopyError && <div className="dataset-feedback" role="alert">{pathCopyError}</div>}
     {(error || loadError) && <div className="dataset-feedback error" role="alert"><AlertTriangle size={17} /><span>{error || loadError}</span><button type="button" onClick={() => { setError(''); setLoadError('') }} aria-label="关闭错误提示"><X size={15} /></button></div>}
 
     {!!deletionReceipts.length && <section className="dataset-deletion-receipts" aria-label="本次删除状态">{deletionReceipts.map(receipt => {
@@ -434,6 +462,14 @@ export function Datasets() {
       : visibleDatasets.length ? <section className="dataset-grid" aria-label="数据集列表">
         {visibleDatasets.map((dataset) => {
           const referenced = dataset.references.length > 0
+          const possibleReferences = dataset.references.filter((reference) => reference.certainty === 'possible').length
+          const confirmedReferences = dataset.references.filter((reference) => reference.certainty === 'confirmed').length
+          const legacyReferences = dataset.references.length - confirmedReferences - possibleReferences
+          const referenceSummary = [
+            confirmedReferences ? confirmedReferences + ' 个确定引用' : '',
+            possibleReferences ? possibleReferences + ' 个可能引用' : '',
+            legacyReferences ? legacyReferences + ' 个引用（旧版未分类）' : '',
+          ].filter(Boolean).join(' · ')
           const classCount = dataset.stats.classes ?? dataset.classes.length
           const operation = dataset.blocking_operation_id ? operationDetails[dataset.blocking_operation_id] : undefined
           const deletingEntry = deletionReceipts.some(receipt => receipt.datasetId === dataset.id && !['completed', 'failed', 'cancelled'].includes(operationDetails[receipt.operationId]?.status))
@@ -443,7 +479,7 @@ export function Datasets() {
               <div className="dataset-card-title"><h2 title={dataset.name}>{dataset.name}</h2><span>{dataset.node_name || (dataset.node_id === 'local' ? '本机' : '远程')} · {dataset.ownership === 'managed' ? '平台管理' : '外部登记'} · {formatCreatedAt(dataset.created_at)}</span></div>
               <div className="dataset-card-actions">
                 <button type="button" className="dataset-reload" aria-label={`重新加载数据集：${dataset.name}`} title={dataset.blocking_operation_id ? '请先完成或在操作记录中重试／取消未完成操作' : '重新读取文件并校验统计，成功后更新卡片；不会修改源文件'} disabled={!!refreshing || !!dataset.blocking_operation_id || dataset.status !== 'ready'} onClick={() => void refreshDataset(dataset)}><RefreshCw size={14} className={refreshing === dataset.id || (dataset.blocking_operation_kind === 'refresh' && dataset.refresh_status !== 'failed') ? 'spin' : ''} /><span>重新加载</span></button>
-                <span className={`dataset-reference-state ${dataset.blocking_operation_id ? 'busy' : referenced ? 'referenced' : 'free'}`}><i />{dataset.blocking_operation_id ? '操作未完成' : referenced ? `${dataset.references.length} 个引用` : dataset.ownership === 'managed' ? '无引用' : '外部文件'}</span>
+                <span className={`dataset-reference-state ${dataset.blocking_operation_id ? 'busy' : referenced ? possibleReferences ? 'possible' : 'referenced' : 'free'}`}><i />{dataset.blocking_operation_id ? '操作未完成' : referenced ? referenceSummary : dataset.ownership === 'managed' ? '无引用' : '外部文件'}</span>
               </div>
             </header>
 
@@ -460,7 +496,8 @@ export function Datasets() {
               <div><span>占用空间</span><strong>{formatBytes(dataset.total_bytes)}</strong></div>
             </div>
 
-            <div className="dataset-path" title={dataset.directory}><FolderOpen size={14} /><code>{dataset.directory}</code></div>
+            <div className="dataset-path" title={dataset.directory}><FolderOpen size={14} /><code>{dataset.directory}</code><button type="button" aria-label={`复制 ${dataset.name} 的数据集路径`} title="复制完整路径" onClick={() => void copyDatasetPath(dataset.directory)}><Copy size={14} /></button></div>
+            <details className="dataset-path-details"><summary>查看完整路径</summary><code>{dataset.directory}</code></details>
 
             {(dataset.can_unregister === false || dataset.blocking_operation_id) && <div className="dataset-delete-block" role="status">
               <AlertTriangle size={14} /><div><strong>登记操作暂不可用</strong><p>{dataset.unregister_block_reason || '该数据集有未完成操作，请先完成、重试或取消。'}</p>
@@ -479,8 +516,9 @@ export function Datasets() {
 
             {dataset.references.length > 0 && <div className="dataset-references">
               <div className="dataset-section-heading"><Link2 size={14} /><strong>引用任务</strong><span>{dataset.references.length}</span></div>
+              {(possibleReferences > 0 || legacyReferences > 0) && <p className="dataset-reference-note">{possibleReferences > 0 && '可能引用：平台暂无法核实远程 YAML 的真实内容；为保护数据，仍会阻止删除。'}{legacyReferences > 0 && '旧版引用未标明确定程度，继续按原有规则保护文件。'}</p>}
               <div>{dataset.references.map((reference) => <span key={reference.id} title={reference.deleted ? '该任务位于回收站' : undefined}>
-                <strong>{reference.name}</strong><em>{reference.deleted ? '回收站' : statusLabel(reference.status)}</em>
+                <strong>{reference.name}</strong><em>{reference.certainty === 'possible' ? '可能引用 · ' : reference.certainty === 'confirmed' ? '确定引用 · ' : '引用（未分类）· '}{reference.deleted ? '回收站' : statusLabel(reference.status)}</em>
               </span>)}</div>
             </div>}
 

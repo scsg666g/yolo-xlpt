@@ -41,7 +41,73 @@ from app.services import (
     sync_artifacts,
     sync_metrics,
     training_environment,
+    validate_training_model_path,
+    validate_remote_training_model_path,
 )
+
+
+def test_training_model_validation_filters_exports_without_reading_remote_files(tmp_path: Path):
+    root = tmp_path / 'models'
+    root.mkdir()
+    for suffix in ('.pt', '.yaml', '.yml', '.onnx', '.pth'):
+        (root / f'model{suffix}').write_bytes(b'fixture')
+    for suffix in ('.pt', '.yaml', '.yml'):
+        path = root / f'model{suffix}'
+        assert validate_training_model_path(str(path), [root]) == path
+        assert validate_remote_training_model_path(f'/remote/models/model{suffix}') == f'/remote/models/model{suffix}'
+    for suffix in ('.onnx', '.pth'):
+        with pytest.raises(ValueError, match='训练模型必须'):
+            validate_training_model_path(str(root / f'model{suffix}'), [root])
+        with pytest.raises(ValueError, match='远程训练模型必须'):
+            validate_remote_training_model_path(f'/remote/models/model{suffix}')
+    with pytest.raises(ValueError, match='训练模型必须'):
+        validate_training_model_path(str(root), [root])
+    with pytest.raises(ValueError, match='远程训练模型必须'):
+        validate_remote_training_model_path('models/model.pt')
+
+
+def test_training_resource_list_excludes_inference_only_models(tmp_path: Path, monkeypatch):
+    root = tmp_path / 'models'
+    root.mkdir()
+    for suffix in ('.pt', '.yaml', '.yml', '.onnx', '.pth'):
+        (root / f'model{suffix}').write_bytes(b'fixture')
+    monkeypatch.setattr(main_module, 'MODEL_ROOTS', [root])
+    monkeypatch.setattr(main_module, 'DATASET_ROOTS', [tmp_path / 'datasets'])
+    session = make_session(tmp_path)
+    try:
+        names = {Path(item['path']).name for item in main_module.resources(session)['models']}
+        assert names == {'model.pt', 'model.yaml', 'model.yml'}
+    finally:
+        session.close()
+
+
+def test_local_task_create_rejects_inference_only_model_without_persisting(tmp_path: Path, monkeypatch):
+    model_root = tmp_path / 'models'
+    model_root.mkdir()
+    export = model_root / 'export.onnx'
+    export.write_bytes(b'fixture')
+    data_root = tmp_path / 'datasets'
+    data_root.mkdir()
+    dataset = data_root / 'data.yaml'
+    dataset.write_text('path: .\ntrain: images/train\nval: images/val\nnames: [object]\n', encoding='utf-8')
+    monkeypatch.setattr(main_module, 'MODEL_ROOTS', [model_root])
+    monkeypatch.setattr(main_module, 'DATASET_ROOTS', [data_root])
+    session = make_session(tmp_path)
+
+    def override_db():
+        yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        response = TestClient(app).post('/api/tasks', json={
+            'name': 'export should be rejected', 'model_path': str(export), 'data_path': str(dataset),
+        })
+        assert response.status_code == 422
+        assert '训练模型必须' in response.json()['detail']
+        assert session.scalar(select(TrainingTask)) is None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
 
 
 def make_session(tmp_path: Path):
@@ -724,6 +790,8 @@ def test_remote_resource_update_rejects_invalid_or_active_changes(tmp_path: Path
         client = TestClient(app)
         invalid_payloads = [
             {},
+            {"model_path": "/remote/models/export.onnx"},
+            {"model_path": "relative/model.pt"},
             {"data_path": " \t\n "},
             {"data_path": "relative/data.yaml"},
             {"data_path": "/remote/datasets/\u0000bad.yaml"},

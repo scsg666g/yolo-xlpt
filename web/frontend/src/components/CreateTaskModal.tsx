@@ -7,6 +7,7 @@ import { remoteOutputPathError, remoteOutputRoots } from '../remoteOutputPaths'
 import { remoteTrainingDataPathError, trainingDataLabel } from '../trainingDataPaths'
 import { UploadDatasetModal } from './UploadDatasetModal'
 import { analyzeImportedParameters, definitionsFromCatalog, importDefinitions, ParameterImportResults, type DetectedParameter, type ImportDiagnostic } from './EditParametersModal'
+import { applyLocalResourceDefaults, defaultLocalDevice, type ResourceFieldEdits } from '../taskCreateDefaults'
 
 interface Props {
   open: boolean
@@ -33,6 +34,10 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
   const [registeredDatasets, setRegisteredDatasets] = useState<import('../types').ManagedDataset[]>([])
   const [form, setForm] = useState<TaskCreatePayload>(initial)
   const outputDrafts = useRef<Record<string, string>>({})
+  const resourceFieldEdits = useRef<ResourceFieldEdits>({ model_path: false, data_path: false, device: false })
+  const [resourceLoadError, setResourceLoadError] = useState('')
+  const [nodeLoadError, setNodeLoadError] = useState('')
+  const [datasetLoadError, setDatasetLoadError] = useState('')
   const [advanced, setAdvanced] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -59,17 +64,22 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
 
   useEffect(() => {
     if (!open) return
+    let active = true
+    setResources(null)
+    setNodes([])
+    setRegisteredDatasets([])
+    setResourceLoadError('')
+    setNodeLoadError('')
+    setDatasetLoadError('')
     api.resources().then((data) => {
+      if (!active) return
       setResources(data)
-      setForm((value) => ({
-        ...value,
-        model_path: value.model_path || data.models[0]?.path || '',
-        data_path: value.data_path || availableDatasets(data, value.task_type)[0]?.path || '',
-        device: data.gpus.length > 1 ? data.gpus.map((gpu) => gpu.index).join(',') : String(data.gpus[0]?.index ?? 'cpu'),
-      }))
-    }).catch((reason) => setError(reason.message))
-    api.computeNodes().then(setNodes).catch(() => setNodes([]))
-    api.datasetEntries().then(setRegisteredDatasets).catch(() => setRegisteredDatasets([]))
+      setResourceLoadError('')
+      setForm((value) => applyLocalResourceDefaults(value, data, resourceFieldEdits.current))
+    }).catch((reason) => { if (active) setResourceLoadError(reason instanceof Error ? reason.message : '本机资源请求失败') })
+    api.computeNodes().then((data) => { if (active) { setNodes(data); setNodeLoadError('') } }).catch((reason) => { if (active) { setNodes([]); setNodeLoadError(reason instanceof Error ? reason.message : '执行服务器请求失败') } })
+    api.datasetEntries().then((data) => { if (active) { setRegisteredDatasets(data); setDatasetLoadError('') } }).catch((reason) => { if (active) { setRegisteredDatasets([]); setDatasetLoadError(reason instanceof Error ? reason.message : '已登记数据集请求失败') } })
+    return () => { active = false }
   }, [open])
 
   useEffect(() => {
@@ -93,12 +103,17 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
 
   if (uploading) return <UploadDatasetModal initialNode={form.execution_node_id || 'local'} onClose={() => setUploading(false)} onUploaded={(result) => {
     setResources((current) => current ? { ...current, datasets: [...current.datasets.filter((file) => file.path !== result.resource.path), result.resource] } : { gpus: [], models: [], datasets: [result.resource], classification_datasets: [] })
+    resourceFieldEdits.current.data_path = true
     setForm((current) => ({ ...current, data_path: result.resource.path, execution_node_id: result.node_id === 'local' ? null : result.node_id || current.execution_node_id }))
     setUploaded(result); setError(''); setUploading(false)
   }} />
 
-  const update = <K extends keyof TaskCreatePayload>(key: K, value: TaskCreatePayload[K]) =>
+  const update = <K extends keyof TaskCreatePayload>(key: K, value: TaskCreatePayload[K]) => {
+    if (key === 'model_path') resourceFieldEdits.current.model_path = true
+    if (key === 'data_path') resourceFieldEdits.current.data_path = true
+    if (key === 'device') resourceFieldEdits.current.device = true
     setForm((current) => ({ ...current, [key]: value }))
+  }
 
   function openImport() { setImportText(''); setDetectedParameters([]); setImportDiagnostics([]); setSelectedImportKeys([]); setImportOpen(true) }
   function changeImportText(value: string) {
@@ -107,6 +122,7 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
   }
   function applyImportedParameters() {
     const selected = detectedParameters.filter((item) => selectedImportKeys.includes(item.key))
+    if (selected.some((item) => item.key === 'device')) resourceFieldEdits.current.device = true
     setForm((current) => {
       const next = { ...current, advanced: { ...current.advanced } }
       for (const item of selected) {
@@ -137,17 +153,19 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
     // Only an explicit node selection supplies a default; refreshed heartbeats
     // must not replace a directory that the user is editing.
     const output = id ? outputDrafts.current[id] ?? (roots.length === 1 ? roots[0] : '') : ''
+    resourceFieldEdits.current = { model_path: false, data_path: false, device: false }
     setForm((current) => ({
       ...current, execution_node_id: id,
       model_path: id ? '' : (resources?.models[0]?.path || ''),
       data_path: id ? '' : (availableDatasets(resources, current.task_type)[0]?.path || ''),
-      device: id ? '0' : String(resources?.gpus[0]?.index ?? 'cpu'),
+      device: id ? '0' : defaultLocalDevice(resources),
       remote_output_root: output,
     }))
   }
 
   function selectTaskType(taskType: string) {
     setUploaded(null)
+    resourceFieldEdits.current.data_path = false
     setForm((current) => ({
       ...current,
       task_type: taskType,
@@ -164,6 +182,7 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
       const task = await api.create({ ...form, remote_output_root: form.remote_output_root?.trim() })
       setForm(initial)
       outputDrafts.current = {}
+      resourceFieldEdits.current = { model_path: false, data_path: false, device: false }
       setUploaded(null); setImportOpen(false); setJsonOpen(false)
       onCreated(task)
     } catch (reason) {
@@ -179,6 +198,9 @@ export function CreateTaskModal({ open, groups, onClose, onCreated }: Props) {
         <header><div><span className="eyebrow">NEW TRAINING RUN</span><h2 id="create-task-title">创建训练任务</h2></div><button type="button" className="icon-button" aria-label="关闭创建任务窗口" disabled={submitting} onClick={onClose}><X size={20} /></button></header>
         <div className="modal-body">
           {error && <div className="alert error">{error}</div>}
+          {resourceLoadError && <div className="alert warning" role="alert">本机模型、数据集和 GPU 加载失败：{resourceLoadError}。本机任务暂无法选择资源，请关闭后重新打开窗口重试。</div>}
+          {nodeLoadError && <div className="alert warning" role="alert">执行服务器列表加载失败：{nodeLoadError}。远程服务器可能无法选择，请关闭后重新打开窗口重试。</div>}
+          {datasetLoadError && <div className="alert warning" role="alert">已登记数据集加载失败：{datasetLoadError}。远程路径仍可手动输入。</div>}
           <div className="form-grid">
             <label className="span-2">任务名称<input data-modal-initial-focus required value={form.name} onChange={(e) => update('name', e.target.value)} placeholder="例如：反光背心 YOLO26x 试验 02" /></label>
             <label className="span-2">训练分组<select value={form.group_id || ''} onChange={(e) => update('group_id', e.target.value || null)}><option value="">未分组</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select><small>将同一模型的多轮实验放在同一分组中，便于折叠和对比。</small></label>
