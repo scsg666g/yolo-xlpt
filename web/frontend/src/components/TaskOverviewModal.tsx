@@ -185,9 +185,10 @@ function normalizeEdges(layout: TaskWorkspaceModeLayout | undefined, validIds: S
   }))
 }
 
-function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onDirtyChange, onFeedback }: Omit<Pick<Props, 'mode' | 'tasks' | 'nodeNames'>, never> & {
+function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQueryChange, onDirtyChange, onFeedback }: Omit<Pick<Props, 'mode' | 'tasks' | 'nodeNames'>, never> & {
   onNavigate: () => boolean
   query: string
+  onQueryChange: (query: string) => void
   onDirtyChange: (dirty: boolean) => void
   onFeedback: (feedback: LayoutFeedback | null) => void
 }) {
@@ -381,11 +382,24 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onDirty
     if (!saved || Math.abs(saved.x - viewport.x) > 0.5 || Math.abs(saved.y - viewport.y) > 0.5 || Math.abs(saved.zoom - viewport.zoom) > 0.002) markDirty()
   }, [markDirty, mode, workspace])
 
-  if (!workspace) return <div className="task-overview-empty" role="status"><LoaderCircle className="spin" size={20} />正在装载任务工作区…</div>
-  if (modeTasks.length === 0) return <div className="task-overview-empty" role="status">当前没有{modeTitles[mode]}的任务。</div>
-  if (visibleNodeIds.size === 0) return <div className="task-overview-empty" role="status">没有找到匹配的任务。</div>
+  const toolbar = <div className="task-overview-toolbar">
+    <label><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索任务名称或执行服务器" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索任务或服务器" /></label>
+    {workspace && modeTasks.length > 0 && <div className="task-overview-canvas-actions" aria-label="画布布局工具">
+      <button type="button" onClick={toggleLayoutMode} aria-pressed={layoutMode === 'free'} title={layoutMode === 'free' ? '切换为固定网格模式' : '切换为自由编辑模式'}>{layoutMode === 'free' ? <Link2 size={14} /> : <Grid2X2 size={14} />}{layoutMode === 'free' ? '自由编辑' : '固定网格'}</button>
+      <button type="button" onClick={arrangeNodes}><Grid2X2 size={14} />自动排列</button>
+      <button type="button" onClick={focusVisible}><Maximize2 size={14} />适配可见任务</button>
+      <button type="button" onClick={resetViewport}><LocateFixed size={14} />回到首屏</button>
+      <button type="button" disabled={!selectedEdges.length} onClick={removeSelectedEdges}><Trash2 size={14} />删除连线</button>
+      <button type="button" className="primary" disabled={saving} onClick={() => void saveLayout()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '正在保存' : '保存布局'}</button>
+    </div>}
+    <span>{query.trim() ? '筛选仅影响显示，不会删除已保存位置' : '布局按当前分类独立保存'}</span>
+  </div>
 
-  return <div className={'task-overview-flow density-' + preferences.cardDensity} aria-label={modeTitles[mode] + '任务画布'}>
+  if (!workspace) return <>{toolbar}<div className="task-overview-empty" role="status"><LoaderCircle className="spin" size={20} />正在装载任务工作区…</div></>
+  if (modeTasks.length === 0) return <>{toolbar}<div className="task-overview-empty" role="status">当前没有{modeTitles[mode]}的任务。</div></>
+  if (visibleNodeIds.size === 0) return <>{toolbar}<div className="task-overview-empty" role="status">没有找到匹配的任务。</div></>
+
+  return <>{toolbar}<div className={'task-overview-flow density-' + preferences.cardDensity} aria-label={modeTitles[mode] + '任务画布'}>
     <ReactFlow nodes={displayedNodes} edges={displayedEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={handleEdgesChange} onConnect={onConnect} onMoveEnd={handleMoveEnd} nodesDraggable={layoutMode === 'free'} nodesConnectable={layoutMode === 'free' && preferences.showConnections} nodesFocusable elementsSelectable panOnDrag selectionOnDrag={false} deleteKeyCode={null} zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.4} maxZoom={1.45} defaultViewport={{ x: 32, y: 32, zoom: preferences.defaultZoom }} onlyRenderVisibleElements={nodes.length > 20} attributionPosition="bottom-left">
       <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
       <Controls showInteractive={false} showFitView={false} position="bottom-right" />
@@ -395,17 +409,9 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onDirty
         return tone === 'attention' ? '#e98585' : tone === 'completed' ? '#6ea9df' : tone === 'active' ? '#62d8aa' : '#8e9aa3'
       }} />}
     </ReactFlow>
-    <div className="task-overview-canvas-actions" aria-label="画布布局工具">
-      <button type="button" onClick={toggleLayoutMode} aria-pressed={layoutMode === 'free'} title={layoutMode === 'free' ? '切换为固定网格模式' : '切换为自由编辑模式'}>{layoutMode === 'free' ? <Link2 size={14} /> : <Grid2X2 size={14} />}{layoutMode === 'free' ? '自由编辑' : '固定网格'}</button>
-      <button type="button" onClick={arrangeNodes}><Grid2X2 size={14} />自动排列</button>
-      <button type="button" onClick={focusVisible}><Maximize2 size={14} />适配可见任务</button>
-      <button type="button" onClick={resetViewport}><LocateFixed size={14} />回到首屏</button>
-      <button type="button" disabled={!selectedEdges.length} onClick={removeSelectedEdges}><Trash2 size={14} />删除连线</button>
-      <button type="button" className="primary" disabled={saving} onClick={() => void saveLayout()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '正在保存' : '保存布局'}</button>
-    </div>
     <span className="task-overview-canvas-tip"><GripHorizontal size={13} />拖动卡片顶部把手 · 从卡片两侧连接点创建关联 · 点击卡片进入训练画布</span>
     {!nodesInitialized && <span className="task-overview-initializing"><LoaderCircle className="spin" size={14} />正在绘制画布</span>}
-  </div>
+  </div></>
 }
 
 export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onNavigate }: Props) {
@@ -427,8 +433,7 @@ export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onNavigate 
   return <div className="modal-backdrop task-overview-backdrop" onMouseDown={requestClose}>
     <div ref={dialogRef} className="modal task-overview-dialog" role="dialog" aria-modal="true" aria-labelledby="task-overview-title" aria-describedby="task-overview-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
       <header className="task-overview-header"><div><span className="eyebrow">TRAINING WORKSPACE</span><h2 id="task-overview-title">{modeTitles[mode]} <span>{count}</span>{dirty && <em>未保存</em>}</h2><p id="task-overview-description">{modeDescriptions[mode]}</p></div><div className="task-overview-header-state">{feedback && <span className={'task-overview-feedback ' + feedback.kind} role={feedback.kind === 'error' ? 'alert' : 'status'}>{feedback.kind === 'loading' || feedback.kind === 'saving' ? <LoaderCircle className="spin" size={14} /> : feedback.kind === 'success' ? <Check size={14} /> : <AlertTriangle size={14} />}{feedback.message}</span>}<button type="button" className="task-overview-close" data-modal-initial-focus onClick={requestClose} aria-label="关闭任务总览"><X size={19} /></button></div></header>
-      <div className="task-overview-toolbar"><label><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索任务名称或执行服务器" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索任务或服务器" /></label><span>{query.trim() ? '筛选仅影响显示，不会删除已保存位置' : '布局按当前分类独立保存'}</span></div>
-      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onNavigate={requestNavigate} query={query} onDirtyChange={setDirty} onFeedback={setFeedback} /></ReactFlowProvider>
+      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onNavigate={requestNavigate} query={query} onQueryChange={setQuery} onDirtyChange={setDirty} onFeedback={setFeedback} /></ReactFlowProvider>
     </div>
   </div>
 }

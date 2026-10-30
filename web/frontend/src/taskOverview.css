@@ -13,11 +13,11 @@
 .task-overview-close { flex: 0 0 auto; width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: var(--panel-2); cursor: pointer; transition: color .18s ease, border-color .18s ease, background .18s ease, transform .18s ease; }
 .task-overview-close:hover { color: var(--text); border-color: var(--green); background: color-mix(in srgb, var(--green) 11%, var(--panel)); transform: rotate(90deg); }
 .task-overview-close:focus-visible, .task-overview-card:focus-visible, .task-overview-canvas-actions button:focus-visible { outline: 3px solid var(--green); outline-offset: 3px; }
-.task-overview-toolbar { flex: 0 0 auto; min-height: 50px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.task-overview-toolbar label { width: min(360px, 70%); height: 35px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--panel-2); }
+.task-overview-toolbar { flex: 0 0 auto; min-height: 58px; display: grid; grid-template-columns: minmax(180px, 360px) minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 7px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.task-overview-toolbar label { width: 100%; min-width: 0; height: 35px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--panel-2); }
 .task-overview-toolbar label:focus-within { border-color: var(--green); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 15%, transparent); }
 .task-overview-toolbar input { width: 100%; min-width: 0; height: 100%; border: 0; outline: none; color: var(--text); background: transparent; font-size: 11px; }
-.task-overview-toolbar > span { color: var(--muted); font-size: 10px; }
+.task-overview-toolbar > span { justify-self: end; color: var(--muted); font-size: 10px; white-space: nowrap; }
 .task-overview-flow { position: relative; flex: 1 1 auto; min-height: 0; background: radial-gradient(circle at 50% 10%, color-mix(in srgb, var(--green) 6%, transparent), transparent 55%), var(--bg); }
 .task-overview-flow .react-flow__background { opacity: .72; }
 .task-overview-flow .react-flow__node-taskOverview { width: 306px; }
@@ -30,7 +30,7 @@
 .task-overview-flow .react-flow__edge-path { stroke: color-mix(in srgb, var(--green) 58%, #668396); stroke-width: 1.8; }
 .task-overview-flow .react-flow__edge.selected .react-flow__edge-path { stroke: #f4ba64; stroke-width: 2.5; }
 .task-overview-flow .react-flow__connection-path { stroke: var(--green); stroke-width: 2; stroke-dasharray: 5 4; }
-.task-overview-canvas-actions { position: absolute; top: 13px; left: 50%; z-index: 5; display: flex; align-items: center; gap: 4px; max-width: calc(100% - 32px); padding: 5px; border: 1px solid var(--line); border-radius: 11px; background: color-mix(in srgb, var(--panel) 94%, transparent); box-shadow: 0 12px 34px rgba(0, 0, 0, .18); transform: translateX(-50%); }
+.task-overview-canvas-actions { min-width: 0; max-width: 100%; justify-self: center; display: flex; align-items: center; gap: 4px; overflow-x: auto; padding: 5px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2); }
 .task-overview-canvas-actions button { min-height: 32px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 9px; border: 1px solid transparent; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; font-size: 10px; font-weight: 600; white-space: nowrap; transition: color .16s ease, border-color .16s ease, background .16s ease, transform .16s ease; }
 .task-overview-canvas-actions button:hover { color: var(--text); border-color: var(--line); background: var(--panel-2); transform: translateY(-1px); }
 .task-overview-canvas-actions button[aria-pressed='true'] { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
@@ -94,14 +94,20 @@
 @keyframes task-overview-dialog-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
 @keyframes task-overview-wait { 0% { transform: translateX(-100%); } 50% { transform: translateX(130%); } 100% { transform: translateX(300%); } }
 
+@media (max-width: 1250px) {
+  .task-overview-toolbar { grid-template-columns: minmax(180px, 300px) minmax(0, 1fr); }
+  .task-overview-toolbar > span { display: none; }
+  .task-overview-canvas-actions { justify-self: end; }
+}
+
 @media (max-width: 900px) {
   .task-overview-backdrop { padding: 6px; }
   .task-overview-dialog { width: calc(100vw - 12px); height: calc(100dvh - 12px); border-radius: 12px; }
   .task-overview-dialog > .task-overview-header { min-height: 72px; padding: 12px 14px; }
-  .task-overview-toolbar { padding: 7px 14px; }
-  .task-overview-header p, .task-overview-toolbar > span { display: none; }
+  .task-overview-toolbar { grid-template-columns: minmax(0, 1fr); padding: 7px 14px; }
+  .task-overview-header p { display: none; }
   .task-overview-feedback { max-width: 36vw; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-  .task-overview-canvas-actions { top: 8px; overflow-x: auto; justify-content: flex-start; width: calc(100% - 16px); }
+  .task-overview-canvas-actions { justify-self: stretch; justify-content: flex-start; width: 100%; }
   .task-overview-canvas-actions button { flex: 0 0 auto; }
   .task-overview-canvas-tip { left: 8px; bottom: 8px; max-width: calc(100% - 205px); font-size: 9px; }
   .task-overview-flow .react-flow__minimap { right: 8px; bottom: 8px; width: 165px; height: 110px; }
@@ -110,7 +116,6 @@
 @media (max-width: 600px) {
   .task-overview-header h2 { font-size: 17px; }
   .task-overview-feedback { display: none; }
-  .task-overview-toolbar label { width: 100%; }
   .task-overview-canvas-tip { display: none; }
   .task-overview-flow .react-flow__minimap { width: 130px; height: 90px; }
   .task-overview-flow .react-flow__controls { margin-bottom: 115px; }

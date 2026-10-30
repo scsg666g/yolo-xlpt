@@ -1,5 +1,9 @@
 # 双实例部署与维护
 
+## 1.14.1 开发版前端调整
+
+任务总览操作区已移到搜索栏右侧，只需重新构建开发版前端；本次没有修改 Agent 或其分发包，也无需迁移历史布局。平台版本 **1.14.1**。
+
 ## 1.14.0 开发版任务工作区升级
 
 本次只更新开发版中心前端和后端。任务总览布局保存在新增的 task_workspaces 表，后端仍按既有启动顺序先执行数据库迁移，再由 Base.metadata.create_all 增量创建新表；不会修改已有任务、Attempt、路径或训练记录。前端构建后即可提供新的近全屏任务工作区，但保存布局所需的 /api/task-workspace 接口必须等待开发版后端在安全窗口加载。
@@ -91,7 +95,7 @@
 
 本仓库的服务模板按两套独立 checkout 配置：开发版使用 `18088`，使用版使用 `18089`。两套服务必须使用不同的 systemd 服务名，不能都安装成 `yolo-platform.service`。模板存在不代表两套服务已在目标机器安装或运行。
 
-安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.14.0**，配套远程 Agent 为 **2.6.3**。
+安装依赖和构建步骤见 [项目首页](../../README.md)；操作规则见 [Web 说明](../README.md)；远程服务器见 [Agent 说明](../agent/README.md)；架构与故障证据见 [项目分析](../../docs/project-analysis.md)。当前开发平台版本为 **1.14.1**，配套远程 Agent 为 **2.6.3**。
 
 仓库保留 `yolo-platform-dev.service` 和 `yolo-platform-prod.service` 供既有部署沿用；它们是特定部署环境下的静态示例，包含原有 checkout 与 Python 环境路径。新 checkout 可用 `render_systemd_unit.py` 按本机项目根目录和 Python 解释器生成对应 unit，脚本只输出配置，不安装、启停或修改任何 systemd 服务。环境差异仍放在各实例自己的 `.env` 中。
 
