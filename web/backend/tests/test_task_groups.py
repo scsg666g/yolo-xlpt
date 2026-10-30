@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
+import app.main as main_module
 from app.database import Base, get_db
 from app.main import app
 from app.models import TaskEvent, TaskGroup, TrainingTask, utcnow
@@ -66,6 +69,44 @@ def test_new_groups_are_listed_before_existing_groups(group_client):
     created = create_group(client, "新分组")
 
     assert [group["id"] for group in client.get("/api/task-groups").json()] == [created["id"], existing["id"]]
+
+
+def test_new_tasks_start_each_selected_group_without_changing_existing_order(group_client, monkeypatch):
+    client, db = group_client
+    smoke = create_group(client, "烟检测")
+    fire = create_group(client, "火检测")
+    smoke_first = add_task(db, "smoke-first", "已有烟任务 1", group_id=smoke["id"], display_order=1000)
+    fire_task = add_task(db, "fire", "已有火任务", group_id=fire["id"], display_order=2000)
+    smoke_last = add_task(db, "smoke-last", "已有烟任务 2", group_id=smoke["id"], display_order=3000)
+    other = add_task(db, "other", "已有未分组任务", display_order=4000)
+    # Resource validation has its own tests; here the API order and persistence matter.
+    monkeypatch.setattr(main_module, "validate_training_model_path", lambda raw, roots: Path(raw))
+    monkeypatch.setattr(main_module, "validate_training_data_path", lambda task_type, raw: Path(raw))
+
+    def create(name: str, group_id: str | None = None) -> dict:
+        response = client.post("/api/tasks", json={
+            "name": name, "group_id": group_id,
+            "model_path": "model.pt", "data_path": "data.yaml",
+        })
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    smoke_new = create("新烟任务", smoke["id"])
+    assert [task["id"] for task in client.get("/api/tasks").json() if task["group_id"] == smoke["id"]] == [
+        smoke_new["id"], smoke_first.id, smoke_last.id,
+    ]
+    smoke_newest = create("更新的烟任务", smoke["id"])
+    ungrouped = create("新未分组任务")
+    ordered = client.get("/api/tasks").json()
+    assert [task["id"] for task in ordered if task["group_id"] == smoke["id"]] == [
+        smoke_newest["id"], smoke_new["id"], smoke_first.id, smoke_last.id,
+    ]
+    assert [task["id"] for task in ordered if task["group_id"] == fire["id"]] == [fire_task.id]
+    assert [task["id"] for task in ordered if task["group_id"] is None] == [ungrouped["id"], other.id]
+    assert [db.get(TrainingTask, task.id).display_order for task in (smoke_first, fire_task, smoke_last, other)] == [
+        1000, 2000, 3000, 4000,
+    ]
+    assert all(task["display_order"] != 0 for task in ordered)
 
 
 def test_create_group_from_ungrouped_tasks_is_atomic(group_client):

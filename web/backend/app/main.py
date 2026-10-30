@@ -222,6 +222,13 @@ def next_task_group_display_order(db: Session) -> int:
     return (first_order if first_order is not None else 0) - 1000
 
 
+def next_task_display_order(db: Session) -> int:
+    # Keep new tasks ahead of their group's existing cards after refresh and
+    # avoid zero, which older databases treat as an uninitialized sort value.
+    first_order = db.scalar(select(func.min(TrainingTask.display_order)))
+    return min(first_order if first_order is not None else 0, 0) - 1000
+
+
 def get_run_or_404(db: Session, task_id: str, run_id: str) -> TrainingRun:
     run = db.scalar(select(TrainingRun).where(TrainingRun.id == run_id, TrainingRun.task_id == task_id))
     if not run:
@@ -581,7 +588,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
             workers=payload.workers,
             optimizer=payload.optimizer,
             config=config,
-            display_order=(db.scalar(select(func.coalesce(func.max(TrainingTask.display_order), 0))) or 0) + 1000,
+            display_order=next_task_display_order(db),
         )
         db.add(task)
         db.flush()
