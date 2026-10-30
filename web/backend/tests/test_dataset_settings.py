@@ -216,3 +216,106 @@ def test_cleanup_reasons_distinguish_retention_and_pending(env):
         assert state == 'reserved'
         state, reason = settings.cleanup_state(op, {'upload_staging_bytes': 0}, store)
         assert state == 'pending' and '等待' in reason
+
+
+def test_manual_failed_snapshot_cleanup_preserves_journal_and_retries_from_source(env):
+    client, factory, root, _ = env
+    identity = 'a' * 32
+    source = root / 'source-data'
+    source.mkdir()
+    (source / 'image.jpg').write_bytes(b'original')
+    snapshot = store.job_dir(identity)
+    snapshot.mkdir(parents=True)
+    (snapshot / 'bundle.tar').write_bytes(b'cached')
+    (snapshot / 'validate' / 'images').mkdir(parents=True)
+    (snapshot / 'validate' / 'images' / 'old.jpg').write_bytes(b'preview')
+    (snapshot / 'outside').symlink_to(source, target_is_directory=True)
+    with factory() as db:
+        db.add(DatasetOperation(id=identity, node_id='local', kind='register', status='failed',
+                                payload={'phase': 'verify', 'source_node': 'local',
+                                         'source_path': str(source), 'name': 'source-data'}))
+        db.commit()
+    detail = client.get(f'/api/dataset-storage/settings/temporary/{identity}').json()
+    assert detail['can_clear']
+    assert any(item['path'] == 'bundle.tar' and item['bytes'] == 6 for item in detail['files'])
+    assert any('validate/images/old.jpg' in item['examples'] for item in detail['files'])
+    assert not detail['sampled_complete']  # The symlink is not followed.
+    cleared = client.post(f'/api/dataset-storage/settings/temporary/{identity}/clear')
+    assert cleared.status_code == 200, cleared.text
+    assert not snapshot.exists() and (source / 'image.jpg').read_bytes() == b'original'
+    with factory() as db:
+        op = db.get(DatasetOperation, identity)
+        assert op.status == 'failed' and op.payload['snapshot_reclaimed']
+        assert op.payload['temporary_files_cleared_at']
+    history = client.get(f'/api/dataset-storage/operations/{identity}').json()
+    assert history['temporary_snapshot_missing'] and history['temporary_files_cleared_at']
+    retry = client.post(f'/api/dataset-storage/operations/{identity}/retry')
+    assert retry.status_code == 200, retry.text
+    assert retry.json()['status'] == 'pending' and retry.json()['phase'] == 'export'
+    assert not retry.json()['temporary_snapshot_missing']
+
+
+def test_manual_temp_cleanup_rejects_active_operation_and_preserves_files(env):
+    client, factory, _, _ = env
+    identity = 'b' * 32
+    snapshot = store.job_dir(identity)
+    snapshot.mkdir(parents=True)
+    (snapshot / 'bundle.tar').write_bytes(b'active')
+    with factory() as db:
+        db.add(DatasetOperation(id=identity, node_id='local', kind='register', status='running',
+                                payload={'phase': 'export', 'source_node': 'local'}))
+        db.commit()
+    assert not client.get(f'/api/dataset-storage/settings/temporary/{identity}').json()['can_clear']
+    assert client.post(f'/api/dataset-storage/settings/temporary/{identity}/clear').status_code == 409
+    assert (snapshot / 'bundle.tar').read_bytes() == b'active'
+    orphan_id = 'c' * 32
+    orphan = store.job_dir(orphan_id)
+    orphan.mkdir()
+    (orphan / 'bundle.tar').write_bytes(b'unknown')
+    orphan_detail = client.get(f'/api/dataset-storage/settings/temporary/{orphan_id}').json()
+    assert orphan_detail['operation'] is None and not orphan_detail['can_clear']
+    assert client.post(f'/api/dataset-storage/settings/temporary/{orphan_id}/clear').status_code == 404
+    assert (orphan / 'bundle.tar').read_bytes() == b'unknown'
+    legacy_id = 'd' * 32
+    legacy = store.job_dir(legacy_id)
+    legacy.mkdir()
+    (legacy / 'bundle.tar').write_bytes(b'leased')
+    with factory() as db:
+        db.add(DatasetOperation(id=legacy_id, node_id='local', kind='register', status='completed',
+                                lease_until=utcnow() + timedelta(hours=1), payload={}))
+        db.commit()
+    assert not client.get(f'/api/dataset-storage/settings/temporary/{legacy_id}').json()['can_clear']
+    assert client.post(f'/api/dataset-storage/settings/temporary/{legacy_id}/clear').status_code == 409
+    assert (legacy / 'bundle.tar').read_bytes() == b'leased'
+
+
+def test_manual_completed_upload_cleanup_preserves_published_dataset_and_history(env):
+    client, factory, root, _ = env
+    loc = location(client, root / 'datasets')
+    finish_local()
+    identity = upload(client, loc, 'kept-dataset')
+    finish_local()
+    assert operation(client, identity)['status'] == 'completed'
+    dataset = root / 'datasets' / 'kept-dataset'
+    assert (dataset / 'data.yaml').is_file()
+    staged = root / 'staging' / identity
+    assert staged.is_dir()
+    detail = client.get(f'/api/dataset-storage/settings/temporary/{identity}').json()
+    assert detail['can_clear'] and any(item['kind'] == 'upload_staging' for item in detail['files'])
+    response = client.post(f'/api/dataset-storage/settings/temporary/{identity}/clear')
+    assert response.status_code == 200, response.text
+    assert not staged.exists() and (dataset / 'data.yaml').is_file()
+    assert operation(client, identity)['status'] == 'completed'
+    with factory() as db:
+        assert db.get(DatasetOperation, identity).payload['temporary_files_cleared_at']
+
+
+def test_historical_nonstandard_operation_id_keeps_retry_behavior(env):
+    client, factory, _, _ = env
+    with factory() as db:
+        db.add(DatasetOperation(id='legacy-operation', node_id='local', kind='register',
+                                status='failed', payload={'phase': 'export', 'source_node': 'local'}))
+        db.commit()
+    response = client.post('/api/dataset-storage/operations/legacy-operation/retry')
+    assert response.status_code == 200, response.text
+    assert response.json()['status'] == 'pending'

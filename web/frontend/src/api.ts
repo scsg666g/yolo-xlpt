@@ -155,6 +155,8 @@ export const api = {
   registerDatasetBatch: (id: string, payload: DatasetBatchRequest) => requestWithTimeout<DatasetRegistrationBatch>(`/api/dataset-storage/discovery/scans/${id}/batches`, { method: 'POST', body: JSON.stringify(payload) }),
   cancelDatasetBatch: (id: string) => requestWithTimeout<DatasetRegistrationBatch>(`/api/dataset-storage/discovery/batches/${id}/cancel`, { method: 'POST' }),
   datasetSettings: (signal?: AbortSignal, refresh = false) => requestWithTimeout<DatasetSettingsResponse>(`/api/dataset-storage/settings${refresh ? '?refresh=true' : ''}`, { signal }),
+  datasetTemporaryDetail: (id: string, signal?: AbortSignal) => requestWithTimeout<import('./types').DatasetTemporaryDetail>(`/api/dataset-storage/settings/temporary/${encodeURIComponent(id)}`, { signal }),
+  clearDatasetTemporary: (id: string) => requestWithTimeout<{ cleared: boolean; message: string }>(`/api/dataset-storage/settings/temporary/${encodeURIComponent(id)}/clear`, { method: 'POST' }, 30_000, datasetSubmissionTimeout),
   updateDatasetSettings: (revision: number, policy: DatasetPolicy, signal?: AbortSignal) => requestWithTimeout<DatasetSettingsResponse>('/api/dataset-storage/settings', { method: 'PATCH', body: JSON.stringify({ revision, policy }), signal }),
   datasetLocations: (signal?: AbortSignal) => requestWithTimeout<DatasetLocation[]>('/api/dataset-storage/locations', { signal }),
   createDatasetLocation: (payload: { node_id: string; name: string; path: string; create: boolean; is_default: boolean }) => requestWithTimeout<{ id: string; operation_id: string }>('/api/dataset-storage/locations', { method: 'POST', body: JSON.stringify(payload) }, 15_000, datasetSubmissionTimeout),

@@ -6,6 +6,7 @@ import { datasetOperationWait } from '../datasetOperationState'
 import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperation, DatasetOperationPage, DatasetOperationSummary } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { DatasetServerSelect, type DatasetServerOption } from './DatasetServerSelect'
+import { DatasetTemporaryModal } from './DatasetTemporaryModal'
 
 const statuses: Record<string, string> = { pending: '等待处理', running: '正在处理', committing: '提交文件中', completed: '已完成', failed: '失败', cancelled: '已取消' }
 const kinds: Record<string, string> = { discover: '目录扫描', check: '目录检查', upload: '上传', register: '登记', refresh: '重新加载', migrate: '复制 / 迁移', delete: '永久删除文件', unregister: '删除登记（保留文件）' }
@@ -16,7 +17,9 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers, i
 }) {
   const [removal, setRemoval] = useState<{ request: DatasetHistoryRemoval; label: string } | null>(null)
   const [removing, setRemoving] = useState(false)
-  const close = () => { if (!removing) { if (removal) setRemoval(null); else onClose() } }
+  const [retryTarget, setRetryTarget] = useState<DatasetOperation | null>(null)
+  const [temporaryTarget, setTemporaryTarget] = useState<string | null>(null)
+  const close = () => { if (!removing) { if (temporaryTarget) return; if (retryTarget) setRetryTarget(null); else if (removal) setRemoval(null); else onClose() } }
   const ref = useModalFocus<HTMLDivElement>(true, close, { canClose: !removing })
   const [status, setStatus] = useState(initialTarget ? 'all' : summary && summary.active + summary.failed > 0 ? 'attention' : 'all')
   const [kind, setKind] = useState('all')
@@ -93,7 +96,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers, i
   }
   async function control(id: string, action: 'retry' | 'cancel') {
     setBusy(id); setError('')
-    try { await api.controlDatasetOperation(id, action); ref.current?.focus(); onChanged(); setRefresh(v => v + 1) }
+    try { await api.controlDatasetOperation(id, action); setRetryTarget(null); ref.current?.focus(); onChanged(); setRefresh(v => v + 1) }
     catch (e) { setError(e instanceof Error ? e.message : '操作失败') }
     finally { setBusy('') }
   }
@@ -149,13 +152,30 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers, i
             {j.transferred > 0 && <p>已传 {formatBytes(j.transferred)}{j.total_bytes ? ` / ${formatBytes(j.total_bytes)}` : ''}</p>}
             {j.error && <p role="alert" className="dataset-operation-error">{j.error}</p>}
             {j.result.directory && <code>目标已保存：{j.result.directory}</code>}
-            <div className="dataset-inline-actions">{j.status === 'failed' && <button type="button" className="button compact" disabled={!!busy} onClick={() => void control(j.id, 'retry')}>{busy === j.id ? '正在提交…' : '重试当前阶段'}</button>}{j.can_cancel && <button type="button" className="button compact ghost" disabled={!!busy} onClick={() => void control(j.id, 'cancel')}>{busy === j.id ? '正在提交…' : '取消操作'}</button>}</div>
+            {j.temporary_files_cleared_at && <p className="dataset-operation-temp-note">平台临时文件已于 {new Date(j.temporary_files_cleared_at).toLocaleString('zh-CN')} 清理；操作记录保留。</p>}
+            <div className="dataset-inline-actions"><button type="button" className="button compact ghost" onClick={() => setTemporaryTarget(j.id)}>查看临时文件</button>{j.status === 'failed' && <button type="button" className="button compact" disabled={!!busy} onClick={() => j.temporary_snapshot_missing ? setRetryTarget(j) : void control(j.id, 'retry')}>{busy === j.id ? '正在提交…' : '重试当前阶段'}</button>}{j.can_cancel && <button type="button" className="button compact ghost" disabled={!!busy} onClick={() => void control(j.id, 'cancel')}>{busy === j.id ? '正在提交…' : '取消操作'}</button>}</div>
           </div>}
         </article>) : <div className="empty"><strong>没有符合条件的记录</strong><button type="button" className="button ghost" onClick={reset}>重置筛选</button></div>}
       </div>
       <footer><span>共 {data?.total ?? 0} 条 · 每页 20 条</span><button type="button" className="button compact ghost" disabled={page <= 1} onClick={() => { setLoading(true); setPage(v => v - 1) }}>上一页</button><span>{page} / {Math.max(1, Math.ceil((data?.total || 0) / 20))}</span><button type="button" className="button compact ghost" disabled={!data || page * 20 >= data.total} onClick={() => { setLoading(true); setPage(v => v + 1) }}>下一页</button></footer>
     </div>
     {removal && <HistoryRemovalConfirmation target={removal} onClose={() => setRemoval(null)} onRemoved={removed} onBusy={setRemoving} />}
+    {retryTarget && <RetrySnapshotConfirmation operation={retryTarget} busy={busy === retryTarget.id} error={error} onClose={() => { setRetryTarget(null); setError('') }} onConfirm={() => void control(retryTarget.id, 'retry')} />}
+    {temporaryTarget && <DatasetTemporaryModal rows={[]} truncated={0} sampledAt={null} initialSelected={temporaryTarget} onClose={() => { setTemporaryTarget(null); setRefresh(value => value + 1) }} onCleared={() => { onChanged(); setRefresh(value => value + 1) }} />}
+    </div>
+  </div>
+}
+
+function RetrySnapshotConfirmation({ operation, busy, error, onClose, onConfirm }: {
+  operation: DatasetOperation; busy: boolean; error: string; onClose: () => void; onConfirm: () => void
+}) {
+  const dialog = useModalFocus<HTMLDivElement>(true, onClose, { canClose: !busy, initialFocusSelector: '[data-cancel]' })
+  return <div className="dataset-history-confirm-backdrop" onMouseDown={event => { event.stopPropagation(); if (!busy) onClose() }}>
+    <div ref={dialog} className="dataset-history-confirm" role="alertdialog" aria-modal="true" aria-labelledby="dataset-retry-snapshot-title" tabIndex={-1} onMouseDown={event => event.stopPropagation()}>
+      <h3 id="dataset-retry-snapshot-title">临时文件已清理</h3>
+      <p>“{operation.name || operation.id}”的中心中转快照已清理。继续重试会从原始来源或仍保留的上传暂存重新生成快照，再执行后续阶段；操作历史不会删除。</p>
+      {error && <p className="dataset-operation-error" role="alert">{error}</p>}
+      <footer><button data-cancel type="button" className="button ghost" disabled={busy} onClick={onClose}>返回</button><button type="button" className="button primary" disabled={busy} onClick={onConfirm}>{busy ? '正在提交…' : '继续重试'}</button></footer>
     </div>
   </div>
 }

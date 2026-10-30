@@ -11,6 +11,7 @@ import shutil
 import stat
 import threading
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
@@ -52,7 +53,7 @@ class ScanBudget:
         return True
 
 
-def tree_bytes(path, budget, depth=0, *, parent_fd=None):
+def tree_bytes(path, budget, depth=0, *, parent_fd=None, examples=None, relative=''):
     """Count file metadata without following links or opening image contents."""
     total = bundle = 0
     complete = True
@@ -77,10 +78,13 @@ def tree_bytes(path, budget, depth=0, *, parent_fd=None):
                     metadata = item.stat(follow_symlinks=False)
                     if stat.S_ISREG(metadata.st_mode):
                         total += metadata.st_size
+                        if examples is not None and len(examples) < 30:
+                            examples.append(f'{relative}/{item.name}'.lstrip('/'))
                         if depth == 0 and item.name.startswith('bundle'):
                             bundle += metadata.st_size
                     elif stat.S_ISDIR(metadata.st_mode):
-                        size, _, child_complete = tree_bytes(item.name, budget, depth + 1, parent_fd=descriptor)
+                        size, _, child_complete = tree_bytes(item.name, budget, depth + 1, parent_fd=descriptor,
+                                                              examples=examples, relative=f'{relative}/{item.name}')
                         total += size
                         complete = complete and child_complete
                     elif stat.S_ISLNK(metadata.st_mode):
@@ -229,6 +233,77 @@ def cleanup_state(op, row, store):
     return 'retained', '当前状态不符合自动回收条件'
 
 
+def temporary_detail(db: Session, identity: str):
+    """Describe only centre-owned temporary paths; never inspect a dataset root."""
+    from .dataset_uploads import UPLOAD_ROOT
+    store = store_module()
+    if not valid_id(identity):
+        raise HTTPException(404, '临时文件记录不存在')
+    op = db.get(DatasetOperation, identity)
+    budget = ScanBudget()
+    files = []
+    complete = True
+    roots = ((store.STORE_ROOT / identity, 'transfer', '中心中转快照'),
+             (UPLOAD_ROOT / identity, 'upload_staging', '浏览器上传暂存'))
+    for path, kind, label in roots:
+        if path.is_symlink():
+            complete = False
+            continue
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        try:
+            with os.scandir(descriptor) as entries:
+                for item in entries:
+                    if not budget.step():
+                        complete = False
+                        break
+                    try:
+                        metadata = item.stat(follow_symlinks=False)
+                        if stat.S_ISDIR(metadata.st_mode):
+                            examples = []
+                            size, _, item_complete = tree_bytes(item.name, budget, parent_fd=descriptor,
+                                                                 examples=examples, relative=item.name)
+                        elif stat.S_ISREG(metadata.st_mode):
+                            size, item_complete, examples = metadata.st_size, True, []
+                        else:
+                            complete = False
+                            continue
+                    except OSError:
+                        complete = False
+                        continue
+                    files.append({'kind': kind, 'label': label, 'path': item.name,
+                                  'bytes': size, 'directory': stat.S_ISDIR(metadata.st_mode),
+                                  'complete': item_complete, 'examples': examples})
+                    complete = complete and item_complete
+                    if budget.limited:
+                        break
+        finally:
+            os.close(descriptor)
+    upload_present = (UPLOAD_ROOT / identity).is_dir() and not (UPLOAD_ROOT / identity).is_symlink()
+    transfer_present = (store.STORE_ROOT / identity).is_dir() and not (store.STORE_ROOT / identity).is_symlink()
+    row = {'upload_staging_bytes': sum(item['bytes'] for item in files if item['kind'] == 'upload_staging')}
+    state, reason = cleanup_state(op, row, store)
+    upload_owned = bool(op and op.kind == 'upload'
+                        and Path(op.payload.get('staging', '')) == UPLOAD_ROOT / identity / 'files')
+    terminal_ready = bool(op and op.status in store.TERMINAL
+                          and (op.payload.get('snapshot_lock_v1') or not op.lease_until
+                               or store.operation_time(op.lease_until) <= utcnow()))
+    can_clear = bool(op and ((transfer_present and (store.failed_snapshot_disposable(op) or terminal_ready))
+                             or (upload_present and upload_owned and terminal_ready)))
+    return {'id': identity, 'operation': store.operation_read(op, db) if op else None, 'files': files,
+            'sampled_complete': complete and not budget.limited and not budget.errors,
+            'cleanup_state': state, 'cleanup_reason': reason,
+            'can_clear': can_clear,
+            'clear_reason': ('可清理当前临时文件；失败上传暂存供重试保留，清理快照后下次重试会从源重新生成。'
+                             if can_clear else '未关联操作记录，无法确认归属，不能手动清理。' if op is None
+                             else '操作进行中、提交中、临时文件不存在或当前状态不允许手动清理。失败上传暂存供重试保留。')}
+
+
 def catalogue_sizes(db):
     byte_value = DatasetEntry.details['total_bytes'].as_integer()
     rows = db.execute(select(DatasetEntry.node_id, func.count(), func.sum(byte_value),
@@ -334,6 +409,24 @@ class PolicyPatch(BaseModel):
 @router.get('/settings')
 def get_settings(refresh: bool = Query(False), db: Session = Depends(get_db)):
     return settings_response(db, refresh=refresh)
+
+
+@router.get('/settings/temporary/{identity}')
+def get_temporary_detail(identity: str, db: Session = Depends(get_db)):
+    return temporary_detail(db, identity)
+
+
+@router.post('/settings/temporary/{identity}/clear')
+def clear_temporary_snapshot(identity: str, db: Session = Depends(get_db)):
+    from .dataset_store import discard_failed_snapshot, discard_terminal_temporary
+    if not valid_id(identity):
+        raise HTTPException(404, '临时文件记录不存在')
+    op = db.get(DatasetOperation, identity)
+    if not op:
+        raise HTTPException(404, '操作记录不存在')
+    if op.status in store_module().TERMINAL:
+        return discard_terminal_temporary(identity, db)
+    return discard_failed_snapshot(identity, db)
 
 
 @router.patch('/settings')

@@ -5,6 +5,7 @@ import { DatasetOperationProgress } from './DatasetOperationProgress'
 import { DatasetServerSelect } from './DatasetServerSelect'
 import { DatasetRegistrationModal } from './DatasetRegistrationModal'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import {
   AlertTriangle,
   History,
@@ -62,6 +63,8 @@ function savePendingRefreshRequest(datasetId: string, requestId: string | null) 
 }
 
 export function Datasets() {
+  const location = useLocation()
+  const navigate = useNavigate()
   const [datasets, setDatasets] = useState<ManagedDataset[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -84,6 +87,18 @@ export function Datasets() {
   const [storageOpen, setStorageOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [historyTarget, setHistoryTarget] = useState<{ operationId: string; name: string; nodeId: string } | null>(null)
+  useEffect(() => {
+    const identity = new URLSearchParams(location.search).get('operation')
+    if (!identity || !/^[0-9a-f]{32}$/.test(identity)) return
+    const controller = new AbortController()
+    void api.datasetOperation(identity, controller.signal).then(operation => {
+      if (!controller.signal.aborted) {
+        setHistoryTarget({ operationId: identity, name: operation.name || identity, nodeId: operation.node_id })
+        setHistoryOpen(true)
+      }
+    }).catch(reason => { if (!controller.signal.aborted) setHistoryError(reason instanceof Error ? reason.message : '关联操作记录读取失败') })
+    return () => controller.abort()
+  }, [location.search])
   const [operationDetails, setOperationDetails] = useState<Record<string, DatasetOperation>>({})
   const [operationErrors, setOperationErrors] = useState<Record<string, string>>({})
   const [deletionReceipts, setDeletionReceipts] = useState<DeletionReceipt[]>([])
@@ -540,7 +555,7 @@ export function Datasets() {
 
     {discoveryOpen && <DatasetDiscoveryModal onClose={() => { setDiscoveryOpen(false); operationsChanged() }} onChanged={operationsChanged} />}
     {storageOpen && <DatasetStorageModal onClose={() => { setStorageOpen(false); setSummaryRefresh(v => v + 1) }} />}
-    {historyOpen && <DatasetOperationDrawer initialTarget={historyTarget || undefined} onClose={() => { setHistoryOpen(false); setHistoryTarget(null) }} onChanged={operationsChanged} summary={operationSummary} servers={servers.map(({ id, name, status }) => ({ id, name, status }))} />}
+    {historyOpen && <DatasetOperationDrawer initialTarget={historyTarget || undefined} onClose={() => { setHistoryOpen(false); setHistoryTarget(null); if (new URLSearchParams(location.search).has('operation')) navigate('/datasets', { replace: true }) }} onChanged={operationsChanged} summary={operationSummary} servers={servers.map(({ id, name, status }) => ({ id, name, status }))} />}
     {actionTarget && <DatasetActionModal dataset={actionTarget === 'register' ? undefined : actionTarget} onClose={() => setActionTarget(null)} onDone={operationsChanged} />}
     {uploading && !deleting && <UploadDatasetModal onClose={() => setUploading(false)} onUploaded={(result) => { void handleUploaded(result) }} />}
     {registrationTarget && <DatasetRegistrationModal key={`${registrationTarget.mode}:${registrationTarget.dataset.id}`} dataset={registrationTarget.dataset} mode={registrationTarget.mode} onClose={() => setRegistrationTarget(null)} onDone={() => {

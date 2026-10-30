@@ -1,7 +1,7 @@
 import { DatasetSettings, type DatasetSettingsStatus } from './DatasetSettings'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Activity, Boxes, Check, Cpu, Database, Download, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Server, Settings2, Sun, Workflow, X } from 'lucide-react'
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import {
   COMPARE_LIMIT_DEFAULT,
@@ -84,6 +84,7 @@ function storageStatusLabel(status: PlatformStorageHealth['status']) {
 }
 
 export function Layout() {
+  const navigate = useNavigate()
   const appearance = useAppearance()
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('overview')
@@ -307,6 +308,12 @@ export function Layout() {
     if (canLeaveSettingsSection()) setSettingsOpen(false)
   }
 
+  function openDatasetOperation(identity: string) {
+    if (!canLeaveSettingsSection()) return
+    setSettingsOpen(false)
+    navigate(`/datasets?operation=${encodeURIComponent(identity)}`)
+  }
+
   function selectSettingsSection(section: SettingsSection) {
     if (section !== settingsSection && canLeaveSettingsSection()) setSettingsSection(section)
   }
@@ -524,7 +531,7 @@ export function Layout() {
                   })}</div> : <div className="settings-empty-state">尚未登记远程 Agent</div>}
                   <p className="settings-readonly-note">训练和模型目录来自运行环境；数据集保存位置可在“数据集”分类中配置，目录检查结果含服务器时间。</p>
                 </>}
-                {settingsSection === 'datasets' && <DatasetSettings refreshToken={datasetRefreshToken} onStatusChange={setDatasetSettingsStatus} />}
+                {settingsSection === 'datasets' && <DatasetSettings refreshToken={datasetRefreshToken} onStatusChange={setDatasetSettingsStatus} onOpenOperation={openDatasetOperation} />}
               </section>
             </div>
           </div>

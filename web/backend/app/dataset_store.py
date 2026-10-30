@@ -69,6 +69,13 @@ def job_dir(identity):
     return STORE_ROOT / identity
 
 
+def snapshot_missing(identity):
+    try:
+        return not job_dir(identity).is_dir()
+    except ValueError:
+        return False  # Historical nonstandard operation IDs retain the old retry path.
+
+
 @contextmanager
 def snapshot_access(identity, *, blocking=True):
     """Keep a snapshot alive across local work and centre-side Agent I/O.
@@ -96,11 +103,17 @@ def failed_snapshot_expired(op, now=None):
     now = now or utcnow()
     retention = dataset_policy()['failed_retention_seconds']
     return bool(retention and op.status == 'failed'
-                and op.kind in ('upload', 'register', 'refresh', 'migrate')
-                and not op.payload.get('published') and not op.payload.get('commit_started')
-                and (not op.lease_until or operation_time(op.lease_until) <= now)
+                and failed_snapshot_disposable(op, now)
                 and (op.payload.get('snapshot_reclaimed') or
                      (now - operation_time(op.updated_at)).total_seconds() >= retention))
+
+
+def failed_snapshot_disposable(op, now=None):
+    """A failed pre-commit snapshot may be detached without changing source files."""
+    now = now or utcnow()
+    return bool(op.status == 'failed' and op.kind in ('upload', 'register', 'refresh', 'migrate')
+                and not op.payload.get('published') and not op.payload.get('commit_started')
+                and (not op.lease_until or operation_time(op.lease_until) <= now))
 
 
 def restart_snapshot(op):
@@ -117,7 +130,87 @@ def restart_snapshot(op):
     op.payload = payload
     op.result = {}
     set_phase(op, 'prepare_upload' if op.kind == 'upload' else 'export',
-              'local' if op.kind == 'upload' else payload['source_node'])
+              'local' if op.kind == 'upload' else payload.get('source_node') or op.node_id)
+
+
+def discard_failed_snapshot(identity: str, db: Session):
+    """Detach one retryable centre snapshot after rechecking status under its reader lock."""
+    directory = job_dir(identity)
+    with snapshot_access(identity, blocking=False) as available:
+        if not available:
+            raise HTTPException(409, '临时文件正在被读取，请稍后重试')
+        with managed_dataset_mutation():
+            db.expire_all()
+            op = db.get(DatasetOperation, identity)
+            if not op:
+                raise HTTPException(404, '操作记录不存在')
+            if not failed_snapshot_disposable(op):
+                raise HTTPException(409, '当前操作仍在执行或提交中，不能清理其临时文件')
+            if directory.is_symlink():
+                raise HTTPException(409, '临时目录类型异常，已拒绝清理')
+            if not directory.is_dir():
+                return {'cleared': False, 'message': '临时快照已不存在，操作记录仍保留'}
+            quarantine = STORE_ROOT / ('.reclaimed-' + uid())
+            directory.rename(quarantine)
+            op.payload = {**op.payload, 'snapshot_reclaimed': True,
+                          'temporary_files_cleared_at': utcnow().isoformat()}
+            db.commit()
+    try:
+        shutil.rmtree(quarantine)
+    except OSError:
+        logger.warning('dataset_manual_snapshot_cleanup_deferred id=%s', identity)
+        return {'cleared': True, 'message': '临时快照已隔离，将继续后台回收；操作记录仍保留'}
+    return {'cleared': True, 'message': '临时快照已清理，操作记录仍保留'}
+
+
+def discard_terminal_temporary(identity: str, db: Session):
+    """Clear completed/cancelled centre files while retaining the journal row."""
+    from .dataset_uploads import UPLOAD_ROOT, upload_session
+    directory = job_dir(identity)
+    staging = UPLOAD_ROOT / identity
+    op = db.get(DatasetOperation, identity)
+    if not op or op.status not in TERMINAL:
+        raise HTTPException(409, '只有已完成或已取消的操作可以清理这些临时文件')
+    if (not op.payload.get('snapshot_lock_v1') and op.lease_until
+            and operation_time(op.lease_until) > utcnow()):
+        raise HTTPException(409, '旧执行器租约尚未释放，请稍后再清理临时文件')
+    cleared = []
+    if directory.is_symlink() or staging.is_symlink():
+        raise HTTPException(409, '临时目录类型异常，已拒绝清理')
+    if directory.is_dir():
+        if not reclaim_snapshot(db, identity):
+            if directory.is_dir() and not directory.is_symlink():
+                raise HTTPException(409, '中转快照仍被使用，请稍后重试')
+        cleared.append('中心中转快照')
+    if staging.is_dir() and op.kind == 'upload':
+        with upload_session(identity, touch=False) as (_, manifest):
+            with managed_dataset_mutation():
+                db.expire_all()
+                op = db.get(DatasetOperation, identity)
+                if (not op or op.status not in TERMINAL
+                        or (not op.payload.get('snapshot_lock_v1') and op.lease_until
+                            and operation_time(op.lease_until) > utcnow())
+                        or manifest.get('operation_id') != identity
+                        or Path(op.payload.get('staging', '')) != staging / 'files'):
+                    raise HTTPException(409, '上传暂存归属或状态已变化，请刷新后重试')
+                quarantine = UPLOAD_ROOT / ('.reclaimed-upload-' + identity)
+                if quarantine.exists() or quarantine.is_symlink():
+                    raise HTTPException(409, '上传暂存正在回收，请稍后刷新')
+                staging.rename(quarantine)
+        try:
+            shutil.rmtree(quarantine)
+        except OSError:
+            logger.warning('dataset_manual_upload_cleanup_deferred id=%s', identity)
+        cleared.append('浏览器上传暂存')
+    if not cleared:
+        raise HTTPException(409, '当前没有可清理的临时文件，请刷新详情')
+    with managed_dataset_mutation():
+        db.expire_all()
+        op = db.get(DatasetOperation, identity)
+        if op:
+            op.payload = {**op.payload, 'temporary_files_cleared_at': utcnow().isoformat()}
+            db.commit()
+    return {'cleared': True, 'message': '、'.join(cleared) + '已清理；操作记录仍保留'}
 
 
 def save_json(path, value):
@@ -283,6 +376,8 @@ def operation_read(op, db=None):
              'created_at': operation_time(op.created_at), 'updated_at': operation_time(op.updated_at), 'result': op.result,
              'source_path': op.payload.get('source_path') or op.payload.get('path'), 'destination': op.payload.get('destination'),
              'can_delete_history': op.status in TERMINAL,
+             'temporary_files_cleared_at': op.payload.get('temporary_files_cleared_at'),
+             'temporary_snapshot_missing': bool(op.payload.get('snapshot_reclaimed')),
              'can_cancel': op.status in ('pending', 'running', 'failed') and not op.payload.get('published') and not op.payload.get('commit_started')}
     if db:
         def node_name(identity):
@@ -1232,7 +1327,9 @@ def control_operation(identity: str, action: str, db: Session = Depends(get_db))
         if not op:
             raise HTTPException(404, '操作记录不存在')
         if action == 'retry' and op.status == 'failed':
-            if op.kind == 'refresh' or op.payload.get('snapshot_reclaimed') or failed_snapshot_expired(op):
+            if (op.kind == 'refresh' or op.payload.get('snapshot_reclaimed')
+                    or failed_snapshot_expired(op) or (op.kind in ('upload', 'register', 'migrate')
+                                                       and snapshot_missing(op.id))):
                 # A corrected source must be exported again, with a new receipt
                 # token. Revalidating the cached failed snapshot cannot see fixes.
                 restart_snapshot(op)

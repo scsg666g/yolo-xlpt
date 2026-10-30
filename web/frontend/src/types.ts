@@ -671,11 +671,24 @@ export interface DatasetOperation {
   progress_steps?: Array<{ stage: string; phase: string; executor: string }>
   queued_at?: string | null; heartbeat_at?: string | null; started_at?: string | null; queue_ahead?: number; waiting_lock?: boolean; waiting_path_lock?: boolean; waiting_resource?: boolean
   can_delete_history?: boolean
+  temporary_files_cleared_at?: string | null
+  temporary_snapshot_missing?: boolean
   node_name?: string; source_node?: string; source_node_name?: string; target_node?: string; target_node_name?: string
   id: string; kind: string; status: string; phase: string; name: string; node_id: string
   transferred: number; total_bytes: number; error: string | null; can_cancel: boolean
   source_path?: string; destination?: string; waiting_offline?: boolean; waiting_training?: boolean
   created_at: string; updated_at: string; result: Partial<DatasetUploadResult> & { dataset_id?: string; visited?: number; found?: number; limited?: boolean; limit_reason?: string }
+}
+
+export interface DatasetTemporaryDetail {
+  id: string
+  operation: DatasetOperation | null
+  files: Array<{ kind: 'transfer' | 'upload_staging'; label: string; path: string; bytes: number; directory: boolean; complete: boolean; examples: string[] }>
+  sampled_complete: boolean
+  cleanup_state: string
+  cleanup_reason: string
+  can_clear: boolean
+  clear_reason: string
 }
 
 export interface DatasetOperationSummary {

@@ -4,6 +4,7 @@ import { api, formatBytes } from '../api'
 import type { DatasetPolicy, DatasetSettingsResponse } from '../types'
 import { DatasetStorageSettings } from './DatasetStorage'
 import { DatasetOperationProgress } from './DatasetOperationProgress'
+import { DatasetTemporaryModal } from './DatasetTemporaryModal'
 import '../datasetSettings.css'
 
 export interface DatasetSettingsStatus {
@@ -51,7 +52,7 @@ function policyHint(key: keyof DatasetPolicy, value: string) {
   return `${formatBytes(amount)}${key === 'refresh_read_bytes_per_second' ? ' / 秒' : ''}`
 }
 
-export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshToken?: number; onStatusChange?: (status: DatasetSettingsStatus) => void }) {
+export function DatasetSettings({ refreshToken = 0, onStatusChange, onOpenOperation }: { refreshToken?: number; onStatusChange?: (status: DatasetSettingsStatus) => void; onOpenOperation?: (id: string) => void }) {
   const [data, setData] = useState<DatasetSettingsResponse | null>(null)
   const [draft, setDraft] = useState<PolicyDraft | null>(null)
   const [baseRevision, setBaseRevision] = useState<number | null>(null)
@@ -63,6 +64,8 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
   const [notice, setNotice] = useState('')
   const [checkedAt, setCheckedAt] = useState<Date | null>(null)
   const [locationStatus, setLocationStatus] = useState<LocationStatus>({ loading: true, checkedAt: null, error: '' })
+  const [temporaryOpen, setTemporaryOpen] = useState(false)
+  const [temporaryRefresh, setTemporaryRefresh] = useState(0)
   const dirtyRef = useRef(false)
   const savingRef = useRef(false)
   const controllerRef = useRef<AbortController | null>(null)
@@ -86,7 +89,7 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
     let active = true
     let running = false
     let timer: ReturnType<typeof setTimeout> | undefined
-    const manualRefresh = previousRefreshToken.current !== refreshToken
+    const manualRefresh = previousRefreshToken.current !== refreshToken || temporaryRefresh > 0
     previousRefreshToken.current = refreshToken
     async function load(refresh = false) {
       if (!active || running || document.hidden) return
@@ -114,7 +117,7 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
     void load(manualRefresh)
     document.addEventListener('visibilitychange', visible)
     return () => { active = false; controllerRef.current?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
-  }, [acceptData, refreshToken])
+  }, [acceptData, refreshToken, temporaryRefresh])
   useEffect(() => () => saveControllerRef.current?.abort(), [])
 
   function edit(key: keyof DatasetPolicy, value: string) {
@@ -159,7 +162,7 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
   const outdated = !!data && !!draft && data.revision !== baseRevision
   const partial = storage?.status === 'partial'
   const workerError = data?.worker.active_error || data?.worker.refresh_active_error
-  return <div className="dataset-settings" aria-busy={loading || saving}>
+  return <><div className="dataset-settings" aria-busy={loading || saving}>
     <p className="dataset-settings-intro"><Info size={15} />训练期间可查看和配置；打开本页不会扫描原始数据集。目录检查与后台处理仍按路径锁和资源限制执行。</p>
     <DatasetStorageSettings refreshToken={refreshToken} onStatusChange={setLocationStatus} />
     {error && <div className="alert error" role="alert">刷新失败：{error}{data ? '；以下保留最近一次成功读取的数据。' : ''}</div>}
@@ -170,7 +173,7 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
         <div className="dataset-settings-heading"><h4 id="dataset-space-title"><Database size={15} />原始数据集与平台临时空间</h4></div>
         <div className="dataset-settings-stats">
           {(['local', 'remote'] as const).map(scope => { const item = storage.registered_bytes[scope]; return <article key={scope}><span>{scope === 'local' ? '本机' : '远程'}原始数据集 · 登记统计</span><strong>{item.unknown_count ? '至少 ' : ''}{formatBytes(item.bytes)}</strong><small>{item.count} 个登记{item.unknown_count ? ` · ${item.unknown_count} 个缺少大小统计` : ''}</small></article> })}
-          <article><span>平台临时文件{partial ? ' · 已观察到' : ''}</span><strong>{size(storage.total_bytes)}</strong><small>中转 {size(storage.transfer_bytes)} · 上传暂存 {size(storage.upload_staging_bytes)}</small></article>
+          <article className="dataset-settings-temporary-stat"><span>平台临时文件{partial ? ' · 已观察到' : ''}</span><strong>{size(storage.total_bytes)}</strong><small>中转 {size(storage.transfer_bytes)} · 上传暂存 {size(storage.upload_staging_bytes)}</small><button type="button" className="button ghost compact" aria-label="查看平台临时文件详情" onClick={() => setTemporaryOpen(true)}>查看详情</button></article>
           <article><span>中转配额占用{partial ? ' · 已观察到' : ''}</span><strong>{size(storage.quota_used_bytes)} / {data.policy.storage_quota_bytes ? formatBytes(data.policy.storage_quota_bytes) : '不限'}</strong><small>{data.policy.storage_quota_bytes && storage.status === 'complete' ? `剩余 ${size(storage.quota_remaining_bytes)}` : '只计入中转归档，不等于全部临时文件'}</small></article>
         </div>
         <p className="dataset-settings-note">原始大小来自数据库登记，包含历史统计，不代表实时磁盘扫描；删除登记后原始文件仍保留，且不再计入这里。登记汇总读取时间：{dateLabel(storage.registered_bytes.measured_at)}。</p>
@@ -201,5 +204,5 @@ export function DatasetSettings({ refreshToken = 0, onStatusChange }: { refreshT
       </form>}
       <aside className="dataset-settings-explanation"><strong>登记与文件的区别</strong><p>“删除登记”只删除页面对应的数据库记录；“永久删除文件”会删除实际目录。更换默认保存位置只影响新上传，不搬动历史数据。日常上传、登记和操作历史请在“数据集管理”页面处理。</p></aside>
     </>}
-  </div>
+  </div>{temporaryOpen && data && <DatasetTemporaryModal rows={data.storage.operations} truncated={data.storage.truncated_operation_count} sampledAt={data.storage.sampled_at} onClose={() => setTemporaryOpen(false)} onCleared={() => setTemporaryRefresh(value => value + 1)} onOpenOperation={onOpenOperation} />}</>
 }
