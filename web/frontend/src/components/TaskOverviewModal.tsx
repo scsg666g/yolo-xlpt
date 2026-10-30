@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useNavigate } from 'react-router-dom'
 import {
   AlertTriangle, ArrowUpRight, Check, CheckCircle2, Clock3, Grid2X2, GripHorizontal,
@@ -29,7 +30,7 @@ type Props = {
   onNavigate: () => void
 }
 
-type OverviewData = { task: TrainingTask; serverName: string; onNavigate: () => boolean }
+type OverviewData = { task: TrainingTask; serverName: string; onNavigate: (taskId: string) => void }
 type OverviewNode = Node<OverviewData, 'taskOverview'>
 type OverviewEdge = Edge
 type LayoutFeedback = { kind: 'loading' | 'saving' | 'success' | 'error'; message: string }
@@ -47,6 +48,7 @@ const modeDescriptions: Record<TaskOverviewMode, string> = {
   completed: '整理已完成任务，并保留轮数、时间和最新验证指标。',
   attention: '集中排查失败与意外中断任务，可用关联线标记排查关系。',
 }
+type PendingExit = { kind: 'close' } | { kind: 'navigate'; taskId: string }
 
 function matchesMode(task: TrainingTask, mode: TaskOverviewMode): boolean {
   if (mode === 'active') return activeStatuses.has(task.status)
@@ -113,7 +115,6 @@ function edgeId(): string {
 }
 
 const TaskOverviewNode = memo(function TaskOverviewNode({ data, dragging }: NodeProps<OverviewNode>) {
-  const navigate = useNavigate()
   const suppressClick = useRef(false)
   const { task, serverName, onNavigate } = data
   const tone = cardTone(task.status)
@@ -134,8 +135,7 @@ const TaskOverviewNode = memo(function TaskOverviewNode({ data, dragging }: Node
   }, [dragging])
   const openTask = () => {
     if (suppressClick.current) return
-    if (!onNavigate()) return
-    navigate('/tasks/' + encodeURIComponent(task.id) + '/canvas')
+    onNavigate(task.id)
   }
 
   return <article className={'task-overview-card tone-' + tone} role="link" tabIndex={0} aria-label={cardAccessibilityLabel(task, current, target, percent)} onClick={openTask} onKeyDown={(event) => {
@@ -186,7 +186,7 @@ function normalizeEdges(layout: TaskWorkspaceModeLayout | undefined, validIds: S
 }
 
 function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQueryChange, onDirtyChange, onFeedback }: Omit<Pick<Props, 'mode' | 'tasks' | 'nodeNames'>, never> & {
-  onNavigate: () => boolean
+  onNavigate: (taskId: string) => void
   query: string
   onQueryChange: (query: string) => void
   onDirtyChange: (dirty: boolean) => void
@@ -415,25 +415,51 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
 }
 
 export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onNavigate }: Props) {
+  const navigate = useNavigate()
   const [query, setQuery] = useState('')
   const [dirty, setDirty] = useState(false)
   const [feedback, setFeedback] = useState<LayoutFeedback | null>(null)
+  const [pendingExit, setPendingExit] = useState<PendingExit | null>(null)
   const requestClose = useCallback(() => {
-    if (dirty && !window.confirm('任务工作区布局尚未保存，确定关闭并放弃本次调整吗？')) return
+    if (pendingExit) return
+    if (dirty) { setPendingExit({ kind: 'close' }); return }
     onClose()
-  }, [dirty, onClose])
-  const requestNavigate = useCallback(() => {
-    if (dirty && !window.confirm('任务工作区布局尚未保存，确定离开并放弃本次调整吗？')) return false
+  }, [dirty, onClose, pendingExit])
+  const openTask = useCallback((taskId: string) => {
+    if (pendingExit) return
+    if (dirty) { setPendingExit({ kind: 'navigate', taskId }); return }
     onNavigate()
-    return true
-  }, [dirty, onNavigate])
-  const dialogRef = useModalFocus<HTMLDivElement>(true, requestClose, { initialFocusSelector: '[data-modal-initial-focus]' })
+    navigate('/tasks/' + encodeURIComponent(taskId) + '/canvas')
+  }, [dirty, navigate, onNavigate, pendingExit])
+  const confirmExit = useCallback(() => {
+    if (!pendingExit) return
+    setPendingExit(null)
+    if (pendingExit.kind === 'close') onClose()
+    else {
+      onNavigate()
+      navigate('/tasks/' + encodeURIComponent(pendingExit.taskId) + '/canvas')
+    }
+  }, [navigate, onClose, onNavigate, pendingExit])
+  const cancelExit = useCallback(() => setPendingExit(null), [])
+  const dialogRef = useModalFocus<HTMLDivElement>(true, requestClose, { canClose: !pendingExit, initialFocusSelector: '[data-modal-initial-focus]' })
+  const confirmRef = useModalFocus<HTMLDivElement>(!!pendingExit, cancelExit, { initialFocusSelector: '[data-confirm-cancel]' })
   const count = tasks.filter((task) => matchesMode(task, mode)).length
 
   return <div className="modal-backdrop task-overview-backdrop" onMouseDown={requestClose}>
     <div ref={dialogRef} className="modal task-overview-dialog" role="dialog" aria-modal="true" aria-labelledby="task-overview-title" aria-describedby="task-overview-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
       <header className="task-overview-header"><div><span className="eyebrow">TRAINING WORKSPACE</span><h2 id="task-overview-title">{modeTitles[mode]} <span>{count}</span>{dirty && <em>未保存</em>}</h2><p id="task-overview-description">{modeDescriptions[mode]}</p></div><div className="task-overview-header-state">{feedback && <span className={'task-overview-feedback ' + feedback.kind} role={feedback.kind === 'error' ? 'alert' : 'status'}>{feedback.kind === 'loading' || feedback.kind === 'saving' ? <LoaderCircle className="spin" size={14} /> : feedback.kind === 'success' ? <Check size={14} /> : <AlertTriangle size={14} />}{feedback.message}</span>}<button type="button" className="task-overview-close" data-modal-initial-focus onClick={requestClose} aria-label="关闭任务总览"><X size={19} /></button></div></header>
-      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onNavigate={requestNavigate} query={query} onQueryChange={setQuery} onDirtyChange={setDirty} onFeedback={setFeedback} /></ReactFlowProvider>
+      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onNavigate={openTask} query={query} onQueryChange={setQuery} onDirtyChange={setDirty} onFeedback={setFeedback} /></ReactFlowProvider>
     </div>
+    {pendingExit && createPortal(<div className="task-overview-confirm-backdrop" onMouseDown={cancelExit}>
+      <div ref={confirmRef} className="task-overview-confirm" role="alertdialog" aria-modal="true" aria-labelledby="task-overview-confirm-title" aria-describedby="task-overview-confirm-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+        <span className="task-overview-confirm-icon"><AlertTriangle size={22} aria-hidden="true" /></span>
+        <h3 id="task-overview-confirm-title">布局尚未保存</h3>
+        <p id="task-overview-confirm-description">{pendingExit.kind === 'close' ? '关闭任务总览后' : '进入训练画布后'}，本次调整的卡片位置、连线和视口将不会保留。</p>
+        <div className="task-overview-confirm-actions">
+          <button type="button" className="button ghost" data-confirm-cancel onClick={cancelExit}>继续编辑</button>
+          <button type="button" className="button danger" onClick={confirmExit}>放弃修改并{pendingExit.kind === 'close' ? '关闭' : '进入'}</button>
+        </div>
+      </div>
+    </div>, document.body)}
   </div>
 }
