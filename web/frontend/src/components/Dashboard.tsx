@@ -1,6 +1,6 @@
 import { metricProfile } from '../metricProfiles'
 import { groupMetricSummary, taskMetric } from '../groupMetrics'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowUpRight, CheckCircle2, ChevronDown, Clock3, Copy, Cpu, Folder, FolderInput, FolderPlus, GitCompareArrows, GripVertical, Pencil, Plus, RefreshCw, RotateCcw, Search, Square, Trash2, Zap } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { api, metricValue, statusLabel } from '../api'
@@ -12,6 +12,9 @@ import { CreateTaskModal } from './CreateTaskModal'
 import { RenameTaskModal } from './RenameTaskModal'
 import { MoveTaskGroupModal, TaskGroupModal } from './TaskGroupModals'
 import { AttemptDeletionHistory } from './AttemptDeletionHistory'
+import type { TaskOverviewMode } from './TaskOverviewModal'
+
+const TaskOverviewModal = lazy(() => import('./TaskOverviewModal').then(({ TaskOverviewModal }) => ({ default: TaskOverviewModal })))
 
 const statusIcon = (status: string) => status === 'completed' ? <CheckCircle2 size={15} /> : status === 'failed' || status === 'interrupted' ? <AlertTriangle size={15} /> : status === 'running' ? <Zap size={15} /> : <Clock3 size={15} />
 const activeStatuses = ['queued', 'starting', 'running', 'stopping']
@@ -123,6 +126,7 @@ export function Dashboard() {
   const [groups, setGroups] = useState<TaskGroup[]>([])
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('all')
+  const [overviewMode, setOverviewMode] = useState<TaskOverviewMode | null>(null)
   const [creating, setCreating] = useState(false)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
@@ -167,6 +171,11 @@ export function Dashboard() {
   const syncRequest = useRef(false)
   const taskActionRequests = useRef(new Set<string>())
   const navigate = useNavigate()
+  const closeOverview = useCallback(() => setOverviewMode(null), [])
+  const openOverviewTask = useCallback((taskId: string) => {
+    setOverviewMode(null)
+    navigate(`/tasks/${taskId}/canvas`)
+  }, [navigate])
   const deleteDialogRef = useModalFocus<HTMLDivElement>(Boolean(deleteTarget), closeDeletion, {
     canClose: !deleting,
     initialFocusSelector: '[data-modal-initial-focus]',
@@ -786,10 +795,10 @@ export function Dashboard() {
     </header>
 
     <section className="stat-row">
-      <div className="stat-card"><span>全部任务</span><strong>{tasks.length}</strong><small>训练记录总数</small></div>
-      <div className="stat-card accent"><span>正在进行</span><strong>{active}</strong><small><i />实时运行与排队</small></div>
-      <div className="stat-card"><span>已完成</span><strong>{completed}</strong><small>成功产出模型</small></div>
-      <div className="stat-card warning"><span>需要关注</span><strong>{attention}</strong><small>失败或意外中断</small></div>
+      <button type="button" className="stat-card stat-card-button" aria-haspopup="dialog" aria-label={`查看全部任务，共 ${tasks.length} 个`} onClick={() => setOverviewMode('all')}><span>全部任务</span><strong>{tasks.length}</strong><small>训练记录总数</small><ArrowUpRight className="stat-card-open" size={16} aria-hidden="true" /></button>
+      <button type="button" className="stat-card stat-card-button accent" aria-haspopup="dialog" aria-label={`查看正在进行的任务，共 ${active} 个`} onClick={() => setOverviewMode('active')}><span>正在进行</span><strong>{active}</strong><small><i />实时运行与排队</small><ArrowUpRight className="stat-card-open" size={16} aria-hidden="true" /></button>
+      <button type="button" className="stat-card stat-card-button" aria-haspopup="dialog" aria-label={`查看已完成的任务，共 ${completed} 个`} onClick={() => setOverviewMode('completed')}><span>已完成</span><strong>{completed}</strong><small>成功产出模型</small><ArrowUpRight className="stat-card-open" size={16} aria-hidden="true" /></button>
+      <button type="button" className="stat-card stat-card-button warning" aria-haspopup="dialog" aria-label={`查看需要关注的任务，共 ${attention} 个`} onClick={() => setOverviewMode('attention')}><span>需要关注</span><strong>{attention}</strong><small>失败或意外中断</small><ArrowUpRight className="stat-card-open" size={16} aria-hidden="true" /></button>
     </section>
 
     <section className="task-section">
@@ -829,6 +838,7 @@ export function Dashboard() {
           </section>
         })}</div>}
     </section>
+    {overviewMode && <Suspense fallback={<div className="modal-backdrop overview-loading-backdrop" role="status"><div className="overview-loading"><RefreshCw size={17} className="spin" />正在打开任务总览…</div></div>}><TaskOverviewModal mode={overviewMode} tasks={tasks} nodeNames={nodeNames} onClose={closeOverview} onOpenTask={openOverviewTask} /></Suspense>}
     {ordering && <div className="order-saving" role="status"><RefreshCw size={13} className="spin" />正在保存任务顺序…</div>}
     {renameTarget && <RenameTaskModal task={renameTarget} onClose={() => setRenameTarget(null)} onSaved={(updated) => { setTasks((current) => current.map((task) => task.id === updated.id ? { ...task, name: updated.name } : task)); setRenameTarget(null) }} />}
     {deleteTarget && <div className="modal-backdrop delete-choice-backdrop" onMouseDown={() => closeDeletion()}>
