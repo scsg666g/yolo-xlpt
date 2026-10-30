@@ -1,6 +1,6 @@
 import { DatasetSettings, type DatasetSettingsStatus } from './DatasetSettings'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Activity, Boxes, Check, Cpu, Database, Download, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Server, Settings2, Sun, X } from 'lucide-react'
+import { Activity, Boxes, Check, Cpu, Database, Download, FolderOpen, LayoutDashboard, Minus, Monitor, Moon, Plus, RefreshCw, RotateCcw, ScanEye, Server, Settings2, Sun, Workflow, X } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
 import { api } from '../api'
 import {
@@ -15,11 +15,14 @@ import {
 import type { ComputeNode, PlatformHealth, PlatformStorageHealth } from '../types'
 import { resetAppearance, updateAppearance, useAppearance } from '../appearance'
 import { AppearanceSettings } from './AppearanceSettings'
+import { SettingsDisclosure } from './SettingsDisclosure'
+import { TaskCenterSettings } from './TaskCenterSettings'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
 
 const settingsSections = [
   { id: 'overview', label: '概览', description: '平台状态与实例信息。', icon: LayoutDashboard },
+  { id: 'taskCenter', label: '任务中心', description: '配置任务总览画布、卡片和默认浏览方式。', icon: Workflow },
   { id: 'appearance', label: '外观', description: '为当前浏览器设置配色与阅读偏好。', icon: Sun },
   { id: 'training', label: '实验与训练', description: '实验对比参数。', icon: Activity },
   { id: 'services', label: '服务状态', description: '数据库与后台服务运行状态。', icon: Cpu },
@@ -419,7 +422,7 @@ export function Layout() {
                   <p>{activeSettingsSection.description}</p>
                 </div>
 
-                {settingsSection === 'overview' && <>
+                {settingsSection === 'overview' && <SettingsDisclosure title="平台实例" description="查看核心服务、版本和节点摘要。" badge={health.phase === 'online' ? '运行正常' : health.phase === 'checking' ? '检查中' : '需要关注'} defaultOpen>
                   <div className={`alert${health.phase === 'error' ? ' error' : health.phase === 'checking' ? ' warning' : ''}`} role={health.phase === 'error' ? 'alert' : 'status'}>{serviceDescription}</div>
                   <div className="form-grid settings-meta-grid">
                     <label>平台实例<input readOnly value={health.details?.instance || '—'} /></label>
@@ -431,15 +434,13 @@ export function Layout() {
                   </div>
                   {diagnosticsNotice && <div className="settings-inline-status" role="status">{diagnosticsNotice}</div>}
                   {computeNodesError && <div className="settings-inline-error" role="status">节点状态暂不可用：{computeNodesError}</div>}
-                </>}
+                </SettingsDisclosure>}
+
+                {settingsSection === 'taskCenter' && <TaskCenterSettings />}
 
                 {settingsSection === 'appearance' && <AppearanceSettings />}
 
-                {settingsSection === 'training' && <>
-                  <div className="parameter-section">
-                    <h3>实验对比</h3>
-                    <p>只影响当前浏览器的实验对比列表，不控制训练调度或 GPU 并发。</p>
-                  </div>
+                {settingsSection === 'training' && <SettingsDisclosure title="实验对比" description="只影响当前浏览器的对比列表，不控制训练调度或 GPU 并发。" badge={`最多 ${compareLimit} 个`} defaultOpen>
                   <div className="compare-limit-setting">
                     <div>
                       <strong>最大同时对比运行数</strong>
@@ -460,7 +461,7 @@ export function Layout() {
                       ? `当前已选择 ${storedCompareCount} 个运行；应用后保留前 ${compareLimitDraft} 个，并移除其余 ${storedCompareCount - compareLimitDraft} 个。`
                       : compareLimitDraft === compareLimit ? `当前上限为 ${compareLimit} 个。` : `新上限 ${compareLimitDraft} 个尚未应用。`}
                   </div>
-                </>}
+                </SettingsDisclosure>}
 
                 {settingsSection === 'services' && <>
                   <div className={`alert${health.phase === 'error' ? ' error' : health.phase === 'checking' ? ' warning' : ''}`} role={health.phase === 'error' ? 'alert' : 'status'}>{serviceDescription}</div>
@@ -531,6 +532,8 @@ export function Layout() {
             {settingsSection === 'appearance' ? <>
               <span className="appearance-save-note" role="status">{appearance.storageAvailable ? '即时生效 · 仅保存在当前浏览器' : '即时生效 · 浏览器存储不可用，刷新后可能恢复默认'}</span>
               <button type="button" className="button ghost" onClick={resetAppearance}><RotateCcw size={15} />恢复默认版</button>
+            </> : settingsSection === 'taskCenter' ? <>
+              <span className="appearance-save-note" role="status">任务中心显示偏好即时生效；布局位置由任务总览单独保存。</span>
             </> : <>
               <span style={{ marginRight: 'auto' }}>{settingsCheckedLabel}</span>
               <button type="button" className="button ghost" disabled={settingsSection === 'datasets' ? datasetSettingsStatus.loading : health.phase === 'checking'} onClick={refreshSettingsStatus}><RefreshCw size={15} className={(settingsSection === 'datasets' ? datasetSettingsStatus.loading : health.phase === 'checking') ? 'spin' : ''} />重新检查</button>

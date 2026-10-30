@@ -35,6 +35,7 @@ from .database import Base, SessionLocal, engine, get_db, migrate_database
 from .experiments import router as experiments_router
 from .log_files import tail_log
 from .training_logs import router as training_logs_router
+from .task_workspace import router as task_workspace_router
 from .gpu_reservations import acquire_node_claim_lock, release_gpu_reservations
 from .dataset_uploads import (
     cleanup_managed_dataset_workdirs,
@@ -166,6 +167,7 @@ app.include_router(compute_nodes_router)
 app.include_router(remote_operations_router)
 app.include_router(experiments_router)
 app.include_router(training_logs_router)
+app.include_router(task_workspace_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],

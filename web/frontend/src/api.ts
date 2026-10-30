@@ -1,4 +1,4 @@
-import type { DatasetSettingsResponse, DatasetPolicy, DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeRefreshResponse, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { DatasetSettingsResponse, DatasetPolicy, DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeRefreshResponse, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TaskWorkspace, TaskWorkspaceUpdate, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -180,6 +180,10 @@ export const api = {
   deleteManagedDataset: (name: string) => requestWithTimeout<void>(`/api/datasets/managed/${encodeURIComponent(name)}`, { method: 'DELETE' }, 30_000,
     '删除请求超时，请刷新数据集列表确认状态'),
   tasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks', { signal }),
+  taskWorkspace: (signal?: AbortSignal) => requestWithTimeout<TaskWorkspace>('/api/task-workspace', { signal }, 10_000, '任务总览布局读取超时'),
+  saveTaskWorkspace: (payload: TaskWorkspaceUpdate, signal?: AbortSignal) => requestWithTimeout<TaskWorkspace>('/api/task-workspace', {
+    method: 'PUT', body: JSON.stringify(payload), signal,
+  }, 15_000, '任务总览布局保存超时，后台可能已经保存，请重新打开确认。'),
   taskGroups: (signal?: AbortSignal) => requestWithTimeout<TaskGroup[]>('/api/task-groups', { signal }),
   createTaskGroup: (name: string) => requestWithTimeout<TaskGroup>('/api/task-groups', { method: 'POST', body: JSON.stringify({ name }) }),
   createTaskGroupFromTasks: (name: string, task_ids: string[]) => requestWithTimeout<TaskGroup>('/api/task-groups/from-tasks', { method: 'POST', body: JSON.stringify({ name, task_ids }) }),

@@ -1028,6 +1028,50 @@ button { color: inherit; }
 .settings-storage-node summary { width: fit-content; cursor: pointer; }
 .settings-storage-roots { display: grid; gap: 6px; margin-top: 8px; }
 .settings-storage-roots code { color: var(--text); font: 400 9px "DM Mono", monospace; overflow-wrap: anywhere; }
+.settings-disclosure { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: color-mix(in srgb, var(--panel) 88%, var(--bg)); }
+.settings-disclosure + .settings-disclosure { margin-top: -7px; }
+.settings-disclosure > summary { min-height: 66px; display: flex; align-items: center; gap: 12px; padding: 12px 14px; list-style: none; cursor: pointer; user-select: none; }
+.settings-disclosure > summary::-webkit-details-marker { display: none; }
+.settings-disclosure > summary:hover { background: color-mix(in srgb, var(--green) 5%, transparent); }
+.settings-disclosure > summary:focus-visible { outline: 2px solid var(--green); outline-offset: -2px; }
+.settings-disclosure-copy { min-width: 0; display: grid; flex: 1; gap: 4px; }
+.settings-disclosure-copy strong { color: var(--text); font-size: 11px; }
+.settings-disclosure-copy small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.settings-disclosure-badge { flex: 0 0 auto; padding: 4px 8px; border: 1px solid color-mix(in srgb, var(--green) 25%, var(--line)); border-radius: 999px; color: var(--green); background: color-mix(in srgb, var(--green) 8%, transparent); font-size: 8px; white-space: nowrap; }
+.settings-disclosure-chevron { flex: 0 0 auto; color: var(--muted); transition: transform .18s ease; }
+.settings-disclosure[open] .settings-disclosure-chevron { transform: rotate(180deg); }
+.settings-disclosure-body { display: grid; gap: 14px; padding: 3px 14px 15px; border-top: 1px solid var(--line); }
+.settings-disclosure-body > .alert:first-child { margin-top: 13px; }
+.task-center-settings { display: grid; gap: 14px; }
+.task-center-settings .settings-disclosure + .settings-disclosure { margin-top: 0; }
+.settings-choice-row, .settings-range-row, .settings-toggle-row, .settings-action-row { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.settings-choice-row, .settings-range-row, .settings-toggle-row { min-height: 50px; }
+.settings-choice-row > div:first-child, .settings-range-row > span:first-child, .settings-toggle-row > span:first-child, .settings-action-row > div { min-width: 0; display: grid; gap: 4px; }
+.settings-choice-row strong, .settings-range-row strong, .settings-toggle-row strong, .settings-action-row strong { color: var(--text); font-size: 10px; }
+.settings-choice-row span, .settings-range-row small, .settings-toggle-row small, .settings-action-row span { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.settings-segmented { flex: 0 0 auto; display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); }
+.settings-segmented button { min-height: 31px; padding: 0 11px; border: 0; border-radius: 5px; color: var(--muted); background: transparent; cursor: pointer; font-size: 9px; }
+.settings-segmented button:hover { color: var(--text); }
+.settings-segmented button[aria-pressed='true'] { color: var(--green); background: color-mix(in srgb, var(--green) 12%, var(--panel)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--green) 28%, transparent); }
+.settings-segmented button:focus-visible { outline: 2px solid var(--green); outline-offset: 1px; }
+.settings-range-control { min-width: 230px; display: grid; grid-template-columns: minmax(150px, 1fr) 44px; align-items: center; gap: 10px; }
+.settings-range-control input { width: 100%; accent-color: var(--green); }
+.settings-range-control output { color: var(--text); font: 600 10px "DM Mono", monospace; text-align: right; }
+.settings-toggle-row { cursor: pointer; }
+.settings-toggle-row input { width: 38px; height: 21px; flex: 0 0 auto; appearance: none; position: relative; border: 1px solid var(--line); border-radius: 999px; background: var(--bg); cursor: pointer; transition: background .16s ease, border-color .16s ease; }
+.settings-toggle-row input::after { content: ''; width: 15px; height: 15px; position: absolute; top: 2px; left: 2px; border-radius: 50%; background: var(--muted); transition: transform .16s ease, background .16s ease; }
+.settings-toggle-row input:checked { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); background: color-mix(in srgb, var(--green) 22%, var(--panel)); }
+.settings-toggle-row input:checked::after { transform: translateX(17px); background: var(--green); }
+.settings-toggle-row input:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.settings-action-row { min-height: 55px; padding: 10px 0; }
+.settings-action-row + .settings-action-row { border-top: 1px solid var(--line); }
+.settings-action-row.danger strong { color: #bd5960; }
+:root[data-theme='dark'] .settings-action-row.danger strong { color: #ff9a9e; }
+.settings-browser-note { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.45; }
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-disclosure-chevron, .settings-toggle-row input, .settings-toggle-row input::after { transition: none; }
+}
 
 @media (max-width: 760px) {
   .platform-settings-modal { width: min(680px, calc(100vw - 20px)); height: min(780px, calc(100dvh - 20px)); min-height: min(460px, calc(100dvh - 20px)); }
@@ -1053,6 +1097,13 @@ button { color: inherit; }
   .settings-subsection-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
   .settings-subsection-heading > span { text-align: left; }
   .settings-node-details { flex-direction: column; gap: 5px; }
+  .settings-choice-row, .settings-range-row, .settings-action-row { align-items: stretch; flex-direction: column; gap: 10px; }
+  .settings-range-control { min-width: 0; width: 100%; }
+  .settings-segmented { width: 100%; }
+  .settings-segmented button { flex: 1; }
+  .settings-action-row .button { width: 100%; justify-content: center; }
+  .settings-disclosure > summary { padding: 11px 12px; }
+  .settings-disclosure-body { padding: 3px 12px 13px; }
 }
 .full-log-download { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: 100%; }
 .full-log-download small { max-width: 380px; overflow-wrap: anywhere; font-size: 12px; }

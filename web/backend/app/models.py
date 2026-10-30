@@ -41,6 +41,18 @@ class TaskGroup(Base):
     tasks: Mapped[list["TrainingTask"]] = relationship(back_populates="group")
 
 
+class TaskWorkspace(Base):
+    """Platform-wide task overview layout shared by browser clients."""
+
+    __tablename__ = "task_workspaces"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    modes: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class TrainingTask(Base):
     __tablename__ = "training_tasks"
 

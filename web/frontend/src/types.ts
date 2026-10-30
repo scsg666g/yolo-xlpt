@@ -42,6 +42,36 @@ export interface PlatformStorageHealth {
   total_bytes: number | null
 }
 
+export interface TaskWorkspaceNode {
+  id: string
+  position: { x: number; y: number }
+}
+
+export interface TaskWorkspaceEdge {
+  id: string
+  source: string
+  target: string
+  label?: string | null
+}
+
+export interface TaskWorkspaceModeLayout {
+  nodes: TaskWorkspaceNode[]
+  edges: TaskWorkspaceEdge[]
+  viewport: { x: number; y: number; zoom: number }
+}
+
+export interface TaskWorkspace {
+  version: number
+  revision: number
+  modes: Record<string, TaskWorkspaceModeLayout>
+  updated_at: string | null
+}
+
+export interface TaskWorkspaceUpdate {
+  revision: number
+  modes: Record<string, TaskWorkspaceModeLayout>
+}
+
 export interface TrainingTask {
   id: string
   name: string
