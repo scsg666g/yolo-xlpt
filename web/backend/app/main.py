@@ -13,6 +13,7 @@ import uuid
 from contextlib import asynccontextmanager, nullcontext
 from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -91,7 +92,7 @@ from .services import (
     validate_training_data_path,
 )
 from .run_deletions import active_attempt_delete_operation, attempt_deletion_state
-from .deletion_jobs import deletion_preview, list_attempt_deletion_jobs, list_deletion_jobs, reject_local_task_cleanup
+from .deletion_jobs import deletion_preview, list_attempt_deletion_jobs, list_deletion_jobs, page_attempt_deletion_jobs, reject_local_task_cleanup
 
 logger = logging.getLogger("yolo-platform.requests")
 _task_snapshot = ""
@@ -996,6 +997,17 @@ def attempt_deletion_jobs(limit: int = Query(default=50, ge=1, le=200),
                           task_id: str | None = Query(default=None, max_length=64),
                           db: Session = Depends(get_db)):
     return list_attempt_deletion_jobs(db, limit=limit, task_id=task_id)
+
+
+@app.get("/api/attempt-deletions/page")
+def attempt_deletion_page(limit: int = Query(default=12, ge=1, le=50),
+                          offset: int = Query(default=0, ge=0),
+                          task_id: str | None = Query(default=None, max_length=64),
+                          search: str = Query(default="", max_length=100),
+                          status: Literal["all", "active", "attention", "completed"] = "all",
+                          db: Session = Depends(get_db)):
+    return page_attempt_deletion_jobs(db, limit=limit, offset=offset, task_id=task_id,
+                                      search=search, status=status)
 
 
 @app.get("/api/tasks/{task_id}/deletion-preview")

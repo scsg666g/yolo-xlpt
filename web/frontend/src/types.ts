@@ -155,6 +155,13 @@ export interface AttemptDeletionJob extends DeletionJob {
   attempt_number: number
 }
 
+export interface AttemptDeletionPage {
+  items: AttemptDeletionJob[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface TaskDeletionPreview {
   task_id: string
   task_name: string

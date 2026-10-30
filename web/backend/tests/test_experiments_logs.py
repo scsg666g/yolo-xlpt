@@ -103,6 +103,37 @@ def test_attempt_history_filters_task_before_applying_history_limit(monitoring_c
     assert [job['task_id'] for job in response.json()] == ['older-task']
 
 
+def test_attempt_history_page_searches_all_records_before_pagination(monitoring_client):
+    client, factory = monitoring_client
+    with factory() as db:
+        task = TrainingTask(id='history-task', name='历史烟检测', task_type='detect',
+                            model_path='base.pt', data_path='data.yaml')
+        db.add(task)
+        for index in range(18):
+            timestamp = utcnow() - timedelta(days=18 - index)
+            db.add(RemoteOperation(
+                id=f'page-history-{index}', task_id=task.id, node_id='__local__',
+                kind='local_delete', status='failed' if index == 2 else 'succeeded',
+                created_at=timestamp, updated_at=timestamp,
+                payload={'scope': 'attempt', 'run_id': f'old-run-{index}',
+                         'attempt_number': index + 1},
+            ))
+        db.commit()
+    first = client.get('/api/attempt-deletions/page?limit=12').json()
+    assert first['total'] == 18
+    assert len(first['items']) == 12
+    second = client.get('/api/attempt-deletions/page?limit=12&offset=12').json()
+    assert len(second['items']) == 6
+    assert {job['id'] for job in first['items']}.isdisjoint(job['id'] for job in second['items'])
+    failed = client.get('/api/attempt-deletions/page?status=attention&search=历史烟检测').json()
+    assert failed['total'] == 1
+    assert failed['items'][0]['id'] == 'page-history-2'
+    attempt = client.get('/api/attempt-deletions/page?search=Attempt%20003').json()
+    assert [job['id'] for job in attempt['items']] == ['page-history-2']
+    assert client.get('/api/attempt-deletions/page?search=本机').json()['total'] == 18
+    assert client.get('/api/attempt-deletions/page?status=invalid').status_code == 422
+
+
 def test_local_full_log_download_preserves_early_lines(monitoring_client, tmp_path, monkeypatch):
     client, factory = monitoring_client
     monkeypatch.setattr(training_logs, 'LOG_ROOT', tmp_path)

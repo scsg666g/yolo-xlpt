@@ -1,8 +1,10 @@
 """Read-only task cleanup previews and durable operation presentation."""
 from __future__ import annotations
 
+import re
+
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from .compute_nodes import REQUIRED_AGENT_VERSION, agent_version_at_least, as_utc
@@ -172,14 +174,19 @@ def list_deletion_jobs(db: Session, *, limit: int = 50) -> list[dict]:
     return [serialize_deletion_job(operation, tasks.get(operation.task_id), nodes.get(operation.node_id)) for operation in operations]
 
 
-def list_attempt_deletion_jobs(db: Session, *, limit: int = 50, task_id: str | None = None) -> list[dict]:
-    """Return local/remote Attempt cleanup progress without hiding failures."""
+def _attempt_deletion_query(task_id: str | None = None):
     query = select(RemoteOperation).where(
             RemoteOperation.kind.in_({"local_delete", "delete"}),
             RemoteOperation.payload["scope"].as_string() == "attempt",
         )
     if task_id is not None:
         query = query.where(RemoteOperation.task_id == task_id)
+    return query
+
+
+def list_attempt_deletion_jobs(db: Session, *, limit: int = 50, task_id: str | None = None) -> list[dict]:
+    """Return local/remote Attempt cleanup progress without hiding failures."""
+    query = _attempt_deletion_query(task_id)
     operations = list(db.scalars(query.order_by(
             RemoteOperation.updated_at.desc(), RemoteOperation.created_at.desc(), RemoteOperation.id.desc(),
         )))
@@ -190,6 +197,56 @@ def list_attempt_deletion_jobs(db: Session, *, limit: int = 50, task_id: str | N
         key=lambda operation: (as_utc(operation.updated_at), operation.id),
         reverse=True,
     )
+    return _serialize_attempt_deletion_jobs(db, operations)
+
+
+def page_attempt_deletion_jobs(db: Session, *, limit: int = 12, offset: int = 0,
+                               task_id: str | None = None, search: str = "",
+                               status: str = "all") -> dict:
+    """Page all historical Attempt cleanups; filtering happens before pagination."""
+    query = _attempt_deletion_query(task_id)
+    if status == "active":
+        query = query.where(RemoteOperation.status.in_(ACTIVE))
+    elif status == "attention":
+        query = query.where(RemoteOperation.status.in_({"failed", "cancelled"}))
+    elif status == "completed":
+        query = query.where(RemoteOperation.status == "succeeded")
+    if search.strip():
+        searched = search.strip()
+        term = searched.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{term}%"
+        attempt_match = re.fullmatch(r"(?:attempt\s*)?0*(\d+)", searched, re.IGNORECASE)
+        extra = []
+        if attempt_match:
+            number = int(attempt_match.group(1))
+            extra.extend((RemoteOperation.payload["attempt_number"].as_string() == str(number),
+                          TrainingRun.attempt_number == number))
+        if searched in "本机服务器":
+            extra.append(RemoteOperation.kind == "local_delete")
+        if searched in "远程服务器":
+            extra.append(RemoteOperation.kind == "delete")
+        query = query.outerjoin(TrainingTask, TrainingTask.id == RemoteOperation.task_id).outerjoin(
+            ComputeNode, ComputeNode.id == RemoteOperation.node_id,
+        ).outerjoin(
+            TrainingRun, TrainingRun.id == RemoteOperation.payload["run_id"].as_string(),
+        ).where(or_(
+            TrainingTask.name.ilike(pattern, escape="\\"),
+            ComputeNode.name.ilike(pattern, escape="\\"),
+            RemoteOperation.task_id.ilike(pattern, escape="\\"),
+            RemoteOperation.payload["task_name"].as_string().ilike(pattern, escape="\\"),
+            RemoteOperation.payload["node_name"].as_string().ilike(pattern, escape="\\"),
+            RemoteOperation.payload["attempt_number"].as_string().ilike(pattern, escape="\\"),
+            *extra,
+        ))
+    total = db.scalar(select(func.count()).select_from(query.order_by(None).subquery())) or 0
+    operations = list(db.scalars(query.order_by(
+        RemoteOperation.updated_at.desc(), RemoteOperation.created_at.desc(), RemoteOperation.id.desc(),
+    ).offset(offset).limit(limit)))
+    return {"items": _serialize_attempt_deletion_jobs(db, operations), "total": total,
+            "limit": limit, "offset": offset}
+
+
+def _serialize_attempt_deletion_jobs(db: Session, operations: list[RemoteOperation]) -> list[dict]:
     task_ids = {operation.task_id for operation in operations}
     run_ids = {
         run_id

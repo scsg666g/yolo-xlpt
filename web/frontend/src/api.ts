@@ -194,6 +194,7 @@ export const api = {
   deletedTasks: (signal?: AbortSignal) => requestWithTimeout<TrainingTask[]>('/api/tasks?deleted_only=true', { signal }).then((tasks) => tasks.filter((task) => task.deleted_at)),
   taskDeletionJobs: (signal?: AbortSignal) => requestWithTimeout<DeletionJob[]>('/api/task-deletions?limit=50', { signal }),
   attemptDeletionJobs: (signal?: AbortSignal, taskId?: string) => requestWithTimeout<import('./types').AttemptDeletionJob[]>(`/api/attempt-deletions?limit=50${taskId ? `&task_id=${encodeURIComponent(taskId)}` : ''}`, { signal }),
+  attemptDeletionPage: (params: URLSearchParams, signal?: AbortSignal) => requestWithTimeout<import('./types').AttemptDeletionPage>(`/api/attempt-deletions/page?${params}`, { signal }),
   taskDeletionPreview: (id: string, signal?: AbortSignal) => requestWithTimeout<TaskDeletionPreview>(
     `/api/tasks/${encodeURIComponent(id)}/deletion-preview`, { signal }, 15_000, '删除范围读取超时，请重试',
   ),
