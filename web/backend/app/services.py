@@ -519,8 +519,8 @@ def validate_input_path(raw: str, roots: list[Path], label: str) -> Path:
 
 
 def training_dataset_roots(raw: str) -> list[Path]:
-    """Keep legacy roots, adding only this registered, ready local dataset."""
-    from .models import DatasetEntry
+    """Retain validated path access after removing a catalogue registration."""
+    from .models import DatasetEntry, DatasetOperation
     from .config import DATASET_STORAGE_ALLOWED_ROOTS
     from sqlalchemy import inspect
     candidate = Path(raw).expanduser().resolve()
@@ -531,6 +531,18 @@ def training_dataset_roots(raw: str) -> list[Path]:
         if inspect(db.get_bind()).has_table('dataset_entries'):
             for entry in db.scalars(select(DatasetEntry).where(DatasetEntry.node_id == 'local', DatasetEntry.status == 'ready')):
                 directory = Path(entry.path)
+                if path_is_within(directory, DATASET_STORAGE_ALLOWED_ROOTS) and path_is_within(candidate, [directory]):
+                    roots.append(directory)
+                    break
+        if inspect(db.get_bind()).has_table('dataset_operations'):
+            # Removing a card must not revoke an existing task's dataset path.
+            # Receipts grant no new paths beyond a previously registered root.
+            for raw_path in db.scalars(select(DatasetOperation.payload['source_path'].as_string()).where(
+                    DatasetOperation.kind == 'unregister', DatasetOperation.status == 'completed',
+                    DatasetOperation.node_id == 'local')):
+                if not raw_path:
+                    continue
+                directory = Path(raw_path)
                 if path_is_within(directory, DATASET_STORAGE_ALLOWED_ROOTS) and path_is_within(candidate, [directory]):
                     roots.append(directory)
                     break
@@ -1382,12 +1394,12 @@ class TrainingScheduler:
         """Durably claim a queued local run before any process can be created."""
         acquire_node_claim_lock(db, "local")
         from .dataset_store import mutation_pending
-        if mutation_pending(db, 'local'):
-            db.rollback()
-            return False
         candidate = db.get(TrainingRun, run_id)
         candidate_task = db.get(TrainingTask, candidate.task_id) if candidate else None
         if not candidate or not candidate_task:
+            db.rollback()
+            return False
+        if mutation_pending(db, 'local', candidate.data_path, task_type=candidate_task.task_type, run=candidate):
             db.rollback()
             return False
         if assignments is None:

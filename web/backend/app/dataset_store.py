@@ -36,6 +36,7 @@ from .database import SessionLocal, get_db
 from .models import ComputeNode, DatasetEntry, DatasetLocation, DatasetOperation, DatasetOperationHistoryRemoval, TrainingRun, TrainingTask, utcnow
 from .gpu_reservations import acquire_node_claim_lock
 from .dataset_uploads import managed_dataset_mutation, dataset_references, managed_marker, validate_name
+from .dataset_conflicts import data_path_conflict, local_run_conflict, run_data_paths
 
 router = APIRouter(prefix='/api/dataset-storage', tags=['dataset storage'])
 STORE_ROOT = DATA_ROOT / 'dataset_storage'
@@ -167,14 +168,28 @@ def concurrent_dataset_refresh(db, node_id):
     return capability.get('dataset_concurrent_reads') is True and capability.get('dataset_concurrent_refresh') is True
 
 
+def concurrent_dataset_delete(db, node_id, context=None):
+    if node_id == 'local':
+        return True
+    node = context['nodes'].get(node_id) if context else db.get(ComputeNode, node_id)
+    return bool(node and ((node.snapshot or {}).get('training') or {}).get('dataset_concurrent_delete') is True)
+
+
+def path_scoped_delete(op):
+    return (op.kind == 'delete' and op.payload.get('phase') == 'remove'
+            and op.payload.get('concurrent_delete') is True
+            and bool(op.payload.get('source_node') and op.payload.get('source_path')))
+
+
 def read_only_refresh(op):
     return op.kind == 'refresh' and op.payload.get('phase') == 'export'
 
 
-def training_safe_operation(op, *, concurrent_reads, concurrent_refresh):
+def training_safe_operation(op, *, concurrent_reads, concurrent_refresh, concurrent_delete=False):
     phase = op.payload.get('phase')
     return ((phase in LIGHTWEIGHT_PHASES and concurrent_reads)
-            or (read_only_refresh(op) and concurrent_refresh))
+            or (read_only_refresh(op) and concurrent_refresh)
+            or (path_scoped_delete(op) and concurrent_delete))
 
 
 def lightweight_operation(op):
@@ -287,7 +302,8 @@ def operation_read(op, db=None):
         concurrent = concurrent_dataset_reads(db, op.node_id)
         busy = training_active(db, op.node_id)
         refresh = concurrent_dataset_refresh(db, op.node_id)
-        safe = training_safe_operation(op, concurrent_reads=concurrent, concurrent_refresh=refresh)
+        deletion = concurrent_dataset_delete(db, op.node_id)
+        safe = training_safe_operation(op, concurrent_reads=concurrent, concurrent_refresh=refresh, concurrent_delete=deletion)
         value['waiting_training'] = op.status == 'pending' and busy and not safe
         value['waiting_lock'] = value['waiting_lock'] or (op.status == 'pending' and not safe and not value['waiting_training'] and bool(capability.get('lock_occupied')))
         if op.status == 'pending' and safe:
@@ -299,7 +315,7 @@ def operation_read(op, db=None):
                 or_(DatasetOperation.created_at < op.created_at,
                     (DatasetOperation.created_at == op.created_at) & (DatasetOperation.id < op.id))))
             value['queue_ahead'] = sum(training_safe_operation(
-                item, concurrent_reads=concurrent, concurrent_refresh=refresh) or bool(
+                item, concurrent_reads=concurrent, concurrent_refresh=refresh, concurrent_delete=deletion) or bool(
                 item.lease_until and operation_time(item.lease_until) > utcnow()) for item in earlier)
     if db and op.node_id == 'local':
         value['waiting_path_lock'] = op.status == 'pending' and local_mutation_blocked_by_refresh(db, op)
@@ -350,6 +366,31 @@ def reference_rows(db, entry, context=None):
                 if p == root or root in p.parents or ((not known or p.name != 'data.yaml' or not known.details.get('config_sha256')) and p.suffix in {'.yaml', '.yml'}):
                     tasks.append(task)
                     break
+    # Runtime data may differ from the editable task and resume request. Keep
+    # historical/recycled attempts protected using the actual command/args too.
+    known_ids = {task.id for task in tasks}
+    node_filter = TrainingRun.execution_node_id == entry.node_id
+    if entry.node_id == 'local':
+        node_filter = or_(TrainingRun.execution_node_id.is_(None), node_filter)
+    runs = (context['runs_by_node'].get(entry.node_id, []) if context else
+            db.scalars(select(TrainingRun).where(node_filter)))
+    for run in runs:
+        if run.task_id in known_ids:
+            continue
+        task = context['tasks_by_id'].get(run.task_id) if context else db.get(TrainingTask, run.task_id)
+        if not task:
+            continue
+        if entry.node_id == 'local':
+            result = local_run_conflict(run, entry.path, task_type=task.task_type, active=True,
+                                        evidence_cache=context.get('conflict_cache') if context else None)
+            if result is not True:
+                continue
+        elif not any(PurePosixPath(path) == PurePosixPath(entry.path)
+                     or PurePosixPath(entry.path) in PurePosixPath(path).parents
+                     for path in run_data_paths(run)):
+            continue
+        tasks.append(task)
+        known_ids.add(task.id)
     return [{'id': t.id, 'name': t.name, 'status': t.status, 'deleted': bool(t.deleted_at)} for t in tasks]
 
 
@@ -402,7 +443,62 @@ def active_training_on_node(db, node_id):
         node_filter, TrainingTask.status.in_(('running', 'starting', 'stopping', 'queued'))).limit(1)))
 
 
-def removal_problem(db, entry, references=None, blocking=None, context=None):
+def training_path_conflict(db, node_id, source_path, data_path, *, task_type='detect', run=None, evidence_cache=None, context=None):
+    """False is a proof of disjointness; unknown evidence remains protected."""
+    if node_id == 'local':
+        if run is not None:
+            return local_run_conflict(run, source_path, task_type=task_type, active=True, evidence_cache=evidence_cache)
+        return data_path_conflict(data_path, source_path, task_type=task_type, evidence_cache=evidence_cache)
+    paths = run_data_paths(run) if run is not None else [data_path]
+    unknown = not paths
+    target = PurePosixPath(source_path)
+    for raw in paths:
+        path = PurePosixPath(str(raw))
+        if not path.is_absolute() or '..' in path.parts:
+            unknown = True
+            continue
+        if path == target or path in target.parents or target in path.parents:
+            return True
+        # The centre cannot open remote YAML. A validated catalogue config is
+        # the existing proof; the Agent rechecks its digest before deletion.
+        known = (context['entries_by_path'].get((node_id, str(path.parent))) if context else
+                 db.scalar(select(DatasetEntry).where(
+                     DatasetEntry.node_id == node_id, DatasetEntry.path == str(path.parent), DatasetEntry.status == 'ready')))
+        if path.name != 'data.yaml' or not known or known.status != 'ready' or not (known.details or {}).get('config_sha256'):
+            unknown = True
+    if run is not None and (run.launch_mode == 'resume' or (run.parameter_snapshot or {}).get('resume')):
+        unknown = True
+    return None if unknown else False
+
+
+def active_training_path_problem(db, entry, evidence_cache=None, context=None):
+    statuses = ('queued', 'starting', 'running', 'stopping')
+    node_id = entry.node_id
+    task_node = TrainingTask.execution_node_id == node_id
+    run_node = TrainingRun.execution_node_id == node_id
+    if node_id == 'local':
+        task_node = or_(TrainingTask.execution_node_id.is_(None), task_node)
+        run_node = or_(TrainingRun.execution_node_id.is_(None), run_node)
+    tasks = (context['active_tasks_by_node'].get(node_id, []) if context else
+             db.scalars(select(TrainingTask).where(task_node, TrainingTask.status.in_(statuses))))
+    for task in tasks:
+        result = training_path_conflict(db, node_id, entry.path, task.data_path, task_type=task.task_type,
+                                        evidence_cache=evidence_cache, context=context)
+        if result is not False:
+            return '活动训练仍使用该目录或数据路径无法可靠核验，请先处理训练任务'
+    runs = (context['active_runs_by_node'].get(node_id, []) if context else
+            db.scalars(select(TrainingRun).where(run_node, TrainingRun.status.in_(statuses))))
+    for run in runs:
+        task = context['tasks_by_id'].get(run.task_id) if context else db.get(TrainingTask, run.task_id)
+        result = training_path_conflict(db, node_id, entry.path, run.data_path,
+                                       task_type=task.task_type if task else 'detect', run=run,
+                                       evidence_cache=evidence_cache, context=context)
+        if result is not False:
+            return '活动 Attempt 的实际数据路径无法证明与该目录独立，请先处理训练任务'
+    return None
+
+
+def removal_problem(db, entry, references=None, blocking=None, context=None, *, allow_concurrent=True):
     if entry.ownership != 'managed':
         return '数据集未接管，请先确认文件管理权'
     if entry.status != 'ready':
@@ -418,8 +514,33 @@ def removal_problem(db, entry, references=None, blocking=None, context=None):
         return '远程节点不存在或已禁用'
     if entry.node_id != 'local' and not (entry.details or {}).get('fingerprint'):
         return '历史远程数据缺少校验指纹，请先重新加载校验'
-    if (entry.node_id in context['active_nodes'] if context else active_training_on_node(db, entry.node_id)):
+    if allow_concurrent and concurrent_dataset_delete(db, entry.node_id, context):
+        return active_training_path_problem(db, entry, context.get('conflict_cache') if context else {}, context)
+    if ((entry.node_id in context['active_nodes'] or entry.node_id in context['active_run_nodes']) if context else
+            active_training_on_node(db, entry.node_id) or training_active(db, entry.node_id)):
         return '该节点仍有活动训练任务，请停止后重试清理'
+    return None
+
+
+def registration_change_problem(db, entry, operations=None):
+    """Catalogue changes never wait for training, only work using this registration."""
+    if entry.status != 'ready':
+        return '数据集当前状态不可更改登记'
+    if operations is None:
+        operations = db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_((*ACTIVE, 'failed'))))
+    target = PurePosixPath(entry.path)
+    for op in operations:
+        p = op.payload or {}
+        if p.get('entry_id') == entry.id or (op.result or {}).get('dataset_id') == entry.id:
+            return '该数据集有未完成操作，请先在操作记录中完成、重试或取消，并等待执行者退出'
+        paths = []
+        if p.get('source_node', op.node_id) == entry.node_id and p.get('source_path'):
+            paths.append(p['source_path'])
+        if p.get('target_node', op.node_id) == entry.node_id and p.get('destination'):
+            paths.append(p['destination'])
+        if any(target == PurePosixPath(path) or target in PurePosixPath(path).parents
+               or PurePosixPath(path) in target.parents for path in paths):
+            return '该目录有未完成的数据集操作，请先完成、重试或取消，并等待执行者退出'
     return None
 
 
@@ -428,7 +549,9 @@ def catalogue_context(db, entries):
     context = {'nodes': {node.id: node for node in db.scalars(select(ComputeNode))},
                'entries_by_path': {(entry.node_id, entry.path): entry for entry in entries},
                'locations_by_node': {}, 'entries_by_node': {}, 'tasks_by_node': {},
-               'historical_by_node': {}, 'busy': {}, 'refresh': {}, 'active_nodes': set()}
+               'historical_by_node': {}, 'busy': {}, 'refresh': {}, 'active_nodes': set(), 'conflict_cache': {},
+               'tasks_by_id': {}, 'runs_by_node': {}, 'active_tasks_by_node': {},
+               'active_runs_by_node': {}, 'active_run_nodes': set()}
     for loc in db.scalars(select(DatasetLocation)):
         context['locations_by_node'].setdefault(loc.node_id, []).append(loc)
     for entry in entries:
@@ -436,13 +559,22 @@ def catalogue_context(db, entries):
     tasks = list(db.scalars(select(TrainingTask).order_by(
         TrainingTask.deleted_at.is_not(None), TrainingTask.created_at.desc(), TrainingTask.id)))
     tasks_by_id = {task.id: task for task in tasks}
+    context['tasks_by_id'] = tasks_by_id
     candidates = {}
     for task in tasks:
         node_id = task.execution_node_id or 'local'
         candidates.setdefault(node_id, set()).add(task.id)
         if task.status in ('running', 'starting', 'stopping', 'queued'):
             context['active_nodes'].add(node_id)
-    for task_id, path, run_node in db.execute(select(TrainingRun.task_id, TrainingRun.data_path, TrainingRun.execution_node_id)):
+            context['active_tasks_by_node'].setdefault(node_id, []).append(task)
+    for run in db.scalars(select(TrainingRun)):
+        task_id, path, run_node = run.task_id, run.data_path, run.execution_node_id
+        node_id = run_node or 'local'
+        context['runs_by_node'].setdefault(node_id, []).append(run)
+        if run.status in ('running', 'starting', 'stopping', 'queued'):
+            context['active_runs_by_node'].setdefault(node_id, []).append(run)
+        if run.status in ('running', 'starting', 'stopping'):
+            context['active_run_nodes'].add(node_id)
         if path:
             node_ids = {run_node or 'local'}
             # Old remote attempts may predate the node snapshot column. Keep
@@ -454,8 +586,9 @@ def catalogue_context(db, entries):
                 candidates.setdefault(node_id, set()).add(task_id)
     for node_id, identities in candidates.items():
         context['tasks_by_node'][node_id] = [task for task in tasks if task.id in identities]
-    for op in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_((*ACTIVE, 'failed')))):
-        if identity := op.payload.get('entry_id'):
+    context['operations'] = list(db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_((*ACTIVE, 'failed')))))
+    for op in context['operations']:
+        if op.status in (*ACTIVE, 'failed') and (identity := op.payload.get('entry_id')):
             context['busy'].setdefault(identity, op)
     latest = select(DatasetOperation.id, func.row_number().over(
         partition_by=DatasetOperation.payload['entry_id'].as_string(),
@@ -476,6 +609,7 @@ def entry_read(entry, db, context=None):
         DatasetOperation.kind == 'refresh', DatasetOperation.payload['entry_id'].as_string() == entry.id)
         .order_by(DatasetOperation.created_at.desc(), DatasetOperation.id.desc()).limit(1))
     delete_problem = removal_problem(db, entry, references, blocking, context)
+    unregister_problem = registration_change_problem(db, entry, context.get('operations') if context else None)
     node = context['nodes'].get(entry.node_id) if context else db.get(ComputeNode, entry.node_id)
     return {'id': entry.id, 'location_id': entry.location_id, 'node_id': entry.node_id,
             'name': entry.name, 'node_name': (node.name if node else ('本机' if entry.node_id == 'local' else entry.node_id)), 'directory': entry.path, 'config_path': str(PurePosixPath(entry.path) / 'data.yaml'),
@@ -488,35 +622,78 @@ def entry_read(entry, db, context=None):
             'refresh_error': refresh.error if refresh else None,
             'blocking_operation_kind': blocking.kind if blocking else None,
             'blocking_operation_id': blocking.id if blocking else None,
-            'can_delete': delete_problem is None, 'delete_block_reason': delete_problem}
+            'can_delete': delete_problem is None, 'delete_block_reason': delete_problem,
+            'can_unregister': unregister_problem is None, 'unregister_block_reason': unregister_problem}
+
+
+def legacy_location(db, root, primary_root):
+    identity = hashlib.sha256(('local:' + str(root.resolve())).encode()).hexdigest()[:32]
+    location = db.get(DatasetLocation, identity)
+    if not location:
+        location = DatasetLocation(id=identity, node_id='local', name='原有数据集目录' if root == primary_root else '兼容数据集目录',
+            path=str(root), resolved_path=str(root.resolve()), enabled=True,
+            is_default=root == primary_root and not db.scalar(select(DatasetLocation.id).where(
+                DatasetLocation.node_id == 'local', DatasetLocation.is_default.is_(True))),
+            status='ready' if root.is_dir() else 'pending')
+        db.add(location)
+        db.flush()
+    return location
+
+
+def record_legacy_publication(db, destination, *, recovering=False):
+    """Old upload clients explicitly register new publications after the one-off import."""
+    path = str(destination.resolve())
+    if db.scalar(select(DatasetEntry.id).where(DatasetEntry.node_id == 'local', DatasetEntry.path == path,
+                                              DatasetEntry.status != 'deleted')):
+        return
+    metadata = managed_marker(destination)
+    if not metadata:
+        return
+    if recovering:
+        removed = db.scalar(select(DatasetOperation).where(
+            DatasetOperation.kind == 'unregister', DatasetOperation.status == 'completed',
+            DatasetOperation.node_id == 'local', DatasetOperation.payload['source_path'].as_string() == path)
+            .order_by(DatasetOperation.created_at.desc()).limit(1))
+        if removed:
+            try:
+                is_new_publication = (bool(metadata.get('created_at')) and
+                    operation_time(datetime.fromisoformat(metadata['created_at'])) > operation_time(removed.created_at))
+            except (ValueError, TypeError):
+                is_new_publication = False
+            if metadata.get('upload_id') == removed.payload.get('upload_id') or not is_new_publication:
+                return
+    from .dataset_uploads import DATASET_ROOTS as legacy_roots
+    location = legacy_location(db, destination.parent, legacy_roots[0])
+    db.add(DatasetEntry(id=uid(), node_id='local', location_id=location.id, name=destination.name,
+        path=path, ownership='managed', status='ready', details={
+            'upload_id': metadata.get('upload_id'), 'names': metadata['classes'], 'stats': metadata['stats'],
+            'total_bytes': metadata['total_bytes'], 'warnings': metadata['warnings']}))
+    db.commit()
 
 
 def bootstrap(db):
-    """Register old platform-owned folders without moving or rehashing them."""
+    """Import legacy folders once per available root, without resurrecting removals."""
     from .dataset_uploads import DATASET_ROOTS as legacy_roots
+    removed_paths = set(db.scalars(select(DatasetOperation.payload['source_path'].as_string()).where(
+        DatasetOperation.kind == 'unregister', DatasetOperation.status == 'completed',
+        DatasetOperation.node_id == 'local')))
     for root in legacy_roots:
-        identity = hashlib.sha256(('local:' + str(root.resolve())).encode()).hexdigest()[:32]
-        location = db.get(DatasetLocation, identity)
-        if not location:
-            location = DatasetLocation(id=identity, node_id='local', name='原有数据集目录' if root == legacy_roots[0] else '兼容数据集目录',
-                                       path=str(root), resolved_path=str(root.resolve()), enabled=True,
-                                       is_default=root == legacy_roots[0] and not db.scalar(select(DatasetLocation.id).where(
-                                           DatasetLocation.node_id == 'local', DatasetLocation.is_default.is_(True))),
-                                       status='ready' if root.is_dir() else 'pending')
-            db.add(location)
-            db.flush()
-        if not root.is_dir() or root.is_symlink():
+        location = legacy_location(db, root, legacy_roots[0])
+        if (location.details or {}).get('legacy_catalogue_imported') or not root.is_dir() or root.is_symlink():
             continue
         for child in root.iterdir():
             if child.name.startswith('.') or child.is_symlink() or not child.is_dir():
                 continue
+            if str(child.resolve()) in removed_paths:
+                continue
             metadata = managed_marker(child)
             if not metadata or not metadata.get('upload_id') or db.scalar(select(DatasetEntry.id).where(DatasetEntry.node_id == 'local', DatasetEntry.path == str(child.resolve()), DatasetEntry.status != 'deleted')):
                 continue
-            db.add(DatasetEntry(id=uid(), node_id='local', location_id=identity, name=child.name,
+            db.add(DatasetEntry(id=uid(), node_id='local', location_id=location.id, name=child.name,
                                 path=str(child.resolve()), ownership='managed', status='ready',
-                                details={'names': metadata.get('classes', []), 'stats': metadata.get('stats', {}),
+                                details={'upload_id': metadata.get('upload_id'), 'names': metadata.get('classes', []), 'stats': metadata.get('stats', {}),
                                          'total_bytes': metadata.get('total_bytes', 0), 'warnings': metadata.get('warnings', [])}))
+        location.details = {**(location.details or {}), 'legacy_catalogue_imported': True}
     db.commit()
 
 
@@ -525,13 +702,25 @@ def busy_entry(db, identity):
                      DatasetOperation.payload['entry_id'].as_string() == identity).limit(1))
 
 
-def mutation_pending(db, node_id):
+def mutation_pending(db, node_id, data_path=None, *, task_type='detect', run=None, node_only=False):
     """Training claims and reference changes share the node DB claim lock."""
     for op in db.scalars(select(DatasetOperation).where(DatasetOperation.status.in_((*ACTIVE, 'failed')))):
-        if op.status == 'failed' and not op.payload.get('commit_started'):
+        if op.status == 'failed' and not op.payload.get('commit_started') and not path_scoped_delete(op):
             continue
         if op.kind == 'delete' or (op.kind == 'migrate' and op.payload.get('remove_source')):
             if op.payload.get('source_node') == node_id:
+                if path_scoped_delete(op):
+                    entry = db.get(DatasetEntry, op.payload.get('entry_id'))
+                    if not entry or entry.status != 'ready' or entry.node_id != node_id or entry.path != op.payload['source_path']:
+                        # A tombstoned identity can never be replayed against a
+                        # later same-name upload. Its stale job cannot block it.
+                        continue
+                if path_scoped_delete(op) and concurrent_dataset_delete(db, node_id):
+                    if node_only:
+                        continue
+                    if data_path is not None and training_path_conflict(
+                            db, node_id, op.payload['source_path'], data_path, task_type=task_type, run=run) is False:
+                        continue
                 return True
     return False
 
@@ -539,14 +728,15 @@ def mutation_pending(db, node_id):
 def node_dataset_file_work(db, node_id):
     concurrent = concurrent_dataset_reads(db, node_id)
     refresh = concurrent_dataset_refresh(db, node_id)
+    deletion = concurrent_dataset_delete(db, node_id)
     return any(op.payload.get('phase') in ('export', 'import', 'remove', 'discover')
                and not training_safe_operation(
-                   op, concurrent_reads=concurrent, concurrent_refresh=refresh) for op in db.scalars(
+                   op, concurrent_reads=concurrent, concurrent_refresh=refresh, concurrent_delete=deletion) for op in db.scalars(
         select(DatasetOperation).where(DatasetOperation.node_id == node_id, DatasetOperation.status.in_(ACTIVE))))
 
 
-def reject_training_mutation(db, node_id):
-    if mutation_pending(db, node_id or 'local'):
+def reject_training_mutation(db, node_id, data_path=None, *, task_type='detect', run=None, node_only=False):
+    if mutation_pending(db, node_id or 'local', data_path, task_type=task_type, run=run, node_only=node_only):
         raise HTTPException(409, '该服务器正在迁移或删除数据集，请等待操作结束后再调整或启动训练')
 
 
@@ -776,17 +966,41 @@ def delete_preview(identity: str, db: Session = Depends(get_db)):
 def adopt(identity: str, body: dict, db: Session = Depends(get_db)):
     with managed_dataset_mutation():
         e = db.get(DatasetEntry, identity)
-        if not e or e.status != 'ready' or busy_entry(db, identity):
-            raise HTTPException(409, '数据集不可接管')
+        if not e or e.status == 'deleted':
+            raise HTTPException(404, '数据集不存在')
+        acquire_node_claim_lock(db, e.node_id)
+        db.refresh(e)
+        if problem := registration_change_problem(db, e):
+            raise HTTPException(409, problem)
         if body.get('confirm_path') != e.path:
             raise HTTPException(422, '请填写完整目录以确认平台将获得文件删除权')
-        acquire_node_claim_lock(db, e.node_id)
         node_or_error(db, e.node_id)
         if problem := managed_path_problem(db, e.node_id, e.path, exclude_id=e.id):
             raise HTTPException(409, problem)
         e.ownership = 'managed'
         db.commit()
     return {'ok': True}
+
+
+@router.delete('/datasets/{identity}/registration', status_code=204)
+def unregister_entry(identity: str, db: Session = Depends(get_db)):
+    """Physically delete one catalogue row; never schedule any filesystem work."""
+    with managed_dataset_mutation():
+        entry = db.get(DatasetEntry, identity)
+        if not entry:
+            return  # A lost response can be retried without touching a replacement ID.
+        acquire_node_claim_lock(db, entry.node_id)
+        db.refresh(entry)
+        if problem := registration_change_problem(db, entry):
+            raise HTTPException(409, problem)
+        # The receipt is separate from the deleted row. It preserves history and
+        # prevents legacy bootstrap from silently re-registering retained files.
+        db.add(DatasetOperation(id=uid(), kind='unregister', status='completed', node_id=entry.node_id,
+            payload={'phase': 'catalogue', 'entry_id': entry.id, 'source_node': entry.node_id,
+                     'source_path': entry.path, 'name': entry.name, 'upload_id': (entry.details or {}).get('upload_id')},
+            result={'registration_removed': True, 'files_preserved': True}))
+        db.delete(entry)
+        db.commit()
 
 
 @router.post('/datasets/{identity}/migrate', status_code=202)
@@ -802,7 +1016,7 @@ def migrate(identity: str, body: Move, db: Session = Depends(get_db)):
         destination = str(PurePosixPath(loc.resolved_path) / name)
         if loc.node_id == e.node_id and (destination == e.path or PurePosixPath(e.path) in PurePosixPath(destination).parents or PurePosixPath(destination) in PurePosixPath(e.path).parents):
             raise HTTPException(409, '源与目标目录不能相同、互相包含')
-        if body.remove_source and (problem := removal_problem(db, e)):
+        if body.remove_source and (problem := removal_problem(db, e, allow_concurrent=False)):
             raise HTTPException(409, problem + '；可选择仅复制并保留源数据')
         if loc.node_id != 'local':
             node_or_error(db, loc.node_id)
@@ -826,6 +1040,7 @@ def delete_entry(identity: str, db: Session = Depends(get_db)):
             raise HTTPException(409, problem)
         op = new_operation(db, 'delete', e.node_id, {'phase': 'remove', 'entry_id': identity,
                            'source_node': e.node_id, 'source_path': e.path, 'name': e.name,
+                           'concurrent_delete': concurrent_dataset_delete(db, e.node_id),
                            'fingerprint': (e.details or {}).get('fingerprint'), 'config_guards': remote_config_guards(db, e.node_id, e.path)})
         # Old managed entries get a first snapshot at deletion under the same lock.
         if e.node_id == 'local' and not op.payload['fingerprint']:
@@ -897,7 +1112,7 @@ def operation_summary(db: Session = Depends(get_db)):
 def operation_page(
     page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
     status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all',
-    kind: Literal['all', 'check', 'upload', 'register', 'refresh', 'migrate', 'delete', 'discover'] = 'all',
+    kind: Literal['all', 'check', 'upload', 'register', 'refresh', 'migrate', 'delete', 'discover', 'unregister'] = 'all',
     node_id: str = Query('all', max_length=64), q: str = Query('', max_length=160),
     before: datetime | None = None, after: datetime | None = None, through: datetime | None = None, db: Session = Depends(get_db),
 ):
@@ -918,7 +1133,7 @@ def operation_page(
 class HistoryRemovalRequest(BaseModel):
     ids: list[str] | None = Field(default=None, min_length=1, max_length=500)
     status: Literal['all', 'attention', 'active', 'pending', 'running', 'committing', 'completed', 'failed', 'cancelled'] = 'all'
-    kind: Literal['all', 'check', 'upload', 'register', 'refresh', 'migrate', 'delete', 'discover'] = 'all'
+    kind: Literal['all', 'check', 'upload', 'register', 'refresh', 'migrate', 'delete', 'discover', 'unregister'] = 'all'
     node_id: str = Field(default='all', max_length=64)
     q: str = Field(default='', max_length=160)
     before: datetime
@@ -1084,7 +1299,9 @@ def action_payload(op, *, concurrent_refresh=False):
                 'config_text': yaml.safe_dump({'path': p['destination'], 'train': 'images/train', 'val': 'images/val',
                                               'names': dict(enumerate(p['names']))}, allow_unicode=True, sort_keys=False)}
     if phase == 'remove':
-        return {**common, 'path': p['source_path'], 'fingerprint': p['fingerprint'], 'config_guards': p.get('config_guards', [])}
+        return {**common, 'path': p['source_path'], 'fingerprint': p['fingerprint'], 'config_guards': p.get('config_guards', []),
+                **({'kind': 'delete', 'concurrent_delete': True, 'entry_id': p['entry_id']}
+                   if path_scoped_delete(op) else {})}
     return common
 
 
@@ -1096,7 +1313,9 @@ def phase_success(db, op, result):
         op.status = 'completed'
     elif phase == 'check':
         loc = db.get(DatasetLocation, p['location_id'])
-        loc.resolved_path, loc.status, loc.details = result['resolved_path'], 'ready', {**result, 'checked_at': utcnow().isoformat()}
+        import_state = {key: value for key, value in (loc.details or {}).items() if key == 'legacy_catalogue_imported'}
+        loc.resolved_path, loc.status, loc.details = result['resolved_path'], 'ready', {
+            **import_state, **result, 'checked_at': utcnow().isoformat()}
         if p.get('make_default'):
             for other in db.scalars(select(DatasetLocation).where(DatasetLocation.node_id == loc.node_id)):
                 other.is_default = other.id == loc.id
@@ -1185,7 +1404,9 @@ def guard_remove(db, op):
     acquire_node_claim_lock(db, op.payload['source_node'])
     if not entry:
         raise ValueError('源数据集不存在，拒绝删除')
-    if problem := removal_problem(db, entry):
+    if entry.node_id != op.payload['source_node'] or entry.path != op.payload['source_path']:
+        raise ValueError('源数据集位置已改变，拒绝删除')
+    if problem := removal_problem(db, entry, allow_concurrent=path_scoped_delete(op)):
         raise ValueError(problem)
 
 
@@ -1198,7 +1419,8 @@ def mark_error(db, op, exc):
     if op.kind == 'check':
         loc = db.get(DatasetLocation, op.payload['location_id'])
         if loc:
-            loc.status, loc.details = 'error', {'message': op.error}
+            import_state = {key: value for key, value in (loc.details or {}).items() if key == 'legacy_catalogue_imported'}
+            loc.status, loc.details = 'error', {**import_state, 'message': op.error}
     db.commit()
 
 
@@ -1722,9 +1944,10 @@ def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, d
         busy = training_active(db, node_id)
         concurrent = concurrent_dataset_reads(db, node_id)
         refresh = concurrent_dataset_refresh(db, node_id)
-        reads_only = lightweight_only or ((concurrent or refresh) and (busy or capability.get('lock_occupied')))
+        deletion = concurrent_dataset_delete(db, node_id)
+        reads_only = lightweight_only or ((concurrent or refresh or deletion) and (busy or capability.get('lock_occupied')))
         op = next((item for item in operations if not reads_only or item.payload.get('phase') == 'check'
-                   or training_safe_operation(item, concurrent_reads=concurrent, concurrent_refresh=refresh)), None)
+                   or training_safe_operation(item, concurrent_reads=concurrent, concurrent_refresh=refresh, concurrent_delete=deletion)), None)
         if not op:
             return {'operation': None}
         if op.payload['phase'] == 'discover':
@@ -1733,7 +1956,7 @@ def agent_poll(node_id: str, request: Request, lightweight_only: bool = False, d
                 return {'operation': None, 'message': '目录扫描需要 Agent 2.2.0 及 dataset_discovery 能力'}
         # An expired lease reuses its token, so a saved commit receipt is replayed.
         if busy and not (op.payload.get('phase') == 'check' or training_safe_operation(
-                op, concurrent_reads=concurrent, concurrent_refresh=refresh)):
+                op, concurrent_reads=concurrent, concurrent_refresh=refresh, concurrent_delete=deletion)):
             return {'operation': None}
         if op.payload['phase'] == 'remove':
             try:

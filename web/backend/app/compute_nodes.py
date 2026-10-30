@@ -162,6 +162,7 @@ class TrainingCapability(BaseModel):
     dataset_progress: bool = False
     dataset_concurrent_reads: bool = False
     dataset_concurrent_refresh: bool = False
+    dataset_concurrent_delete: bool = False
 
     @field_validator("output_roots", "model_test_roots", "dataset_roots")
     @classmethod
@@ -905,7 +906,7 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
     # arbitrate a node-wide legacy/automatic claim against a UUID claim.
     acquire_node_claim_lock(db, node_id)
     from .dataset_store import mutation_pending, node_dataset_file_work
-    if mutation_pending(db, node_id) or node_dataset_file_work(db, node_id):
+    if mutation_pending(db, node_id, node_only=True) or node_dataset_file_work(db, node_id):
         return {'task': None, 'poll_interval_seconds': 5, 'message': '等待数据集文件操作完成'}
     # Terminal rows can be left behind when the process exited between two
     # heartbeats. Reconcile their durable GPU ownership before selecting work.
@@ -960,6 +961,9 @@ def poll_training(node_id: str, request: Request, db: Session = Depends(get_db))
             release_gpu_reservations(db, run.id)
             db.commit()
             acquire_node_claim_lock(db, node_id)
+            continue
+        if mutation_pending(db, node_id, run.data_path, task_type=task.task_type, run=run):
+            last_message = '训练数据目录正在删除或无法证明与删除目录独立'
             continue
         snapshot = run.parameter_snapshot or {}
         output_error = remote_output_root_unavailable_reason(node, snapshot.get("remote_output_root"))

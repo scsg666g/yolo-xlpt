@@ -251,7 +251,7 @@ def serialize_run(db: Session, run: TrainingRun) -> RunRead:
 
 
 def reject_active_remote_delete(db: Session, node_id: str) -> None:
-    reject_training_mutation(db, node_id)
+    reject_training_mutation(db, node_id, node_only=True)
     if active_remote_delete(db, node_id):
         raise HTTPException(
             409,
@@ -520,7 +520,7 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db)):
     guard = managed_dataset_mutation()
     with guard:
         acquire_node_claim_lock(db, node.id if node else 'local')
-        reject_training_mutation(db, node.id if node else 'local')
+        reject_training_mutation(db, node.id if node else 'local', payload.data_path, task_type=payload.task_type)
         if node:
             acquire_node_claim_lock(db, node.id)
             db.refresh(node)
@@ -596,7 +596,7 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 def start_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     acquire_node_claim_lock(db, task.execution_node_id or "local")
-    reject_training_mutation(db, task.execution_node_id or "local")
+    reject_training_mutation(db, task.execution_node_id or "local", task.data_path, task_type=task.task_type)
     if task.status != "draft":
         raise HTTPException(409, f"当前状态 {task.status} 不能启动")
     if task.execution_node_id:
@@ -626,7 +626,7 @@ def start_task(task_id: str, db: Session = Depends(get_db)):
 def resume_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     acquire_node_claim_lock(db, task.execution_node_id or "local")
-    reject_training_mutation(db, task.execution_node_id or "local")
+    reject_training_mutation(db, task.execution_node_id or "local", task.data_path, task_type=task.task_type)
     if task.status not in {"stopped", "interrupted"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能继续训练")
     previous = current_run(db, task)
@@ -669,6 +669,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
             raise HTTPException(409, f"断点已经完成全部 {task.completed_epochs} 个 Epoch，请选择重新训练")
         raise HTTPException(409, f"断点已经完成全部 {task.completed_epochs} 个 Epoch，请选择重新训练")
     run = create_training_run(db, task, "resume", checkpoint)
+    reject_training_mutation(db, task.execution_node_id or "local", run.data_path, task_type=task.task_type, run=run)
     add_event(
         db,
         task.id,
@@ -686,7 +687,7 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
 def retry_task(task_id: str, db: Session = Depends(get_db)):
     task = get_task_or_404(db, task_id)
     acquire_node_claim_lock(db, task.execution_node_id or "local")
-    reject_training_mutation(db, task.execution_node_id or "local")
+    reject_training_mutation(db, task.execution_node_id or "local", task.data_path, task_type=task.task_type)
     if task.status not in {"failed", "stopped", "interrupted", "completed"}:
         raise HTTPException(409, f"当前状态 {task.status} 不能重新训练")
     if task.execution_node_id:
@@ -854,7 +855,7 @@ def clone_task(task_id: str, db: Session = Depends(get_db)):
     guard = nullcontext() if source.execution_node_id else managed_dataset_mutation()
     with guard:
         acquire_node_claim_lock(db, source.execution_node_id or 'local')
-        reject_training_mutation(db, source.execution_node_id or 'local')
+        reject_training_mutation(db, source.execution_node_id or 'local', source.data_path, task_type=source.task_type)
         if not source.execution_node_id:
             db.refresh(source)
             reject_local_task_cleanup(db)
@@ -1042,7 +1043,7 @@ def update_task_resources(task_id: str, payload: TaskResourceUpdate, db: Session
     guard = managed_dataset_mutation()
     with guard:
         acquire_node_claim_lock(db, task.execution_node_id or 'local')
-        reject_training_mutation(db, task.execution_node_id or 'local')
+        reject_training_mutation(db, task.execution_node_id or 'local', payload.data_path or task.data_path, task_type=task.task_type)
         if not task.execution_node_id:
             db.refresh(task)
             reject_local_task_cleanup(db)

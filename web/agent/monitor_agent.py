@@ -30,7 +30,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "2.6.2"
+VERSION = "2.6.3"
 LIGHTWEIGHT_DATASET_PHASES = ('check', 'discover')
 DEFAULT_DATASET_REFRESH_READ_RATE = 32 * 1024**2
 DEFAULT_DATASET_REFRESH_MIN_FREE = 512 * 1024**2
@@ -401,7 +401,7 @@ def training_capability(config: dict) -> dict:
                 "lock_occupied": False, "output_roots": [], "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
                 "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True,
-                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True}
+                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True, "dataset_concurrent_delete": True}
     reported_roots = []
     try:
         reported_roots = [str(root) for root in configured_output_roots(config)]
@@ -442,7 +442,7 @@ def training_capability(config: dict) -> dict:
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
                 "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True,
-                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True}
+                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True, "dataset_concurrent_delete": True}
     except (OSError, ValueError, KeyError, RuntimeError) as exc:
         return {"enabled": True, "ready": False, "reason": str(exc)[:400],
                 "supported_parameters": sorted(TRAINING_KEYS), "yolo_version": None,
@@ -451,7 +451,7 @@ def training_capability(config: dict) -> dict:
                 "output_roots": reported_roots, "gpu_parallelism": True,
                 "model_test_roots": list(config.get("model_test_roots", [])),
                 "dataset_roots": list(config.get("dataset_roots", [])), "dataset_discovery": True, "dataset_progress": True,
-                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True}
+                "dataset_concurrent_reads": True, "dataset_concurrent_refresh": True, "dataset_concurrent_delete": True}
 
 
 def next_report_sequence() -> int:
@@ -649,6 +649,10 @@ class LockBundle:
 
     def close(self) -> None:
         # Closing without LOCK_UN preserves locks inherited by a training child.
+        launch = getattr(self, 'dataset_launch_gate', None)
+        if launch is not None:
+            self.dataset_launch_gate = None
+            launch.close()
         for handle in reversed(self.handles):
             handle.close()
         self.handles.clear()
@@ -706,6 +710,10 @@ def acquire_training_lock(config: dict, output_roots: list[Path] | None = None):
 def release_training_lock(handle) -> None:
     if handle is None:
         return
+    launch = getattr(handle, 'dataset_launch_gate', None)
+    if launch is not None:
+        handle.dataset_launch_gate = None
+        release_training_lock(launch)
     handles = handle.handles if isinstance(handle, LockBundle) else [handle]
     _release_lock_handles(handles)
     if isinstance(handle, LockBundle):
@@ -1016,10 +1024,18 @@ def acquire_parallel_training_lock(config: dict, task: dict) -> LockBundle | Non
 
 def acquire_task_training_lock(config: dict, task: dict):
     """Use GPU-scoped 2.x reservations, falling back to the legacy exclusive protocol."""
-    assignment = normalize_gpu_assignment(task)
-    if assignment:
-        return acquire_parallel_training_lock(config, task)
-    return acquire_training_lock(config)
+    gate = dataset_launch_gate(config)
+    if gate is None:
+        return None
+    try:
+        assignment = normalize_gpu_assignment(task)
+        lock = acquire_parallel_training_lock(config, task) if assignment else acquire_training_lock(config)
+        if lock is not None:
+            lock.dataset_launch_gate = gate
+            gate = None
+        return lock
+    finally:
+        release_training_lock(gate)
 
 
 def training_launch_environment(config: dict, task: dict) -> dict[str, str]:
@@ -1253,6 +1269,23 @@ def process_identity_matches(identity: dict | None) -> bool:
         return False
     current = process_identity(identity["pid"])
     return bool(current and current == identity)
+
+
+def launched_process_identity(process, command: list[str], timeout_seconds: float = 1.0) -> dict | None:
+    """Allow procfs/exec to settle before publishing a new child's identity."""
+    deadline = time.monotonic() + timeout_seconds
+    previous = None
+    while True:
+        current = process_identity(process.pid)
+        if current and _argv_matches_command(_process_argv(process.pid), command):
+            if current == previous:
+                return current
+            previous = current
+        else:
+            previous = None
+        if process.poll() is not None or time.monotonic() >= deadline:
+            return None
+        time.sleep(0.01)
 
 
 def process_parent(pid: int) -> int | None:
@@ -2807,6 +2840,9 @@ def recover_remote_task(config: dict, state: dict, stop: threading.Event, traini
             return
         command = state.get("command") or []
         save_active_run(config, task, "running", command=command, identity=identity)
+        if lock is not None and getattr(lock, 'dataset_launch_gate', None) is not None:
+            release_training_lock(lock.dataset_launch_gate)
+            lock.dataset_launch_gate = None
         LOGGER.info("已安全接管 Agent 重启前的训练进程 %s（PID %s）", run_id, identity["pid"])
         requested_stop = bool(control.get("stop"))
         stop_reason = "platform_stop" if requested_stop else None
@@ -3009,9 +3045,13 @@ def _run_remote_task(config: dict, task: dict, stop: threading.Event, training_l
             process = subprocess.Popen(command, cwd=config["training_cwd"], env=environment, stdout=log_handle,
                                        stderr=subprocess.STDOUT, text=True, start_new_session=True,
                                        pass_fds=inherited_locks)
-            identity = process_identity(process.pid)
+            identity = launched_process_identity(process, command)
             if identity:
                 save_active_run(config, task, "running", command=command, identity=identity)
+            launch = getattr(training_lock, 'dataset_launch_gate', None)
+            if launch is not None:
+                release_training_lock(launch)
+                training_lock.dataset_launch_gate = None
             report_progress({"status": "running", "pid": process.pid, "run_dir": task["run_dir"],
                              "completed_epochs": task.get("completed_epochs", 0),
                              "progress": task.get("progress", 0), "latest_metrics": task.get("latest_metrics", {})})
@@ -3368,13 +3408,219 @@ def run_dataset_reclamation(config):
         LOGGER.warning('数据集中转清理暂未完成，现有断点已保留')
 
 
+DATASET_DELETE_EVIDENCE_READER = r'''
+import hashlib, json, os, sys, time
+from pathlib import Path
+import yaml
+request = json.load(sys.stdin)
+paths, guards, seen, checked = set(), {}, set(), set()
+metadata_count, deadline = 0, time.monotonic() + 12
+def path(raw, base):
+    if not isinstance(raw, str) or not raw.strip() or any(x in raw for x in ('://', chr(0), '*', '?', '[')):
+        raise ValueError('训练数据路径无法完整解析')
+    candidate = Path(raw).expanduser()
+    candidate = candidate if candidate.is_absolute() else Path(base) / candidate
+    if any(p.is_symlink() for p in (candidate, *candidate.parents)):
+        raise ValueError('训练路径含符号链接，无法证明删除安全')
+    resolved = candidate.resolve()
+    paths.add(str(resolved))
+    return resolved
+def read(p):
+    p = path(str(p), request['cwd'])
+    if not p.is_file() or p.stat().st_size > 4 * 1024**2:
+        raise ValueError('训练配置或清单不可读或过大')
+    data = p.read_bytes()
+    guards[str(p)] = hashlib.sha256(data).hexdigest()
+    return data.decode('utf-8-sig')
+def tree(p):
+    global metadata_count
+    if p in checked: return
+    checked.add(p)
+    if not p.is_dir(): raise ValueError('训练 split 目录不可用')
+    pending = [p]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                metadata_count += 1
+                if metadata_count > 100000 or time.monotonic() > deadline:
+                    raise ValueError('训练目录元数据检查超过安全预算')
+                if entry.is_symlink():
+                    raise ValueError('训练目录子树含符号链接，无法证明删除安全')
+                if entry.is_dir(follow_symlinks=False): pending.append(Path(entry.path))
+                elif not entry.is_file(follow_symlinks=False):
+                    raise ValueError('训练目录包含未知类型文件')
+def labels(p):
+    parts = list(p.parts)
+    positions = [i for i, part in enumerate(parts) if part == 'images']
+    if positions:
+        parts[positions[-1]] = 'labels'
+        label = Path(*parts)
+        if p.is_file(): label = label.with_suffix('.txt')
+        path(str(label), request['cwd'])
+        if label.is_dir(): tree(label)
+def split(raw, base):
+    p = path(raw, base)
+    if p.suffix.lower() == '.txt':
+        for row in read(p).splitlines():
+            row = row.strip()
+            if row:
+                # Ultralytics preserves other relative rows against its cwd.
+                item = path(row, p.parent if row.startswith('./') else request['cwd'])
+                if not item.is_file(): raise ValueError('训练图片清单包含不可核验的路径')
+                labels(item)
+    else:
+        tree(p)
+        labels(p)
+def dataset(raw, task_type):
+    p = path(raw, request['cwd'])
+    if p in seen: return
+    seen.add(p)
+    if task_type == 'classify':
+        if not (p / 'train').is_dir(): raise ValueError('分类数据目录不可核验')
+        tree(p)
+        return
+    cfg = yaml.safe_load(read(p))
+    if not isinstance(cfg, dict) or 'train' not in cfg or 'val' not in cfg:
+        raise ValueError('训练数据 YAML 缺少 split 配置')
+    root = cfg.get('path')
+    if root is None or root == '':
+        root = str(p.parent)
+    # An explicit relative root can resolve against training cwd or DATASETS_DIR.
+    # Never assume it is relative to the YAML file, even when that tree exists.
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise ValueError('显式相对数据根依赖训练工作目录或 YOLO 全局设置，无法完整核验删除安全')
+    root = path(root, p.parent)
+    for key in ('train', 'val', 'test', 'minival'):
+        value = cfg.get(key)
+        if value is None or value == '': continue
+        values = value if isinstance(value, list) else [value]
+        if not values: raise ValueError('训练 split 列表为空')
+        for item in values: split(item, root)
+for state in request['states']:
+    task = state['task']; kind = task.get('task_type', 'detect')
+    dataset(task['data_path'], kind)
+    command = state.get('command') or []
+    if not isinstance(command, list): raise ValueError('实际训练命令不可核验')
+    if '--command-json' in command:
+        command = json.loads(command[command.index('--command-json') + 1])
+    if not isinstance(command, list): raise ValueError('实际训练命令不可核验')
+    checkpoint = task.get('checkpoint_path')
+    documents, document_seen = [], set()
+    def resume(raw):
+        if raw is None or raw is False or (isinstance(raw, str) and raw.lower() in ('false', 'none', '')): return
+        if raw is True or (isinstance(raw, str) and raw.lower() == 'true'):
+            raw = checkpoint
+        source = path(raw, request['cwd'])
+        if not source.is_file() or source.suffix.lower() != '.pt':
+            raise ValueError('续训来源不可核验')
+        documents.append(source.parent.parent / 'args.yaml')
+    if state.get('phase') == 'running': documents.append(Path(task['run_dir']) / 'args.yaml')
+    if checkpoint: resume(checkpoint)
+    for item in command:
+        if isinstance(item, str) and item.startswith('data='): dataset(item[5:], kind)
+        if isinstance(item, str) and item.startswith('resume='): resume(item[7:])
+    while documents:
+        document = path(str(documents.pop()), request['cwd'])
+        if document in document_seen: continue
+        document_seen.add(document)
+        cfg = yaml.safe_load(read(document))
+        if not isinstance(cfg, dict) or not isinstance(cfg.get('data'), str):
+            raise ValueError('实际运行或续训配置缺少可验证 data')
+        dataset(cfg['data'], kind)
+        resume(cfg.get('resume'))
+        if isinstance(cfg.get('model'), str) and cfg['model'].lower().endswith('.pt'):
+            path(cfg['model'], request['cwd'])
+    for key in ('model_path', 'checkpoint_path', 'run_dir', 'log_path'):
+        if task.get(key): path(task[key], request['cwd'])
+print(json.dumps({'paths': sorted(paths), 'guards': guards}))
+'''
+
+def dataset_launch_gate(config, *, exclusive=False):
+    """Freeze new launches until a destructive operation has committed."""
+    handle = (workspace_state_dir(config) / '.dataset-launch.lock').open('a+')
+    try:
+        fcntl.flock(handle.fileno(), (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def concurrent_delete_work(work):
+    return (work.get('kind') == 'delete' and work.get('phase') == 'remove'
+            and work.get('concurrent_delete') is True)
+
+
+def dataset_delete_evidence(config, states):
+    yolo = config.get('yolo_bin', '')
+    resolved = shutil.which(yolo) if '/' not in yolo else yolo
+    python = Path(resolved).resolve().parent / 'python' if resolved else Path(sys.executable)
+    if not python.is_file():
+        python = Path(sys.executable)
+    try:
+        result = subprocess.run([str(python), '-c', DATASET_DELETE_EVIDENCE_READER],
+            input=json.dumps({'cwd': config['training_cwd'], 'states': states}), text=True,
+            capture_output=True, timeout=20, cwd=config['training_cwd'])
+        if result.returncode:
+            raise ValueError('实际训练配置、续训或图片清单无法完整核验，暂不能并发删除')
+        evidence = json.loads(result.stdout)
+        if not isinstance(evidence.get('paths'), list) or not isinstance(evidence.get('guards'), dict):
+            raise ValueError('实际训练数据证据格式无效')
+        return evidence
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        raise ValueError('训练 Python/PyYAML 证据读取失败，暂不能并发删除') from exc
+
+
+def verify_dataset_delete(config, work, *, own_legacy=False):
+    """Require positive state/config/lock evidence; open file counts prove nothing."""
+    target = DATASET_FILES['inside'](work['path'], config['dataset_roots'])
+    for _pid, other in _live_agent_configs():
+        if other is None or other.get('enable_training', False):
+            raise ValueError('本机存在其他训练 Agent，无法完整核验其数据引用')
+    states = load_active_runs(config)
+    known = {os.getpid()} if own_legacy else set()
+    for state in states:
+        if state.get('phase') not in ('running', 'claimed', 'confirmed', 'launching'):
+            raise ValueError('活动训练状态无法核验')
+        identity = _recovery_identity(state)
+        if state.get('phase') in ('running', 'launching') and identity is None:
+            raise ValueError('活动训练进程身份无法核验')
+        if identity:
+            known.add(identity['pid'])
+            if process_holds_task_locks(config, state['task'], identity['pid']):
+                known.add(os.getpid())
+    lock = configured_training_lock(config)
+    if lock.exists():
+        metadata = lock.stat()
+        expected = (os.major(metadata.st_dev), os.minor(metadata.st_dev), metadata.st_ino)
+        try:
+            for line in Path('/proc/locks').read_text().splitlines():
+                row = line.split()
+                if len(row) < 6 or row[1] == '->': continue
+                parts = row[5].split(':')
+                if len(parts) != 3: continue
+                key = (int(parts[0], 16), int(parts[1], 16), int(parts[2]))
+                if key == expected and int(row[4]) not in known:
+                    raise ValueError('训练工作区锁被未知外部进程占用，暂不能并发删除')
+        except (OSError, IndexError) as exc:
+            raise ValueError('无法核验训练工作区锁归属') from exc
+    evidence = dataset_delete_evidence(config, states) if states else {'paths': [], 'guards': {}}
+    if any(paths_overlap(target, Path(path)) for path in evidence['paths']):
+        raise ValueError('目标目录与实际训练、续训或图片清单引用重叠，拒绝删除')
+    for guard in work.get('config_guards', []):
+        path = DATASET_FILES['inside'](guard['path'], config['dataset_roots'])
+        if not path.is_file() or DATASET_FILES['digest'](path) != guard['sha256']:
+            raise ValueError('同节点数据配置发生变化，请重新加载校验后再删除')
+    return evidence
+
+
 def poll_dataset_operation(config, busy):
     """Old centres may ignore the filter; never execute their heavy work while busy."""
     path = f"/api/dataset-storage/agent/{config['node_id']}/poll"
     if busy:
         path += '?lightweight_only=true'
     work = dataset_api(config, path, 'POST', {}).get('operation')
-    if work and busy and work.get('phase') not in LIGHTWEIGHT_DATASET_PHASES and not concurrent_refresh_work(work):
+    if work and busy and work.get('phase') not in LIGHTWEIGHT_DATASET_PHASES and not concurrent_refresh_work(work) and not concurrent_delete_work(work):
         return None
     return work
 
@@ -3427,6 +3673,8 @@ def run_dataset_operation(config, work, stop):
     locks = []
     training_lock = None
     read_only_refresh = concurrent_refresh_work(work)
+    concurrent_delete = concurrent_delete_work(work)
+    deletion_evidence = None
     minimum_free = [0]
     resource_checked = [0.0, None]
     current_progress = [None]
@@ -3435,6 +3683,10 @@ def run_dataset_operation(config, work, stop):
     def check(stage=None):
         if stop.is_set():
             raise OSError('Agent 正在退出，等待下次恢复')
+        if stage == 'committing' and concurrent_delete:
+            current = verify_dataset_delete(config, work, own_legacy=True)
+            if deletion_evidence is not None and current['guards'] != deletion_evidence['guards']:
+                raise ValueError('训练配置或图片清单在删除校验期间发生变化，拒绝提交')
         if stage or time.monotonic() - last[0] > 4:
             dataset_api(config, base + '/heartbeat', 'POST', {'token': token, 'phase': phase, 'committing': stage == 'committing'})
             last[0] = time.monotonic()
@@ -3516,7 +3768,22 @@ def run_dataset_operation(config, work, stop):
             if owner is not None and not owner_path.exists():
                 dataset_atomic_json(owner_path, owner)
             report_progress({'stage': phase})
-            if phase not in LIGHTWEIGHT_DATASET_PHASES and not read_only_refresh:
+            if concurrent_delete:
+                gate = dataset_launch_gate(config, exclusive=True)
+                if gate is None:
+                    report_progress({'stage': 'waiting_lock'})
+                    return
+                locks.append(gate)
+                verify_dataset_delete(config, work)
+                legacy = configured_training_lock(config).open('a+')
+                try:
+                    fcntl.flock(legacy.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    legacy.close()
+                    raise ValueError('旧训练或外部进程持有独占工作区锁，暂不能并发删除')
+                locks.append(legacy)
+                deletion_evidence = verify_dataset_delete(config, work, own_legacy=True)
+            if phase not in LIGHTWEIGHT_DATASET_PHASES and not read_only_refresh and not concurrent_delete:
                 training_lock = acquire_training_lock(config)
                 if training_lock is None:
                     report_progress({'stage': 'waiting_lock'})

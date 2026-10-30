@@ -3,30 +3,33 @@ import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, RefreshCw, Search, Trash2, X } from 'lucide-react'
 import { api, formatBytes } from '../api'
 import { datasetOperationWait } from '../datasetOperationState'
-import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationPage, DatasetOperationSummary } from '../types'
+import type { DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperation, DatasetOperationPage, DatasetOperationSummary } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import { DatasetServerSelect, type DatasetServerOption } from './DatasetServerSelect'
 
 const statuses: Record<string, string> = { pending: '等待处理', running: '正在处理', committing: '提交文件中', completed: '已完成', failed: '失败', cancelled: '已取消' }
-const kinds: Record<string, string> = { discover: '目录扫描', check: '目录检查', upload: '上传', register: '登记', refresh: '重新加载', migrate: '复制 / 迁移', delete: '永久删除' }
+const kinds: Record<string, string> = { discover: '目录扫描', check: '目录检查', upload: '上传', register: '登记', refresh: '重新加载', migrate: '复制 / 迁移', delete: '永久删除文件', unregister: '删除登记（保留文件）' }
 
-export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }: {
+export function DatasetOperationDrawer({ onClose, onChanged, summary, servers, initialTarget }: {
   onClose: () => void; onChanged: () => void; summary: DatasetOperationSummary | null; servers: DatasetServerOption[]
+  initialTarget?: { operationId: string; name: string; nodeId: string }
 }) {
   const [removal, setRemoval] = useState<{ request: DatasetHistoryRemoval; label: string } | null>(null)
   const [removing, setRemoving] = useState(false)
   const close = () => { if (!removing) { if (removal) setRemoval(null); else onClose() } }
   const ref = useModalFocus<HTMLDivElement>(true, close, { canClose: !removing })
-  const [status, setStatus] = useState(summary && summary.active + summary.failed > 0 ? 'attention' : 'all')
+  const [status, setStatus] = useState(initialTarget ? 'all' : summary && summary.active + summary.failed > 0 ? 'attention' : 'all')
   const [kind, setKind] = useState('all')
-  const [server, setServer] = useState('all')
-  const [query, setQuery] = useState('')
-  const [search, setSearch] = useState('')
+  const [server, setServer] = useState(initialTarget?.nodeId || 'all')
+  const [query, setQuery] = useState(initialTarget?.name || '')
+  const [search, setSearch] = useState(initialTarget?.name || '')
   const [page, setPage] = useState(1)
   const [snapshot, setSnapshot] = useState('')
   const [latest, setLatest] = useState(summary?.latest_created_at)
   const [data, setData] = useState<DatasetOperationPage | null>(null)
-  const [detail, setDetail] = useState('')
+  const [targetOperation, setTargetOperation] = useState<DatasetOperation | null>(null)
+  const [targetRemoved, setTargetRemoved] = useState(false)
+  const [detail, setDetail] = useState(initialTarget?.operationId || '')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState('')
   const [loading, setLoading] = useState(true)
@@ -40,6 +43,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
   const eligibleIds = data?.items.filter(j => j.can_delete_history).map(j => j.id) || []
   const snapshotRef = useRef(snapshot)
   snapshotRef.current = snapshot
+  const showingTarget = !targetRemoved && !!initialTarget && search === initialTarget.name && server === initialTarget.nodeId && status === 'all' && kind === 'all' && !after && !through && page === 1
   useEffect(() => { const timer = setTimeout(() => { setSearch(query); setPage(1) }, 250); return () => clearTimeout(timer) }, [query])
   useEffect(() => {
     const previous = document.body.style.overflow
@@ -59,10 +63,14 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
       if (after) params.set('after', dayBoundary(after))
       if (through) params.set('through', dayBoundary(through, true))
       try {
-        const result = await api.datasetOperationPage(params, controller.signal)
+        const [result, target] = await Promise.all([
+          api.datasetOperationPage(params, controller.signal),
+          showingTarget && initialTarget.operationId ? api.datasetOperation(initialTarget.operationId, controller.signal).catch(() => null) : null,
+        ])
         if (active) {
           if (!snapshotRef.current) { snapshotRef.current = result.snapshot; setSnapshot(result.snapshot) }
           setData(result); setError(''); setLoading(false)
+          if (target) setTargetOperation(target)
           if (result.page !== page) setPage(result.page)
         }
       } catch (e) { if (active && !controller.signal.aborted) { setError(e instanceof Error ? e.message : '操作记录加载失败'); setLoading(false) } }
@@ -71,7 +79,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
     function visible() { if (!document.hidden) { clearTimeout(timer); void load() } }
     setLoading(true); void load(); document.addEventListener('visibilitychange', visible)
     return () => { active = false; controller?.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible) }
-  }, [page, status, kind, server, search, after, through, refresh])
+  }, [page, status, kind, server, search, after, through, refresh, initialTarget?.operationId, showingTarget])
   useEffect(() => {
     if (document.activeElement === document.body) ref.current?.focus()
   }, [data, ref])
@@ -95,9 +103,14 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
   }
   function removed(count: number) {
     setRemoval(null); setSelected([]); setNotice(`已删除 ${count} 条操作记录，数据集及实际文件保留。`)
+    if (initialTarget && (!removal?.request.ids || removal.request.ids.includes(initialTarget.operationId))) { setTargetRemoved(true); setTargetOperation(null) }
     ref.current?.focus(); onChanged(); setRefresh(v => v + 1)
   }
   const hasNew = !!summary?.latest_created_at && summary.latest_created_at !== latest && !!snapshot && new Date(summary.latest_created_at).getTime() > new Date(snapshot).getTime()
+  const showTarget = targetOperation && showingTarget
+  const visibleOperations = data?.items || []
+  const operations = showTarget && !visibleOperations.some(operation => operation.id === targetOperation.id)
+    ? [targetOperation, ...visibleOperations] : visibleOperations
   return <div className="dataset-drawer-backdrop" onMouseDown={close}>
     <div ref={ref} className="dataset-history-drawer" role="dialog" aria-modal="true" aria-labelledby="dataset-history-title" tabIndex={-1} onMouseDown={e => e.stopPropagation()}>
       <div className="dataset-history-content" inert={!!removal}><header><div><h2 id="dataset-history-title">数据集操作记录</h2><p>上传、校验与迁移在后台执行，关闭面板不会中断。</p></div><button type="button" className="icon-button" aria-label="关闭操作记录" onClick={close}><X size={20} /></button></header>
@@ -119,7 +132,7 @@ export function DatasetOperationDrawer({ onClose, onChanged, summary, servers }:
       {hasNew && <button className="dataset-new-records" type="button" onClick={newest}>有新操作记录，点击查看（当前页保持不变）</button>}
       {error && <div className="alert error" role="alert">{error}</div>}
       <div className="dataset-history-body" aria-busy={loading}>
-        {loading && !data ? <p className="empty">正在加载操作记录…</p> : data?.items.length ? data.items.map(j => <article className="dataset-history-row" key={j.id}>
+        {loading && !data ? <p className="empty">正在加载操作记录…</p> : operations.length ? operations.map(j => <article className="dataset-history-row" key={j.id}>
           <div className="dataset-history-row-main">{selectionMode && <input type="checkbox" className="dataset-history-checkbox" aria-label={`选择记录：${j.name || j.id}`} disabled={!j.can_delete_history || loading} checked={selectedIds.includes(j.id)} onChange={e => setSelected(current => e.target.checked ? [...current, j.id] : current.filter(id => id !== j.id))} />}
           <button type="button" className="dataset-history-row-toggle" aria-expanded={detail === j.id} aria-controls={`operation-${j.id}`} onClick={() => setDetail(detail === j.id ? '' : j.id)}>
             {detail === j.id ? <ChevronDown size={16} /> : <ChevronRight size={16} />}<span><strong title={j.name}>{j.name || '保存位置检查'}</strong><small>{kinds[j.kind] || j.kind} · {j.source_node_name || j.node_name || j.node_id}{j.target_node && j.target_node !== j.source_node ? ` → ${j.target_node_name || j.target_node}` : ''}</small></span>

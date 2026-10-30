@@ -389,6 +389,8 @@ export interface ManagedDatasetReference {
 }
 
 export interface ManagedDataset {
+  can_unregister?: boolean
+  unregister_block_reason?: string | null
   checked_at?: string | null
   refresh_status?: string | null
   refresh_error?: string | null

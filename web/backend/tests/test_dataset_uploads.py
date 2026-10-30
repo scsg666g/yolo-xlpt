@@ -12,7 +12,7 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 import app.dataset_uploads as uploads
@@ -444,6 +444,36 @@ def test_managed_dataset_listing_and_deletion_cleans_receipt(environment):
     assert not destination.exists()
     assert not (uploads.UPLOAD_ROOT / upload_id).exists()
     assert client.get("/api/datasets/managed").json() == []
+
+
+def test_legacy_delete_unknown_active_training_fails_closed(environment):
+    client, root = environment
+    assert complete(client, stage(client, dataset_files()), ['person', 'hat']).status_code == 200
+    with client.app.state.session_factory() as db:
+        db.add(TrainingTask(id='unknown-active', name='unknown active', status='running',
+                            model_path='model.pt', data_path=str(root / 'missing.yaml')))
+        db.commit()
+    response = client.delete('/api/datasets/managed/中文 训练集')
+    assert response.status_code == 409
+    assert (root / '中文 训练集').is_dir()
+
+
+def test_legacy_same_name_reupload_uses_current_catalogue_row(environment):
+    from app.models import DatasetEntry
+    client, root = environment
+    assert complete(client, stage(client, dataset_files()), ['person', 'hat']).status_code == 200
+    with client.app.state.session_factory() as db:
+        # Legacy uploads now publish their catalogue row immediately. Model the
+        # old tombstone alongside that actual current registration.
+        current = db.scalar(select(DatasetEntry).where(
+            DatasetEntry.path == str(root / '中文 训练集'), DatasetEntry.status == 'ready'))
+        current_id = current.id
+        db.add(DatasetEntry(id='old-deleted', location_id='legacy', node_id='local', name='中文 训练集',
+                            path=str(root / '中文 训练集'), ownership='managed', status='deleted'))
+        db.commit()
+    assert client.delete('/api/datasets/managed/中文 训练集').status_code == 204
+    with client.app.state.session_factory() as db:
+        assert db.get(DatasetEntry, current_id).status == 'deleted'
 
 
 def test_managed_dataset_lock_serializes_mutations(environment):

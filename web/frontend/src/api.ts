@@ -166,6 +166,7 @@ export const api = {
   adoptDataset: (id: string, confirm_path: string) => requestWithTimeout(`/api/dataset-storage/datasets/${id}/adopt`, { method: 'POST', body: JSON.stringify({ confirm_path }) }, 15_000, datasetSubmissionTimeout),
   datasetDeletePreview: (id: string, signal?: AbortSignal) => requestWithTimeout<ManagedDataset & { can_delete: boolean }>(`/api/dataset-storage/datasets/${id}/delete-preview`, { signal }),
   deleteDatasetEntry: (id: string) => requestWithTimeout<DatasetOperation>(`/api/dataset-storage/datasets/${id}`, { method: 'DELETE' }, 30_000, datasetSubmissionTimeout),
+  unregisterDataset: (id: string) => requestWithTimeout<void>(`/api/dataset-storage/datasets/${encodeURIComponent(id)}/registration`, { method: 'DELETE' }, 15_000, '删除登记请求超时，请刷新列表确认；原始文件会保留。'),
   previewDatasetHistoryRemoval: (payload: DatasetHistoryRemoval, signal?: AbortSignal) => requestWithTimeout<DatasetHistoryRemovalPreview>('/api/dataset-storage/operations/history-removal-preview', { method: 'POST', body: JSON.stringify(payload), signal }),
   removeDatasetHistory: (payload: DatasetHistoryRemoval) => requestWithTimeout<{ removed: number }>('/api/dataset-storage/operations/history-removal', { method: 'POST', body: JSON.stringify(payload) }),
   datasetOperationSummary: (signal?: AbortSignal) => requestWithTimeout<DatasetOperationSummary>('/api/dataset-storage/operations/summary', { signal }),

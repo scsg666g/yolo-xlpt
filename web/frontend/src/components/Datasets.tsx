@@ -1,7 +1,9 @@
 import { DatasetDiscoveryModal } from './DatasetDiscoveryModal'
 import { DatasetStorageModal, DatasetActionModal } from './DatasetStorage'
 import { DatasetOperationDrawer } from './DatasetOperationDrawer'
+import { DatasetOperationProgress } from './DatasetOperationProgress'
 import { DatasetServerSelect } from './DatasetServerSelect'
+import { DatasetRegistrationModal } from './DatasetRegistrationModal'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
@@ -21,10 +23,11 @@ import {
   X,
 } from 'lucide-react'
 import { api, formatBytes, statusLabel } from '../api'
-import type { ComputeNode, DatasetOperationSummary, DatasetUploadResult, ManagedDataset } from '../types'
+import type { ComputeNode, DatasetOperation, DatasetOperationSummary, DatasetUploadResult, ManagedDataset } from '../types'
 import { UploadDatasetModal } from './UploadDatasetModal'
 
-type DatasetFilter = 'all' | 'deletable' | 'referenced'
+type DatasetFilter = 'all' | 'unregisterable' | 'referenced'
+type DeletionReceipt = { operationId: string; datasetId: string; name: string; node: string; nodeId: string; directory: string }
 
 function valueOrZero(value: number | undefined) {
   return value ?? 0
@@ -68,6 +71,7 @@ export function Datasets() {
   const [uploading, setUploading] = useState(false)
   const [deleteTarget, setDeleteTarget] = useState<ManagedDataset | null>(null)
   const [deleting, setDeleting] = useState(false)
+  const [registrationTarget, setRegistrationTarget] = useState<{ dataset: ManagedDataset; mode: 'unregister' | 'adopt' } | null>(null)
   const [refreshing, setRefreshing] = useState<string | null>(null)
   const refreshSubmitting = useRef(false)
   // Keep uncertain submissions identifiable; retrying must not create a second job.
@@ -77,6 +81,13 @@ export function Datasets() {
   const [discoveryOpen, setDiscoveryOpen] = useState(false)
   const [storageOpen, setStorageOpen] = useState(false)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [historyTarget, setHistoryTarget] = useState<{ operationId: string; name: string; nodeId: string } | null>(null)
+  const [operationDetails, setOperationDetails] = useState<Record<string, DatasetOperation>>({})
+  const [operationErrors, setOperationErrors] = useState<Record<string, string>>({})
+  const [deletionReceipts, setDeletionReceipts] = useState<DeletionReceipt[]>([])
+  const operationIds = useRef<string[]>([])
+  const latestOperations = useRef(operationDetails)
+  latestOperations.current = operationDetails
   const [operationSummary, setOperationSummary] = useState<DatasetOperationSummary | null>(null)
   const [historyError, setHistoryError] = useState('')
   const [nodes, setNodes] = useState<ComputeNode[]>([])
@@ -90,6 +101,15 @@ export function Datasets() {
   const deleteOpener = useRef<HTMLButtonElement | null>(null)
   const deletePreviewVersion = useRef(0)
   const deletePreviewController = useRef<AbortController | null>(null)
+  operationIds.current = [...new Set([
+    ...datasets.map(dataset => dataset.blocking_operation_id).filter((id): id is string => !!id),
+    ...deletionReceipts.filter(receipt => !['completed', 'cancelled'].includes(operationDetails[receipt.operationId]?.status)).map(receipt => receipt.operationId),
+  ])]
+
+  function showOperation(dataset: ManagedDataset) {
+    setHistoryTarget({ operationId: dataset.blocking_operation_id || '', name: dataset.name, nodeId: dataset.node_id })
+    setHistoryOpen(true)
+  }
 
   const loadDatasets = useCallback(async () => {
     loadRequest.current?.controller.abort()
@@ -131,8 +151,29 @@ export function Datasets() {
     async function load() {
       if (!active || running || document.hidden) return
       running = true; controller = new AbortController()
-      const result = await Promise.allSettled([api.datasetOperationSummary(controller.signal), api.computeNodes(controller.signal)])
+      const ids = operationIds.current
+      const [result, details] = await Promise.all([
+        Promise.allSettled([api.datasetOperationSummary(controller.signal), api.computeNodes(controller.signal)]),
+        Promise.allSettled(ids.map(id => api.datasetOperation(id, controller!.signal))),
+      ])
       if (active && !controller.signal.aborted) {
+        if (details.some(detail => detail.status === 'fulfilled' && ['completed', 'failed', 'cancelled'].includes(detail.value.status)
+          && latestOperations.current[detail.value.id]?.status !== detail.value.status)) forceReload = true
+        if (ids.length) {
+          setOperationDetails(current => {
+            const next = { ...current }
+            details.forEach((detail, index) => { if (detail.status === 'fulfilled') next[ids[index]] = detail.value })
+            return next
+          })
+          setOperationErrors(current => {
+            const next = { ...current }
+            details.forEach((detail, index) => {
+              if (detail.status === 'fulfilled') delete next[ids[index]]
+              else next[ids[index]] = '操作状态暂未更新，保留最后记录；请查看操作记录。'
+            })
+            return next
+          })
+        }
         const [history, compute] = result
         if (history.status === 'fulfilled') {
           setOperationSummary(history.value); setHistoryError('')
@@ -234,7 +275,7 @@ export function Datasets() {
     const query = search.trim().toLocaleLowerCase()
     return datasets.filter((dataset) => {
       if (serverFilter !== 'all' && dataset.node_id !== serverFilter) return false
-      if (filter === 'deletable' && !dataset.can_delete) return false
+      if (filter === 'unregisterable' && (dataset.can_unregister === false || dataset.blocking_operation_id)) return false
       if (filter === 'referenced' && !dataset.references.length) return false
       if (!query) return true
       return [dataset.name, dataset.directory, dataset.config_path, ...dataset.classes]
@@ -256,10 +297,14 @@ export function Datasets() {
     setNotice('')
     const name = deleteTarget.name
     try {
-      await api.deleteDatasetEntry(deleteTarget.id)
+      const operation = await api.deleteDatasetEntry(deleteTarget.id)
+      setOperationDetails(current => ({ ...current, [operation.id]: operation }))
+      setDeletionReceipts(current => [...current.filter(receipt => receipt.operationId !== operation.id), {
+        operationId: operation.id, datasetId: deleteTarget.id, name, node: deleteTarget.node_name || (deleteTarget.node_id === 'local' ? '本机服务器' : deleteTarget.node_id), nodeId: deleteTarget.node_id, directory: deleteTarget.directory,
+      }])
       operationsChanged()
       setDeleteTarget(null)
-      setNotice(`数据集“${name}”已提交永久删除，请在操作历史中查看完成状态。`)
+      setNotice(`数据集“${name}”的删除请求已受理，请以下方实时状态确认文件清理结果。`)
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : '数据集删除失败'
       setDeleteTarget(null)
@@ -331,11 +376,11 @@ export function Datasets() {
       <div>
         <span className="eyebrow">DATASET LIBRARY</span>
         <h1>数据集管理</h1>
-        <p>统一管理本机和远程数据集：保存位置、上传、已有目录登记、复制迁移及安全删除。当前托管校验支持 YOLO 目标检测。</p>
+        <p>统一管理本机和远程数据集；删除登记保留原始文件，可在训练期间操作。当前托管校验支持 YOLO 目标检测。</p>
       </div>
       <div className="header-actions datasets-header-actions">
         <button type="button" className="button ghost" onClick={() => setStorageOpen(true)}><Settings2 size={16} />保存位置</button>
-        <button type="button" className="button ghost" title={historyError || '查看全部数据集操作记录'} onClick={() => setHistoryOpen(true)}><History size={16} />操作记录{operationSummary && operationSummary.active > 0 && <span className="dataset-count-badge">{operationSummary.active} 进行中</span>}{operationSummary && operationSummary.failed > 0 && <span className="dataset-count-badge failed">{operationSummary.failed} 失败</span>}{historyError && <AlertTriangle size={14} />}</button>
+        <button type="button" className="button ghost" title={historyError || '查看全部数据集操作记录'} onClick={() => { setHistoryTarget(null); setHistoryOpen(true) }}><History size={16} />操作记录{operationSummary && operationSummary.active > 0 && <span className="dataset-count-badge">{operationSummary.active} 进行中</span>}{operationSummary && operationSummary.failed > 0 && <span className="dataset-count-badge failed">{operationSummary.failed} 失败</span>}{historyError && <AlertTriangle size={14} />}</button>
         <button type="button" className="button ghost" onClick={() => setDiscoveryOpen(true)}><Search size={16} />扫描已有数据集</button>
         <button type="button" className="button ghost" onClick={() => setActionTarget('register')}><FolderOpen size={16} />登记已有目录</button>
         <button type="button" className="button ghost" disabled={loading || deleting} onClick={() => { setNotice(''); operationsChanged() }}>
@@ -349,6 +394,20 @@ export function Datasets() {
 
     {notice && <div className="dataset-feedback success" role="status"><CheckCircle2 size={17} />{notice}</div>}
     {(error || loadError) && <div className="dataset-feedback error" role="alert"><AlertTriangle size={17} /><span>{error || loadError}</span><button type="button" onClick={() => { setError(''); setLoadError('') }} aria-label="关闭错误提示"><X size={15} /></button></div>}
+
+    {!!deletionReceipts.length && <section className="dataset-deletion-receipts" aria-label="本次删除状态">{deletionReceipts.map(receipt => {
+      const operation = operationDetails[receipt.operationId]
+      return <article key={receipt.operationId} className="dataset-deletion-receipt" aria-live="polite">
+        <div><strong>{receipt.name}</strong><span>{receipt.node}</span><button type="button" className="button ghost compact" onClick={() => { setHistoryTarget({ operationId: receipt.operationId, name: receipt.name, nodeId: receipt.nodeId }); setHistoryOpen(true) }}>查看删除操作</button></div>
+        <code>{receipt.directory}</code>
+        {operation && <DatasetOperationProgress operation={operation} />}
+        {operation?.status === 'completed' && <p role="status">后台已确认文件清理和数据集登记删除完成，可以重新上传。</p>}
+        {operation?.status === 'failed' && <p role="alert">删除失败：{operation.error || '请查看操作记录并重试或取消。'}文件可能尚未清理完成，请确认状态后再上传。</p>}
+        {operation?.status === 'cancelled' && <p role="status">删除已取消，请以数据集列表和服务器目录的实际状态为准。</p>}
+        {operationErrors[receipt.operationId] && <p role="status">{operationErrors[receipt.operationId]}</p>}
+        {['completed', 'cancelled'].includes(operation?.status) && <button type="button" className="button ghost compact" onClick={() => setDeletionReceipts(current => current.filter(item => item.operationId !== receipt.operationId))}>收起结果</button>}
+      </article>
+    })}</section>}
 
     <section className="dataset-overview" aria-label="数据集概览">
       <article><Database size={19} /><div><strong>{summary.count}</strong><span>平台数据集</span></div></article>
@@ -364,7 +423,7 @@ export function Datasets() {
         {search && <button type="button" onClick={() => setSearch('')} aria-label="清空搜索"><X size={14} /></button>}
       </label>
       <div className="dataset-filters" role="group" aria-label="按引用状态筛选">
-        {([['all', '全部'], ['deletable', '可删除'], ['referenced', '已引用']] as Array<[DatasetFilter, string]>).map(([value, label]) =>
+        {([['all', '全部'], ['unregisterable', '可删登记'], ['referenced', '已引用']] as Array<[DatasetFilter, string]>).map(([value, label]) =>
           <button key={value} type="button" className={filter === value ? 'active' : ''} onClick={() => setFilter(value)} aria-pressed={filter === value}>{label}</button>)}
       </div>
       <DatasetServerSelect options={servers} value={serverFilter} onChange={setServerFilter} />
@@ -376,6 +435,8 @@ export function Datasets() {
         {visibleDatasets.map((dataset) => {
           const referenced = dataset.references.length > 0
           const classCount = dataset.stats.classes ?? dataset.classes.length
+          const operation = dataset.blocking_operation_id ? operationDetails[dataset.blocking_operation_id] : undefined
+          const deletingEntry = deletionReceipts.some(receipt => receipt.datasetId === dataset.id && !['completed', 'failed', 'cancelled'].includes(operationDetails[receipt.operationId]?.status))
           return <article className="dataset-card" key={dataset.id}>
             <header>
               <div className="dataset-card-icon"><Database size={19} /></div>
@@ -387,7 +448,7 @@ export function Datasets() {
             </header>
 
             <div className="dataset-check-status"><small>{dataset.checked_at ? `最近完整校验：${formatCreatedAt(dataset.checked_at)}` : '统计来自登记记录，完整校验时间未记录'}</small>
-              {dataset.blocking_operation_kind === 'refresh' && <button type="button" onClick={() => setHistoryOpen(true)}>{dataset.refresh_status === 'failed' ? '重新加载失败，保留上次统计；查看处理' : dataset.refresh_status === 'pending' ? '重新加载已提交，保留上次统计；查看等待原因' : '重新加载校验中，保留上次统计；查看进度'}</button>}
+              {dataset.blocking_operation_kind === 'refresh' && <button type="button" onClick={() => showOperation(dataset)}>{dataset.refresh_status === 'failed' ? '重新加载失败，保留上次统计；查看处理' : dataset.refresh_status === 'pending' ? '重新加载已提交，保留上次统计；查看等待原因' : '重新加载校验中，保留上次统计；查看进度'}</button>}
               {dataset.refresh_status === 'cancelled' && <small>上次重新加载已取消，保留上次统计</small>}
               {dataset.refresh_error && dataset.refresh_status === 'failed' && <small role="alert">{dataset.refresh_error}</small>}
             </div>
@@ -400,6 +461,14 @@ export function Datasets() {
             </div>
 
             <div className="dataset-path" title={dataset.directory}><FolderOpen size={14} /><code>{dataset.directory}</code></div>
+
+            {(dataset.can_unregister === false || dataset.blocking_operation_id) && <div className="dataset-delete-block" role="status">
+              <AlertTriangle size={14} /><div><strong>登记操作暂不可用</strong><p>{dataset.unregister_block_reason || '该数据集有未完成操作，请先完成、重试或取消。'}</p>
+                {dataset.blocking_operation_id && <button type="button" className="button ghost compact" onClick={() => showOperation(dataset)}>查看并处理相关操作</button>}
+              </div>
+            </div>}
+            {operation && <div className="dataset-card-operation"><DatasetOperationProgress operation={operation} />{operation.error && <p role="alert">{operation.error}</p>}{operationErrors[operation.id] && <small role="status">{operationErrors[operation.id]}</small>}</div>}
+            {dataset.blocking_operation_id && !operation && <small className="dataset-card-operation" role="status">{operationErrors[dataset.blocking_operation_id] || '正在读取后台操作状态…'}</small>}
 
             <div className="dataset-classes">
               <div className="dataset-section-heading"><Tags size={14} /><strong>类别</strong><span>{dataset.classes.length}</span></div>
@@ -420,10 +489,12 @@ export function Datasets() {
             <footer>
               <span>{valueOrZero(dataset.stats.labels).toLocaleString('zh-CN')} 个标签文件{valueOrZero(dataset.stats.background_images) > 0 ? ` · ${dataset.stats.background_images} 张背景图` : ''}</span>
               <button type="button" className="button ghost compact" disabled={!!dataset.blocking_operation_id} onClick={() => setActionTarget(dataset)}>复制 / 迁移</button>
-              {dataset.ownership === 'external' && <button type="button" className="button ghost compact" disabled={!!dataset.blocking_operation_id} onClick={() => { const path = window.prompt(`接管后平台将有权删除文件，请输入完整目录确认：\n${dataset.directory}`); if (path) void api.adoptDataset(dataset.id, path).then(loadDatasets).catch((e: Error) => setError(e.message)) }}>接管文件</button>}
-              <button type="button" className="button danger compact" disabled={!dataset.can_delete || deleting} title={dataset.delete_block_reason || (dataset.blocking_operation_id ? '请先完成或取消该数据集的未完成操作' : referenced ? '请先更换或永久删除引用该数据集的任务' : '永久删除数据集')} onClick={(event) => openDeleteDialog(dataset, event.currentTarget)}>
-                <Trash2 size={14} />{dataset.blocking_operation_id ? '操作未完成' : referenced ? '仍被引用' : '删除'}
-              </button>
+              {dataset.ownership === 'external' && <button type="button" className="button ghost compact" disabled={dataset.can_unregister === false || !!dataset.blocking_operation_id} onClick={() => setRegistrationTarget({ dataset, mode: 'adopt' })}>接管文件</button>}
+              <button type="button" className="button danger compact" aria-label={`删除登记：${dataset.name}`} disabled={dataset.can_unregister === false || !!dataset.blocking_operation_id || deletingEntry} title={dataset.unregister_block_reason || '只删除数据库登记，保留原始数据集文件；支持训练期间操作'} onClick={() => setRegistrationTarget({ dataset, mode: 'unregister' })}><Trash2 size={14} />删除登记</button>
+              {dataset.ownership === 'managed' && <details className="dataset-file-actions"><summary>文件操作</summary><div>
+                <p>{dataset.delete_block_reason || '永久删除会清理该目录内的图片、标签和配置文件。'}</p>
+                <button type="button" className="button danger compact" aria-label={`永久删除文件：${dataset.name}`} disabled={!dataset.can_delete || deleting || deletingEntry} onClick={event => openDeleteDialog(dataset, event.currentTarget)}><Trash2 size={14} />永久删除文件</button>
+              </div></details>}
             </footer>
           </article>
         })}
@@ -431,19 +502,28 @@ export function Datasets() {
 
     {discoveryOpen && <DatasetDiscoveryModal onClose={() => { setDiscoveryOpen(false); operationsChanged() }} onChanged={operationsChanged} />}
     {storageOpen && <DatasetStorageModal onClose={() => { setStorageOpen(false); setSummaryRefresh(v => v + 1) }} />}
-    {historyOpen && <DatasetOperationDrawer onClose={() => setHistoryOpen(false)} onChanged={operationsChanged} summary={operationSummary} servers={servers.map(({ id, name, status }) => ({ id, name, status }))} />}
+    {historyOpen && <DatasetOperationDrawer initialTarget={historyTarget || undefined} onClose={() => { setHistoryOpen(false); setHistoryTarget(null) }} onChanged={operationsChanged} summary={operationSummary} servers={servers.map(({ id, name, status }) => ({ id, name, status }))} />}
     {actionTarget && <DatasetActionModal dataset={actionTarget === 'register' ? undefined : actionTarget} onClose={() => setActionTarget(null)} onDone={operationsChanged} />}
     {uploading && !deleting && <UploadDatasetModal onClose={() => setUploading(false)} onUploaded={(result) => { void handleUploaded(result) }} />}
+    {registrationTarget && <DatasetRegistrationModal key={`${registrationTarget.mode}:${registrationTarget.dataset.id}`} dataset={registrationTarget.dataset} mode={registrationTarget.mode} onClose={() => setRegistrationTarget(null)} onDone={() => {
+      const { dataset, mode } = registrationTarget
+      if (mode === 'unregister') setDatasets(current => current.filter(item => item.id !== dataset.id))
+      setNotice(mode === 'unregister' ? `已删除“${dataset.name}”的数据库登记，原始文件和训练任务保留。` : `已接管“${dataset.name}”的文件管理权限。`)
+      setRegistrationTarget(null)
+      operationsChanged()
+    }} />}
 
     {deleteTarget && <div className="modal-backdrop dataset-delete-backdrop" onMouseDown={closeDeleteDialog}>
       <div ref={deleteDialog} className="modal dataset-delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="dataset-delete-title" aria-busy={deleting} tabIndex={-1} onKeyDown={handleDeleteDialogKeyDown} onMouseDown={(event) => event.stopPropagation()}>
         <header><div><span className="eyebrow">DELETE DATASET</span><h2 id="dataset-delete-title">永久删除数据集</h2></div><button type="button" className="icon-button" disabled={deleting} onClick={closeDeleteDialog} aria-label="关闭删除确认"><X size={19} /></button></header>
         <div className="dataset-delete-body">
           <div className="dataset-delete-warning"><AlertTriangle size={21} /><div><strong>删除后无法恢复</strong><span>将永久删除数据集“{deleteTarget.name}”的图片、标签和配置文件。</span></div></div>
+          <div className="dataset-delete-detail"><span>服务器</span><strong>{deleteTarget.node_name || (deleteTarget.node_id === 'local' ? '本机服务器' : deleteTarget.node_id)}</strong><code>{deleteTarget.node_id}</code></div>
           <div className="dataset-delete-detail"><span>目录</span><code>{deleteTarget.directory}</code></div>
           <p>当前没有任务引用此数据集。基础模型、训练记录和其他数据集不受影响。</p>
+          <p>确认后提交后台校验和清理，页面持续显示进度；收到完成回执后才表示文件已删除。</p>
         </div>
-        <footer><button ref={deleteCancelButton} type="button" className="button ghost" disabled={deleting} onClick={closeDeleteDialog}>取消</button><button type="button" className="button danger" disabled={deleting} onClick={() => void deleteDataset()}>{deleting ? <RefreshCw size={15} className="spin" /> : <Trash2 size={15} />}{deleting ? '正在删除…' : '确认永久删除'}</button></footer>
+        <footer><button ref={deleteCancelButton} type="button" className="button ghost" disabled={deleting} onClick={closeDeleteDialog}>取消</button><button type="button" className="button danger" disabled={deleting} onClick={() => void deleteDataset()}>{deleting ? <RefreshCw size={15} className="spin" /> : <Trash2 size={15} />}{deleting ? '正在提交删除…' : '确认永久删除'}</button></footer>
       </div>
     </div>}
   </div>

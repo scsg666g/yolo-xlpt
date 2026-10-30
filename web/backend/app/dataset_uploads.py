@@ -265,8 +265,11 @@ def delete_managed_dataset(name: str, db: Session = Depends(get_db)):
         if metadata is None:
             raise HTTPException(404, "平台上传的数据集不存在")
         from .models import DatasetEntry
-        from .dataset_store import busy_entry
-        entry = db.scalar(select(DatasetEntry).where(DatasetEntry.node_id == 'local', DatasetEntry.path == str(directory)))
+        from .dataset_store import busy_entry, active_training_path_problem
+        from .gpu_reservations import acquire_node_claim_lock
+        acquire_node_claim_lock(db, 'local')
+        entry = db.scalar(select(DatasetEntry).where(DatasetEntry.node_id == 'local', DatasetEntry.path == str(directory),
+                                                   DatasetEntry.status != 'deleted'))
         if entry and busy_entry(db, entry.id):
             raise HTTPException(409, '该数据集已有未完成操作')
         config_path = str((directory / "data.yaml").resolve())
@@ -277,6 +280,9 @@ def delete_managed_dataset(name: str, db: Session = Depends(get_db)):
             if suffix:
                 task_names += "、"
             raise HTTPException(409, f"数据集仍被任务引用：{task_names}{suffix}；请先更换数据集或永久删除任务")
+        protection_entry = entry or DatasetEntry(node_id='local', path=str(directory))
+        if problem := active_training_path_problem(db, protection_entry):
+            raise HTTPException(409, problem)
         quarantine = root / MANAGED_DELETION_DIR
         detached = quarantine / f"{uuid.uuid4().hex}-{name}"
         try:
@@ -736,6 +742,8 @@ def complete_upload(upload_id: str, payload: UploadComplete, db: Session = Depen
         with managed_dataset_mutation():
             recovered_result = published_upload_result(destination, upload_id)
             if recovered_result is not None:
+                from .dataset_store import record_legacy_publication
+                record_legacy_publication(db, destination, recovering=True)
                 try:
                     receipt.write_text(
                         json.dumps({**manifest, "result": recovered_result}, ensure_ascii=False),
@@ -802,6 +810,8 @@ def complete_upload(upload_id: str, payload: UploadComplete, db: Session = Depen
                 if destination.exists() or destination.is_symlink():
                     raise HTTPException(409, f"服务器已存在同名目录“{manifest['name']}”，请重命名本地文件夹后上传")
                 publication.replace(destination)
+                from .dataset_store import record_legacy_publication
+                record_legacy_publication(db, destination)
                 receipt.replace(directory / "manifest.json")
         except HTTPException:
             shutil.rmtree(publication, ignore_errors=True)
