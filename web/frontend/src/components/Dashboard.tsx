@@ -20,6 +20,7 @@ const TaskOverviewModal = lazy(() => import('./TaskOverviewModal').then(({ TaskO
 const statusIcon = (status: string) => status === 'completed' ? <CheckCircle2 size={15} /> : status === 'failed' || status === 'interrupted' ? <AlertTriangle size={15} /> : status === 'running' ? <Zap size={15} /> : <Clock3 size={15} />
 const activeStatuses = ['queued', 'starting', 'running', 'stopping']
 const activeDeletionStatuses = new Set<DeletionJob['status']>(['pending', 'running', 'finalizing'])
+const trashPageSize = 12
 const ungroupedKey = '__ungrouped__'
 
 const deletionPhaseLabels: Record<DeletionJob['phase'], string> = {
@@ -146,6 +147,10 @@ export function Dashboard() {
   const [filteredCollapsedGroups, setFilteredCollapsedGroups] = useState<Set<string>>(() => new Set())
   const [deleting, setDeleting] = useState(false)
   const [trashOpen, setTrashOpen] = useState(false)
+  const [trashView, setTrashView] = useState<'tasks' | 'history'>('tasks')
+  const [trashQuery, setTrashQuery] = useState('')
+  const [trashFilter, setTrashFilter] = useState('all')
+  const [trashPage, setTrashPage] = useState(1)
   const [trashTasks, setTrashTasks] = useState<TrainingTask[]>([])
   const [deletionJobs, setDeletionJobs] = useState<DeletionJob[]>([])
   const [trashLoading, setTrashLoading] = useState(false)
@@ -165,6 +170,7 @@ export function Dashboard() {
   const taskRequest = useRef<{ controller: AbortController; timer: number } | null>(null)
   const taskDataVersion = useRef(0)
   const trashRequest = useRef<AbortController | null>(null)
+  const trashListRef = useRef<HTMLDivElement | null>(null)
   const trashLoadingRequest = useRef<AbortController | null>(null)
   const deletePreviewRequest = useRef<AbortController | null>(null)
   const deletionJobsRef = useRef<DeletionJob[]>([])
@@ -319,6 +325,40 @@ export function Dashboard() {
       .filter((job) => !taskIds.has(job.task_id))
       .sort((left, right) => new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime())
   }, [latestDeletionJobs, trashTasks])
+
+  const visibleTrashTasks = useMemo(() => {
+    const query = trashQuery.trim().toLocaleLowerCase()
+    return trashTasks.filter((task) => {
+      const job = latestDeletionJobs.get(task.id)
+      const pending = ['remote_delete_pending', 'local_delete_pending'].includes(task.deleted_reason || '')
+      const failed = ['remote_delete_failed', 'local_delete_failed'].includes(task.deleted_reason || '')
+      const category = job ? activeDeletionStatuses.has(job.status) ? 'active'
+        : job.status === 'failed' || job.status === 'cancelled' ? 'attention' : 'completed'
+        : pending ? 'active' : failed ? 'attention' : 'restorable'
+      const location = job ? deletionExecutorLabel(job)
+        : task.execution_node_id ? nodeNames[task.execution_node_id] || task.execution_node_id : '本机服务器'
+      return (trashFilter === 'all' || category === trashFilter)
+        && (!query || [task.name, task.id, location, job ? deletionPhaseLabel(job) : category === 'restorable' ? '可恢复 文件已保留' : category === 'attention' ? '清理失败' : '清理中', job?.message, job?.error]
+          .some((value) => value?.toLocaleLowerCase().includes(query)))
+    }).sort((left, right) => new Date(right.deleted_at || 0).getTime() - new Date(left.deleted_at || 0).getTime())
+  }, [latestDeletionJobs, nodeNames, trashFilter, trashQuery, trashTasks])
+
+  const visibleDeletionJobs = useMemo(() => {
+    const query = trashQuery.trim().toLocaleLowerCase()
+    return recentDeletionJobs.filter((job) => {
+      const category = activeDeletionStatuses.has(job.status) ? 'active'
+        : job.status === 'failed' || job.status === 'cancelled' ? 'attention' : 'completed'
+      return (trashFilter === 'all' || category === trashFilter)
+        && (!query || [job.task_name, job.task_id, deletionExecutorLabel(job), deletionPhaseLabel(job), job.message, job.error]
+          .some((value) => value?.toLocaleLowerCase().includes(query)))
+    })
+  }, [recentDeletionJobs, trashFilter, trashQuery])
+  const trashResults = trashView === 'tasks' ? visibleTrashTasks : visibleDeletionJobs
+  const trashPageCount = Math.max(1, Math.ceil(trashResults.length / trashPageSize))
+  const currentTrashPage = Math.min(trashPage, trashPageCount)
+  const trashPageStart = (currentTrashPage - 1) * trashPageSize
+
+  useEffect(() => { if (trashListRef.current) trashListRef.current.scrollTop = 0 }, [trashView, trashQuery, trashFilter, currentTrashPage])
 
   const refreshTrash = useCallback(async (showLoading = false): Promise<DeletionJob[] | null> => {
     trashRequest.current?.abort()
@@ -595,6 +635,10 @@ export function Dashboard() {
         const result = await api.permanentRemove(target.id)
         setSubmittedDeletionJobId(result.operation_id)
         setOperationNotice(result.message || '已提交文件清理，可在回收站查看进度')
+        setTrashView('tasks')
+        setTrashFilter('all')
+        setTrashQuery('')
+        setTrashPage(1)
       } else {
         await api.remove(target.id)
         setOperationNotice('任务已移入回收站，训练文件已保留')
@@ -621,6 +665,10 @@ export function Dashboard() {
   function openTrash() {
     setTrashError('')
     setTrashLoading(true)
+    setTrashView('tasks')
+    setTrashFilter('all')
+    setTrashQuery('')
+    setTrashPage(1)
     setTrashOpen(true)
   }
 
@@ -694,21 +742,25 @@ export function Dashboard() {
       : task.execution_node_id ? nodeNames[task.execution_node_id] || `远程服务器 ${task.execution_node_id.slice(0, 8)}` : '本机服务器'
     const legacyTone = legacyFailed ? 'failed' : legacyPending ? 'active' : 'retained'
     const legacyStatus = legacyFailed ? '清理失败' : legacyPending ? '清理中' : '文件已保留'
-    return <article className={`trash-item ${job ? deletionTone(job) : legacyTone}`} key={task.id}>
+    return <article className={`trash-item trash-item-compact ${job ? deletionTone(job) : legacyTone}`} key={task.id}>
       <div className="trash-item-copy">
-        <div className="trash-item-title"><strong>{task.name}</strong>{!job && <span className={`deletion-status ${legacyTone}`}>{legacyStatus}</span>}</div>
-        {job ? renderDeletionJobStatus(job) : <>
-          <span>{location} · 原任务状态：{statusLabel(task.status)}</span>
-          <p className="deletion-job-message">{legacyPending
-            ? '永久清理已提交，该任务不能恢复。'
-            : legacyFailed
-              ? '部分文件可能已被删除，该任务不能恢复。'
-              : '任务可恢复，训练文件和模型测试历史尚未清理。'}</p>
-          {legacyPending && <small>已提交文件清理，正在等待服务器处理</small>}
-          {legacyFailed && <p className="deletion-job-error"><AlertTriangle size={14} />清理未完成，暂未读取到详细错误，请刷新后重试。</p>}
-        </>}
-        <small>移入回收站：{dateTimeLabel(task.deleted_at)}</small>
-        {job && renderDeletionReceipt(job)}
+        <details className="trash-item-details">
+          <summary><span className="trash-item-title"><strong title={task.name}>{task.name}</strong><span className={`deletion-status ${job ? deletionTone(job) : legacyTone}`}>{job ? deletionPhaseLabel(job) : legacyStatus}</span></span><span className="trash-item-meta" title={location}>{location} · {dateTimeLabel(task.deleted_at)}</span><ChevronDown size={15} aria-hidden="true" /></summary>
+          <div className="trash-item-expanded">
+            <span>执行服务器：{location} · 移入回收站：{dateTimeLabel(task.deleted_at)}</span>
+            {job ? renderDeletionJobStatus(job) : <>
+              <span>原任务状态：{statusLabel(task.status)}</span>
+              <p className="deletion-job-message">{legacyPending
+                ? '永久清理已提交，该任务不能恢复。'
+                : legacyFailed
+                  ? '部分文件可能已被删除，该任务不能恢复。'
+                  : '任务可恢复，训练文件和模型测试历史尚未清理。'}</p>
+              {legacyPending && <small>已提交文件清理，正在等待服务器处理</small>}
+              {legacyFailed && <p className="deletion-job-error"><AlertTriangle size={14} />清理未完成，暂未读取到详细错误，请刷新后重试。</p>}
+            </>}
+            {job && renderDeletionReceipt(job)}
+          </div>
+        </details>
       </div>
       <div className="trash-item-actions">
         <button type="button" className="button ghost compact" disabled={deleting || restoreBlocked} title={restoreBlocked ? (job?.phase === 'workspace_busy' ? '已提交永久清理；工作区空闲后重试，任务不能恢复' : '永久清理已提交，该任务不能恢复') : '恢复任务'} onClick={() => void restoreTask(task)}><RotateCcw size={14} />恢复</button>
@@ -718,12 +770,12 @@ export function Dashboard() {
   }
 
   function renderRecentDeletionJob(job: DeletionJob) {
-    return <article className={`trash-item deletion-history ${deletionTone(job)} ${job.id === submittedDeletionJobId ? 'is-new' : ''}`} key={job.id}>
+    return <article className={`trash-item trash-item-compact deletion-history ${deletionTone(job)} ${job.id === submittedDeletionJobId ? 'is-new' : ''}`} key={job.id}>
       <div className="trash-item-copy">
-        <div className="trash-item-title"><strong>{job.task_name}</strong></div>
-        {renderDeletionJobStatus(job)}
-        <small>更新时间：{dateTimeLabel(job.updated_at)}</small>
-        {renderDeletionReceipt(job)}
+        <details className="trash-item-details">
+          <summary><span className="trash-item-title"><strong title={job.task_name}>{job.task_name}</strong><span className={`deletion-status ${deletionTone(job)}`}>{deletionPhaseLabel(job)}</span></span><span className="trash-item-meta" title={deletionExecutorLabel(job)}>{deletionExecutorLabel(job)} · {dateTimeLabel(job.updated_at)}</span><ChevronDown size={15} aria-hidden="true" /></summary>
+          <div className="trash-item-expanded"><span>执行服务器：{deletionExecutorLabel(job)} · 更新时间：{dateTimeLabel(job.updated_at)}</span>{renderDeletionJobStatus(job)}{renderDeletionReceipt(job)}</div>
+        </details>
       </div>
     </article>
   }
@@ -851,9 +903,14 @@ export function Dashboard() {
         <footer><span>原任务状态：{statusLabel(deleteTarget.status)}</span><button type="button" className="button ghost" disabled={deleting} onClick={() => closeDeletion()}>取消</button></footer>
       </div>
     </div>}
-    {trashOpen && !deleteTarget && <div className="modal-backdrop" onMouseDown={() => !deleting && setTrashOpen(false)}><div ref={trashDialogRef} className="modal trash-modal" role="dialog" aria-modal="true" aria-labelledby="trash-modal-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
+    {trashOpen && !deleteTarget && <div className="modal-backdrop" onMouseDown={() => !deleting && setTrashOpen(false)}><div ref={trashDialogRef} className="modal trash-modal task-trash-modal" role="dialog" aria-modal="true" aria-labelledby="trash-modal-title" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
       <header><div><span className="eyebrow">RECYCLE BIN</span><h2 id="trash-modal-title">训练任务回收站</h2><p>{trashTasks.length} 个回收站任务 · {recentDeletionJobs.length} 条近期清理记录</p></div><div className="trash-header-actions"><button type="button" className="icon-button" title="刷新清理状态" aria-label="刷新回收站和清理状态" disabled={trashLoading} onClick={() => void refreshTrash(true)}><RefreshCw size={16} className={trashLoading ? 'spin' : ''} /></button><button type="button" className="icon-button" data-modal-initial-focus title="关闭" aria-label="关闭回收站" disabled={deleting} onClick={() => setTrashOpen(false)}>×</button></div></header>
-      <div className="trash-list">{operationNotice && <p className="trash-operation-notice" role="status">{operationNotice}</p>}{trashError && <p className="alert error" role="alert">{trashError}</p>}{trashLoading && !trashTasks.length && !recentDeletionJobs.length && <div className="empty">正在加载回收站…</div>}{trashTasks.map(renderTrashTask)}{recentDeletionJobs.length > 0 && <section className="trash-history" aria-labelledby="trash-history-title"><div className="trash-history-heading"><strong id="trash-history-title">近期清理记录</strong><span>不再出现在回收站任务列表的清理状态与回执。</span></div>{recentDeletionJobs.map(renderRecentDeletionJob)}</section>}{!trashLoading && !trashTasks.length && !recentDeletionJobs.length && <div className="empty">回收站为空</div>}</div>
+      <div className="trash-browser">
+        <div className="trash-browser-tabs" role="group" aria-label="回收站分类"><button type="button" className={trashView === 'tasks' ? 'active' : ''} aria-pressed={trashView === 'tasks'} onClick={() => { setTrashView('tasks'); setTrashFilter('all'); setTrashPage(1) }}>回收站任务 <strong>{trashTasks.length}</strong></button><button type="button" className={trashView === 'history' ? 'active' : ''} aria-pressed={trashView === 'history'} onClick={() => { setTrashView('history'); setTrashFilter('all'); setTrashPage(1) }}>近期清理记录 <strong>{recentDeletionJobs.length}</strong></button></div>
+        <div className="trash-browser-filters"><label className="trash-browser-search"><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索回收站任务、服务器或清理记录" placeholder="搜索任务、服务器或状态说明" value={trashQuery} onChange={(event) => { setTrashQuery(event.target.value); setTrashPage(1) }} /></label><select aria-label="筛选回收站状态" value={trashFilter} onChange={(event) => { setTrashFilter(event.target.value); setTrashPage(1) }}><option value="all">全部状态</option>{trashView === 'tasks' && <option value="restorable">可恢复</option>}<option value="active">清理中</option><option value="attention">需关注</option><option value="completed">已完成</option></select><span className="trash-browser-count">找到 {trashResults.length} 条</span></div>
+      </div>
+      <div ref={trashListRef} className="trash-list">{operationNotice && <p className="trash-operation-notice" role="status">{operationNotice}</p>}{trashError && <p className="alert error" role="alert">{trashError}</p>}{trashLoading && !trashTasks.length && !recentDeletionJobs.length ? <div className="empty">正在加载回收站…</div> : trashView === 'tasks' ? visibleTrashTasks.slice(trashPageStart, trashPageStart + trashPageSize).map(renderTrashTask) : visibleDeletionJobs.slice(trashPageStart, trashPageStart + trashPageSize).map(renderRecentDeletionJob)}{!trashLoading && trashResults.length === 0 && <div className="trash-browser-empty">{trashQuery.trim() || trashFilter !== 'all' ? '没有匹配的记录，请调整搜索或筛选条件。' : trashView === 'tasks' ? '回收站暂无任务' : '暂无近期清理记录'}</div>}</div>
+      {trashPageCount > 1 && <nav className="trash-pagination" aria-label="回收站分页"><span>第 {currentTrashPage} / {trashPageCount} 页 · 共 {trashResults.length} 条</span><div><button type="button" className="button ghost compact" disabled={currentTrashPage === 1} onClick={() => setTrashPage(currentTrashPage - 1)}>上一页</button><button type="button" className="button ghost compact" disabled={currentTrashPage === trashPageCount} onClick={() => setTrashPage(currentTrashPage + 1)}>下一页</button></div></nav>}
       <footer><span>上次检查：{trashLastUpdated ? trashLastUpdated.toLocaleTimeString('zh-CN') : '尚未完成'} · 移入回收站的任务不会被历史同步重新导入</span><button type="button" className="button ghost" disabled={deleting} onClick={() => setTrashOpen(false)}>关闭</button></footer>
     </div></div>}
     {groupEditor && <TaskGroupModal group={groupEditor.group} taskIds={groupEditor.taskIds} initialDelete={groupEditor.initialDelete} onClose={() => setGroupEditor(null)} onSaved={saveGroup} onDeleted={removeGroup} />}
