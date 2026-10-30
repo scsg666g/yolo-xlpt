@@ -6,7 +6,7 @@ import {
   Link2, LoaderCircle, LocateFixed, Maximize2, Monitor, Save, Search, Server, Trash2, X, Zap,
 } from 'lucide-react'
 import {
-  addEdge, Background, BackgroundVariant, Controls, Handle, MarkerType, MiniMap,
+  addEdge, Background, BackgroundVariant, ConnectionLineType, Controls, Handle, MarkerType, MiniMap,
   Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesInitialized,
   useNodesState, useReactFlow, type Connection, type Edge, type Node, type NodeProps,
   type Viewport,
@@ -181,7 +181,7 @@ const nodeTypes = { taskOverview: TaskOverviewNode }
 
 function normalizeEdges(layout: TaskWorkspaceModeLayout | undefined, validIds: Set<string>): OverviewEdge[] {
   return (layout?.edges || []).filter((edge) => edge.source !== edge.target && validIds.has(edge.source) && validIds.has(edge.target)).map((edge) => ({
-    ...edge, type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed }, className: 'task-overview-edge',
+    ...edge, type: 'default', markerEnd: { type: MarkerType.ArrowClosed }, className: 'task-overview-edge',
   }))
 }
 
@@ -298,7 +298,7 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
     if (!connection.source || !connection.target || connection.source === connection.target) return
     if (edges.some((edge) => (edge.source === connection.source && edge.target === connection.target)
       || (edge.source === connection.target && edge.target === connection.source))) return
-    setEdges((current) => addEdge({ ...connection, id: edgeId(), type: 'smoothstep', markerEnd: { type: MarkerType.ArrowClosed }, className: 'task-overview-edge' }, current))
+    setEdges((current) => addEdge({ ...connection, id: edgeId(), type: 'default', markerEnd: { type: MarkerType.ArrowClosed }, className: 'task-overview-edge' }, current))
     markDirty()
   }, [edges, markDirty, setEdges])
 
@@ -400,7 +400,7 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
   if (visibleNodeIds.size === 0) return <>{toolbar}<div className="task-overview-empty" role="status">没有找到匹配的任务。</div></>
 
   return <>{toolbar}<div className={'task-overview-flow density-' + preferences.cardDensity} aria-label={modeTitles[mode] + '任务画布'}>
-    <ReactFlow nodes={displayedNodes} edges={displayedEdges} nodeTypes={nodeTypes} onNodesChange={handleNodesChange} onEdgesChange={handleEdgesChange} onConnect={onConnect} onMoveEnd={handleMoveEnd} nodesDraggable={layoutMode === 'free'} nodesConnectable={layoutMode === 'free' && preferences.showConnections} nodesFocusable elementsSelectable panOnDrag selectionOnDrag={false} deleteKeyCode={null} zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.4} maxZoom={1.45} defaultViewport={{ x: 32, y: 32, zoom: preferences.defaultZoom }} onlyRenderVisibleElements={nodes.length > 20} attributionPosition="bottom-left">
+    <ReactFlow nodes={displayedNodes} edges={displayedEdges} nodeTypes={nodeTypes} connectionLineType={ConnectionLineType.Bezier} onNodesChange={handleNodesChange} onEdgesChange={handleEdgesChange} onConnect={onConnect} onMoveEnd={handleMoveEnd} nodesDraggable={layoutMode === 'free'} nodesConnectable={layoutMode === 'free' && preferences.showConnections} nodesFocusable elementsSelectable panOnDrag selectionOnDrag={false} deleteKeyCode={null} zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.4} maxZoom={1.45} defaultViewport={{ x: 32, y: 32, zoom: preferences.defaultZoom }} onlyRenderVisibleElements={nodes.length > 20} attributionPosition="bottom-left">
       <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
       <Controls showInteractive={false} showFitView={false} position="bottom-right" />
       {preferences.showMiniMap && <MiniMap position="bottom-right" pannable zoomable nodeStrokeWidth={2} nodeColor={(node) => {

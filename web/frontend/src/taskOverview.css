@@ -27,7 +27,7 @@
 .task-overview-flow .react-flow__controls-button:hover { background: var(--panel-2); }
 .task-overview-flow .react-flow__controls-button svg { fill: currentColor; }
 .task-overview-flow .react-flow__minimap { right: 13px; bottom: 13px; width: 180px; height: 125px; border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--panel) 92%, transparent); box-shadow: 0 10px 30px rgba(0, 0, 0, .18); }
-.task-overview-flow .react-flow__edge-path { stroke: color-mix(in srgb, var(--green) 58%, #668396); stroke-width: 1.8; }
+.task-overview-flow .react-flow__edge-path { stroke: color-mix(in srgb, var(--green) 58%, #668396); stroke-width: 1.8; stroke-linecap: round; }
 .task-overview-flow .react-flow__edge.selected .react-flow__edge-path { stroke: #f4ba64; stroke-width: 2.5; }
 .task-overview-flow .react-flow__connection-path { stroke: var(--green); stroke-width: 2; stroke-dasharray: 5 4; }
 .task-overview-canvas-actions { grid-column: 2; min-width: 0; max-width: 100%; justify-self: center; display: flex; align-items: center; gap: 4px; overflow-x: auto; padding: 5px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel-2); }
