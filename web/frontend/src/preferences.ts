@@ -5,7 +5,7 @@ export const COMPARE_LIMIT_MAX = 8
 export const COMPARE_LIMIT_DEFAULT = 4
 export const COMPARE_LIMIT_STORAGE_KEY = 'yolo-forge-compare-limit'
 export const COMPARE_RUNS_STORAGE_KEY = 'yolo-forge-compare-runs'
-export const TASK_CENTER_PREFERENCES_STORAGE_KEY = 'yolo-forge-task-center-v1'
+export const TASK_CENTER_PREFERENCES_STORAGE_KEY = 'yolo-forge-task-center-v2'
 
 export type TaskCenterPreferences = {
   layoutMode: 'free' | 'grid'
@@ -27,6 +27,7 @@ export const TASK_CENTER_PREFERENCES_DEFAULTS: Readonly<TaskCenterPreferences> =
 
 const COMPARE_LIMIT_EVENT = 'yolo-forge-compare-limit-change'
 const LEGACY_TASK_CENTER_STORAGE_KEYS = [
+  'yolo-forge-task-center-v1',
   'yolo-forge-task-overview-preferences',
   'yolo-forge-task-overview-settings',
 ] as const
@@ -87,7 +88,12 @@ function readTaskCenterStoredPreferences(): TaskCenterPreferencesSnapshot {
       if (stored === null) continue
       try {
         const parsed: unknown = JSON.parse(stored)
-        return Object.freeze({ ...normalizeTaskCenterPreferences(parsed), storageAvailable: true })
+        const preferences = normalizeTaskCenterPreferences(parsed)
+        // Earlier releases defaulted to free editing. Migrate only the layout
+        // default, retaining density, zoom and visibility choices. Explicit
+        // choices made with the current settings version remain authoritative.
+        if (key !== TASK_CENTER_PREFERENCES_STORAGE_KEY) preferences.layoutMode = 'grid'
+        return Object.freeze({ ...preferences, storageAvailable: true })
       } catch {
         // A malformed current value should not hide a valid legacy preference.
       }

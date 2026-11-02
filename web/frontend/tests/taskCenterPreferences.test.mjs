@@ -4,7 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
 
-const storageKey = 'yolo-forge-task-center-v1'
+const storageKey = 'yolo-forge-task-center-v2'
 const source = readFileSync(new URL('../src/preferences.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
@@ -97,12 +97,45 @@ test('legacy storage migrates in memory and new writes use the versioned key', (
   const page = browser({ saved: {
     'yolo-forge-task-overview-settings': JSON.stringify({ layout: 'manual', density: 'compact', zoom: 0.72 }),
   } })
-  assert.equal(page.snapshot().layoutMode, 'free')
+  assert.equal(page.snapshot().layoutMode, 'grid')
   assert.equal(page.snapshot().cardDensity, 'compact')
   assert.equal(page.snapshot().defaultZoom, 0.72)
   page.api.updateTaskCenterPreferences({ showMiniMap: false })
   assert.equal(JSON.parse(page.values.get(storageKey)).showMiniMap, false)
   assert.equal(JSON.parse(page.values.get(storageKey)).cardDensity, 'compact')
+})
+
+test('previous free default migrates to grouped columns without resetting other preferences', () => {
+  const old = { layoutMode: 'free', cardDensity: 'compact', defaultZoom: 1.05, showMiniMap: false, showConnections: false }
+  const page = browser({ saved: { 'yolo-forge-task-center-v1': JSON.stringify(old) } })
+  assert.deepEqual({ ...page.snapshot() }, { ...old, layoutMode: 'grid', storageAvailable: true })
+  page.api.updateTaskCenterPreferences({ showConnections: true })
+  assert.equal(JSON.parse(page.values.get(storageKey)).layoutMode, 'grid')
+  assert.equal(JSON.parse(page.values.get('yolo-forge-task-center-v1')).layoutMode, 'free')
+  const reloaded = browser({ saved: Object.fromEntries(page.values) })
+  assert.equal(reloaded.snapshot().layoutMode, 'grid')
+  assert.equal(reloaded.snapshot().cardDensity, 'compact')
+})
+
+test('new explicit free preference survives reopening and takes precedence over legacy defaults', () => {
+  const page = browser({ saved: { 'yolo-forge-task-center-v1': JSON.stringify({ layoutMode: 'free' }) } })
+  page.api.updateTaskCenterPreferences({ layoutMode: 'free' })
+  const reloaded = browser({ saved: Object.fromEntries(page.values) })
+  assert.equal(reloaded.snapshot().layoutMode, 'free')
+  reloaded.api.resetTaskCenterPreferences()
+  assert.equal(reloaded.snapshot().layoutMode, 'grid')
+})
+
+test('legacy migration works with read-only storage and a malformed current record', () => {
+  const page = browser({ readOnly: true, saved: {
+    [storageKey]: 'broken JSON',
+    'yolo-forge-task-center-v1': JSON.stringify({ layoutMode: 'free', cardDensity: 'compact' }),
+  } })
+  assert.equal(page.snapshot().layoutMode, 'grid')
+  assert.equal(page.snapshot().cardDensity, 'compact')
+  page.api.updateTaskCenterPreferences({ defaultZoom: 1 })
+  assert.equal(page.snapshot().layoutMode, 'grid')
+  assert.equal(page.snapshot().storageAvailable, false)
 })
 
 test('updates clamp zoom, preserve unrelated fields and reset all preferences', () => {

@@ -275,7 +275,8 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
     if (loadedModeRef.current !== mode) {
       setEdges(normalizeEdges(savedLayout, layoutTaskIds))
       loadedModeRef.current = mode
-      const viewport = savedLayout?.viewport || { x: 32, y: 32, zoom: preferences.defaultZoom }
+      // A saved free-layout pan must not place the default group columns offscreen.
+      const viewport = layoutMode === 'free' && savedLayout?.viewport || { x: 32, y: 32, zoom: preferences.defaultZoom }
       restoringViewportRef.current = true
       window.requestAnimationFrame(() => { void setViewport(viewport, { duration: 0 }).finally(() => { restoringViewportRef.current = false }) })
     } else setEdges((current) => current.filter((edge) => layoutTaskIds.has(edge.source) && layoutTaskIds.has(edge.target)))
