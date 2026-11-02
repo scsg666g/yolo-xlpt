@@ -1,3 +1,7 @@
+import {
+  bindImageTest, imageResultUrl, imageResultIsCurrent, imageTestKey, imageTestState,
+  pendingTestImages, refreshImageTest, removeImageTest,
+} from '../modelTestQueue'
 import { applyHistoryRefresh, bridgeHistoryHead, historyNeedsDetailRefresh, refreshActiveHistoryTail, retainedHistorySelection } from '../modelTestHistory'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -9,7 +13,7 @@ import type { Artifact, ModelTest, ModelTestSummary } from '../types'
 import {
   activeModelTestStatuses, createModelTestRequestId, createOrRecoverModelTest, hasExactModelVersion, ModelStrip, modelTestAttemptText,
   modelTestDate, modelTestParameterText, modelTestRequestMayHaveReachedServer, modelTestResultLabel, modelTestStatusLabels, modelTestTaskLabel, modelTestTaskType, modelTestWeightName,
-  startOrRecoverModelTest, type SelectedImage, TestWorkspace, uploadPendingModelTestImages,
+  startOrRecoverModelTest, type SelectedImage, TestQueueControls, TestWorkspace, uploadPendingModelTestImages,
 } from './ModelTestShared'
 
 interface Props {
@@ -32,7 +36,9 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
   const [images, setImages] = useState<SelectedImage[]>([])
   const [confidence, setConfidence] = useState(0.25)
   const [iou, setIou] = useState(0.7)
-  const [test, setTest] = useState<ModelTest | null>(null)
+  const [test, storeTest] = useState<ModelTest | null>(null)
+  const batch = useRef<{ ids: number[]; key: string; id: string | null } | null>(null)
+
   const [selected, setSelected] = useState(0)
   const [busy, setBusy] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -67,6 +73,15 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
   const dragDepth = useRef(0)
   const nextImageId = useRef(0)
   const previewUrls = useRef(new Set<string>())
+
+  function setTest(value: ModelTest | null) {
+    storeTest(value)
+    const current = batch.current
+    if (value && current?.id === value.id) {
+      setImages((images) => bindImageTest(images, current.ids, current.key, value))
+    }
+  }
+
   const files = images.map(({ file }) => file)
   const historyRunId = historyScope === 'current' ? runId : undefined
 
@@ -252,7 +267,8 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
       previewUrls.current.add(previewUrl)
       return { id: nextImageId.current++, file, previewUrl }
     })
-    setImages((current) => [...current, ...additions]); setError(''); setTest(null); setStage(''); setEnlarged(null)
+    setSelected(images.length)
+    setImages((current) => [...current, ...additions]); setError(''); setStage(''); setEnlarged(null)
   }
 
   function removeImage(index: number) {
@@ -265,7 +281,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
       window.setTimeout(() => URL.revokeObjectURL(removed.previewUrl), 0)
     }
     setSelected(Math.max(0, Math.min(selected > index ? selected - 1 : selected, remaining.length - 1)))
-    setError(''); setTest(null); setStage(''); setEnlarged(null)
+    setError(''); setStage(''); setEnlarged(null)
   }
 
   function resetDrag() { dragDepth.current = 0; setDragging(false) }
@@ -294,7 +310,10 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
     chooseImages(event.dataTransfer.files)
   }
 
-  async function run() {
+  async function run(scope: 'pending' | 'current' | 'all' = 'pending') {
+    if (images.some((image) => imageTestState(image, queueKey) === 'active')) return
+    const selectedImages = scope === 'all' ? images : scope === 'current' ? images.slice(selected, selected + 1) : pendingTestImages(images, queueKey)
+    const files = selectedImages.map((image) => image.file)
     if (busy || pendingUploadId.current || !files.length) return
     if (rerunSource && !hasExactModelVersion(rerunSource)) {
       setError('该历史记录没有可验证的原权重版本，不能按原权重重测')
@@ -311,6 +330,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
     let createdId: string | null = null
     let lastKnown: ModelTest | null = null
     const pause = async () => { await new Promise<void>((resolve) => window.setTimeout(resolve, 1500)); signal.throwIfAborted() }
+    batch.current = { ids: selectedImages.map((image) => image.id), key: queueKey, id: null }
     resetDrag(); setBusy(true); setError(''); setTest(null); setEnlarged(null)
     try {
       if (rerunSource) {
@@ -331,6 +351,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
       }
       const requestId = createModelTestRequestId()
       createdId = requestId
+      batch.current!.id = requestId
       pendingUploadId.current = requestId
       const created = await createOrRecoverModelTest(requestId, files, signal, () => api.createModelTest(
         artifactId, confidence, iou, files, requestId, signal, runId, rerunSource?.id,
@@ -376,6 +397,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
           pendingUploadId.current = null
         }
         if (lastKnown?.status === 'failed') {
+          pendingUploadId.current = null
           setStage(modelTestStatusLabels.failed)
           setError(lastKnown.error || message)
         } else if (lastKnown?.status === 'cancelled') {
@@ -431,6 +453,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
         }
       } else if (requestError.status === 404) {
         pendingUploadId.current = null
+        setImages((images) => removeImageTest(images, testId))
         setTest(null); setStage('')
         setError('服务器暂未找到本次测试记录，已解除本页占用；请刷新历史记录确认后再重试')
         await refreshHistory(undefined, true)
@@ -488,6 +511,9 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
     setDeletingId(item.id); setHistoryError('')
     try {
       await api.deleteModelTest(item.id)
+      setImages((images) => removeImageTest(images, item.id))
+      if (test?.id === item.id) setTest(null)
+      if (rerunSource?.id === item.id) setRerunSource(null)
       historyRefreshVersion.current += 1
       historyLoadingVersion.current += 1
       setHistory((current) => current.filter((record) => record.id !== item.id))
@@ -527,6 +553,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
         prepared.push({ id: nextImageId.current++, file, previewUrl })
       }
       releaseImages(images)
+      batch.current = null
       setImages(prepared); setConfidence(item.confidence); setIou(item.iou); setSelected(0)
       setTest(null); setStage(''); setError(''); setRerunSource(item); setTab('new'); setEnlarged(null)
     } catch (reason) {
@@ -542,9 +569,40 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
   const failed = stage === modelTestStatusLabels.failed
   const currentTaskType = modelTestTaskType(test || rerunSource) || taskType || null
   const classification = currentTaskType === 'classify'
-  const parametersChanged = completed && (confidence !== test.confidence || (!classification && iou !== test.iou))
-  const currentName = test?.files[selected]?.name || files[selected]?.name
-  const currentResult = completed ? `/api/model-tests/${test.id}/images/${selected}/result` : ''
+  const queueKey = imageTestKey(rerunSource ? `history:${rerunSource.artifact_id}:${rerunSource.model_sha256}` : `artifact:${artifact?.id}:${artifact?.size}:${artifact?.modified_at}`, confidence, iou, classification)
+  const pendingCount = pendingTestImages(images, queueKey).length
+  const activeQueue = images.some((image) => imageTestState(image, queueKey) === 'active')
+  const currentImageResult = images[selected]?.result
+  const parametersChanged = images.some((image) => image.result && !imageResultIsCurrent(image, queueKey))
+
+  async function refreshQueue() {
+    setBusy(true)
+    setError('')
+    try {
+      const ids = [...new Set(images.filter((image) => imageTestState(image, queueKey) === 'active').map((image) => image.attempt!.test.id))]
+      for (const id of ids) {
+        try {
+          const current = await api.modelTest(id, new AbortController().signal)
+          setImages((images) => refreshImageTest(images, current))
+          if (batch.current?.id === id) {
+            setTest(current)
+            setStage(modelTestStatusLabels[current.status])
+          }
+          if (!activeModelTestStatuses.has(current.status) && pendingUploadId.current === id) pendingUploadId.current = null
+        } catch (reason) {
+          if ((reason as { status?: number }).status !== 404) throw reason
+          setImages((images) => removeImageTest(images, id))
+          if (test?.id === id) setTest(null)
+          if (pendingUploadId.current === id) pendingUploadId.current = null
+        }
+      }
+      await refreshHistory(undefined, true)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '刷新测试状态失败')
+    } finally { setBusy(false) }
+  }
+  const currentName = files[selected]?.name
+  const currentResult = imageResultUrl(images[selected])
   const canOpenNewTab = !!test || (!!rerunSource && hasExactModelVersion(rerunSource)) || (!!artifact && !newTestDisabledReason)
   const hasPendingUpload = !!pendingUploadId.current
 
@@ -563,20 +621,21 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
       <div className={`model-test-body${tab === 'history' ? ' history-mode' : ''}`}>
         {tab === 'new' ? <>
           <ModelStrip test={test || rerunSource} artifact={artifact} fallbackAttempt={attemptNumber} fallbackTask={taskType} bestMetric={bestMetric} />
-          {rerunSource && !test && <div className="model-test-rerun-notice"><RotateCcw size={15} /><span>已载入历史图片和参数；将固定使用原测试的权重版本，并创建一条新记录。</span><button className="icon-button" title={artifact && !newTestDisabledReason ? '改用当前权重' : '取消重测'} aria-label={artifact && !newTestDisabledReason ? '改用当前权重' : '取消重测'} onClick={() => { setRerunSource(null); if (!artifact || newTestDisabledReason) setTab('history') }}><X size={14} /></button></div>}
+          {rerunSource && !test && <div className="model-test-rerun-notice"><RotateCcw size={15} /><span>已载入历史图片和参数；将固定使用原测试的权重版本，并创建一条新记录。</span><button className="icon-button" disabled={busy} title={artifact && !newTestDisabledReason ? '改用当前权重' : '取消重测'} aria-label={artifact && !newTestDisabledReason ? '改用当前权重' : '取消重测'} onClick={() => { setRerunSource(null); if (!artifact || newTestDisabledReason) setTab('history') }}><X size={14} /></button></div>}
           <div className="model-test-settings">
             <button className="button ghost" disabled={busy} onClick={() => input.current?.click()}><Upload size={16} />{files.length ? `添加图片（${files.length}/10）` : '上传图片'}</button>
             <input ref={input} hidden disabled={busy} type="file" accept=".jpg,.jpeg,.png,.webp,.bmp" multiple onChange={(event) => chooseImages(event.target.files)} />
             <div className="model-test-slider"><label htmlFor="test-confidence">置信度 Conf <strong>{confidence.toFixed(2)}</strong></label><input id="test-confidence" type="range" min="0.01" max="1" step="0.01" value={confidence} disabled={busy} onChange={(event) => setConfidence(Number(event.target.value))} /></div>
             <div className="model-test-slider" title={classification ? '分类模型没有检测框，不使用 IoU' : undefined}><label htmlFor="test-iou">NMS IoU <strong>{classification ? '不适用' : iou.toFixed(2)}</strong></label><input id="test-iou" type="range" min="0.01" max="1" step="0.01" value={iou} disabled={busy || classification} aria-describedby={classification ? 'test-parameters-help' : undefined} onChange={(event) => setIou(Number(event.target.value))} /></div>
-            <button className="button primary" disabled={busy || hasPendingUpload || !files.length} onClick={() => void run()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{completed ? '再次测试' : '运行测试'}</button>
+            <button className="button primary" disabled={busy || hasPendingUpload || !pendingCount || activeQueue} onClick={() => void run()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}{busy ? '正在测试…' : activeQueue ? '后台处理中' : pendingCount ? `测试待处理图片（${pendingCount}）` : images.length ? '全部已完成' : '运行测试'}</button>
           </div>
+          <TestQueueControls images={images} queueKey={queueKey} disabled={busy || hasPendingUpload} onRun={(scope) => void run(scope)} onRefresh={() => void refreshQueue()} />
           <p id="test-parameters-help" className="model-test-help">{busy ? '测试期间不能添加或移除图片' : '可继续拖入图片追加，点击缩略图右上角移除'} · 最多 10 张 · 单张 20 MB / 2000 万像素 · 总大小 100 MB · {classification ? '分类结果按置信度筛选 Top-5；分类模型没有检测框，IoU 不适用' : '置信度筛选预测结果；IoU 仅对框类任务生效'} · CPU 推理</p>
           {error && <div className="model-test-error" role="alert">{error}</div>}
           {(stage || busy) && <div className={`model-test-status${failed ? ' failed' : ''}`} role="status">{busy ? <LoaderCircle className="spin" size={14} /> : failed ? <AlertCircle size={14} /> : null}{stage}{completed && ` · ${modelTestParameterText(test)}`}</div>}
-          {parametersChanged && <div className="model-test-parameter-notice"><Info size={15} />当前显示的是 {modelTestParameterText(test)} 的历史结果；再次测试会新建一条记录。</div>}
+          {parametersChanged && <div className="model-test-parameter-notice"><Info size={15} />模型或参数已变更，旧结果仍可查看；测试待处理图片将使用当前设置创建新记录。</div>}
           {!images.length ? <button className="model-test-empty" onClick={() => input.current?.click()}><Upload size={32} /><strong>点击或拖入图片</strong><span>支持 JPG、PNG、WEBP、BMP，可多选</span></button>
-            : <TestWorkspace test={test} images={images} selected={selected} onSelect={setSelected} onRemove={removeImage} busy={busy} failed={failed} openLightbox={openLightbox} />}
+            : <TestWorkspace test={test} images={images} queueKey={queueKey} selected={selected} onSelect={setSelected} onRemove={removeImage} busy={busy} failed={failed} openLightbox={openLightbox} />}
         </> : <div className="model-test-history-layout">
           <aside className="model-test-history-sidebar">
             <div className="model-test-history-toolbar">
@@ -612,9 +671,9 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
       </div>
       <footer>
         {tab === 'new' ? <>
-          <span>{completed ? `${currentName || '当前图片'} · ${modelTestResultLabel(modelTestTaskType(test), test.files[selected]?.prediction_count ?? test.files[selected]?.detections ?? null)} · 已保存到历史记录` : hasPendingUpload && !busy ? '本次上传尚未完成，请取消后再创建测试' : hasPendingUpload ? '正在上传或提交；关闭后请在历史记录确认最终状态' : busy ? '关闭只停止本页等待，已提交的测试会继续运行' : '分类结果按置信度筛选 Top-5；IoU 仅对检测框类任务生效'}</span>
+          <span>{currentImageResult ? `${currentName} · ${modelTestParameterText(currentImageResult.test)} · 结果已保存到历史` : hasPendingUpload ? '图片上传状态待确认，可取消本次上传' : busy ? '关闭只停止本页等待，已提交的测试会继续运行' : '仅测试待处理图片；历史按实际批次保存'}</span>
           {hasPendingUpload && !busy && <button className="button danger" onClick={() => void cancelPendingUpload()}><X size={15} />取消本次上传</button>}
-          {completed && <a className="button ghost" href={`/api/model-tests/${test.id}/download`} download><FileArchive size={15} />下载全部</a>}
+          {completed && <a className="button ghost" href={`/api/model-tests/${test.id}/download`} download><FileArchive size={15} />下载最近批次</a>}
           {currentResult && <a className="button primary" href={`${currentResult}?download=true`} download><Download size={15} />当前结果图</a>}
         </> : <>
           <span>{selectedHistory ? `${modelTestDate(selectedHistory.created_at)} · ${modelTestStatusLabels[selectedHistory.status]}` : `共 ${visibleHistory.length} 条记录`}</span>

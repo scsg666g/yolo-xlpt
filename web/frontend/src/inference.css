@@ -157,3 +157,28 @@
   .model-test-history-detail { overflow: visible; padding: 16px; }
   .model-test-history-detail .model-test-model-strip { grid-template-columns: 1fr; margin: 0 0 16px; }
 }
+
+.model-test-queue { display: grid; grid-template-columns: minmax(160px, 1fr) auto; align-items: center; gap: 9px 16px; margin: 14px 0; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.model-test-queue-summary { color: var(--text); font-size: 12px; line-height: 1.6; }
+.model-test-queue progress { grid-column: 1; width: 100%; height: 6px; border: 0; border-radius: 6px; overflow: hidden; background: var(--line); accent-color: var(--green); }
+.model-test-queue progress::-webkit-progress-bar { background: var(--line); }
+.model-test-queue progress::-webkit-progress-value { background: var(--green); transition: width 180ms ease; }
+.model-test-queue progress::-moz-progress-bar { background: var(--green); }
+.model-test-queue-actions { grid-column: 2; grid-row: 1 / 3; display: flex; flex-wrap: wrap; gap: 8px; }
+.model-test-queue-actions .button { font-size: 12px; }
+.model-test-thumbnails .model-test-image-state { align-self: flex-start; max-width: 100%; padding: 3px 6px; border-radius: 4px; font-size: 11px; line-height: 1.4; color: var(--muted); background: var(--panel); }
+.model-test-thumbnails .model-test-image-state.completed { color: var(--green); }
+.model-test-thumbnails .model-test-image-state.active { color: var(--green); animation: model-test-state-pulse 1.4s ease-in-out infinite; }
+.model-test-thumbnails .model-test-image-state.failed, .model-test-thumbnails .model-test-image-state.stale { color: var(--text); border: 1px solid var(--line); }
+.model-test-thumbnail-select { transition: border-color 140ms ease, background-color 140ms ease, box-shadow 140ms ease; }
+.model-test-thumbnail-select:hover { border-color: var(--green); background: var(--panel); }
+.model-test-thumbnail-select:focus-visible, .model-test-queue button:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+@keyframes model-test-state-pulse { 50% { opacity: .55; } }
+@media (max-width: 700px) {
+  .model-test-queue { grid-template-columns: minmax(0, 1fr); }
+  .model-test-queue-actions { grid-column: 1; grid-row: auto; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .model-test-thumbnails .model-test-image-state.active { animation: none; }
+  .model-test-thumbnail-select, .model-test-queue progress::-webkit-progress-value { transition: none; }
+}

@@ -6,13 +6,9 @@ import {
 } from 'lucide-react'
 import { api, formatBytes } from '../api'
 import type { Artifact, ModelTest, ModelTestSummary, YoloTaskType } from '../types'
+import { imageResultIsCurrent, imageTestState, pendingTestImages, type SelectedImage } from '../modelTestQueue'
+export type { SelectedImage } from '../modelTestQueue'
 import '../inference.css'
-
-export interface SelectedImage {
-  id: number
-  file: File
-  previewUrl: string
-}
 
 export const modelTestStatusLabels: Record<ModelTest['status'], string> = {
   uploading: '准备图片', preparing: '准备模型', queued: '等待测试', running: '正在测试',
@@ -254,9 +250,10 @@ export function ModelStrip({ test, artifact, fallbackAttempt, fallbackTask, best
   </section>
 }
 
-export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy, failed, openLightbox }: {
+export function TestWorkspace({ test: batchTest, images, queueKey, selected, onSelect, onRemove, busy, failed, openLightbox }: {
   test: ModelTest | null
   images?: SelectedImage[]
+  queueKey?: string
   selected: number
   onSelect: (index: number) => void
   onRemove?: (index: number) => void
@@ -267,17 +264,20 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
   const localRows: ModelTest['files'] = (images || []).map(({ file }) => ({
     name: file.name, size: file.size, uploaded: false, detections: null, objects: [], timings: {},
   }))
-  const rows = test?.files.length ? test.files : localRows
+  const queue = queueKey !== undefined && images !== undefined
+  const rows = queue ? images.map((image, index) => image.result?.test.files[image.result.index] || localRows[index]) : batchTest?.files.length ? batchTest.files : localRows
   if (!rows.length) return null
   const current = Math.max(0, Math.min(selected, rows.length - 1))
+  const test = queue ? images[current]?.result?.test || null : batchTest
   const completed = test?.status === 'completed'
+  const statisticRows = queue ? rows.filter((_, index) => imageTestState(images[index], queueKey) === 'completed') : completed ? rows : []
   const taskType = modelTestTaskType(test)
   const taskLabel = modelTestTaskLabel(taskType)
   const selectedResult = rows[current]
   const objects = completed ? selectedResult.objects : []
-  const allObjects = completed ? rows.flatMap((file) => file.objects) : []
-  const resultImages = completed ? rows.filter((file) => (file.prediction_count ?? file.detections) !== null && (file.prediction_count ?? file.detections)! > 0).length : 0
-  const emptyImages = completed ? rows.filter((file) => (file.prediction_count ?? file.detections) === 0).length : 0
+  const allObjects = statisticRows.flatMap((file) => file.objects)
+  const resultImages = statisticRows.filter((file) => (file.prediction_count ?? file.detections) !== null && (file.prediction_count ?? file.detections)! > 0).length
+  const emptyImages = statisticRows.filter((file) => (file.prediction_count ?? file.detections) === 0).length
   const classCounts = allObjects.reduce<Record<string, { count: number; confidence: number }>>((counts, item) => {
     const previous = counts[item.class_name] || { count: 0, confidence: 0 }
     counts[item.class_name] = { count: previous.count + 1, confidence: previous.confidence + item.confidence }
@@ -286,6 +286,8 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
   const classRows = Object.entries(classCounts).sort((left, right) => right[1].count - left[1].count)
   const averageConfidence = allObjects.length ? allObjects.reduce((sum, item) => sum + item.confidence, 0) / allObjects.length : null
   const imageUrl = (index: number, kind: 'original' | 'result') => {
+    const origin = queue ? images[index]?.result : null
+    if (queue) return kind === 'original' ? images[index]?.previewUrl || '' : origin ? `/api/model-tests/${origin.test.id}/images/${origin.index}/result` : ''
     if (test && (kind === 'result' ? completed : test.files[index]?.uploaded)) return `/api/model-tests/${test.id}/images/${index}/${kind}`
     return kind === 'original' ? images?.[index]?.previewUrl || '' : ''
   }
@@ -297,25 +299,28 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
     <aside className="model-test-thumbnails">
       {rows.map((file, index) => {
         const thumbnail = imageUrl(index, 'original')
-        return <div className="model-test-thumbnail" key={`${file.name}-${index}`}>
+        return <div className="model-test-thumbnail" key={queue ? images[index].id : `${file.name}-${index}`}>
           <button className={`model-test-thumbnail-select ${current === index ? 'selected' : ''}`} onClick={() => onSelect(index)}>
             {thumbnail ? <img src={thumbnail} alt={file.name} /> : <span className="model-test-thumbnail-placeholder"><Images size={18} /></span>}
             <span title={file.name}>{file.name}</span>
-            <small className={completed && (file.prediction_count ?? file.detections ?? 0) > 0 ? 'has-detections' : ''}>{completed ? modelTestResultLabel(taskType, file.prediction_count ?? file.detections) : formatBytes(file.size)}</small>
+            {queue && <span className={`model-test-image-state ${imageTestState(images[index], queueKey)}`}>{queueStateLabel[imageTestState(images[index], queueKey)]}</span>}
+            <small className={(queue ? !!images[index].result : completed) && (file.prediction_count ?? file.detections ?? 0) > 0 ? 'has-detections' : ''}>{(queue ? !!images[index].result : completed) ? modelTestResultLabel(modelTestTaskType(queue ? images[index].result?.test : test), file.prediction_count ?? file.detections) : formatBytes(file.size)}</small>
           </button>
-          {onRemove && <button className="model-test-remove" disabled={busy} aria-label={`移除 ${file.name}`} title="移除图片" onClick={() => onRemove(index)}><X size={14} /></button>}
+          {onRemove && <button className="model-test-remove" disabled={busy || (queue && imageTestState(images[index], queueKey) === 'active')} aria-label={`移除 ${file.name}`} title="移除图片" onClick={() => onRemove(index)}><X size={14} /></button>}
         </div>
       })}
     </aside>
     <div className="model-test-main">
       {waitingMessage && <p className="model-test-help" role="status">{waitingMessage}</p>}
-      {completed && <div className="model-test-summary">共 {rows.length} 张 {taskLabel}图片：{resultImages} 张有结果，{emptyImages} 张没有结果。</div>}
+      {statisticRows.length > 0 && <div className="model-test-summary">{queue ? '当前设置下已完成' : '共'} {statisticRows.length} 张图片：{resultImages} 张有结果，{emptyImages} 张没有结果。</div>}
+      {queue && images[current].result && !imageResultIsCurrent(images[current], queueKey) && <p className="model-test-parameter-notice" role="status">这是旧模型或旧参数的结果（{modelTestParameterText(test!)}），未计入当前设置的统计；点击测试待处理图片可更新。</p>}
+      {queue && images[current].attempt?.test.status === 'failed' && <p className="model-test-error" role="alert">{images[current].attempt.test.error || '当前图片测试失败，可重试'}{images[current].result ? '；下方保留上次完成的结果。' : ''}</p>}
       <div className="model-test-comparison">
         {[{ url: original, title: '原图', kind: 'original' }, { url: result, title: taskType ? `${taskLabel}结果` : '预测结果', kind: 'result' }].map(({ url, title, kind }) => <section className="model-test-panel" key={title}>
           <div><strong>{title}</strong>{url && <button className="icon-button" title={`放大${title}`} aria-label={`放大${title}`} onClick={(event) => openLightbox(url, title, event.currentTarget)}><Maximize2 size={15} /></button>}</div>
           {kind === 'result' && completed && <div className={`model-test-outcome ${(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? 'detected' : 'not-detected'}`} role="status">
             {(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? <CheckCircle2 size={19} /> : <Info size={19} />}
-            <div><strong>{(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? modelTestResultLabel(taskType, selectedResult.prediction_count ?? selectedResult.detections) : `当前阈值下未获得${taskLabel}预测结果`}</strong>{(selectedResult.prediction_count ?? selectedResult.detections) === 0 && <p>可适当调整阈值后重新测试；这不能单独作为图片中不存在该类内容的依据。</p>}</div>
+            <div><strong>{(selectedResult.prediction_count ?? selectedResult.detections ?? 0) > 0 ? modelTestResultLabel(taskType, selectedResult.prediction_count ?? selectedResult.detections) : `本次结果参数下未获得${taskLabel}预测结果`}</strong>{(selectedResult.prediction_count ?? selectedResult.detections) === 0 && <p>可适当调整阈值后重新测试；这不能单独作为图片中不存在该类内容的依据。</p>}</div>
           </div>}
           {url ? <button className="model-test-image" onDoubleClick={(event) => openLightbox(url, title, event.currentTarget)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openLightbox(url, title, event.currentTarget) } }} aria-label={`${title}，双击放大`}><img src={url} alt={`${selectedResult.name} ${title}`} /></button>
             : <div className="model-test-placeholder">{busy ? <LoaderCircle className="spin" size={28} /> : failed ? <AlertCircle size={32} /> : <ScanEye size={32} />}<span>{busy ? '模型结果生成中…' : failed ? '模型测试失败，请查看错误原因' : '运行测试后，查看模型预测结果'}</span></div>}
@@ -324,16 +329,42 @@ export function TestWorkspace({ test, images, selected, onSelect, onRemove, busy
       {completed && <section className="model-test-insights" aria-label="测试统计">
         <div className="model-test-stat-grid">
           <div><Target size={17} /><span>{taskType === 'classify' ? '全部候选类别' : '全部预测结果'}<strong>{allObjects.length}</strong></span></div>
-          <div><Images size={17} /><span>有结果图片<strong>{resultImages}/{rows.length}</strong></span></div>
+          <div><Images size={17} /><span>有结果图片<strong>{resultImages}/{statisticRows.length}</strong></span></div>
           <div><Gauge size={17} /><span>平均置信度<strong>{averageConfidence === null ? '—' : averageConfidence.toFixed(3)}</strong></span></div>
-          <div><Clock3 size={17} /><span>平均推理<strong>{milliseconds(test.timings ? test.timings.inference / rows.length : undefined)}</strong></span></div>
+          <div><Clock3 size={17} /><span>平均推理<strong>{milliseconds(queue ? statisticRows.length ? statisticRows.reduce((sum, file) => sum + (file.timings.inference || 0), 0) / statisticRows.length : undefined : test.timings ? test.timings.inference / rows.length : undefined)}</strong></span></div>
         </div>
         <div className="model-test-detail-grid">
           <div><h3>当前图片预测 <span>{objects.length}</span></h3>{objects.length ? <div className="model-test-object-list">{objects.map((item, index) => <div key={`${item.class_id ?? item.class_name}-${index}`}><span>#{index + 1}</span><strong>{item.class_name}{taskType === 'segment' && item.mask_available ? ' · 含掩码' : ''}{taskType === 'pose' && item.keypoints ? ` · ${item.keypoints.length} 个关键点` : ''}{taskType === 'obb' && item.obb_points ? ' · 旋转框' : ''}</strong><em>{item.confidence.toFixed(3)}</em></div>)}</div> : <p>当前图片没有可显示的预测结果。</p>}</div>
-          <div><h3>整批类别统计 <span>{classRows.length}</span></h3>{classRows.length ? <div className="model-test-class-list">{classRows.map(([name, value]) => <div key={name}><strong>{name}</strong><span><i style={{ width: `${Math.max(8, value.count / allObjects.length * 100)}%` }} /></span><em>{value.count} · 平均 {(value.confidence / value.count).toFixed(3)}</em></div>)}</div> : <p>本次没有预测结果。</p>}</div>
-          <div><h3>性能数据</h3><dl><div><dt>模型加载</dt><dd>{milliseconds(test.timings?.model_load)}</dd></div><div><dt>预处理</dt><dd>{milliseconds(selectedResult.timings.preprocess)}</dd></div><div><dt>当前图推理</dt><dd>{milliseconds(selectedResult.timings.inference)}</dd></div><div><dt>后处理</dt><dd>{milliseconds(selectedResult.timings.postprocess)}</dd></div><div><dt>整批总耗时</dt><dd>{milliseconds(test.timings?.total)}</dd></div></dl></div>
+          <div><h3>{queue ? '当前设置类别统计' : '整批类别统计'} <span>{classRows.length}</span></h3>{classRows.length ? <div className="model-test-class-list">{classRows.map(([name, value]) => <div key={name}><strong>{name}</strong><span><i style={{ width: `${Math.max(8, value.count / allObjects.length * 100)}%` }} /></span><em>{value.count} · 平均 {(value.confidence / value.count).toFixed(3)}</em></div>)}</div> : <p>本次没有预测结果。</p>}</div>
+          <div><h3>性能数据</h3><dl><div><dt>{queue ? '当前图所属批次加载' : '模型加载'}</dt><dd>{milliseconds(test.timings?.model_load)}</dd></div><div><dt>预处理</dt><dd>{milliseconds(selectedResult.timings.preprocess)}</dd></div><div><dt>当前图推理</dt><dd>{milliseconds(selectedResult.timings.inference)}</dd></div><div><dt>后处理</dt><dd>{milliseconds(selectedResult.timings.postprocess)}</dd></div><div><dt>{queue ? '当前图所属批次耗时' : '整批总耗时'}</dt><dd>{milliseconds(test.timings?.total)}</dd></div></dl></div>
         </div>
       </section>}
     </div>
   </div>
+}
+
+
+const queueStateLabel = { pending: '待测试', active: '处理中', completed: '已完成', failed: '失败 / 已取消', stale: '旧模型 / 参数结果' }
+
+export function TestQueueControls({ images, queueKey, disabled, onRun, onRefresh }: {
+  images: SelectedImage[]
+  queueKey: string
+  disabled: boolean
+  onRun: (scope: 'current' | 'all') => void
+  onRefresh: () => void
+}) {
+  if (!images.length) return null
+  const counts = images.reduce((total, image) => {
+    total[imageTestState(image, queueKey)] += 1
+    return total
+  }, { pending: 0, active: 0, completed: 0, failed: 0, stale: 0 })
+  return <section className="model-test-queue" aria-label="图片测试状态">
+    <div className="model-test-queue-summary" role="status">共 {images.length} 张 · 已完成 {counts.completed} 张 · 待处理 {pendingTestImages(images, queueKey).length} 张{counts.active > 0 && ` · 处理中 ${counts.active} 张`}{counts.failed > 0 && ` · 失败 / 取消 ${counts.failed} 张`}{counts.stale > 0 && ` · 旧结果 ${counts.stale} 张`}</div>
+    <progress aria-label="当前设置已完成图片比例" value={counts.completed} max={images.length} />
+    <div className="model-test-queue-actions">
+      <button type="button" className="button ghost" disabled={disabled || counts.active > 0} onClick={() => onRun('current')}>重新测试此图</button>
+      <button type="button" className="button ghost" disabled={disabled || counts.active > 0} onClick={() => onRun('all')}>重新测试全部（{images.length}）</button>
+      {counts.active > 0 && <button type="button" className="button ghost" disabled={disabled} onClick={onRefresh}>刷新后台状态</button>}
+    </div>
+  </section>
 }

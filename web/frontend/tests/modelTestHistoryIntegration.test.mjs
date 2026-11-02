@@ -6,7 +6,7 @@ import ts from 'typescript'
 
 // Run actual component effects with deterministic network and timers. JSX stays
 // inspectable and no browser, service, user data or generated disk files are used.
-function historyView(component, api, query = 'runs=run-a') {
+function historyView(component, api, query = 'runs=run-a', props = {}) {
   const slots = []; const effects = []; const timers = new Map(); const listeners = new Map()
   let index = 0; let timerId = 0; let tree
   const same = (left, right) => left && right && left.length === right.length && left.every((value, i) => Object.is(value, right[i]))
@@ -25,7 +25,7 @@ function historyView(component, api, query = 'runs=run-a') {
     },
   }
   const window = {
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: { getItem: () => null, setItem: () => {} }, confirm: () => true,
     setTimeout(work) { const id = ++timerId; timers.set(id, work); return id }, clearTimeout: id => timers.delete(id),
     requestAnimationFrame(work) { work(); return ++timerId }, cancelAnimationFrame() {},
     matchMedia: () => ({ matches: false }),
@@ -49,7 +49,7 @@ function historyView(component, api, query = 'runs=run-a') {
     if (name === '../preferences') return { useCompareLimit: () => 4, readStoredCompareRuns: () => [], writeStoredCompareRuns() {} }
     let relative
     if (name === './ModelTestShared') relative = 'components/ModelTestShared.tsx'
-    else if (['../modelTestHistory', '../metricProfiles', '../datasetSnapshot', '../comparisonEvidence', '../chartMetrics'].includes(name)) relative = `${name.slice(3)}.ts`
+    else if (['../modelTestHistory', '../modelTestQueue', '../metricProfiles', '../datasetSnapshot', '../comparisonEvidence', '../chartMetrics'].includes(name)) relative = `${name.slice(3)}.ts`
     else if (name === './datasetSnapshot') relative = 'datasetSnapshot.ts'
     else if (name === './types') return {}
     else if (name === component) relative = `components/${component}.tsx`
@@ -60,13 +60,13 @@ function historyView(component, api, query = 'runs=run-a') {
     const compiled = ts.transpileModule(source, { compilerOptions: {
       target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX,
     } }).outputText
-    vm.runInNewContext(compiled, { exports: module.exports, require: load, window, document, navigator, AbortController, URL, URLSearchParams })
+    vm.runInNewContext(compiled, { exports: module.exports, require: load, window, document, navigator, AbortController, URL, URLSearchParams, File, crypto: globalThis.crypto })
     return module.exports
   }
   const Component = load(component)[component]
   function render() {
     index = 0
-    tree = Component({ taskId: 'task-a', taskName: '测试任务', onClose() {} })
+    tree = Component({ taskId: 'task-a', taskName: '测试任务', onClose() {}, ...props })
     const pending = effects.splice(0)
     for (const effect of pending) slots[effect.index]?.cleanup?.()
     for (const effect of pending) slots[effect.index] = { deps: effect.deps, cleanup: effect.work() }
@@ -87,6 +87,10 @@ function historyView(component, api, query = 'runs=run-a') {
     findAll, settle, clipboard,
     async click(node) { assert.ok(node, 'control exists'); node.props.onClick(); render(); await settle() },
     async change(node, value) { assert.ok(node, 'control exists'); node.props.onChange({ target: { value } }); render(); await settle() },
+    async upload(files) {
+      const input = findAll(node => node.type === 'input' && node.props.type === 'file')[0]
+      assert.ok(input, 'image input exists'); input.props.onChange({ target: { files } }); render(); await settle()
+    },
     async tick() { const work = [...timers.values()]; timers.clear(); work.forEach(next => next()); await settle() },
     keyDown(key) { listeners.get('keydown')?.({ key, isComposing: false, preventDefault() {} }); render() },
     dispose() { for (const item of slots) item?.cleanup?.() },
@@ -283,3 +287,88 @@ test('comparison keeps the last curve after a failed poll, marks it stale and cl
     assert.equal(view.findAll(node => node.props.className === 'button primary')[0].props['aria-expanded'], false)
   } finally { view.dispose() }
 })
+
+
+for (const component of ['ModelTests', 'ModelTestModal']) {
+  test(`${component}: incremental uploads, retry scopes and parameter invalidation`, async () => {
+    const records = new Map(); const submitted = []; const uploads = []; let outcome = 'completed'; let pollError = false
+    const artifact = { id: 7, name: 'best.pt', size: 123, modified_at: '2026-11-02' }
+    const asset = { id: 'asset-a', name: 'fixture.pt', source_type: 'local_path', status: 'ready', size: 123, sha256: 'a'.repeat(64) }
+    const api = {
+      tasks: async () => [], taskGroups: async () => [], computeNodes: async () => [],
+      modelAssets: async () => ({ items: [asset] }),
+      globalModelTests: async () => ({ items: [...records.values()].reverse(), next_cursor: null }),
+      modelTests: async () => ({ items: [...records.values()].reverse(), next_cursor: null }),
+      modelTest: async id => { if (pollError) throw new Error('network unavailable'); return structuredClone(records.get(id)) },
+      taskModelTest: async (_task, id) => structuredClone(records.get(id)),
+      prepareArtifact: async () => ({ status: 'ready' }),
+      createStandaloneModelTest: async (_id, confidence, iou, files, id) => create(confidence, iou, files, id),
+      createModelTest: async (_id, confidence, iou, files, id) => create(confidence, iou, files, id),
+      uploadModelTestImage: async (id, index, file) => { uploads.push(file.name); records.get(id).files[index].uploaded = true },
+      deleteModelTest: async id => { records.delete(id) },
+      startModelTest: async id => {
+        const value = records.get(id); value.status = outcome
+        value.files.forEach(file => { file.detections = outcome === 'completed' ? 1 : null })
+        return structuredClone(value)
+      },
+    }
+    function create(confidence, iou, files, id) {
+      submitted.push(Array.from(files, file => file.name))
+      const value = { ...entry(id, 'uploading'), id, artifact_id: 7, model_asset_id: 'asset-a', model_sha256: 'a'.repeat(64), model_size: 123,
+        confidence, iou, timings: null, files: files.map(file => ({ name: file.name, size: file.size, uploaded: false, detections: null, objects: [], timings: {} })) }
+      records.set(id, value); return structuredClone(value)
+    }
+    const view = historyView(component, api, '', { artifact, taskType: 'detect' })
+    const primary = () => view.findAll(node => node.type === 'button' && node.props.className === 'button primary' && /测试|全部已完成|后台处理中/.test(String(node.props.children)))[0]
+    const queue = () => view.findAll(node => node.type?.name === 'TestQueueControls')[0]
+    const currentWorkspace = () => workspace(view).props
+    try {
+      await view.settle()
+      if (component === 'ModelTests') {
+        const library = view.findAll(node => node.type === 'RegisteredModelLibrary')[0]
+        library.props.onSelect(asset); await view.settle()
+      }
+      await view.upload([new File(['A'], 'A.jpg')]); await view.click(primary())
+      assert.equal(currentWorkspace().images[0].result.test.status, 'completed')
+      const firstId = currentWorkspace().images[0].result.test.id
+      await view.upload([new File(['B'], 'B.jpg')])
+      assert.equal(currentWorkspace().selected, 1)
+      assert.equal(currentWorkspace().images[0].result.test.id, firstId)
+      assert.equal(currentWorkspace().images[1].result, undefined)
+      await view.click(primary())
+      assert.deepEqual(submitted, [['A.jpg'], ['B.jpg']]); assert.deepEqual(uploads, ['A.jpg', 'B.jpg'])
+      assert.equal(primary().props.disabled, true)
+      assert.notEqual(firstId, currentWorkspace().images[1].result.test.id)
+      assert.equal(currentWorkspace().images[1].result.index, 0)
+      queue().props.onRun('current'); await view.settle()
+      assert.deepEqual(submitted.at(-1), ['B.jpg']); assert.equal(currentWorkspace().images[0].result.test.id, firstId)
+      const confidence = view.findAll(node => node.type === 'input' && node.props.id?.endsWith('confidence'))[0]
+      await view.change(confidence, '0.40'); assert.equal(primary().props.disabled, false)
+      await view.click(primary()); assert.deepEqual(submitted.at(-1), ['A.jpg', 'B.jpg'])
+      assert.equal(currentWorkspace().images[0].result.test.confidence, 0.4)
+      outcome = 'failed'; await view.upload([new File(['C'], 'C.jpg')]); await view.click(primary())
+      assert.deepEqual(submitted.at(-1), ['C.jpg']); assert.equal(currentWorkspace().images[0].result.test.confidence, 0.4)
+      outcome = 'completed'; await view.click(primary()); assert.deepEqual(submitted.at(-1), ['C.jpg'])
+      currentWorkspace().onRemove(0); await view.settle()
+      assert.equal(currentWorkspace().images[0].file.name, 'B.jpg'); assert.equal(currentWorkspace().images[0].result.index, 1)
+      queue().props.onRun('all'); await view.settle(); assert.deepEqual(submitted.at(-1), ['B.jpg', 'C.jpg'])
+      outcome = 'queued'; queue().props.onRun('current'); await view.settle()
+      pollError = true; await view.tick()
+      assert.equal(primary().props.disabled, true)
+      const submissionCount = submitted.length
+      const background = [...records.values()].at(-1); background.status = 'completed'
+      pollError = false; queue().props.onRefresh(); await view.settle()
+      assert.equal(submitted.length, submissionCount)
+      assert.equal(currentWorkspace().images[currentWorkspace().selected].result.test.id, background.id)
+      // Deleting the selected background batch clears its references in the new-test view.
+      await view.click(view.findAll(node => node.props.role === 'tab')[1])
+      await view.click(rows(view)[0])
+      const deleteButton = view.findAll(node => node.type === 'button' && String(node.props.children).includes('删除记录'))[0]
+      await view.click(deleteButton)
+      await view.click(view.findAll(node => node.props.role === 'tab')[0])
+      assert.equal(currentWorkspace().images[currentWorkspace().selected].result, undefined)
+      assert.equal(primary().props.disabled, false)
+
+    } finally { view.dispose() }
+  })
+}
