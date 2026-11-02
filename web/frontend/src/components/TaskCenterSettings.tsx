@@ -32,12 +32,12 @@ export function TaskCenterSettings() {
   }
 
   return <div className="task-center-settings">
-    <SettingsDisclosure title="默认视图" description="控制每次打开任务总览时的初始排列和缩放。" badge={preferences.layoutMode === 'free' ? '自由布局' : '自动网格'} defaultOpen>
+    <SettingsDisclosure title="默认视图" description="控制每次打开任务总览时的初始排列和缩放。" badge={preferences.layoutMode === 'free' ? '自由布局' : '分组竖排'} defaultOpen>
       <div className="settings-choice-row">
-        <div><strong>布局模式</strong><span>自由布局可拖动卡片；自动网格会按任务顺序整齐排列。</span></div>
+        <div><strong>布局模式</strong><span>分组竖排为每组单独一列，自动连线并在删除后补位；自由布局可拖动卡片。</span></div>
         <div className="settings-segmented" role="group" aria-label="任务总览默认布局">
           <button type="button" aria-pressed={preferences.layoutMode === 'free'} onClick={() => updateTaskCenterPreferences({ layoutMode: 'free' })}>自由布局</button>
-          <button type="button" aria-pressed={preferences.layoutMode === 'grid'} onClick={() => updateTaskCenterPreferences({ layoutMode: 'grid' })}>自动网格</button>
+          <button type="button" aria-pressed={preferences.layoutMode === 'grid'} onClick={() => updateTaskCenterPreferences({ layoutMode: 'grid' })}>分组竖排</button>
         </div>
       </div>
       <label className="settings-range-row" htmlFor="task-center-default-zoom">

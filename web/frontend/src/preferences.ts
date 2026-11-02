@@ -18,7 +18,7 @@ export type TaskCenterPreferences = {
 export type TaskCenterPreferencesSnapshot = TaskCenterPreferences & { storageAvailable: boolean }
 
 export const TASK_CENTER_PREFERENCES_DEFAULTS: Readonly<TaskCenterPreferences> = Object.freeze({
-  layoutMode: 'free',
+  layoutMode: 'grid',
   cardDensity: 'comfortable',
   defaultZoom: 0.9,
   showMiniMap: true,

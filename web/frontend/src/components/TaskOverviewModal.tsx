@@ -6,15 +6,16 @@ import {
   Link2, LoaderCircle, LocateFixed, Maximize2, Monitor, Save, Search, Server, Trash2, X, Zap,
 } from 'lucide-react'
 import {
-  addEdge, Background, BackgroundVariant, ConnectionLineType, Controls, Handle, MarkerType, MiniMap,
+  addEdge, Background, BackgroundVariant, BaseEdge, ConnectionLineType, Controls, Handle, MarkerType, MiniMap,
   Position, ReactFlow, ReactFlowProvider, useEdgesState, useNodesInitialized,
   useNodesState, useReactFlow, type Connection, type Edge, type Node, type NodeProps,
-  type Viewport,
+  type Viewport, type EdgeProps,
 } from '@xyflow/react'
 import { api, statusLabel } from '../api'
 import { taskMetric } from '../groupMetrics'
 import { primaryMetric } from '../metricProfiles'
 import { sortOverviewTasks } from '../taskOrder'
+import { overviewGroupLayout } from '../taskOverviewLayout'
 import { useTaskCenterPreferences } from '../preferences'
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
 import type { TaskGroup, TaskWorkspace, TaskWorkspaceModeLayout, TrainingTask } from '../types'
@@ -32,7 +33,7 @@ type Props = {
   onNavigate: () => void
 }
 
-type OverviewData = { task: TrainingTask; serverName: string; onNavigate: (taskId: string) => void }
+type OverviewData = { task: TrainingTask; serverName: string; onNavigate: (taskId: string) => void; groupName?: string; groupCount?: number; firstInGroup?: boolean; grouped?: boolean }
 type OverviewNode = Node<OverviewData, 'taskOverview'>
 type OverviewEdge = Edge
 type LayoutFeedback = { kind: 'loading' | 'saving' | 'success' | 'error'; message: string }
@@ -45,7 +46,7 @@ const activeStatuses = new Set<TrainingTask['status']>(['queued', 'starting', 'r
 const attentionStatuses = new Set<TrainingTask['status']>(['failed', 'interrupted'])
 const modeTitles: Record<TaskOverviewMode, string> = { all: '全部任务', active: '正在进行', completed: '已完成', attention: '需要关注' }
 const modeDescriptions: Record<TaskOverviewMode, string> = {
-  all: '自由整理全部任务，关联线仅用于表达关系，不影响训练调度。',
+  all: '每个分组独占一列，组内新建任务在前；删除后自动补位，连线仅表示分组顺序。',
   active: '集中查看正在运行、排队或停止中的任务及其实时进度。',
   completed: '整理已完成任务，并保留轮数、时间和最新验证指标。',
   attention: '集中排查失败与意外中断任务，可用关联线标记排查关系。',
@@ -104,14 +105,6 @@ function cardAccessibilityLabel(task: TrainingTask, current: number, target: num
   return label
 }
 
-function defaultPosition(index: number, columns: number) {
-  return { x: index % columns * (CARD_WIDTH + GRID_GAP_X), y: Math.floor(index / columns) * (CARD_HEIGHT + GRID_GAP_Y) }
-}
-
-function overviewColumns(width: number): number {
-  return Math.max(1, Math.min(5, Math.floor((Math.max(360, width) - 80) / (CARD_WIDTH + GRID_GAP_X))))
-}
-
 function edgeId(): string {
   return 'overview-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10)
 }
@@ -143,8 +136,11 @@ const TaskOverviewNode = memo(function TaskOverviewNode({ data, dragging }: Node
   return <article className={'task-overview-card tone-' + tone} role="link" tabIndex={0} aria-label={cardAccessibilityLabel(task, current, target, percent)} onClick={openTask} onKeyDown={(event) => {
     if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openTask() }
   }}>
+    {data.grouped && data.firstInGroup && <span className="task-overview-group-heading"><strong>{data.groupName}</strong><span>{data.groupCount} 个任务</span></span>}
     <Handle type="target" position={Position.Left} className="task-overview-handle task-overview-handle-target" aria-label={'连接到 ' + task.name} onClick={(event) => event.stopPropagation()} />
     <Handle type="source" position={Position.Right} className="task-overview-handle task-overview-handle-source" aria-label={'从 ' + task.name + ' 创建关联'} onClick={(event) => event.stopPropagation()} />
+    <Handle id="group-in" type="target" position={Position.Top} isConnectable={false} className="task-overview-group-handle" />
+    <Handle id="group-out" type="source" position={Position.Bottom} isConnectable={false} className="task-overview-group-handle" />
     <span className="task-overview-card-top">
       <span className="task-overview-card-drag" title={'拖动任务卡片：' + task.name} aria-hidden="true" onClick={(event) => event.stopPropagation()}><GripHorizontal size={16} /></span>
       <span className="task-overview-card-icon" aria-hidden="true">{tone === 'attention' ? <AlertTriangle size={17} /> : tone === 'completed' ? <CheckCircle2 size={17} /> : task.status === 'running' ? <Zap size={17} /> : <Clock3 size={17} />}</span>
@@ -177,9 +173,15 @@ const TaskOverviewNode = memo(function TaskOverviewNode({ data, dragging }: Node
       <span className="task-overview-card-foot"><span>{metric || '暂无验证指标'}</span><span>{formatTime(time)}</span></span>
     </span>}
   </article>
-}, (before, after) => before.dragging === after.dragging && before.data.task.id === after.data.task.id && before.data.serverName === after.data.serverName && before.data.onNavigate === after.data.onNavigate && cardSignature(before.data.task) === cardSignature(after.data.task))
+}, (before, after) => before.dragging === after.dragging && before.data.task.id === after.data.task.id && before.data.serverName === after.data.serverName && before.data.onNavigate === after.data.onNavigate && before.data.grouped === after.data.grouped && before.data.groupName === after.data.groupName && before.data.groupCount === after.data.groupCount && before.data.firstInGroup === after.data.firstInGroup && cardSignature(before.data.task) === cardSignature(after.data.task))
 
 const nodeTypes = { taskOverview: TaskOverviewNode }
+
+function GroupChainEdge({ sourceX, sourceY, targetX, targetY, ...props }: EdgeProps) {
+  const middle = (sourceY + targetY) / 2
+  return <BaseEdge {...props} path={`M ${sourceX},${sourceY} C ${sourceX + 20},${middle} ${targetX + 20},${middle} ${targetX},${targetY}`} />
+}
+const edgeTypes = { groupChain: GroupChainEdge }
 
 function normalizeEdges(layout: TaskWorkspaceModeLayout | undefined, validIds: Set<string>): OverviewEdge[] {
   return (layout?.edges || []).filter((edge) => edge.source !== edge.target && validIds.has(edge.source) && validIds.has(edge.target)).map((edge) => ({
@@ -195,7 +197,7 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
   onFeedback: (feedback: LayoutFeedback | null) => void
 }) {
   const preferences = useTaskCenterPreferences()
-  const { fitView, getNodes, getViewport, setViewport } = useReactFlow<OverviewNode, OverviewEdge>()
+  const { fitView, getViewport, setViewport } = useReactFlow<OverviewNode, OverviewEdge>()
   const nodesInitialized = useNodesInitialized()
   const [nodes, setNodes, onNodesChange] = useNodesState<OverviewNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<OverviewEdge>([])
@@ -214,7 +216,9 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
     return orderedTasks.filter((task) => persistedIds.has(task.id) || matchesMode(task, mode))
   }, [mode, orderedTasks, workspace])
   const layoutTaskIds = useMemo(() => new Set(layoutTasks.map((task) => task.id)), [layoutTasks])
-  const columns = useMemo(() => overviewColumns(window.innerWidth), [])
+  const visibleTasks = useMemo(() => modeTasks.filter((task) => !normalizedQuery || task.name.toLocaleLowerCase().includes(normalizedQuery) || taskServerName(task, nodeNames).toLocaleLowerCase().includes(normalizedQuery)), [modeTasks, nodeNames, normalizedQuery])
+  const groupLayout = useMemo(() => overviewGroupLayout(visibleTasks, groups), [visibleTasks, groups])
+  const groupedById = useMemo(() => new Map(groupLayout.map((item) => [item.task.id, item])), [groupLayout])
 
   const markDirty = useCallback(() => {
     if (dirtyRef.current) return
@@ -248,21 +252,22 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
         const position = currentPositions.get(task.id) || savedPositions.get(task.id)
         return position ? [position] : []
       })
-      let nextSlot = 0
-      const freePosition = () => {
-        let position = defaultPosition(nextSlot++, columns)
+      const freePosition = (initial: { x: number; y: number }) => {
+        let position = initial
         while (occupied.some((other) => Math.abs(position.x - other.x) < CARD_WIDTH + GRID_GAP_X
           && Math.abs(position.y - other.y) < CARD_HEIGHT + GRID_GAP_Y)) {
-          position = defaultPosition(nextSlot++, columns)
+          position = { x: position.x, y: position.y + CARD_HEIGHT + GRID_GAP_Y }
         }
         occupied.push(position)
         return position
       }
-      return layoutTasks.map((task, index) => ({
+      return layoutTasks.map((task) => ({
         id: task.id,
         type: 'taskOverview',
-        position: layoutMode === 'grid' ? defaultPosition(index, columns) : currentPositions.get(task.id) || savedPositions.get(task.id) || freePosition(),
-        data: { task, serverName: taskServerName(task, nodeNames), onNavigate },
+        position: layoutMode === 'grid' ? groupedById.get(task.id)?.position || { x: 0, y: 48 } : currentPositions.get(task.id) || savedPositions.get(task.id) || freePosition(groupedById.get(task.id)?.position || { x: 0, y: 48 }),
+        data: { task, serverName: taskServerName(task, nodeNames), onNavigate,
+          groupName: groupedById.get(task.id)?.groupName, groupCount: groupedById.get(task.id)?.groupCount,
+          firstInGroup: groupedById.get(task.id)?.firstInGroup, grouped: layoutMode === 'grid' },
         draggable: layoutMode === 'free', selectable: false, dragHandle: '.task-overview-card-drag',
         style: { pointerEvents: 'all' },
       }))
@@ -274,27 +279,28 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
       restoringViewportRef.current = true
       window.requestAnimationFrame(() => { void setViewport(viewport, { duration: 0 }).finally(() => { restoringViewportRef.current = false }) })
     } else setEdges((current) => current.filter((edge) => layoutTaskIds.has(edge.source) && layoutTaskIds.has(edge.target)))
-  }, [columns, layoutMode, layoutTaskIds, layoutTasks, mode, nodeNames, onNavigate, preferences.defaultZoom, setEdges, setNodes, setViewport, workspace])
+  }, [groupedById, layoutMode, layoutTaskIds, layoutTasks, mode, nodeNames, onNavigate, preferences.defaultZoom, setEdges, setNodes, setViewport, workspace])
 
   useEffect(() => { setLayoutMode(preferences.layoutMode) }, [preferences.layoutMode])
 
-  const visibleNodeIds = useMemo(() => new Set(modeTasks.filter((task) => !normalizedQuery || task.name.toLocaleLowerCase().includes(normalizedQuery) || taskServerName(task, nodeNames).toLocaleLowerCase().includes(normalizedQuery)).map((task) => task.id)), [modeTasks, nodeNames, normalizedQuery])
+  const visibleNodeIds = useMemo(() => new Set(visibleTasks.map((task) => task.id)), [visibleTasks])
   const displayedNodes = useMemo(() => nodes.map((node) => ({ ...node, hidden: !visibleNodeIds.has(node.id), draggable: layoutMode === 'free' })), [layoutMode, nodes, visibleNodeIds])
-  const displayedEdges = useMemo(() => edges.map((edge) => ({ ...edge, hidden: !preferences.showConnections || !visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target) })), [edges, preferences.showConnections, visibleNodeIds])
+  const displayedEdges = useMemo(() => {
+    const manual = edges.map((edge) => ({ ...edge, hidden: !preferences.showConnections || !visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target) }))
+    if (layoutMode !== 'grid' || !preferences.showConnections) return manual
+    const automatic: OverviewEdge[] = groupLayout.flatMap((item) => item.previousId ? [{
+      id: 'group-chain-' + JSON.stringify([item.previousId, item.task.id]), source: item.previousId, target: item.task.id,
+      sourceHandle: 'group-out', targetHandle: 'group-in', type: 'groupChain', selectable: false, deletable: false,
+      markerEnd: { type: MarkerType.ArrowClosed }, className: 'task-overview-group-edge',
+    }] : [])
+    return [...manual, ...automatic]
+  }, [edges, groupLayout, layoutMode, preferences.showConnections, visibleNodeIds])
 
   const arrangeNodes = useCallback(() => {
-    const arrangedIds = layoutTasks.filter((task) => visibleNodeIds.has(task.id)).map((task) => task.id)
-    const arrangedIndices = new Map(arrangedIds.map((id, index) => [id, index]))
-    setNodes((current) => current.map((node) => {
-      const index = arrangedIndices.get(node.id)
-      return index === undefined ? node : { ...node, position: defaultPosition(index, columns) }
-    }))
+    setLayoutMode('grid')
     markDirty()
-    window.requestAnimationFrame(() => {
-      const visible = getNodes().filter((node) => visibleNodeIds.has(node.id))
-      if (visible.length) void fitView({ nodes: visible, padding: 0.12, minZoom: 0.68, maxZoom: 1, duration: 260 })
-    })
-  }, [columns, fitView, getNodes, layoutTasks, markDirty, setNodes, visibleNodeIds])
+    onFeedback({ kind: 'success', message: '已按分组竖向排列，删除任务后自动补位' })
+  }, [markDirty, onFeedback])
 
   const focusVisible = useCallback(() => {
     const visible = displayedNodes.filter((node) => visibleNodeIds.has(node.id))
@@ -324,22 +330,20 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
   }, [markDirty, selectedEdges, setEdges])
 
   const toggleLayoutMode = useCallback(() => {
-    setLayoutMode((current) => {
-      if (current === 'free') {
-        setNodes((items) => items.map((node, index) => ({ ...node, position: defaultPosition(index, columns) })))
-        markDirty()
-        return 'grid'
-      }
-      return 'free'
-    })
-  }, [columns, markDirty, setNodes])
+    if (layoutMode === 'grid') {
+      const saved = new Map((workspace?.modes[mode]?.nodes || []).map((node) => [node.id, node.position]))
+      setNodes((items) => items.map((node) => ({ ...node, position: saved.get(node.id) || node.position })))
+    }
+    setLayoutMode(layoutMode === 'free' ? 'grid' : 'free')
+    markDirty()
+  }, [layoutMode, markDirty, mode, setNodes, workspace])
 
   const saveLayout = useCallback(async () => {
     if (!workspace || saving) return
     setSaving(true)
     onFeedback({ kind: 'saving', message: '正在保存工作区布局…' })
     const modeLayout: TaskWorkspaceModeLayout = {
-      nodes: nodes.map(({ id, position }) => ({ id, position })),
+      nodes: layoutMode === 'grid' ? overviewGroupLayout(layoutTasks, groups).map(({ task, position }) => ({ id: task.id, position })) : nodes.map(({ id, position }) => ({ id, position })),
       edges: edges.map(({ id, source, target, label }) => ({ id, source, target, ...(typeof label === 'string' ? { label } : {}) })),
       viewport: getViewport(),
     }
@@ -370,7 +374,7 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
     } finally {
       setSaving(false)
     }
-  }, [edges, getViewport, mode, nodes, onDirtyChange, onFeedback, saving, setEdges, setNodes, workspace])
+  }, [edges, getViewport, groups, layoutMode, layoutTasks, mode, nodes, onDirtyChange, onFeedback, saving, setEdges, setNodes, workspace])
 
   const handleNodesChange = useCallback((changes: Parameters<typeof onNodesChange>[0]) => {
     onNodesChange(changes)
@@ -381,14 +385,14 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
     onEdgesChange(changes)
     const selected = new Set(selectedEdges)
     for (const change of changes) {
-      if (change.type === 'select') {
+      if (change.type === 'select' && edges.some((edge) => edge.id === change.id)) {
         if (change.selected) selected.add(change.id)
         else selected.delete(change.id)
       }
       if (change.type === 'remove') { selected.delete(change.id); markDirty() }
     }
     setSelectedEdges([...selected])
-  }, [markDirty, onEdgesChange, selectedEdges])
+  }, [edges, markDirty, onEdgesChange, selectedEdges])
 
   const handleMoveEnd = useCallback((event: MouseEvent | TouchEvent | null, viewport: Viewport) => {
     if (!event || restoringViewportRef.current || !workspace) return
@@ -399,22 +403,22 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
   const toolbar = <div className="task-overview-toolbar">
     <label><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索任务名称或执行服务器" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索任务或服务器" /></label>
     {workspace && modeTasks.length > 0 && <div className="task-overview-canvas-actions" aria-label="画布布局工具">
-      <button type="button" onClick={toggleLayoutMode} aria-pressed={layoutMode === 'free'} title={layoutMode === 'free' ? '切换为固定网格模式' : '切换为自由编辑模式'}>{layoutMode === 'free' ? <Link2 size={14} /> : <Grid2X2 size={14} />}{layoutMode === 'free' ? '自由编辑' : '固定网格'}</button>
-      <button type="button" onClick={arrangeNodes} title="按任务中心分组顺序排列，组内新建任务在前；保留连线"><Grid2X2 size={14} />自动排列</button>
+      <button type="button" onClick={toggleLayoutMode} aria-pressed={layoutMode === 'grid'} title={layoutMode === 'free' ? '切换为分组竖排，自动连线与补位' : '切换为自由编辑，恢复已保存的位置'}>{layoutMode === 'free' ? <Link2 size={14} /> : <Grid2X2 size={14} />}{layoutMode === 'free' ? '自由编辑' : '分组竖排'}</button>
+      <button type="button" onClick={arrangeNodes} title="每组一列，组内新建任务在前，自动连线与补位"><Grid2X2 size={14} />按分组排列</button>
       <button type="button" onClick={focusVisible}><Maximize2 size={14} />适配可见任务</button>
       <button type="button" onClick={resetViewport}><LocateFixed size={14} />回到首屏</button>
       <button type="button" disabled={!selectedEdges.length} onClick={removeSelectedEdges}><Trash2 size={14} />删除连线</button>
       <button type="button" className="primary" disabled={saving} onClick={() => void saveLayout()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '正在保存' : '保存布局'}</button>
     </div>}
-    <span title="默认及自动排列按分组、组内创建时间从新到旧排序；已保存的自由布局优先保留">{query.trim() ? '筛选仅影响显示，不会删除已保存位置' : '默认按分组 · 组内新建在前'}</span>
+    <span>{query.trim() ? '仅展示匹配任务，不改变已保存布局' : layoutMode === 'grid' ? '每组一列 · 自动连线 · 删除后补位' : '自由拖动 · 布局按当前分类独立保存'}</span>
   </div>
 
   if (!workspace) return <>{toolbar}<div className="task-overview-empty" role="status"><LoaderCircle className="spin" size={20} />正在装载任务工作区…</div></>
   if (modeTasks.length === 0) return <>{toolbar}<div className="task-overview-empty" role="status">当前没有{modeTitles[mode]}的任务。</div></>
   if (visibleNodeIds.size === 0) return <>{toolbar}<div className="task-overview-empty" role="status">没有找到匹配的任务。</div></>
 
-  return <>{toolbar}<div className={'task-overview-flow density-' + preferences.cardDensity} aria-label={modeTitles[mode] + '任务画布'}>
-    <ReactFlow nodes={displayedNodes} edges={displayedEdges} nodeTypes={nodeTypes} connectionLineType={ConnectionLineType.Bezier} onNodesChange={handleNodesChange} onEdgesChange={handleEdgesChange} onConnect={onConnect} onMoveEnd={handleMoveEnd} nodesDraggable={layoutMode === 'free'} nodesConnectable={layoutMode === 'free' && preferences.showConnections} nodesFocusable elementsSelectable panOnDrag selectionOnDrag={false} deleteKeyCode={null} zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.4} maxZoom={1.45} defaultViewport={{ x: 32, y: 32, zoom: preferences.defaultZoom }} onlyRenderVisibleElements={nodes.length > 20} attributionPosition="bottom-left">
+  return <>{toolbar}<div className={'task-overview-flow layout-' + layoutMode + ' density-' + preferences.cardDensity} aria-label={modeTitles[mode] + '任务画布'}>
+    <ReactFlow nodes={displayedNodes} edges={displayedEdges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} connectionLineType={ConnectionLineType.Bezier} onNodesChange={handleNodesChange} onEdgesChange={handleEdgesChange} onConnect={onConnect} onMoveEnd={handleMoveEnd} nodesDraggable={layoutMode === 'free'} nodesConnectable={layoutMode === 'free' && preferences.showConnections} nodesFocusable elementsSelectable panOnDrag selectionOnDrag={false} deleteKeyCode={null} zoomOnScroll zoomOnPinch zoomOnDoubleClick={false} minZoom={0.4} maxZoom={1.45} defaultViewport={{ x: 32, y: 32, zoom: preferences.defaultZoom }} onlyRenderVisibleElements={nodes.length > 20} attributionPosition="bottom-left">
       <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
       <Controls showInteractive={false} showFitView={false} position="bottom-right" />
       {preferences.showMiniMap && <MiniMap position="bottom-right" pannable zoomable nodeStrokeWidth={2} nodeColor={(node) => {
@@ -423,7 +427,7 @@ function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query,
         return tone === 'attention' ? '#e98585' : tone === 'completed' ? '#6ea9df' : tone === 'active' ? '#62d8aa' : '#8e9aa3'
       }} />}
     </ReactFlow>
-    <span className="task-overview-canvas-tip"><GripHorizontal size={13} />拖动卡片顶部把手 · 从卡片两侧连接点创建关联 · 点击卡片进入训练画布</span>
+    <span className="task-overview-canvas-tip"><GripHorizontal size={13} />{layoutMode === 'grid' ? '每组一列，新建在前 · 删除自动补位 · 切换自由编辑可拖动卡片' : '拖动卡片顶部把手 · 从卡片两侧连接点创建关联'} · 点击卡片进入训练画布</span>
     {!nodesInitialized && <span className="task-overview-initializing"><LoaderCircle className="spin" size={14} />正在绘制画布</span>}
   </div></>
 }

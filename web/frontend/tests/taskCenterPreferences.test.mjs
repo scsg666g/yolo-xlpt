@@ -61,10 +61,10 @@ function browser({ saved = {}, blocked = false, readOnly = false } = {}) {
   }
 }
 
-test('task center defaults preserve readable free-layout behavior', () => {
+test('task center defaults use automatic group columns with readable card scale', () => {
   const page = browser()
   assert.deepEqual({ ...page.snapshot() }, {
-    layoutMode: 'free',
+    layoutMode: 'grid',
     cardDensity: 'comfortable',
     defaultZoom: 0.9,
     showMiniMap: true,
@@ -88,7 +88,7 @@ test('old and malformed preference values are normalized field by field', () => 
   const malformed = browser({ saved: {
     [storageKey]: JSON.stringify({ layoutMode: 'broken', cardDensity: 'tiny', defaultZoom: 'nope' }),
   } }).snapshot()
-  assert.equal(malformed.layoutMode, 'free')
+  assert.equal(malformed.layoutMode, 'grid')
   assert.equal(malformed.cardDensity, 'comfortable')
   assert.equal(malformed.defaultZoom, 0.9)
 })
@@ -115,7 +115,7 @@ test('updates clamp zoom, preserve unrelated fields and reset all preferences', 
   assert.equal(page.snapshot().showConnections, false)
   page.api.resetTaskCenterPreferences()
   assert.deepEqual(JSON.parse(page.values.get(storageKey)), {
-    layoutMode: 'free', cardDensity: 'comfortable', defaultZoom: 0.9, showMiniMap: true, showConnections: true,
+    layoutMode: 'grid', cardDensity: 'comfortable', defaultZoom: 0.9, showMiniMap: true, showConnections: true,
   })
 })
 

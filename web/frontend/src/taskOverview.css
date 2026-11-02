@@ -21,6 +21,13 @@
 .task-overview-flow { position: relative; flex: 1 1 auto; min-height: 0; background: radial-gradient(circle at 50% 10%, color-mix(in srgb, var(--green) 6%, transparent), transparent 55%), var(--bg); }
 .task-overview-flow .react-flow__background { opacity: .72; }
 .task-overview-flow .react-flow__node-taskOverview { width: 306px; }
+.task-overview-group-heading { position: absolute; top: -40px; left: 0; width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text); pointer-events: none; }
+.task-overview-group-heading strong { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 14px; }
+.task-overview-group-heading > span { flex-shrink: 0; color: var(--muted); font-size: 11px; }
+.task-overview-group-handle { opacity: 0; pointer-events: none; width: 6px; height: 6px; }
+.task-overview-group-edge .react-flow__edge-path { stroke: var(--green); stroke-width: 2; opacity: .65; }
+.layout-grid .react-flow__node-taskOverview { transition: transform .22s ease; }
+@media (prefers-reduced-motion: reduce) { .layout-grid .react-flow__node-taskOverview { transition: none; } }
 .task-overview-flow .react-flow__node.selected .task-overview-card { border-color: var(--card-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--card-accent) 25%, transparent), 0 18px 42px rgba(0, 0, 0, .25); }
 .task-overview-flow .react-flow__controls { overflow: hidden; margin-bottom: 160px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 9px 26px rgba(0, 0, 0, .12); }
 .task-overview-flow .react-flow__controls-button { width: 31px; height: 31px; border-color: var(--line); color: var(--text); background: var(--panel); fill: var(--text); }
