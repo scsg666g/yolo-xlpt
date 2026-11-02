@@ -14,9 +14,10 @@ import {
 import { api, statusLabel } from '../api'
 import { taskMetric } from '../groupMetrics'
 import { primaryMetric } from '../metricProfiles'
+import { sortOverviewTasks } from '../taskOrder'
 import { useTaskCenterPreferences } from '../preferences'
 import { earlyStoppingExplanation, trainingEpochProgress, trainingEpochTarget, trainingStatusLabel } from '../trainingCompletion'
-import type { TaskWorkspace, TaskWorkspaceModeLayout, TrainingTask } from '../types'
+import type { TaskGroup, TaskWorkspace, TaskWorkspaceModeLayout, TrainingTask } from '../types'
 import { useModalFocus } from '../useModalFocus'
 import '../taskOverview.css'
 
@@ -25,6 +26,7 @@ export type TaskOverviewMode = 'all' | 'active' | 'completed' | 'attention'
 type Props = {
   mode: TaskOverviewMode
   tasks: TrainingTask[]
+  groups: TaskGroup[]
   nodeNames: Record<string, string>
   onClose: () => void
   onNavigate: () => void
@@ -185,7 +187,7 @@ function normalizeEdges(layout: TaskWorkspaceModeLayout | undefined, validIds: S
   }))
 }
 
-function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQueryChange, onDirtyChange, onFeedback }: Omit<Pick<Props, 'mode' | 'tasks' | 'nodeNames'>, never> & {
+function TaskOverviewCanvas({ mode, tasks, groups, nodeNames, onNavigate, query, onQueryChange, onDirtyChange, onFeedback }: Pick<Props, 'mode' | 'tasks' | 'groups' | 'nodeNames'> & {
   onNavigate: (taskId: string) => void
   query: string
   onQueryChange: (query: string) => void
@@ -205,15 +207,12 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
   const restoringViewportRef = useRef(false)
   const dirtyRef = useRef(false)
   const normalizedQuery = query.trim().toLocaleLowerCase()
-  const modeTasks = useMemo(() => tasks.filter((task) => matchesMode(task, mode)), [tasks, mode])
+  const orderedTasks = useMemo(() => sortOverviewTasks(tasks, groups), [tasks, groups])
+  const modeTasks = useMemo(() => orderedTasks.filter((task) => matchesMode(task, mode)), [orderedTasks, mode])
   const layoutTasks = useMemo(() => {
-    const taskById = new Map(tasks.map((task) => [task.id, task]))
-    const persistedOrder = (workspace?.modes[mode]?.nodes || []).map((node) => node.id)
-    const persistedIds = new Set(persistedOrder)
-    const persisted = persistedOrder.map((id) => taskById.get(id)).filter((task): task is TrainingTask => !!task)
-    const appended = modeTasks.filter((task) => !persistedIds.has(task.id))
-    return [...persisted, ...appended]
-  }, [mode, modeTasks, tasks, workspace])
+    const persistedIds = new Set((workspace?.modes[mode]?.nodes || []).map((node) => node.id))
+    return orderedTasks.filter((task) => persistedIds.has(task.id) || matchesMode(task, mode))
+  }, [mode, orderedTasks, workspace])
   const layoutTaskIds = useMemo(() => new Set(layoutTasks.map((task) => task.id)), [layoutTasks])
   const columns = useMemo(() => overviewColumns(window.innerWidth), [])
 
@@ -245,10 +244,24 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
     const savedPositions = new Map((savedLayout?.nodes || []).map((item) => [item.id, item.position]))
     setNodes((current) => {
       const currentPositions = new Map(current.map((node) => [node.id, node.position]))
+      const occupied = layoutTasks.flatMap((task) => {
+        const position = currentPositions.get(task.id) || savedPositions.get(task.id)
+        return position ? [position] : []
+      })
+      let nextSlot = 0
+      const freePosition = () => {
+        let position = defaultPosition(nextSlot++, columns)
+        while (occupied.some((other) => Math.abs(position.x - other.x) < CARD_WIDTH + GRID_GAP_X
+          && Math.abs(position.y - other.y) < CARD_HEIGHT + GRID_GAP_Y)) {
+          position = defaultPosition(nextSlot++, columns)
+        }
+        occupied.push(position)
+        return position
+      }
       return layoutTasks.map((task, index) => ({
         id: task.id,
         type: 'taskOverview',
-        position: layoutMode === 'grid' ? defaultPosition(index, columns) : currentPositions.get(task.id) || savedPositions.get(task.id) || defaultPosition(index, columns),
+        position: layoutMode === 'grid' ? defaultPosition(index, columns) : currentPositions.get(task.id) || savedPositions.get(task.id) || freePosition(),
         data: { task, serverName: taskServerName(task, nodeNames), onNavigate },
         draggable: layoutMode === 'free', selectable: false, dragHandle: '.task-overview-card-drag',
         style: { pointerEvents: 'all' },
@@ -270,17 +283,18 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
   const displayedEdges = useMemo(() => edges.map((edge) => ({ ...edge, hidden: !preferences.showConnections || !visibleNodeIds.has(edge.source) || !visibleNodeIds.has(edge.target) })), [edges, preferences.showConnections, visibleNodeIds])
 
   const arrangeNodes = useCallback(() => {
-    const arrangedIds = nodes.filter((node) => visibleNodeIds.has(node.id)).map((node) => node.id)
+    const arrangedIds = layoutTasks.filter((task) => visibleNodeIds.has(task.id)).map((task) => task.id)
+    const arrangedIndices = new Map(arrangedIds.map((id, index) => [id, index]))
     setNodes((current) => current.map((node) => {
-      const index = arrangedIds.indexOf(node.id)
-      return index < 0 ? node : { ...node, position: defaultPosition(index, columns) }
+      const index = arrangedIndices.get(node.id)
+      return index === undefined ? node : { ...node, position: defaultPosition(index, columns) }
     }))
     markDirty()
     window.requestAnimationFrame(() => {
       const visible = getNodes().filter((node) => visibleNodeIds.has(node.id))
       if (visible.length) void fitView({ nodes: visible, padding: 0.12, minZoom: 0.68, maxZoom: 1, duration: 260 })
     })
-  }, [columns, fitView, getNodes, markDirty, nodes, setNodes, visibleNodeIds])
+  }, [columns, fitView, getNodes, layoutTasks, markDirty, setNodes, visibleNodeIds])
 
   const focusVisible = useCallback(() => {
     const visible = displayedNodes.filter((node) => visibleNodeIds.has(node.id))
@@ -386,13 +400,13 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
     <label><Search size={15} aria-hidden="true" /><input type="search" aria-label="搜索任务名称或执行服务器" value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="搜索任务或服务器" /></label>
     {workspace && modeTasks.length > 0 && <div className="task-overview-canvas-actions" aria-label="画布布局工具">
       <button type="button" onClick={toggleLayoutMode} aria-pressed={layoutMode === 'free'} title={layoutMode === 'free' ? '切换为固定网格模式' : '切换为自由编辑模式'}>{layoutMode === 'free' ? <Link2 size={14} /> : <Grid2X2 size={14} />}{layoutMode === 'free' ? '自由编辑' : '固定网格'}</button>
-      <button type="button" onClick={arrangeNodes}><Grid2X2 size={14} />自动排列</button>
+      <button type="button" onClick={arrangeNodes} title="按任务中心分组顺序排列，组内新建任务在前；保留连线"><Grid2X2 size={14} />自动排列</button>
       <button type="button" onClick={focusVisible}><Maximize2 size={14} />适配可见任务</button>
       <button type="button" onClick={resetViewport}><LocateFixed size={14} />回到首屏</button>
       <button type="button" disabled={!selectedEdges.length} onClick={removeSelectedEdges}><Trash2 size={14} />删除连线</button>
       <button type="button" className="primary" disabled={saving} onClick={() => void saveLayout()}>{saving ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}{saving ? '正在保存' : '保存布局'}</button>
     </div>}
-    <span>{query.trim() ? '筛选仅影响显示，不会删除已保存位置' : '布局按当前分类独立保存'}</span>
+    <span title="默认及自动排列按分组、组内创建时间从新到旧排序；已保存的自由布局优先保留">{query.trim() ? '筛选仅影响显示，不会删除已保存位置' : '默认按分组 · 组内新建在前'}</span>
   </div>
 
   if (!workspace) return <>{toolbar}<div className="task-overview-empty" role="status"><LoaderCircle className="spin" size={20} />正在装载任务工作区…</div></>
@@ -414,7 +428,7 @@ function TaskOverviewCanvas({ mode, tasks, nodeNames, onNavigate, query, onQuery
   </div></>
 }
 
-export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onNavigate }: Props) {
+export function TaskOverviewModal({ mode, tasks, groups, nodeNames, onClose, onNavigate }: Props) {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
   const [dirty, setDirty] = useState(false)
@@ -448,7 +462,7 @@ export function TaskOverviewModal({ mode, tasks, nodeNames, onClose, onNavigate 
   return <div className="modal-backdrop task-overview-backdrop" onMouseDown={requestClose}>
     <div ref={dialogRef} className="modal task-overview-dialog" role="dialog" aria-modal="true" aria-labelledby="task-overview-title" aria-describedby="task-overview-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
       <header className="task-overview-header"><div><span className="eyebrow">TRAINING WORKSPACE</span><h2 id="task-overview-title">{modeTitles[mode]} <span>{count}</span>{dirty && <em>未保存</em>}</h2><p id="task-overview-description">{modeDescriptions[mode]}</p></div><div className="task-overview-header-state">{feedback && <span className={'task-overview-feedback ' + feedback.kind} role={feedback.kind === 'error' ? 'alert' : 'status'}>{feedback.kind === 'loading' || feedback.kind === 'saving' ? <LoaderCircle className="spin" size={14} /> : feedback.kind === 'success' ? <Check size={14} /> : <AlertTriangle size={14} />}{feedback.message}</span>}<button type="button" className="task-overview-close" data-modal-initial-focus onClick={requestClose} aria-label="关闭任务总览"><X size={19} /></button></div></header>
-      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} nodeNames={nodeNames} onNavigate={openTask} query={query} onQueryChange={setQuery} onDirtyChange={setDirty} onFeedback={setFeedback} /></ReactFlowProvider>
+      <ReactFlowProvider><TaskOverviewCanvas mode={mode} tasks={tasks} groups={groups} nodeNames={nodeNames} onNavigate={openTask} query={query} onQueryChange={setQuery} onDirtyChange={setDirty} onFeedback={setFeedback} /></ReactFlowProvider>
     </div>
     {pendingExit && createPortal(<div className="task-overview-confirm-backdrop" onMouseDown={cancelExit}>
       <div ref={confirmRef} className="task-overview-confirm" role="alertdialog" aria-modal="true" aria-labelledby="task-overview-confirm-title" aria-describedby="task-overview-confirm-description" tabIndex={-1} onMouseDown={(event) => event.stopPropagation()}>
