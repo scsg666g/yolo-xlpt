@@ -346,8 +346,9 @@ export function TestWorkspace({ test: batchTest, images, queueKey, selected, onS
 
 const queueStateLabel = { pending: '待测试', active: '处理中', completed: '已完成', failed: '失败 / 已取消', stale: '旧模型 / 参数结果' }
 
-export function TestQueueControls({ images, queueKey, disabled, onRun, onRefresh }: {
+export function TestQueueControls({ images, selected, queueKey, disabled, onRun, onRefresh }: {
   images: SelectedImage[]
+  selected: number
   queueKey: string
   disabled: boolean
   onRun: (scope: 'current' | 'all') => void
@@ -358,11 +359,17 @@ export function TestQueueControls({ images, queueKey, disabled, onRun, onRefresh
     total[imageTestState(image, queueKey)] += 1
     return total
   }, { pending: 0, active: 0, completed: 0, failed: 0, stale: 0 })
+  const current = images[selected]
+  const state = current ? imageTestState(current, queueKey) : null
+  const currentLabel = state === 'active' ? '正在测试…'
+    : state === 'completed' ? '重新测试此图'
+      : state === 'failed' ? '重试此图'
+        : state === 'stale' ? '按当前设置测试此图' : '测试选中图片'
   return <section className="model-test-queue" aria-label="图片测试状态">
     <div className="model-test-queue-summary" role="status">共 {images.length} 张 · 已完成 {counts.completed} 张 · 待处理 {pendingTestImages(images, queueKey).length} 张{counts.active > 0 && ` · 处理中 ${counts.active} 张`}{counts.failed > 0 && ` · 失败 / 取消 ${counts.failed} 张`}{counts.stale > 0 && ` · 旧结果 ${counts.stale} 张`}</div>
     <progress aria-label="当前设置已完成图片比例" value={counts.completed} max={images.length} />
     <div className="model-test-queue-actions">
-      <button type="button" className="button ghost" disabled={disabled || counts.active > 0} onClick={() => onRun('current')}>重新测试此图</button>
+      <button type="button" className="button ghost" disabled={disabled || counts.active > 0 || !current} title={current ? `${currentLabel}：${current.file.name}，仅处理选中的这一张图片` : '请先选择图片'} onClick={() => onRun('current')}>{state === 'active' && <LoaderCircle className="spin" size={14} />}{currentLabel}</button>
       <button type="button" className="button ghost" disabled={disabled || counts.active > 0} onClick={() => onRun('all')}>重新测试全部（{images.length}）</button>
       {counts.active > 0 && <button type="button" className="button ghost" disabled={disabled} onClick={onRefresh}>刷新后台状态</button>}
     </div>

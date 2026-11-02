@@ -322,13 +322,27 @@ for (const component of ['ModelTests', 'ModelTestModal']) {
     const primary = () => view.findAll(node => node.type === 'button' && node.props.className === 'button primary' && /测试|全部已完成|后台处理中/.test(String(node.props.children)))[0]
     const queue = () => view.findAll(node => node.type?.name === 'TestQueueControls')[0]
     const currentWorkspace = () => workspace(view).props
+    const singleButton = () => {
+      const control = queue()
+      assert.equal(control.props.selected, currentWorkspace().selected)
+      return control.type(control.props).props.children[2].props.children[0]
+    }
     try {
       await view.settle()
       if (component === 'ModelTests') {
         const library = view.findAll(node => node.type === 'RegisteredModelLibrary')[0]
         library.props.onSelect(asset); await view.settle()
       }
-      await view.upload([new File(['A'], 'A.jpg')]); await view.click(primary())
+      await view.upload([new File(['A'], 'A.jpg'), new File(['untested'], 'unselected.jpg')])
+      assert.match(String(singleButton().props.children), /测试选中图片/)
+      assert.match(singleButton().props.title, /A.jpg/)
+      await view.click(singleButton())
+      assert.deepEqual(submitted, [['A.jpg']])
+      assert.equal(currentWorkspace().images[1].attempt, undefined)
+      assert.equal(currentWorkspace().images[1].result, undefined)
+      assert.equal(primary().props.disabled, false)
+      assert.match(String(singleButton().props.children), /重新测试此图/)
+      currentWorkspace().onRemove(1); await view.settle()
       assert.equal(currentWorkspace().images[0].result.test.status, 'completed')
       const firstId = currentWorkspace().images[0].result.test.id
       await view.upload([new File(['B'], 'B.jpg')])
@@ -340,19 +354,23 @@ for (const component of ['ModelTests', 'ModelTestModal']) {
       assert.equal(primary().props.disabled, true)
       assert.notEqual(firstId, currentWorkspace().images[1].result.test.id)
       assert.equal(currentWorkspace().images[1].result.index, 0)
-      queue().props.onRun('current'); await view.settle()
+      await view.click(singleButton())
       assert.deepEqual(submitted.at(-1), ['B.jpg']); assert.equal(currentWorkspace().images[0].result.test.id, firstId)
       const confidence = view.findAll(node => node.type === 'input' && node.props.id?.endsWith('confidence'))[0]
       await view.change(confidence, '0.40'); assert.equal(primary().props.disabled, false)
+      assert.match(String(singleButton().props.children), /按当前设置测试此图/)
       await view.click(primary()); assert.deepEqual(submitted.at(-1), ['A.jpg', 'B.jpg'])
       assert.equal(currentWorkspace().images[0].result.test.confidence, 0.4)
       outcome = 'failed'; await view.upload([new File(['C'], 'C.jpg')]); await view.click(primary())
       assert.deepEqual(submitted.at(-1), ['C.jpg']); assert.equal(currentWorkspace().images[0].result.test.confidence, 0.4)
-      outcome = 'completed'; await view.click(primary()); assert.deepEqual(submitted.at(-1), ['C.jpg'])
+      assert.match(String(singleButton().props.children), /重试此图/)
+      outcome = 'completed'; await view.click(singleButton()); assert.deepEqual(submitted.at(-1), ['C.jpg'])
       currentWorkspace().onRemove(0); await view.settle()
       assert.equal(currentWorkspace().images[0].file.name, 'B.jpg'); assert.equal(currentWorkspace().images[0].result.index, 1)
       queue().props.onRun('all'); await view.settle(); assert.deepEqual(submitted.at(-1), ['B.jpg', 'C.jpg'])
-      outcome = 'queued'; queue().props.onRun('current'); await view.settle()
+      outcome = 'queued'; await view.click(singleButton())
+      assert.match(String(singleButton().props.children), /正在测试/)
+      assert.equal(singleButton().props.disabled, true)
       pollError = true; await view.tick()
       assert.equal(primary().props.disabled, true)
       const submissionCount = submitted.length
