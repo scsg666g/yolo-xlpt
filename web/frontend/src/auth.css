@@ -93,3 +93,23 @@ body:has(.auth-screen) { min-width: 320px; background: #070a17; zoom: 1 !importa
 @media (prefers-reduced-motion: reduce) {
   .auth-screen *, .account-security * { transition: none !important; animation: none !important; }
 }
+
+.account-logout-backdrop { position: fixed; inset: 0; z-index: 150; display: grid; place-items: center; padding: 20px; background: #030c13a6; backdrop-filter: blur(5px); animation: account-logout-fade .16s ease-out; }
+.account-logout-dialog { position: relative; width: min(440px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto; padding: 28px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); color: var(--text); box-shadow: 0 24px 90px #0005; animation: account-logout-enter .2s ease-out; }
+.account-logout-icon { display: grid; place-items: center; width: 54px; height: 54px; border-radius: 15px; background: color-mix(in srgb, var(--green) 12%, var(--panel-2)); color: var(--green); margin-bottom: 20px; }
+.account-logout-dialog h2 { font-size: 21px; margin: 0 0 12px; }
+.account-logout-dialog > p { margin: 0 0 20px; font-size: 13px; line-height: 1.8; color: var(--muted); }
+.account-logout-dialog .account-training-note { margin-bottom: 18px; }
+.account-logout-dialog > .account-logout-draft { margin-bottom: 16px; }
+.account-logout-close { position: absolute; top: 16px; right: 16px; display: grid; place-items: center; width: 36px; height: 36px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--muted); cursor: pointer; transition: background .15s, color .15s; }
+.account-logout-close:hover:not(:disabled) { background: var(--panel-2); color: var(--text); }
+.account-logout-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 24px; }
+.account-logout-actions .button { min-height: 42px; padding: 9px 18px; transition: transform .15s, filter .15s; }
+.account-logout-actions .button:hover:not(:disabled) { filter: brightness(1.1); }
+.account-logout-actions .button:active:not(:disabled) { transform: scale(.97); }
+.account-logout-dialog button:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.account-logout-dialog button:disabled { cursor: wait; }
+@keyframes account-logout-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes account-logout-enter { from { opacity: 0; transform: translateY(8px) scale(.98); } to { opacity: 1; transform: none; } }
+@media (max-width: 400px) { .account-logout-dialog { padding: 24px 20px; } }
+@media (prefers-reduced-motion: reduce) { .account-logout-backdrop, .account-logout-dialog, .account-logout-dialog * { animation: none !important; transition: none !important; } }
