@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
+import { AuthGate } from './components/AuthGate'
 
 const Dashboard = lazy(() => import('./components/Dashboard').then((module) => ({ default: module.Dashboard })))
 const TaskCanvas = lazy(() => import('./components/TaskCanvas').then((module) => ({ default: module.TaskCanvas })))
@@ -15,7 +16,7 @@ function PageLoading() {
 
 export default function App() {
   return (
-    <Routes>
+    <AuthGate><Routes>
       <Route element={<Layout />}>
         <Route index element={<Suspense fallback={<PageLoading />}><Dashboard /></Suspense>} />
         <Route path="compare" element={<Suspense fallback={<PageLoading />}><ExperimentCompare /></Suspense>} />
@@ -25,6 +26,6 @@ export default function App() {
         <Route path="tasks/:taskId/canvas" element={<Suspense fallback={<PageLoading />}><TaskCanvas /></Suspense>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
-    </Routes>
+    </Routes></AuthGate>
   )
 }

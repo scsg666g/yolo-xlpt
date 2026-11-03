@@ -17,6 +17,8 @@ import { resetAppearance, updateAppearance, useAppearance } from '../appearance'
 import { AppearanceSettings } from './AppearanceSettings'
 import { SettingsDisclosure } from './SettingsDisclosure'
 import { TaskCenterSettings } from './TaskCenterSettings'
+import { AccountSecurity } from './AccountSecurity'
+import { ShieldCheck } from 'lucide-react'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
 
@@ -28,6 +30,7 @@ const settingsSections = [
   { id: 'services', label: '服务状态', description: '数据库与后台服务运行状态。', icon: Cpu },
   { id: 'storage', label: '存储与路径', description: '训练输出目录等平台路径。', icon: FolderOpen },
   { id: 'datasets', label: '数据集', description: '保存位置、上传中转空间与后台处理策略。', icon: Database },
+  { id: 'account', label: '账号与安全', description: '管理当前管理员账号、密码与登录状态。', icon: ShieldCheck },
 ] as const
 
 type SettingsSection = typeof settingsSections[number]['id']
@@ -108,6 +111,8 @@ export function Layout() {
   const storageController = useRef<AbortController | null>(null)
   const settingsTrigger = useRef<HTMLButtonElement>(null)
   const settingsDialog = useRef<HTMLElement>(null)
+  const [accountDraft, setAccountDraft] = useState({ dirty: false, saving: false })
+  const updateAccountDraft = useCallback((dirty: boolean, saving: boolean) => setAccountDraft({ dirty, saving }), [])
 
   const checkHealth = useCallback(async (showChecking = false) => {
     healthController.current?.abort()
@@ -294,6 +299,11 @@ export function Layout() {
   }
 
   function canLeaveSettingsSection() {
+    if (settingsSection === 'account') {
+      if (accountDraft.saving) { window.alert('账号操作正在提交，请等待完成。'); return false }
+      if (accountDraft.dirty && !window.confirm('密码修改尚未保存，是否放弃修改？')) return false
+      setAccountDraft({ dirty: false, saving: false })
+    }
     if (settingsSection !== 'datasets') return true
     if (datasetSettingsStatus.policySaving) {
       window.alert('数据集处理设置正在保存，请等待保存完成。')
@@ -446,6 +456,7 @@ export function Layout() {
                 {settingsSection === 'taskCenter' && <TaskCenterSettings />}
 
                 {settingsSection === 'appearance' && <AppearanceSettings />}
+                {settingsSection === 'account' && <AccountSecurity onDraftChange={updateAccountDraft} />}
 
                 {settingsSection === 'training' && <SettingsDisclosure title="实验对比" description="只影响当前浏览器的对比列表，不控制训练调度或 GPU 并发。" badge={`最多 ${compareLimit} 个`} defaultOpen>
                   <div className="compare-limit-setting">
@@ -536,7 +547,10 @@ export function Layout() {
             </div>
           </div>
           <footer>
-            {settingsSection === 'appearance' ? <>
+            {settingsSection === 'account' ? <>
+              <span className="appearance-save-note">密码修改后需重新登录；后台训练继续运行。</span>
+              <button type="submit" form="account-password-form" className="button primary" disabled={!accountDraft.dirty || accountDraft.saving}>{accountDraft.saving && <RefreshCw size={15} className="spin" />}{accountDraft.saving ? '正在提交…' : '保存新密码'}</button>
+            </> : settingsSection === 'appearance' ? <>
               <span className="appearance-save-note" role="status">{appearance.storageAvailable ? '即时生效 · 仅保存在当前浏览器' : '即时生效 · 浏览器存储不可用，刷新后可能恢复默认'}</span>
               <button type="button" className="button ghost" onClick={resetAppearance}><RotateCcw size={15} />恢复默认版</button>
             </> : settingsSection === 'taskCenter' ? <>

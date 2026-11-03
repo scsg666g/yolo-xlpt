@@ -277,7 +277,7 @@ curl --fail http://127.0.0.1:18088/api/health
 ## 安全边界
 
 - `.env`、数据库及备份建议仅允许运行账户读取；服务的 `UMask=0077` 会保护新建文件，但不会自动修改旧文件权限。
-- 平台管理页面目前没有内置用户登录。只应通过可信内网/VPN访问；跨公网必须在反向代理增加 HTTPS 和身份认证。
+- 平台已内置单管理员登录。首次启动后按 [账号与安全](../README.md#账号与安全) 设置账号；通过 HTTPS 反向代理访问可保护密码传输。`PLATFORM_COOKIE_SECURE=true` 可强制安全 Cookie（启用后必须使用 HTTPS）。
 - Agent Token 只保护对应节点的 Agent 接口，不等同于网页管理员认证。Token、SSH 密码和真实 `agent-config.json` 不应提交仓库。
 - 本机 `PLATFORM_MODEL_TEST_ROOTS` 与远程 `model_test_roots` 只能放可信 `.pt`；PyTorch / Ultralytics 加载权重时可能执行其中携带的代码，路径和摘要校验不能安全地加载恶意权重。
 - 节点有等待或进行中的模型传输时不能禁用或移除，进行中的传输也会阻止 Token 轮换。传输进入终态后可以移除节点；中心的模型缓存和历史不会随节点删除，已固定的 `ready` 版本可继续测试，但要抓取新版本必须重新接入并登记新的节点来源。

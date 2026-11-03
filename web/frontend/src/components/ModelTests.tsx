@@ -10,6 +10,7 @@ import {
   RotateCcw, ScanEye, Server, SlidersHorizontal, Sparkles, Trash2, Upload, X,
 } from 'lucide-react'
 import { api, formatBytes, statusLabel } from '../api'
+import { authGeneration, notifyAuthExpired } from '../authSession'
 import type {
   Artifact, ComputeNode, ModelAsset, ModelTest, ModelTestSummary,
   TaskGroup, TrainingRun, TrainingTask,
@@ -906,7 +907,9 @@ export function ModelTests() {
     const prepared: SelectedImage[] = []
     try {
       for (let index = 0; index < item.files.length; index++) {
+        const generation = authGeneration()
         const response = await fetch(`/api/model-tests/${item.id}/images/${index}/original`, { signal: abort.signal })
+        if (response.status === 401) notifyAuthExpired(undefined, generation)
         if (!response.ok) throw new Error(`无法读取第 ${index + 1} 张原图`)
         const blob = await response.blob()
         const file = new File([blob], item.files[index].name || `image-${index + 1}.jpg`, { type: blob.type || 'image/jpeg' })

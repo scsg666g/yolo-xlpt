@@ -1,11 +1,16 @@
 import type { DatasetSettingsResponse, DatasetPolicy, DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeRefreshResponse, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, ModelTestRuntime, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TaskWorkspace, TaskWorkspaceUpdate, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
+import { authGeneration, csrfHeaders, notifyAuthExpired, type AccountStatus } from './authSession'
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const generation = authGeneration()
   const response = await fetch(path, {
     ...init,
-    headers: { 'Content-Type': 'application/json', ...init?.headers },
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json', ...csrfHeaders(), ...init?.headers },
   })
   if (!response.ok) {
+    if (response.status === 401 && !path.startsWith('/api/auth/')) notifyAuthExpired(undefined, generation)
     const body = await response.json().catch(() => ({ detail: response.statusText }))
     const detail = typeof body.detail === 'string' ? body.detail
       : Array.isArray(body.detail) ? body.detail.map((item: { loc?: Array<string | number>; msg?: string }) => `${item.loc?.slice(1).join('.') || '参数'}：${item.msg || '格式错误'}`).join('；')
@@ -58,6 +63,11 @@ const deletionTimeout = '删除请求超时，后台可能已经受理。请关�
 const datasetSubmissionTimeout = '数据集操作提交超时，后台可能已经受理。请刷新数据集和操作记录确认状态，再决定是否重试。'
 
 export const api = {
+  accountStatus: (signal?: AbortSignal) => requestWithTimeout<AccountStatus>('/api/auth/status', { signal }),
+  login: (username: string, password: string) => requestWithTimeout<{ username: string; csrf_token: string }>('/api/auth/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  setupAccount: (username: string, password: string, code: string) => requestWithTimeout<{ username: string; csrf_token: string }>('/api/auth/setup', { method: 'POST', body: JSON.stringify({ username, password, code }) }),
+  logout: () => requestWithTimeout<void>('/api/auth/logout', { method: 'POST' }),
+  changePassword: (current_password: string, new_password: string) => requestWithTimeout<void>('/api/auth/password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) }),
   health: (signal?: AbortSignal) => requestWithTimeout<PlatformHealth>('/api/health', { signal }, 8_000, '健康检查超时'),
   storageHealth: (signal?: AbortSignal) => requestWithTimeout<PlatformStorageHealth>('/api/health/storage', { signal }, 8_000, '存储状态检查超时'),
   createModelTest: (
@@ -266,17 +276,20 @@ export const api = {
 
 export function uploadDatasetFile(id: string, index: number, file: File, signal: AbortSignal, onProgress: (bytes: number) => void): Promise<void> {
   return new Promise((resolve, reject) => {
+    const generation = authGeneration()
     const xhr = new XMLHttpRequest()
     const abort = () => xhr.abort()
     const cleanup = () => signal.removeEventListener('abort', abort)
     if (signal.aborted) { reject(new DOMException('上传已取消', 'AbortError')); return }
     xhr.open('PUT', `/api/datasets/uploads/${id}/files/${index}`)
     xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    for (const [key, value] of Object.entries(csrfHeaders())) xhr.setRequestHeader(key, value)
     xhr.timeout = 10 * 60 * 1000
     xhr.upload.onprogress = (event) => onProgress(event.loaded)
     xhr.onload = () => {
       cleanup()
       if (xhr.status >= 200 && xhr.status < 300) { onProgress(file.size); resolve(); return }
+      if (xhr.status === 401) notifyAuthExpired(undefined, generation)
       let detail = `文件上传失败（${xhr.status}）`
       try { detail = JSON.parse(xhr.responseText).detail || detail } catch { /* Non-JSON gateway error. */ }
       reject(new Error(detail))

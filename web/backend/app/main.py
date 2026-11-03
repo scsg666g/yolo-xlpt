@@ -33,6 +33,7 @@ from .compute_nodes import (
     router as compute_nodes_router,
 )
 from .database import Base, SessionLocal, engine, get_db, migrate_database
+from .auth import BrowserAuthMiddleware, initialize as initialize_auth, router as auth_router, session_for
 from .experiments import router as experiments_router
 from .log_files import tail_log
 from .training_logs import router as training_logs_router
@@ -123,6 +124,7 @@ RESERVED_CUSTOM_KEYS = {
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _task_snapshot
+    initialize_auth()
     migrate_database()
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
@@ -158,6 +160,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="YOLO 模型训练平台", version=PLATFORM_VERSION, lifespan=lifespan)
+app.include_router(auth_router)
 app.include_router(dataset_store_router)
 app.include_router(dataset_discovery_router)
 app.include_router(dataset_upload_router)
@@ -176,6 +179,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(BrowserAuthMiddleware)
 
 
 @app.middleware("http")
@@ -1373,7 +1377,7 @@ async def task_snapshot_pump() -> None:
 
 
 @app.get("/api/stream")
-async def stream():
+async def stream(request: Request):
     async def events():
         subscriber: asyncio.Queue[str] = asyncio.Queue(maxsize=1)
         _task_stream_subscribers.add(subscriber)
@@ -1385,13 +1389,19 @@ async def stream():
             global _task_snapshot
             _task_snapshot = snapshot
             last_sent = snapshot
+            if not await asyncio.to_thread(session_for, request):
+                return
             yield f"event: tasks\ndata: {snapshot}\n\n"
             while True:
                 try:
                     snapshot = await asyncio.wait_for(subscriber.get(), timeout=15)
                 except TimeoutError:
+                    if not await asyncio.to_thread(session_for, request):
+                        return
                     yield ": keep-alive\n\n"
                     continue
+                if not await asyncio.to_thread(session_for, request):
+                    return
                 if snapshot != last_sent:
                     last_sent = snapshot
                     yield f"event: tasks\ndata: {snapshot}\n\n"

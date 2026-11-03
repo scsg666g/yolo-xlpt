@@ -10,6 +10,7 @@ import './compute.css'
 import './datasets.css'
 import './editor.css'
 import './appearance.css'
+import './auth.css'
 
 initializeAppearance()
 
