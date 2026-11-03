@@ -1,10 +1,17 @@
-"""Run one isolated Ultralytics image inference job and emit structured results."""
+"""Isolated CPU inference, with optional single-model reuse over a private stdin pipe."""
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 import json
+import logging
+import os
+from queue import Queue
+import threading
 import sys
 import time
+import traceback
+from types import SimpleNamespace
 from pathlib import Path
 
 SUPPORTED_TASKS = frozenset({"detect", "segment", "classify", "pose", "obb"})
@@ -13,16 +20,20 @@ MAX_MASK_POLYGON_POINTS = 128
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--source", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--summary", required=True)
+    parser.add_argument("--resident", action="store_true")
+    parser.add_argument("--model")
+    parser.add_argument("--source")
+    parser.add_argument("--output")
+    parser.add_argument("--summary")
     parser.add_argument("--ultralytics-root", required=True)
-    parser.add_argument("--confidence", required=True, type=float)
-    parser.add_argument("--iou", required=True, type=float)
+    parser.add_argument("--confidence", default=0.25, type=float)
+    parser.add_argument("--iou", default=0.7, type=float)
     parser.add_argument("--imgsz", default=640, type=int)
     parser.add_argument("--expected-task", choices=sorted(SUPPORTED_TASKS))
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.resident and not all((args.model, args.source, args.output, args.summary)):
+        parser.error("单次推理必须提供 model、source、output 和 summary")
+    return args
 
 
 def ensure_supported_model_task(model, expected_task: str | None = None) -> str:
@@ -166,12 +177,16 @@ def plot_predictions(result, task: str, predictions: list[dict]):
     return annotator.result()
 
 
-def main() -> None:
-    args = parse_args()
-    sys.path.insert(0, str(Path(args.ultralytics_root).resolve()))
-
+def run_job(args, model=None, *, on_loaded=None) -> object:
+    """Run a batch and keep only the model/predictor, never the batch's images."""
     from PIL import Image
     from ultralytics import YOLO
+
+    # Ultralytics creates its handler on first import; point it at the current
+    # batch log again when the same interpreter handles another request.
+    for handler in logging.getLogger("ultralytics").handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setStream(sys.stdout)
 
     source = Path(args.source)
     output = Path(args.output)
@@ -182,9 +197,13 @@ def main() -> None:
 
     started = time.perf_counter()
     model_started = time.perf_counter()
-    model = YOLO(args.model)
+    reused = model is not None
+    if model is None:
+        model = YOLO(args.model)
     task = ensure_supported_model_task(model, args.expected_task)
-    model_load_ms = (time.perf_counter() - model_started) * 1000
+    model_load_ms = 0.0 if reused else (time.perf_counter() - model_started) * 1000
+    if on_loaded:
+        on_loaded()
     names = _class_names(model.names)
     results = model.predict(
         source=[str(path) for path in images],
@@ -195,6 +214,7 @@ def main() -> None:
         batch=1,
         stream=True,
         verbose=False,
+        save=False, save_txt=False, save_crop=False, show=False,
     )
 
     items = []
@@ -211,6 +231,7 @@ def main() -> None:
         raise RuntimeError("推理没有生成完整结果")
     timings = {
         "model_load": round(model_load_ms, 3),
+        "model_reused": reused,
         "preprocess": round(sum(item["timings"].get("preprocess", 0) for item in items), 3),
         "inference": round(sum(item["timings"].get("inference", 0) for item in items), 3),
         "postprocess": round(sum(item["timings"].get("postprocess", 0) for item in items), 3),
@@ -225,6 +246,83 @@ def main() -> None:
         "imgsz": args.imgsz,
     }
     Path(args.summary).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    # Ultralytics retains its last dataset, batch and results on the predictor.
+    # Reuse the predictor but release images/tensors between submissions.
+    predictor = getattr(model, "predictor", None)
+    if predictor is not None:
+        predictor.results = None
+        predictor.batch = None
+        predictor.dataset = None
+    return model
+
+
+def write_message(path: str, payload: dict) -> None:
+    target = Path(path)
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(target)
+
+
+def serve(stream, *, exit_on_disconnect: bool = False) -> None:
+    lines = stream
+    if exit_on_disconnect:
+        messages = Queue(maxsize=1)
+
+        def read_requests():
+            try:
+                for line in stream:
+                    messages.put(line)
+            finally:
+                # The pipe is private to the owning backend. EOF also stops a
+                # busy predictor, preventing orphan memory and late file writes
+                # after backend recovery has requeued the same batch.
+                os._exit(0)
+
+        threading.Thread(target=read_requests, name="inference-owner", daemon=True).start()
+        lines = iter(messages.get, None)
+    model = None
+    model_key = None
+    for line in lines:
+        request = json.loads(line)
+        request_id = request["request_id"]
+        key = request["model_key"]
+        # The parent replaces the process for a different weight version. Refuse
+        # cross-version reuse even if a caller accidentally violates that rule.
+        if model_key is not None and key != model_key:
+            raise RuntimeError("驻留模型版本不匹配")
+        try:
+            with open(request["log"], "w", encoding="utf-8") as log:
+                with redirect_stdout(log), redirect_stderr(log):
+                    try:
+                        model = run_job(
+                            SimpleNamespace(**request), model,
+                            on_loaded=lambda: write_message(request["progress"], {
+                                "request_id": request_id, "stage": "running",
+                            }),
+                        )
+                        model_key = key
+                    except Exception:
+                        traceback.print_exc()
+                        raise
+                    finally:
+                        for handler in logging.getLogger("ultralytics").handlers:
+                            if isinstance(handler, logging.StreamHandler):
+                                handler.setStream(sys.__stdout__)
+            write_message(request["response"], {"request_id": request_id, "ok": True})
+        except Exception:
+            write_message(request["response"], {"request_id": request_id, "ok": False})
+            # A partially failed predictor is never reused.
+            return
+    # EOF means the owning backend has exited. Do not leave an orphan cache.
+
+
+def main() -> None:
+    args = parse_args()
+    sys.path.insert(0, str(Path(args.ultralytics_root).resolve()))
+    if args.resident:
+        serve(sys.stdin, exit_on_disconnect=True)
+    else:
+        run_job(args)
 
 
 if __name__ == "__main__":

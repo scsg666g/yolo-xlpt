@@ -20,6 +20,7 @@ import {
   startOrRecoverModelTest, type SelectedImage, TestQueueControls, TestWorkspace, uploadPendingModelTestImages,
 } from './ModelTestShared'
 import { RegisteredModelLibrary, TrainingTaskLibrary } from './ModelLibrary'
+import { ModelTestRuntimeStatus } from './ModelTestRuntimeStatus'
 import '../model-tests.css'
 
 type SourceType = 'local_path' | 'training_artifact' | 'remote_path'
@@ -1018,6 +1019,7 @@ export function ModelTests() {
       </div>
     </header>
 
+    <ModelTestRuntimeStatus />
     {view === 'new' ? <div className="model-tests-new-layout">
       <aside className="model-source-panel">
         <div className="model-tests-section-heading"><div><span>01</span><h2>选择模型来源</h2></div><p>路径始终属于当前选择的服务器。</p></div>

@@ -16,6 +16,8 @@ import {
   startOrRecoverModelTest, type SelectedImage, TestQueueControls, TestWorkspace, uploadPendingModelTestImages,
 } from './ModelTestShared'
 
+import { ModelTestRuntimeStatus } from './ModelTestRuntimeStatus'
+
 interface Props {
   artifact?: Artifact | null
   taskId: string
@@ -614,6 +616,7 @@ export function ModelTestModal({ artifact, taskId, taskName, taskType, runId, at
     <div ref={dialog} tabIndex={-1} className={`modal model-test-modal${dragging ? ' is-dragging' : ''}`} role="dialog" aria-modal="true" aria-labelledby="model-test-title" onDragEnter={dragEnter} onDragOver={dragOver} onDragLeave={dragLeave} onDrop={dropImages}>
       {dragging && <div className="model-test-drop-indicator" role="status"><Upload size={40} /><strong>松开添加图片</strong><span>{files.length ? '追加到当前图片列表' : '支持一次拖入多张图片'}</span></div>}
       <header><div className="modal-heading"><div className="heading-icon"><ScanEye size={22} /></div><div><span className="eyebrow">MODEL TEST</span><h2 id="model-test-title">测试模型</h2><p>{taskName} · 本机和远程权重均在中心服务器 CPU 测试并保存记录</p></div></div><button className="icon-button" onClick={onClose} aria-label="关闭模型测试" title="关闭"><X size={20} /></button></header>
+      <ModelTestRuntimeStatus />
       <nav className="model-test-tabs" role="tablist" aria-label="模型测试视图">
         <button role="tab" aria-selected={tab === 'new'} className={tab === 'new' ? 'active' : ''} disabled={!canOpenNewTab} title={!canOpenNewTab ? newTestDisabledReason || '当前没有可用的模型权重' : '新建测试'} onClick={() => setTab('new')}><ScanEye size={15} />新建测试</button>
         <button role="tab" aria-selected={tab === 'history'} className={tab === 'history' ? 'active' : ''} onClick={() => setTab('history')}><History size={15} />历史记录 <span>{history.length}</span></button>

@@ -531,6 +531,20 @@ export interface ModelAssetPage {
   local_roots?: string[]
 }
 
+export interface ModelTestRuntime {
+  state: 'released' | 'loading' | 'running' | 'ready'
+  model_name: string | null
+  model_sha256: string | null
+  active_test_id: string | null
+  idle_seconds: number
+  expires_in_seconds: number | null
+  waiting_tests: number
+  can_release: boolean
+  release_reason: string
+  device: 'CPU'
+  location: 'center'
+}
+
 export interface ModelTest {
   id: string
   status: 'uploading' | 'preparing' | 'queued' | 'running' | 'cancel_requested' | 'completed' | 'failed' | 'cancelled'
@@ -592,7 +606,7 @@ export interface ModelTest {
       execution_node_name?: string | null
     }
   }
-  timings: { model_load: number; preprocess: number; inference: number; postprocess: number; total: number } | null
+  timings: { model_reused?: boolean; model_load: number; preprocess: number; inference: number; postprocess: number; total: number } | null
   files: Array<{
     name: string
     size: number

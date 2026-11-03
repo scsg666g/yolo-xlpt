@@ -1,4 +1,4 @@
-import type { DatasetSettingsResponse, DatasetPolicy, DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeRefreshResponse, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TaskWorkspace, TaskWorkspaceUpdate, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
+import type { DatasetSettingsResponse, DatasetPolicy, DatasetScanRequest, DatasetScan, DatasetCandidatePage, DatasetBatchRequest, DatasetRegistrationBatch, DatasetHistoryRemoval, DatasetHistoryRemovalPreview, DatasetOperationSummary, DatasetOperationPage, DatasetLocation, DatasetOperation, Artifact, ComputeNode, ComputeNodeCredential, ComputeNodeRefreshResponse, ComputeNodeSettings, ComputeResources, DatasetUploadResult, DeletionJob, EffectiveBestWeight, ManagedDataset, MetricPoint, ModelAsset, ModelAssetPage, ModelAssetSourceType, ModelTest, ModelTestPage, ModelTestRuntime, PlatformHealth, PlatformStorageHealth, Resources, TaskCreatePayload, TaskDeletionPreview, TaskEvent, TaskGroup, TaskWorkspace, TaskWorkspaceUpdate, TrainingParameterDefinition, TrainingRun, TrainingTask, TrainingTrace } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -117,6 +117,8 @@ export const api = {
     `/api/model-assets/${encodeURIComponent(id)}/prepare?retry=${retry}`, { method: 'POST', signal }, 120_000,
     '模型准备超时，请稍后刷新确认状态',
   ),
+  modelTestRuntime: (signal?: AbortSignal) => requestWithTimeout<ModelTestRuntime>('/api/model-tests/runtime', { signal }),
+  releaseModelTestRuntime: (signal?: AbortSignal) => requestWithTimeout<ModelTestRuntime>('/api/model-tests/runtime/release', { method: 'POST', signal }),
   globalModelTests: (signal?: AbortSignal, cursor?: string, limit = 50, sourceType?: ModelAssetSourceType | 'training_artifact' | '', status?: ModelTest['status'] | '') => {
     const params = new URLSearchParams({ limit: String(limit) })
     if (cursor) params.set('cursor', cursor)

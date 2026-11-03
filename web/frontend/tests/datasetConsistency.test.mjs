@@ -46,6 +46,7 @@ function page(api, { component = 'Datasets', file = component, props = {} } = {}
     setTimeout: work => { const id = ++timerId; timers.set(id, work); return id }, clearTimeout: id => timers.delete(id),
     require(name) {
       if (name === 'react') return react
+      if (name === 'react-router-dom') return { useLocation: () => ({ search: '' }), useNavigate: () => () => {} }
       if (name === 'react/jsx-runtime') return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) }
       if (name === '../api') return { api, formatBytes: String, statusLabel: String }
       if (name === '../useModalFocus') return { useModalFocus: () => react.useRef(null) }

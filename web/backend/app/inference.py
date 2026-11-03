@@ -75,6 +75,7 @@ logger = logging.getLogger("yolo-platform.inference")
 MAX_IMAGE_BYTES = 20 * 1024**2
 MAX_TOTAL_BYTES = 100 * 1024**2
 INFERENCE_TIMEOUT_SECONDS = max(1, nonnegative_int_env('PLATFORM_MODEL_TEST_TIMEOUT_SECONDS', 300))
+MODEL_IDLE_SECONDS = nonnegative_int_env('PLATFORM_MODEL_TEST_IDLE_SECONDS', 300)
 UPLOAD_TTL = 24 * 60 * 60
 ACTIVE_STATUSES = {"uploading", "preparing", "queued", "running", "cancel_requested"}
 SUPPORTED_MODEL_TASKS = {"detect", "segment", "classify", "pose", "obb"}
@@ -785,9 +786,15 @@ class _TestCancelled(RuntimeError):
 
 
 class InferenceWorker:
-    def __init__(self, session_factory=SessionLocal, interval: float = 1.0):
+    def __init__(self, session_factory=SessionLocal, interval: float = 1.0, *, idle_seconds: float = MODEL_IDLE_SECONDS):
         self.session_factory = session_factory
         self.interval = interval
+        self.idle_seconds = max(0, idle_seconds)
+        self._model_key: str | None = None
+        self._model_name: str | None = None
+        self._model_state = "released"
+        self._model_idle_at: float | None = None
+        self._release_reason = "not_loaded"
         self.lifecycle_lock = threading.RLock()
         self.lock = threading.RLock()
         self._state_changed = threading.Condition(self.lock)
@@ -810,10 +817,137 @@ class InferenceWorker:
     def stop(self) -> None:
         self._stop.set()
         with self.lock:
-            if self._process and self._process.poll() is None:
-                self._process.kill()
+            self._release_model_locked("shutdown")
         if self._thread:
             self._thread.join(timeout=5)
+
+    def _release_model_locked(self, reason: str) -> None:
+        """Only ever kill the inference child owned by this worker."""
+        process = self._process
+        if process:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
+            if process.stdin:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    # A dead child can leave an unflushed pipe buffer.
+                    logger.debug("model_test_pipe_already_closed", exc_info=True)
+        self._process = None
+        self._model_key = None
+        self._model_name = None
+        self._model_state = "released"
+        self._model_idle_at = None
+        self._release_reason = reason
+
+    def _waiting_tests(self) -> int:
+        with self.session_factory() as db:
+            return db.scalar(select(func.count()).select_from(ModelTest).where(
+                ModelTest.status.in_({"queued", "running", "cancel_requested"}),
+                ModelTest.delete_requested.is_(False),
+            )) or 0
+
+    def expire_idle_model(self) -> bool:
+        with self.lifecycle_lock, self.lock:
+            if self._current_id or not self._process:
+                return False
+            if self._process.poll() is not None:
+                self._release_model_locked("process_exit")
+                return True
+            if (
+                self._model_idle_at is None
+                or time.monotonic() - self._model_idle_at < self.idle_seconds
+                or self._waiting_tests()
+            ):
+                return False
+            self._release_model_locked("idle")
+            return True
+
+    def runtime_status(self) -> dict:
+        with self.lock:
+            if self._process and not self._current_id and self._process.poll() is not None:
+                self._release_model_locked("process_exit")
+            waiting = self._waiting_tests()
+            expires = None
+            if self._model_idle_at is not None and self._process:
+                expires = max(0, math.ceil(self.idle_seconds - (time.monotonic() - self._model_idle_at)))
+            return {
+                "state": self._model_state,
+                "model_name": self._model_name,
+                "model_sha256": self._model_key.split(":", 1)[0] if self._model_key else None,
+                "active_test_id": self._current_id,
+                "idle_seconds": self.idle_seconds,
+                "expires_in_seconds": expires,
+                "waiting_tests": waiting,
+                "can_release": bool(self._process and not self._current_id and not waiting),
+                "release_reason": self._release_reason,
+                "device": "CPU", "location": "center",
+            }
+
+    def release_idle_model(self) -> dict:
+        with self.lifecycle_lock, self.lock:
+            if self._current_id or self._waiting_tests():
+                raise HTTPException(409, "模型测试正在执行或排队，请完成后再释放")
+            self._release_model_locked("manual")
+            return self.runtime_status()
+
+    def _run_resident_job(self, request: dict, model_name: str) -> None:
+        test_id = request["request_id"]
+        response_path = Path(request["response"])
+        progress_path = Path(request["progress"])
+        environment = {
+            **training_environment(), "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2",
+        }
+        with self.lock:
+            with self.session_factory() as db:
+                current = db.get(ModelTest, test_id)
+                if self._stop.is_set():
+                    raise _WorkerRestart()
+                if test_id in self._cancelled_ids or not current or current.status != "running" or current.delete_requested:
+                    raise _TestCancelled()
+            if self._process and (self._model_key != request["model_key"] or self._process.poll() is not None):
+                self._release_model_locked("model_changed")
+            if not self._process:
+                self._process = subprocess.Popen(
+                    [str(YOLO_BIN.with_name("python")), str(Path(__file__).with_name("inference_runner.py")),
+                     "--resident", "--ultralytics-root", str(ULTRALYTICS_ROOT)],
+                    cwd=ULTRALYTICS_ROOT, env=environment, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    text=True, encoding="utf-8", start_new_session=True,
+                )
+                self._model_key = request["model_key"]
+                self._model_state = "loading"
+            else:
+                self._model_state = "running"
+            self._model_name = model_name
+            self._model_idle_at = None
+            process = self._process
+            process.stdin.write(json.dumps(request, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+        deadline = time.monotonic() + INFERENCE_TIMEOUT_SECONDS
+        while True:
+            with self.lock:
+                if self._stop.is_set():
+                    raise _WorkerRestart()
+                if test_id in self._cancelled_ids:
+                    raise _TestCancelled()
+                if progress_path.is_file():
+                    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+                    if progress.get("request_id") != test_id or progress.get("stage") != "running":
+                        raise RuntimeError("模型测试进程返回无效状态")
+                    self._model_state = "running"
+                    progress_path.unlink(missing_ok=True)
+                if response_path.is_file():
+                    response = json.loads(response_path.read_text(encoding="utf-8"))
+                    if response.get("request_id") != test_id or response.get("ok") is not True:
+                        raise RuntimeError(failure_detail(request["log"]) or "模型推理失败，请检查权重是否兼容当前训练环境")
+                    return
+                if process.poll() is not None:
+                    raise RuntimeError(failure_detail(request["log"]) or "模型测试进程意外退出，请重试")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"推理超过 {INFERENCE_TIMEOUT_SECONDS} 秒，请减少图片数量或尺寸后重试")
+            self._stop.wait(0.05)
 
     @property
     def is_alive(self) -> bool:
@@ -918,7 +1052,7 @@ class InferenceWorker:
             try:
                 self._expire_uploads()
                 if not self.process_one():
-                    continue
+                    self.expire_idle_model()
             except Exception:
                 logger.exception("image_inference_worker_error")
 
@@ -952,6 +1086,7 @@ class InferenceWorker:
         work: Path | None = None
         output: Path | None = None
         retain_pin = False
+        succeeded = False
         with self._state_changed:
             if test_id in self._cancelled_ids:
                 return
@@ -979,7 +1114,8 @@ class InferenceWorker:
                 pin_error = _pin_validation_error(record.id, record.model_sha256, record.model_size)
                 if pin_error:
                     raise RuntimeError(pin_error)
-                model = work / "model.pt"
+                model_key = f"{record.model_sha256}:{record.model_size}"
+                model_name = str((record.model_snapshot or {}).get("weight_name") or "模型")[:255]
                 confidence, iou = record.confidence, record.iou
                 task_id = record.task_id
                 expected_task = (record.model_snapshot or {}).get("task_type")
@@ -995,62 +1131,30 @@ class InferenceWorker:
             for stale in (
                 directory / "summary.json", directory / "detections.json", directory / "results.json",
                 directory / "detection-results.zip", directory / "model-test-results.zip",
+                work / "worker-response.json", work / "worker-progress.json",
+                work / "worker-response.tmp", work / "worker-progress.tmp",
             ):
                 stale.unlink(missing_ok=True)
 
             log = directory / "inference.log"
             summary_path = directory / "summary.json"
-            python_bin = YOLO_BIN.with_name("python")
-            command = [
-                str(python_bin), str(Path(__file__).with_name("inference_runner.py")),
-                "--model", str(work / "model.pt"), "--source", str(directory / "images"),
-                "--output", str(output), "--summary", str(summary_path),
-                "--ultralytics-root", str(ULTRALYTICS_ROOT), "--confidence", str(confidence),
-                "--iou", str(iou), "--imgsz", "640",
-            ]
-            if expected_task in SUPPORTED_MODEL_TASKS:
-                command.extend(["--expected-task", expected_task])
-            environment = {
-                **training_environment(), "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2",
-            }
-            with log.open("w", encoding="utf-8") as handle:
-                with self.lock:
-                    with self.session_factory() as db:
-                        current = db.get(ModelTest, test_id)
-                        if self._stop.is_set():
-                            raise _WorkerRestart()
-                        if (
-                            test_id in self._cancelled_ids
-                            or not current
-                            or current.status != "running"
-                            or current.delete_requested
-                        ):
-                            raise _TestCancelled()
-                    self._process = subprocess.Popen(
-                        command, cwd=ULTRALYTICS_ROOT, env=environment,
-                        stdout=handle, stderr=subprocess.STDOUT, start_new_session=True,
-                    )
-                    process = self._process
-                try:
-                    code = process.wait(timeout=INFERENCE_TIMEOUT_SECONDS)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                    raise RuntimeError(f"推理超过 {INFERENCE_TIMEOUT_SECONDS} 秒，请减少图片数量或尺寸后重试") from None
-            if self._stop.is_set():
-                raise _WorkerRestart()
-            with self.lock:
-                if test_id in self._cancelled_ids:
-                    raise _TestCancelled()
-            if code:
-                raise RuntimeError(failure_detail(str(log)) or "模型推理失败，请检查权重是否兼容当前训练环境")
-
+            self._run_resident_job({
+                "request_id": test_id, "model_key": model_key,
+                "model": str(work / "model.pt"), "source": str(directory / "images"),
+                "output": str(output), "summary": str(summary_path), "log": str(log),
+                "response": str(work / "worker-response.json"),
+                "progress": str(work / "worker-progress.json"),
+                "confidence": confidence, "iou": iou, "imgsz": 640,
+                "expected_task": expected_task if expected_task in SUPPORTED_MODEL_TASKS else None,
+            }, model_name)
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
             image_results = summary.get("images", [])
             task_type = summary.get("task_type")
             if task_type not in SUPPORTED_MODEL_TASKS:
                 raise RuntimeError("模型推理结果缺少有效的 YOLO 任务类型")
             with self.lock:
+                if self._stop.is_set():
+                    raise _WorkerRestart()
                 with self.session_factory() as db:
                     record = db.scalar(_record_query(test_id))
                     if not record or record.delete_requested or record.status in {"cancel_requested", "cancelled"}:
@@ -1096,7 +1200,10 @@ class InferenceWorker:
                     record.finished_at = utcnow()
                     db.commit()
                     _persist_settled_storage(db, record)
+                    succeeded = True
         except _WorkerRestart:
+            with self.lock:
+                self._release_model_locked("shutdown")
             retain_pin = True
             with self.session_factory() as db:
                 record = db.get(ModelTest, test_id)
@@ -1106,6 +1213,8 @@ class InferenceWorker:
                     record.started_at = None
                     db.commit()
         except _TestCancelled:
+            with self.lock:
+                self._release_model_locked("cancelled")
             if output and output.exists() and output.is_dir() and not output.is_symlink():
                 shutil.rmtree(output, ignore_errors=True)
             with self.session_factory() as db:
@@ -1114,6 +1223,7 @@ class InferenceWorker:
                     _persist_settled_storage(db, record)
         except Exception as exc:
             with self.lock:
+                self._release_model_locked("failed")
                 cancelled_in_process = test_id in self._cancelled_ids
             if cancelled_in_process:
                 return
@@ -1128,17 +1238,26 @@ class InferenceWorker:
                     db.commit()
                     _persist_settled_storage(db, record)
         finally:
-            if not retain_pin:
-                try:
-                    delete_test_work(test_id)
-                except (OSError, ValueError):
-                    logger.warning("model_test_work_cleanup_failed test_id=%s", test_id)
-            with self._state_changed:
-                self._process = None
-                self._current_id = None
-                self._current_task_id = None
-                self._cancelled_ids.discard(test_id)
-                self._state_changed.notify_all()
+            try:
+                with self.lock:
+                    if succeeded and self._process and self._process.poll() is None and not self._stop.is_set():
+                        self._model_state = "ready"
+                        self._model_idle_at = time.monotonic()
+                        if self.idle_seconds == 0:
+                            self._release_model_locked("idle")
+                    elif self._process:
+                        self._release_model_locked("shutdown" if self._stop.is_set() else "failed")
+                if not retain_pin:
+                    try:
+                        delete_test_work(test_id)
+                    except (OSError, ValueError):
+                        logger.warning("model_test_work_cleanup_failed test_id=%s", test_id)
+            finally:
+                with self._state_changed:
+                    self._current_id = None
+                    self._current_task_id = None
+                    self._cancelled_ids.discard(test_id)
+                    self._state_changed.notify_all()
 
     def cancel_task_tests(self, task_id: str, *, purge: bool = False, session_factory=None) -> None:
         factory = session_factory or self.session_factory
@@ -1208,6 +1327,16 @@ class InferenceWorker:
 
 
 worker = InferenceWorker()
+
+
+@router.get("/api/model-tests/runtime")
+def model_test_runtime():
+    return worker.runtime_status()
+
+
+@router.post("/api/model-tests/runtime/release")
+def release_model_test_runtime():
+    return worker.release_idle_model()
 
 
 @contextmanager

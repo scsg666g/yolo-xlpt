@@ -71,3 +71,70 @@ def test_extracts_pose_keypoints_and_obb_corners():
     ]
     assert obb["obb_points"] == [[1, 2], [3, 2], [3, 4], [1, 4]]
     assert obb["obb_xywhr"] == [2, 3, 4, 5, 0.2]
+
+
+def test_warm_batches_reuse_model_reset_parameters_and_drop_image_references(tmp_path, monkeypatch):
+    import json
+    import sys
+    from PIL import Image
+    from app.inference_runner import run_job
+
+    calls = []
+    loads = []
+
+    class Pixels:
+        __array_interface__ = {"shape": (4, 4, 3), "typestr": "|u1", "strides": (12, 3, 1)}
+
+        def __getitem__(self, key): return self
+        def copy(self): return self
+        def tobytes(self): return bytes(4 * 4 * 3)
+
+    class Model:
+        task = "detect"
+        names = {0: "test"}
+
+        def __init__(self, path):
+            loads.append(path)
+            self.predictor = SimpleNamespace(results="old", batch="old", dataset="old")
+
+        def predict(self, **kwargs):
+            calls.append(kwargs)
+            yield SimpleNamespace(boxes=None, speed={}, plot=Pixels)
+
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=Model))
+    source = tmp_path / "images"
+    source.mkdir()
+    Image.new("RGB", (4, 4)).save(source / "0.jpg")
+    args = SimpleNamespace(model="pinned.pt", source=source, output=tmp_path / "output", summary=tmp_path / "summary.json",
+                           confidence=0.25, iou=0.7, imgsz=640, expected_task="detect")
+    model = run_job(args)
+    assert json.loads(args.summary.read_text())["timings"]["model_reused"] is False
+    args.confidence, args.iou = 0.8, 0.3
+    assert run_job(args, model) is model
+    summary = json.loads(args.summary.read_text())
+    assert summary["timings"]["model_reused"] is True
+    assert summary["timings"]["model_load"] == 0
+    assert len(loads) == 1
+    assert [item["conf"] for item in calls] == [0.25, 0.8]
+    assert [item["iou"] for item in calls] == [0.7, 0.3]
+    assert model.predictor.results is model.predictor.batch is model.predictor.dataset is None
+    args.expected_task = "pose"
+    with pytest.raises(RuntimeError, match="训练任务类型为 pose"):
+        run_job(args, model)
+
+
+def test_resident_protocol_stops_after_failed_batch_and_logs_error(tmp_path, monkeypatch):
+    import json
+    from io import StringIO
+    import app.inference_runner as runner
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("broken weight")
+
+    monkeypatch.setattr(runner, "run_job", fail)
+    request = {"request_id": "test", "model_key": "digest:10", "log": str(tmp_path / "job.log"),
+               "response": str(tmp_path / "response.json"), "progress": str(tmp_path / "progress.json")}
+    runner.serve(StringIO(json.dumps(request) + "\n" + "invalid next request\n"))
+    assert json.loads((tmp_path / "response.json").read_text()) == {"request_id": "test", "ok": False}
+    assert "broken weight" in (tmp_path / "job.log").read_text()
+    assert not list(tmp_path.glob("*.tmp"))

@@ -80,6 +80,7 @@ def image_test_client(tmp_path, monkeypatch):
         try:
             yield TestClient(app), db, artifact, factory, test_worker
         finally:
+            test_worker.stop()
             app.dependency_overrides.pop(get_db, None)
 
 
@@ -109,14 +110,20 @@ def upload_all(client, test_id, count=1):
 def install_fake_process(monkeypatch, expected_images=1, seen_models=None, detected_task=None):
     class FakeProcess:
         def __init__(self, command, **_kwargs):
-            model = Path(command[command.index("--model") + 1])
+            self.killed = False
+            self.jobs = 0
+            self.stdin = SimpleNamespace(write=self.submit, flush=lambda: None, close=lambda: None)
+
+        def submit(self, line):
+            request = json.loads(line)
+            model = Path(request["model"])
             if seen_models is not None:
                 seen_models.append(model.read_bytes())
-            output = Path(command[command.index("--output") + 1])
-            summary = Path(command[command.index("--summary") + 1])
+            output = Path(request["output"])
+            summary = Path(request["summary"])
             output.mkdir()
             task_type = detected_task or (
-                command[command.index("--expected-task") + 1] if "--expected-task" in command else "detect"
+                request.get("expected_task") or "detect"
             )
             images = []
             for index in range(expected_images):
@@ -142,21 +149,24 @@ def install_fake_process(monkeypatch, expected_images=1, seen_models=None, detec
                 "task_type": task_type,
                 "device": "CPU", "imgsz": 640,
                 "timings": {
-                    "model_load": 120, "preprocess": 3 * expected_images,
+                    "model_load": 0 if self.jobs else 120, "model_reused": bool(self.jobs),
+                    "preprocess": 3 * expected_images,
                     "inference": 25 * expected_images, "postprocess": 2 * expected_images,
                     "total": 160,
                 },
                 "images": images,
             }), encoding="utf-8")
+            Path(request["response"]).write_text(json.dumps({"request_id": request["request_id"], "ok": True}))
+            self.jobs += 1
 
         def wait(self, timeout=None):
-            return 0
+            return -9 if self.killed else 0
 
         def poll(self):
-            return 0
+            return -9 if self.killed else None
 
         def kill(self):
-            return None
+            self.killed = True
 
     monkeypatch.setattr(inference.subprocess, "Popen", FakeProcess)
 
@@ -936,17 +946,16 @@ def test_delete_waits_for_worker_cleanup_before_removing_history(image_test_clie
     directory = storage.test_history_root(artifact.task_id, test_id)
     process_waiting = threading.Event()
     process_killed = threading.Event()
+    process_reaped = threading.Event()
     cleanup_entered = threading.Event()
     release_cleanup = threading.Event()
 
     class BlockingProcess:
         def __init__(self, *_args, **_kwargs):
-            pass
+            self.stdin = SimpleNamespace(write=lambda line: None, flush=process_waiting.set, close=lambda: None)
 
         def wait(self, timeout=None):
-            process_waiting.set()
-            if not process_killed.wait(3):
-                raise inference.subprocess.TimeoutExpired("inference", timeout)
+            process_reaped.set()
             return -9
 
         def poll(self):
@@ -964,6 +973,7 @@ def test_delete_waits_for_worker_cleanup_before_removing_history(image_test_clie
             and process_killed.is_set()
             and threading.current_thread().name == "model-test-worker"
         ):
+            assert process_reaped.is_set()
             cleanup_entered.set()
             if not release_cleanup.wait(3):
                 raise RuntimeError("test did not release worker cleanup")
@@ -990,6 +1000,8 @@ def test_delete_waits_for_worker_cleanup_before_removing_history(image_test_clie
     delete_thread = threading.Thread(target=run_delete, name="model-test-delete", daemon=True)
     worker_thread.start()
     assert process_waiting.wait(2)
+    assert client.post("/api/model-tests/runtime/release").status_code == 409
+    assert not test_worker.expire_idle_model()
     delete_thread.start()
     try:
         assert cleanup_entered.wait(2)
@@ -2093,3 +2105,273 @@ def test_recovery_keeps_active_reservation_and_releases_stale_markers(image_test
     assert storage.reservation_path(artifact.task_id, active_id).is_file()
     assert not storage.reservation_path(artifact.task_id, terminal_id).exists()
     assert not storage.reservation_path(artifact.task_id, orphan_id).exists()
+
+
+@pytest.fixture
+def resident_runner(tmp_path, monkeypatch):
+    """Real IPC/process lifetime; only the YOLO model is a tiny CPU simulation."""
+    import sys
+    root = tmp_path / "runner-env"
+    package = root / "ultralytics"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text('''
+from pathlib import Path
+from types import SimpleNamespace
+class Pixels:
+    __array_interface__ = {"shape": (30, 40, 3), "typestr": "|u1", "strides": (120, 3, 1)}
+    def __getitem__(self, key): return self
+    def copy(self): return self
+    def tobytes(self): return bytes(30 * 40 * 3)
+class YOLO:
+    task = "detect"
+    names = {0: "test"}
+    def __init__(self, model):
+        with (Path(__file__).parent / "loads.txt").open("a") as log:
+            log.write(Path(model).read_bytes().hex() + "\\n")
+        self.predictor = SimpleNamespace(results=None, batch=None, dataset=None)
+    def predict(self, **kwargs):
+        assert kwargs["device"] == "cpu"
+        for path in kwargs["source"]:
+            yield SimpleNamespace(boxes=None, speed={"preprocess": 1, "inference": 2, "postprocess": 1},
+                                  plot=Pixels)
+''', encoding="utf-8")
+    monkeypatch.setattr(inference, "ULTRALYTICS_ROOT", root)
+    monkeypatch.setattr(inference, "YOLO_BIN", Path(sys.executable).with_name("yolo"))
+    return package / "loads.txt"
+
+
+def submit_resident_test(client, artifact, test_worker, **overrides):
+    test_id = create(client, artifact, **overrides).json()["id"]
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    assert test_worker.process_one()
+    detail = client.get(f"/api/model-tests/{test_id}").json()
+    assert detail["status"] == "completed", detail.get("error")
+    return detail
+
+
+def test_resident_runner_reuses_exact_version_and_idle_release_keeps_history(image_test_client, resident_runner):
+    client, _, artifact, _, test_worker = image_test_client
+    first = submit_resident_test(client, artifact, test_worker)
+    process = test_worker._process
+    assert first["timings"]["model_reused"] is False
+    first_idle = test_worker._model_idle_at
+    state = client.get("/api/model-tests/runtime").json()
+    assert state["state"] == "ready" and state["can_release"]
+    assert state["idle_seconds"] == 300
+    assert state["model_sha256"] == first["model_sha256"]
+    assert test_worker._model_idle_at == first_idle  # Looking at status never extends the lease.
+
+    second = submit_resident_test(client, artifact, test_worker, confidence=0.8, iou=0.3)
+    assert test_worker._process is process
+    assert second["timings"]["model_reused"] is True
+    assert second["timings"]["model_load"] == 0
+    assert len(resident_runner.read_text().splitlines()) == 1
+    assert test_worker._model_idle_at > first_idle
+    assert not test_worker.expire_idle_model()
+    test_worker._model_idle_at -= 301
+    assert test_worker.expire_idle_model()
+    assert process.poll() is not None
+    assert client.get("/api/model-tests/runtime").json()["release_reason"] == "idle"
+    for detail in (first, second):
+        assert client.get(f"/api/model-tests/{detail['id']}/download").status_code == 200
+        assert not storage.test_work_root(detail["id"]).exists()
+    third = submit_resident_test(client, artifact, test_worker)
+    assert third["timings"]["model_reused"] is False
+    assert len(resident_runner.read_text().splitlines()) == 2
+
+
+def test_resident_changed_weights_reload_even_at_identical_path(image_test_client, resident_runner):
+    client, db, artifact, _, test_worker = image_test_client
+    first = submit_resident_test(client, artifact, test_worker)
+    old_process = test_worker._process
+    # Same file name and byte length: identity must come from SHA, not metadata.
+    weight = Path(artifact.path)
+    weight.write_bytes(b"X" * weight.stat().st_size)
+    db.refresh(artifact)
+    second = submit_resident_test(client, artifact, test_worker)
+    assert second["model_sha256"] != first["model_sha256"]
+    assert old_process.poll() is not None
+    assert test_worker._process is not old_process
+    assert second["timings"]["model_reused"] is False
+    assert len(resident_runner.read_text().splitlines()) == 2
+
+
+def test_resident_queued_work_blocks_release_and_expiry(image_test_client, monkeypatch):
+    client, _, artifact, _, test_worker = image_test_client
+    install_fake_process(monkeypatch)
+    submit_resident_test(client, artifact, test_worker)
+    process = test_worker._process
+    test_id = create(client, artifact).json()["id"]
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    test_worker._model_idle_at -= 301
+    assert not test_worker.expire_idle_model()
+    assert client.post("/api/model-tests/runtime/release").status_code == 409
+    assert not client.get("/api/model-tests/runtime").json()["can_release"]
+    assert not process.killed
+    assert test_worker.process_one()
+    released = client.post("/api/model-tests/runtime/release")
+    assert released.status_code == 200
+    assert released.json()["state"] == "released"
+    assert released.json()["release_reason"] == "manual"
+    assert process.killed
+    assert client.post("/api/model-tests/runtime/release").status_code == 200
+
+
+def test_resident_zero_idle_releases_after_each_batch(image_test_client, monkeypatch):
+    client, _, artifact, _, test_worker = image_test_client
+    test_worker.idle_seconds = 0
+    install_fake_process(monkeypatch)
+    for _ in range(2):
+        detail = submit_resident_test(client, artifact, test_worker)
+        assert detail["timings"]["model_reused"] is False
+        assert test_worker._process is None
+    assert client.get("/api/model-tests/runtime").json()["release_reason"] == "idle"
+
+
+@pytest.mark.parametrize("mode", ["timeout", "exit", "malformed", "wrong_request", "failed", "bad_summary", "broken_pipe"])
+def test_resident_failure_reaps_child_and_next_job_starts_clean(image_test_client, monkeypatch, mode):
+    client, _, artifact, _, test_worker = image_test_client
+    install_fake_process(monkeypatch)
+    healthy = inference.subprocess.Popen
+    children = []
+
+    class BrokenProcess:
+        def __init__(self, *args, **kwargs):
+            self.killed = False
+            self.stdin = SimpleNamespace(write=self.submit, flush=lambda: None, close=self.close)
+            children.append(self)
+
+        def close(self):
+            if mode == "broken_pipe":
+                raise BrokenPipeError("dead pipe")
+
+        def submit(self, line):
+            if mode == "broken_pipe":
+                raise BrokenPipeError("dead pipe")
+            request = json.loads(line)
+            response = Path(request["response"])
+            if mode == "malformed":
+                response.write_text("{")
+            elif mode in {"wrong_request", "failed", "bad_summary"}:
+                response.write_text(json.dumps({"request_id": "wrong" if mode == "wrong_request" else request["request_id"], "ok": mode != "failed"}))
+                if mode == "bad_summary":
+                    Path(request["summary"]).write_text("{}")
+
+        def poll(self):
+            return -9 if self.killed or mode == "exit" else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(inference.subprocess, "Popen", BrokenProcess)
+    monkeypatch.setattr(inference, "INFERENCE_TIMEOUT_SECONDS", 0.05)
+    test_id = create(client, artifact).json()["id"]
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+    assert test_worker.process_one()
+    assert client.get(f"/api/model-tests/{test_id}").json()["status"] == "failed"
+    assert children[0].poll() is not None
+    assert test_worker._process is None and test_worker._current_id is None
+    assert not storage.test_work_root(test_id).exists()
+    monkeypatch.setattr(inference.subprocess, "Popen", healthy)
+    submit_resident_test(client, artifact, test_worker)
+
+
+def test_resident_backend_shutdown_requeues_valid_pin_and_recovery_runs(image_test_client, monkeypatch):
+    client, db, artifact, _, test_worker = image_test_client
+    test_id = create(client, artifact).json()["id"]
+    upload_all(client, test_id)
+    assert client.post(f"/api/model-tests/{test_id}/start").status_code == 202
+
+    class ShutdownProcess:
+        def __init__(self, *args, **kwargs):
+            self.killed = False
+            self.stdin = SimpleNamespace(write=lambda line: test_worker.stop(), flush=lambda: None, close=lambda: None)
+
+        def poll(self):
+            return -9 if self.killed else None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(inference.subprocess, "Popen", ShutdownProcess)
+    assert test_worker.process_one()
+    db.expire_all()
+    assert db.get(ModelTest, test_id).status == "queued"
+    assert (storage.test_work_root(test_id) / "model.pt").is_file()
+    test_worker._recover()
+    test_worker._stop.clear()
+    install_fake_process(monkeypatch)
+    assert test_worker.process_one()
+    assert client.get(f"/api/model-tests/{test_id}").json()["status"] == "completed"
+    assert not storage.test_work_root(test_id).exists()
+
+
+def test_resident_worker_loop_releases_without_browser_polling(image_test_client, monkeypatch):
+    import time
+    client, _, artifact, _, test_worker = image_test_client
+    install_fake_process(monkeypatch)
+    submit_resident_test(client, artifact, test_worker)
+    process = test_worker._process
+    test_worker.idle_seconds = 0.02
+    test_worker.start()
+    deadline = time.monotonic() + 3
+    while not process.killed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert process.killed
+    assert test_worker.runtime_status()["release_reason"] == "idle"
+
+
+def test_resident_pipe_disconnect_stops_even_an_inflight_predictor(tmp_path, resident_runner):
+    import os
+    import subprocess
+    import sys
+    import time
+    package = resident_runner.parent
+    with (package / "__init__.py").open("a") as file:
+        file.write('''
+import time
+original_predict = YOLO.predict
+def slow_predict(self, **kwargs):
+    time.sleep(60)
+    return original_predict(self, **kwargs)
+YOLO.predict = slow_predict
+''')
+    images = tmp_path / "images"
+    images.mkdir()
+    Image.new("RGB", (40, 30)).save(images / "0.jpg")
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"test")
+    request = {"request_id": "parent-exit", "model_key": "digest:4", "model": str(model),
+               "source": str(images), "output": str(tmp_path / "results"), "summary": str(tmp_path / "summary.json"),
+               "log": str(tmp_path / "job.log"), "response": str(tmp_path / "response.json"),
+               "progress": str(tmp_path / "progress.json"), "confidence": 0.25, "iou": 0.7,
+               "imgsz": 640, "expected_task": "detect"}
+    process = subprocess.Popen([sys.executable, str(Path(inference.__file__).with_name("inference_runner.py")),
+                                "--resident", "--ultralytics-root", str(package.parent)],
+                               stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               text=True, env={**os.environ, "CUDA_VISIBLE_DEVICES": ""})
+    try:
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        deadline = time.monotonic() + 5
+        while not Path(request["progress"]).exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert Path(request["progress"]).exists()
+        assert process.poll() is None
+        process.stdin.close()  # Simulate the backend disappearing mid-inference.
+        assert process.wait(timeout=5) == 0
+        assert not Path(request["summary"]).exists()
+        assert not Path(request["response"]).exists()
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
