@@ -95,7 +95,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         <button type="submit" className="auth-submit" disabled={busy}><span>{busy ? (setup ? '正在创建…' : '正在进入…') : setup ? '创建账号并进入平台' : '开启探索'}</span>{busy ? <LoaderCircle size={19} className="spin" /> : <ArrowRight size={19} />}</button>
         <p className="auth-training-note"><ShieldCheck size={14} />{setup ? '无默认密码 · 请妥善保管账号' : '登录状态不会影响后台训练'}</p>
       </form>}
-    </section><div className="auth-orbit-caption" aria-hidden="true"><strong>VISION</strong><span>BEYOND THE ORDINARY</span></div></div>
+    </section><div className="auth-visual-region" aria-hidden="true"><div className="auth-orbit-caption"><strong>VISION</strong><span>BEYOND THE ORDINARY</span></div></div></div>
     <footer className="auth-footer"><span>YOLO · 模型训练平台 <small>v{import.meta.env.VITE_PLATFORM_VERSION}</small></span><button type="button" className="auth-motion-toggle" onClick={() => setPaused(!paused)} aria-pressed={paused}>{paused ? <Play size={14} /> : <Pause size={14} />}{paused ? '开启动效' : '暂停动效'}</button></footer>
   </main>
 }
