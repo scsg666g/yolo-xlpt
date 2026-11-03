@@ -1,8 +1,36 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { ArrowRight, Eye, EyeOff, LoaderCircle, LockKeyhole, Pause, Play, RefreshCw, ScanEye, ShieldCheck, UserRound } from 'lucide-react'
 import { api } from '../api'
 import { AUTH_EXPIRED_EVENT, setCsrfToken, type AccountStatus } from '../authSession'
 import { HolographicHalo } from './HolographicHalo'
+
+// One desktop composition scales as a whole; long setup/error states may scroll.
+// The compact CSS layout keeps native-sized controls for phones and tablets.
+function AuthScene({ children }: { children: ReactNode }) {
+  const viewport = useRef<HTMLDivElement>(null)
+  const scene = useRef<HTMLDivElement>(null)
+  const [layout, setLayout] = useState({ scale: 1, width: 1440, height: 900 })
+  useLayoutEffect(() => {
+    const frame = viewport.current!
+    const content = scene.current!
+    const update = () => {
+      if (window.matchMedia('(max-width: 1099px)').matches) return
+      const scale = Math.min(frame.clientWidth / 1440, Math.max(frame.clientHeight / 900, .78))
+      const next = { scale, width: 1440 * scale, height: content.offsetHeight * scale }
+      setLayout(previous => previous.scale === next.scale && previous.height === next.height ? previous : next)
+    }
+    const observer = new ResizeObserver(update)
+    observer.observe(frame)
+    observer.observe(content)
+    update()
+    return () => observer.disconnect()
+  }, [])
+  return <div className="auth-scene-viewport" ref={viewport}>
+    <div className="auth-scene-bounds" style={{ width: layout.width, height: layout.height, '--auth-scene-scale': layout.scale } as CSSProperties}>
+      <div className="auth-scene" ref={scene}>{children}</div>
+    </div>
+  </div>
+}
 
 export function PasswordField({ label, value, onChange, autoComplete, minLength = 1, disabled = false }: {
   label: string; value: string; onChange: (value: string) => void
@@ -79,6 +107,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }
   return <main className="auth-screen">
     <HolographicHalo paused={paused} />
+    <AuthScene>
     <header className="auth-header"><div className="auth-brand"><ScanEye aria-hidden="true" /><strong>YOLO</strong><span>VISION LAB</span></div><span className="auth-header-label">模型训练平台</span></header>
     <div className="auth-content"><section className="auth-form-region" aria-labelledby="auth-title">
       <div className="auth-kicker">ENTER THE NEXT DIMENSION</div>
@@ -97,5 +126,6 @@ export function AuthGate({ children }: { children: ReactNode }) {
       </form>}
     </section><div className="auth-visual-region" aria-hidden="true"><div className="auth-orbit-caption"><strong>VISION</strong><span>BEYOND THE ORDINARY</span></div></div></div>
     <footer className="auth-footer"><span>YOLO · 模型训练平台 <small>v{import.meta.env.VITE_PLATFORM_VERSION}</small></span><button type="button" className="auth-motion-toggle" onClick={() => setPaused(!paused)} aria-pressed={paused}>{paused ? <Play size={14} /> : <Pause size={14} />}{paused ? '开启动效' : '暂停动效'}</button></footer>
+    </AuthScene>
   </main>
 }

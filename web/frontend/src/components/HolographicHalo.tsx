@@ -12,7 +12,7 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
     let frame = 0, previous = 0, time = 0, width = 0, height = 0, drawn = false
     const parent = element.parentElement!
     const visual = parent.querySelector<HTMLElement>('.auth-visual-region')
-    let pointerX = 0, pointerY = 0, haloX = 0, haloY = 0, radius = 0
+    let pointerX = 0, pointerY = 0, haloX = 0, haloY = 0, radius = 0, haloScale = 1
     const stars = Array.from({ length: 80 }, (_, i) => ({
       x: ((i * 719 + 71) % 997) / 997, y: ((i * 367 + 89) % 991) / 991,
       r: i % 5 === 0 ? 1.3 : .65, phase: i * .73,
@@ -23,15 +23,20 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
       // Size and align the halo within its column, including when form height changes.
       const area = visual?.getBoundingClientRect()
       if (area && area.width > 0 && area.height > 0) {
+        haloScale = area.width / visual!.offsetWidth
         haloX = area.left - rect.left + area.width / 2
         haloY = area.top - rect.top + area.height * .41
-        radius = Math.min(area.width * .58, area.height * .36)
+        radius = Math.min(area.width * .58, area.height * .36) / haloScale
       } else {
+        haloScale = 1
         haloX = width * .92; haloY = height * .24
         radius = Math.min(width * .47, 245)
       }
-      const dpr = Math.min(devicePixelRatio || 1, 1.5)
-      element!.width = Math.round(width * dpr); element!.height = Math.round(height * dpr)
+      // Keep large/HiDPI displays from multiplying the animation's pixel budget.
+      const dpr = Math.min(devicePixelRatio || 1, 1.5, Math.sqrt(4_000_000 / Math.max(1, width * height)))
+      const pixelWidth = Math.round(width * dpr), pixelHeight = Math.round(height * dpr)
+      if (element!.width !== pixelWidth) element!.width = pixelWidth
+      if (element!.height !== pixelHeight) element!.height = pixelHeight
       context!.setTransform(dpr, 0, 0, dpr, 0, 0); drawn = false
     }
     function draw(now: number) {
@@ -50,7 +55,8 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
       }
       ctx.globalAlpha = 1
       ctx.save()
-      ctx.translate(haloX + pointerX * 10, haloY + pointerY * 10)
+      ctx.translate(haloX + pointerX * 10 * haloScale, haloY + pointerY * 10 * haloScale)
+      ctx.scale(haloScale, haloScale)
       ctx.rotate(-.32 + Math.sin(time * .15) * .05)
       const glow = ctx.createRadialGradient(0, 0, radius * .5, 0, 0, radius * 1.25)
       glow.addColorStop(0, '#111a3700'); glow.addColorStop(.45, '#456ed61a')
@@ -92,12 +98,16 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
     if (content) observer.observe(content)
     const form = parent.querySelector('.auth-form-region')
     if (form) observer.observe(form)
+    const bounds = parent.querySelector('.auth-scene-bounds')
+    if (bounds) observer.observe(bounds)
+    parent.addEventListener('scroll', resize, true)
     parent.addEventListener('pointermove', pointer); parent.addEventListener('pointerleave', leave)
     media.addEventListener('change', motion)
     resize(); frame = requestAnimationFrame(draw)
     return () => {
       cancelAnimationFrame(frame); observer.disconnect()
       parent.removeEventListener('pointermove', pointer); parent.removeEventListener('pointerleave', leave)
+      parent.removeEventListener('scroll', resize, true)
       media.removeEventListener('change', motion)
     }
   }, [])
