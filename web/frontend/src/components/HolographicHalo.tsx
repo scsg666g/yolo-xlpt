@@ -10,7 +10,7 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
     if (!element || !context) return
     const media = matchMedia('(prefers-reduced-motion: reduce)')
     let frame = 0, previous = 0, time = 0, width = 0, height = 0, drawn = false
-    let pointerX = 0, pointerY = 0
+    let pointerX = 0, pointerY = 0, haloX = 0
     const stars = Array.from({ length: 80 }, (_, i) => ({
       x: ((i * 719 + 71) % 997) / 997, y: ((i * 367 + 89) % 991) / 991,
       r: i % 5 === 0 ? 1.3 : .65, phase: i * .73,
@@ -18,6 +18,9 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
     function resize() {
       const rect = element!.getBoundingClientRect()
       width = rect.width; height = rect.height
+      // Follow the visual column even on ultrawide screens with capped content width.
+      const visual = element!.parentElement?.querySelector('.auth-orbit-caption')?.getBoundingClientRect()
+      haloX = width < 760 ? width * .92 : visual && visual.width > 0 ? visual.left - rect.left + visual.width / 2 : width * .24
       const dpr = Math.min(devicePixelRatio || 1, 1.5)
       element!.width = Math.round(width * dpr); element!.height = Math.round(height * dpr)
       context!.setTransform(dpr, 0, 0, dpr, 0, 0); drawn = false
@@ -40,7 +43,7 @@ export function HolographicHalo({ paused }: { paused: boolean }) {
       const compact = width < 760
       const radius = compact ? Math.min(width * .47, 245) : Math.min(width * .235, 350)
       ctx.save()
-      ctx.translate((compact ? width * .92 : width * .76) + pointerX * 10, (compact ? height * .24 : height * .48) + pointerY * 10)
+      ctx.translate(haloX + pointerX * 10, (compact ? height * .24 : height * .48) + pointerY * 10)
       ctx.rotate(-.32 + Math.sin(time * .15) * .05)
       const glow = ctx.createRadialGradient(0, 0, radius * .5, 0, 0, radius * 1.25)
       glow.addColorStop(0, '#111a3700'); glow.addColorStop(.45, '#456ed61a')
