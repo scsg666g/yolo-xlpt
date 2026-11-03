@@ -19,11 +19,13 @@ function mapSections(value: unknown, update: (value: ChartSection) => ChartSecti
   return Array.isArray(value) ? value.map((item) => update(section(item))) : update(section(value))
 }
 
-function themedOption(option: unknown, theme: 'light' | 'dark') {
+function themedOption(option: unknown, theme: 'light' | 'dark', holographic = false) {
   const source = section(option)
   const colors = theme === 'light'
     ? { text: '#294454', muted: '#637887', line: '#bcced9', grid: '#dce6ed', tooltip: '#ffffff' }
-    : { text: '#e8eff4', muted: '#96a6b2', line: '#344653', grid: '#2a3946', tooltip: '#18242f' }
+    : holographic
+      ? { text: '#e6edf9', muted: '#a2afc8', line: '#43527c', grid: '#303c59', tooltip: '#10162b' }
+      : { text: '#e8eff4', muted: '#96a6b2', line: '#344653', grid: '#2a3946', tooltip: '#18242f' }
   const axis = (value: ChartSection): ChartSection => ({
     ...value,
     nameTextStyle: { ...section(value.nameTextStyle), color: colors.muted },
@@ -56,7 +58,7 @@ function themedOption(option: unknown, theme: 'light' | 'dark') {
 }
 
 export function LineChartView({ option, style }: { option: unknown; style?: CSSProperties }) {
-  const { resolvedTheme } = useAppearance()
-  const chartOption = useMemo(() => themedOption(option, resolvedTheme), [option, resolvedTheme])
+  const { resolvedTheme, mode } = useAppearance()
+  const chartOption = useMemo(() => themedOption(option, resolvedTheme, mode === 'holographic'), [option, resolvedTheme, mode])
   return <ReactEChartsCore echarts={echarts} option={chartOption} style={style} />
 }

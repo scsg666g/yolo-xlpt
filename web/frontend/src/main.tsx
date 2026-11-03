@@ -11,6 +11,7 @@ import './datasets.css'
 import './editor.css'
 import './appearance.css'
 import './auth.css'
+import './holographic.css'
 
 initializeAppearance()
 

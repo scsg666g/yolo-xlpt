@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react'
 
-export type ThemeMode = 'light' | 'dark' | 'system'
+export type ThemeMode = 'light' | 'dark' | 'system' | 'holographic'
 
 export type AppearancePreferences = {
   mode: ThemeMode
@@ -61,7 +61,7 @@ function normalizePreferences(value: unknown, fallback = APPEARANCE_DEFAULTS): A
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...fallback }
   const candidate = value as Record<string, unknown>
   return {
-    mode: candidate.mode === 'light' || candidate.mode === 'dark' || candidate.mode === 'system'
+    mode: candidate.mode === 'light' || candidate.mode === 'dark' || candidate.mode === 'system' || candidate.mode === 'holographic'
       ? candidate.mode : fallback.mode,
     accent: candidate.accent === 'default' || candidate.accent === 'blue'
       || candidate.accent === 'violet' || candidate.accent === 'amber' || candidate.accent === 'custom'
@@ -96,7 +96,7 @@ function readStoredPreferences(): { preferences: AppearancePreferences; storageA
 }
 
 function resolveTheme(mode: ThemeMode): ResolvedTheme {
-  return mode === 'system' ? (systemTheme?.matches ? 'dark' : 'light') : mode
+  return mode === 'system' ? (systemTheme?.matches ? 'dark' : 'light') : mode === 'holographic' ? 'dark' : mode
 }
 
 type RGB = [number, number, number]
@@ -146,19 +146,20 @@ function applyAppearance(value: AppearanceSnapshot): void {
   if (typeof document === 'undefined') return
   const root = document.documentElement
   root.dataset.theme = value.resolvedTheme
+  root.dataset.appearance = value.mode
   root.dataset.accent = value.accent
   root.dataset.fontSize = value.fontSize
   root.dataset.density = value.density
   root.style.colorScheme = value.resolvedTheme
 
   const color = value.accent === 'default'
-    ? (value.resolvedTheme === 'light' ? '#159a78' : '#76e9ba')
+    ? (value.mode === 'holographic' ? '#96d5ff' : value.resolvedTheme === 'light' ? '#159a78' : '#76e9ba')
     : value.accent === 'custom'
       ? value.customColor
       : ACCENT_PRESETS.find((preset) => preset.id === value.accent)!.color
   const channels = rgb(color)
   const foreground = value.accent === 'default'
-    ? (value.resolvedTheme === 'light' ? '#ffffff' : '#0b1b16')
+    ? (value.mode === 'holographic' ? '#101a35' : value.resolvedTheme === 'light' ? '#ffffff' : '#0b1b16')
     : (contrast(channels, [255, 255, 255]) >= contrast(channels, [0, 0, 0]) ? '#ffffff' : '#000000')
   root.style.setProperty('--accent', color)
   root.style.setProperty('--accent-contrast', foreground)

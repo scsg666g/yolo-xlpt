@@ -18,7 +18,7 @@ import { AppearanceSettings } from './AppearanceSettings'
 import { SettingsDisclosure } from './SettingsDisclosure'
 import { TaskCenterSettings } from './TaskCenterSettings'
 import { AccountSecurity } from './AccountSecurity'
-import { ShieldCheck } from 'lucide-react'
+import { ShieldCheck, Sparkles } from 'lucide-react'
 
 const HEALTH_POLL_INTERVAL_MS = 30_000
 
@@ -396,6 +396,7 @@ export function Layout() {
           <div>
             <button type="button" className={appearance.mode === 'light' ? 'active' : ''} onClick={() => updateAppearance({ mode: 'light' })} title="明亮主题" aria-pressed={appearance.mode === 'light'}><Sun size={14} />明亮</button>
             <button type="button" className={appearance.mode === 'dark' ? 'active' : ''} onClick={() => updateAppearance({ mode: 'dark' })} title="深色主题" aria-pressed={appearance.mode === 'dark'}><Moon size={14} />深色</button>
+            <button type="button" className={`theme-holographic ${appearance.mode === 'holographic' ? 'active' : ''}`} onClick={() => updateAppearance({ mode: 'holographic' })} title="全息深蓝 · 登录页同款配色" aria-pressed={appearance.mode === 'holographic'}><Sparkles size={14} />全息深蓝</button>
           </div>
           {appearance.mode === 'system' && <small className="theme-system-note"><Monitor size={11} />跟随系统 · 当前{appearance.resolvedTheme === 'dark' ? '深色' : '明亮'}</small>}
         </div>

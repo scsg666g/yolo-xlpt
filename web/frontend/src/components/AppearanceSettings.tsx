@@ -1,10 +1,11 @@
 import { useEffect, useState, type CSSProperties } from 'react'
-import { Check, Monitor, Moon, Palette, Sun } from 'lucide-react'
+import { Check, Monitor, Moon, Palette, Sparkles, Sun } from 'lucide-react'
 import { ACCENT_PRESETS, updateAppearance, useAppearance, type ThemeMode } from '../appearance'
 
 const modes = [
   { id: 'light', label: '明亮', description: '清晰、轻盈的工作空间', icon: Sun },
   { id: 'dark', label: '深色', description: '适合夜间与长时间查看', icon: Moon },
+  { id: 'holographic', label: '全息深蓝', description: '登录页同款深蓝 · 冰蓝与淡紫', icon: Sparkles },
   { id: 'system', label: '跟随系统', description: '随设备外观自动切换', icon: Monitor },
 ] satisfies { id: ThemeMode; label: string; description: string; icon: typeof Sun }[]
 
@@ -31,7 +32,7 @@ export function AppearanceSettings() {
   return <div className="appearance-settings">
     <fieldset className="appearance-section">
       <legend>显示模式</legend>
-      <p>默认版保留当前配色、字号与间距。所有调整即时生效。</p>
+      <p>选择工作空间外观，即时生效并保存在当前浏览器。全息深蓝与登录页配色一致。</p>
       <div className="appearance-modes">
         {modes.map(({ id, label, description, icon: Icon }) => <button
           key={id} type="button" className={`appearance-mode ${appearance.mode === id ? 'selected' : ''}`}
@@ -46,13 +47,13 @@ export function AppearanceSettings() {
 
     <fieldset className="appearance-section">
       <legend>主题配色</legend>
-      <p>调整按钮和选中项的颜色；训练状态与图表曲线保持各自的配色。</p>
+      <p>调整按钮和选中项的颜色；全息深蓝的默认配色为冰蓝。训练状态与图表曲线保持各自的配色。</p>
       <div className="appearance-swatches">
         {ACCENT_PRESETS.map(({ id, label, color }) => <button
           key={id} type="button" className={`appearance-swatch ${appearance.accent === id ? 'selected' : ''}`}
           aria-pressed={appearance.accent === id} onClick={() => updateAppearance({ accent: id })}
-          style={{ '--swatch-color': color } as CSSProperties}
-        ><i aria-hidden="true" /><span>{label}</span>{appearance.accent === id && <Check size={13} />}</button>)}
+          style={{ '--swatch-color': id === 'default' && appearance.mode === 'holographic' ? '#96d5ff' : color } as CSSProperties}
+        ><i aria-hidden="true" /><span>{id === 'default' && appearance.mode === 'holographic' ? '默认冰蓝' : label}</span>{appearance.accent === id && <Check size={13} />}</button>)}
         <button type="button" className={`appearance-swatch ${appearance.accent === 'custom' ? 'selected' : ''}`} aria-pressed={appearance.accent === 'custom'} onClick={() => updateAppearance({ accent: 'custom' })}><Palette size={17} />自定义{appearance.accent === 'custom' && <Check size={13} />}</button>
       </div>
       <div className="appearance-custom-color">

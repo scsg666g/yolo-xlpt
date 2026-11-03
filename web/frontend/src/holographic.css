@@ -1,0 +1,91 @@
+/* Login-inspired workspace palette. Dark semantics keep charts/statuses compatible. */
+.appearance-modes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.appearance-mode-image.holographic { background: radial-gradient(ellipse at 75% 15%, #24264e, #0c1124 75%); border-color: #364161; }
+.appearance-mode-image.holographic > i { background: #1a2441; }
+.appearance-mode-image.holographic > span b { background: #485375; }
+.appearance-mode-image.holographic > span b:first-child { background: linear-gradient(100deg, #96d5ff, #b4acff); }
+.theme-picker .theme-holographic { grid-column: 1 / -1; }
+
+:root[data-appearance='holographic'] {
+  --bg: #070a17;
+  --panel: #10162b;
+  --panel-2: #151d35;
+  --line: #303c59;
+  --text: #e6edf9;
+  --muted: #a2afc8;
+  --blue: #9bcaff;
+  --holo-glow: #a99eff;
+  --holo-gradient: linear-gradient(105deg, #96d5ff, #b4b0ff);
+  background: var(--bg);
+  color: var(--text);
+  accent-color: var(--accent);
+}
+:root[data-appearance='holographic'] body:not(:has(.auth-screen)) {
+  background: radial-gradient(ellipse at 85% 0%, #22274966, transparent 48%), radial-gradient(ellipse at 15% 75%, #18244b44, transparent 55%), var(--bg);
+}
+:root[data-appearance='holographic'] .sidebar { background: #0b1023f2; border-color: var(--line); }
+:root[data-appearance='holographic'] :is(.theme-picker, .settings-nav) { background: #0c1226; border-color: var(--line); }
+:root[data-appearance='holographic'] :is(.brand-mark, .button.primary, .task-overview-canvas-actions button.primary) { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); box-shadow: 0 6px 22px var(--accent-soft); }
+:root[data-appearance='holographic'][data-accent='default'] :is(.brand-mark, .button.primary, .task-overview-canvas-actions button.primary) { background: var(--holo-gradient); }
+:root[data-appearance='holographic'] .brand-version { color: var(--accent-text); border-color: var(--accent-border); background: var(--accent-soft); }
+:root[data-appearance='holographic'] :is(.sidebar nav a, .theme-picker button, .theme-picker > span, .brand-copy > span, .icon-text) { color: var(--muted); }
+:root[data-appearance='holographic'] :is(.sidebar nav a.active, .settings-nav button.active, .theme-picker button.active, .appearance-mode.selected, .appearance-swatch.selected, .appearance-segmented button[aria-pressed='true'], .dataset-filters button.active, .model-tests-view-tabs button.active, .model-source-tabs button.active, .auto-refresh.active) { color: var(--accent-text); background: var(--accent-soft); border-color: var(--accent-border); }
+:root[data-appearance='holographic'] .sidebar nav a.active { box-shadow: inset 3px 0 var(--accent); }
+:root[data-appearance='holographic'] :is(.sidebar nav a, .settings-nav button, .theme-picker button, .icon-button, .icon-text):hover { color: var(--accent-text); background: var(--accent-soft); border-color: var(--accent-border); }
+:root[data-appearance='holographic'] :is(.eyebrow, .page-kicker, .appearance-preview-kicker, .task-group-icon, .task-group-title > svg) { color: var(--accent-text); }
+:root[data-appearance='holographic'] :is(.button, .icon-button, .icon-text, .sidebar nav a, .settings-nav button, .theme-picker button, .appearance-mode, .appearance-swatch, input, select, textarea):focus-visible { outline-color: var(--accent); }
+:root[data-appearance='holographic'] :is(.button.primary:hover, .task-overview-canvas-actions button.primary:hover) { color: var(--accent-contrast); border-color: var(--holo-glow); box-shadow: 0 8px 26px var(--accent-soft); filter: brightness(1.06); }
+:root[data-appearance='holographic'] .button:not(.primary):not(.danger) { background: var(--panel-2); color: var(--text); border-color: var(--line); }
+:root[data-appearance='holographic'] .button:not(.primary):not(.danger):hover { border-color: var(--accent-border); box-shadow: 0 6px 20px var(--accent-soft); }
+
+/* Main surfaces, including legacy components with literal dark backgrounds. */
+:root[data-appearance='holographic'] :is(
+  .stat-card, .task-card, .task-group-header, .dataset-card, .dataset-overview article,
+  .dataset-toolbar, .compute-overview article, .gpu-card, .compute-panel, .node-section,
+  .compare-empty, .compare-panel, .compare-picker,
+  .model-source-panel, .model-test-run-panel, .model-tests-history-card,
+  .canvas-detail-section, .canvas-detail-chart, .weight-detail-summary > div,
+  .canvas-node, .task-overview-card
+) { background: var(--panel); border-color: var(--line); }
+:root[data-appearance='holographic'] :is(.stat-card:hover, .task-card:hover, .dataset-card:hover) { border-color: var(--accent-border); box-shadow: 0 12px 30px #02051455; }
+:root[data-appearance='holographic'] :is(
+  .search, .toolbar-actions select, .form-grid input, .form-grid select,
+  .dataset-search, .dataset-filters, .node-search, .node-toolbar > select.node-status-filter,
+  .compare-picker-search, .compare-picker-search input, .attempt-picker
+) { background-color: #0c1226; border-color: var(--line); color: var(--text); }
+:root[data-appearance='holographic'] :is(.search, .dataset-search, .node-search, .compare-picker-search):focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+:root[data-appearance='holographic'] :is(.dataset-search, .node-search, .search) input { color: var(--text); }
+:root[data-appearance='holographic'] :is(input, textarea)::placeholder { color: #8a99b6; }
+:root[data-appearance='holographic'] :is(.toolbar-actions select, .form-grid select, .node-status-filter) option { color: var(--text); background: var(--panel); }
+:root[data-appearance='holographic'] :is(.node-content, .node-controls, .gpu-details, .gpu-details > div, .gpu-card > header, .compute-panel > header, .dataset-metrics, .dataset-metrics > div, .metric-strip, .metric-strip > div, .task-section, .task-group, .process-table td, .process-table th, .host-panel dl > div, .canvas-node > header) { border-color: var(--line); }
+:root[data-appearance='holographic'] :is(.task-path, .progress-heading, .metric-strip span, .task-card footer, .dataset-metrics span, .node-row span, .canvas-node header span, .artifact-list small, .section-toolbar > div > span) { color: var(--muted); }
+:root[data-appearance='holographic'] :is(.dataset-metrics strong, .metric-strip strong, .node-row strong, .node-identity strong, .gpu-details strong, .gpu-bars label strong, .host-panel dd, .process-table td) { color: var(--text); }
+:root[data-appearance='holographic'] :is(.dataset-overview article > svg, .dataset-card-icon, .gpu-index, .account-avatar, .account-logout-icon) { color: var(--accent-text); background: var(--accent-soft); }
+:root[data-appearance='holographic'] :is(.dataset-path, .path-value, .log-view, .canvas-command, .process-table th, .host-name, .weight-mini-card, .canvas-detail-field, .compare-notice) { background: #0b1124; border-color: var(--line); color: var(--muted); }
+:root[data-appearance='holographic'] .usage-gauge::before { background: var(--panel); }
+:root[data-appearance='holographic'] :is(.progress, .gpu-bars > div > div) { background: #26324d; }
+
+/* Portalled overlays and both canvases share the workspace surface. */
+:root[data-appearance='holographic'] .modal-backdrop { background: #030716b8; }
+:root[data-appearance='holographic'] :is(.modal, .modal > header, .modal > footer, .canvas-toolbar, .canvas-detail-modal, .canvas-detail-modal > header, .canvas-detail-modal > footer, .task-overview-dialog, .task-overview-header, .task-overview-toolbar) { background: var(--panel); color: var(--text); border-color: var(--line); }
+:root[data-appearance='holographic'] :is(.canvas-page, .canvas-wrap .react-flow, .task-overview-flow) { background: radial-gradient(ellipse at 50% 5%, #252b5044, transparent 65%), var(--bg); }
+:root[data-appearance='holographic'] :is(.react-flow__controls, .react-flow__controls-button, .react-flow__minimap, .canvas-legend) { color: var(--text); fill: var(--text); border-color: var(--line); background: var(--panel); }
+:root[data-appearance='holographic'] .react-flow__background-pattern { fill: #43527c; }
+:root[data-appearance='holographic'] .task-overview-canvas-actions button[aria-pressed='true'] { color: var(--accent-text); background: var(--accent-soft); }
+:root[data-appearance='holographic'] .task-overview-header h2 > span { color: var(--accent-text); background: var(--accent-soft); }
+@media (max-width: 430px) { .appearance-modes { grid-template-columns: minmax(0, 1fr); } }
+
+:root[data-appearance='holographic'] .stat-card.accent { border-color: var(--accent-border); background: linear-gradient(140deg, #182443, #15182f); }
+:root[data-appearance='holographic'] .stat-card.warning { border-color: #66503a; }
+:root[data-appearance='holographic'] .task-overview-card.tone-attention { border-color: color-mix(in srgb, var(--card-accent) 43%, var(--line)); }
+:root[data-appearance='holographic'] :is(.task-overview-card:hover, .task-overview-flow .react-flow__node.selected .task-overview-card) { border-color: var(--card-accent); }
+:root[data-appearance='holographic'] :is(.sidebar-footer, .theme-picker, .compare-picker > header, .compare-picker-group) { border-color: var(--line); }
+:root[data-appearance='holographic'] .selected-experiments article { background: var(--panel); border-color: var(--line); border-top-color: var(--experiment-color); }
+:root[data-appearance='holographic'] :is(.picker-done, .compare-picker-group-toggle > svg:nth-child(2)) { color: var(--accent-text); }
+:root[data-appearance='holographic'] :is(.compare-picker-list > button:hover, .compare-picker-group-toggle:hover) { background: var(--accent-soft); }
+:root[data-appearance='holographic'] .canvas-node { border-top-color: var(--node-accent); }
+:root[data-appearance='holographic'] :is(.compare-panel > header, .comparison-table th, .comparison-table td) { border-color: var(--line); }
+:root[data-appearance='holographic'] :is(.comparison-table th, .parameter-panel .comparison-table tbody td:first-child, .compare-panel header select) { background: var(--panel-2); color: var(--muted); }
+:root[data-appearance='holographic'] :is(.compare-panel header h2, .selected-experiments footer strong) { color: var(--text); }
+:root[data-appearance='holographic'] :is(.compare-panel header span, .selected-experiments p, .selected-experiments footer small, .comparison-table td:first-child) { color: var(--muted); }
+:root[data-appearance='holographic'] .compare-panel > header > div { color: var(--accent-text); }

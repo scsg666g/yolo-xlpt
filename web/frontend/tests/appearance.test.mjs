@@ -219,3 +219,36 @@ test('preset and extreme custom colors remain readable in both themes without ch
     }
   }
 })
+
+test('holographic appearance persists as a dark workspace without replacing old preferences', () => {
+  const page = browser()
+  page.api.updateAppearance({ mode: 'holographic', fontSize: 'large', density: 'compact' })
+  assert.equal(page.dataset.theme, 'dark')
+  assert.equal(page.dataset.appearance, 'holographic')
+  assert.equal(page.properties.get('--accent'), '#96d5ff')
+  assert.ok(contrast(page.properties.get('--accent'), page.properties.get('--accent-contrast')) >= 4.5)
+  const reloaded = browser({ saved: Object.fromEntries(page.values) })
+  assert.equal(reloaded.snapshot().mode, 'holographic')
+  assert.equal(reloaded.snapshot().fontSize, 'large')
+  assert.equal(reloaded.snapshot().density, 'compact')
+  reloaded.systemDark(false)
+  assert.equal(reloaded.dataset.theme, 'dark')
+  reloaded.api.updateAppearance({ mode: 'light' })
+  assert.equal(reloaded.dataset.appearance, 'light')
+  assert.equal(reloaded.properties.get('--accent'), '#159a78')
+  assert.equal(reloaded.properties.has('--green'), false)
+})
+
+test('holographic appearance respects custom accents, cross-tab updates, and reset', () => {
+  const page = browser()
+  page.storageEvent(storageKey, JSON.stringify({ mode: 'holographic', accent: 'custom', customColor: '#b4acff' }))
+  assert.equal(page.snapshot().mode, 'holographic')
+  assert.equal(page.properties.get('--accent'), '#b4acff')
+  for (const background of ['#10162b', '#151d35']) {
+    assert.ok(contrast(page.properties.get('--accent-text'), background) >= 4.5)
+  }
+  page.api.resetAppearance()
+  assert.equal(page.dataset.theme, 'light')
+  assert.equal(page.dataset.appearance, 'light')
+  assert.equal(page.snapshot().accent, 'default')
+})
